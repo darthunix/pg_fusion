@@ -1,4 +1,6 @@
-use pgrx::{prelude::*, GucContext, GucFlags, GucRegistry, GucSetting};
+use pgrx::prelude::*;
+use pgrx::{GucContext, GucFlags, GucRegistry, GucSetting};
+use pgrx::pg_sys::AsPgCStr;
 use planner_hook::init_datafusion_planner_hook;
 
 mod planner_hook;
@@ -24,14 +26,7 @@ pub extern "C" fn _PG_init() {
 
 #[allow(unused_variables)]
 fn mark_guc_prefix_reserved(guc_prefix: &str) {
-    #[cfg(feature = "pg14")]
     unsafe {
-        pgrx::pg_sys::EmitWarningsOnPlaceholders(guc_prefix.as_pg_cstr())
-    }
-
-    #[cfg(any(feature = "pg15", feature = "pg16", feature = "pg17"))]
-    unsafe {
-        use pgrx::pg_sys::AsPgCStr;
         pgrx::pg_sys::MarkGUCPrefixReserved(guc_prefix.as_pg_cstr())
     }
 }
