@@ -31,6 +31,7 @@ fn mark_guc_prefix_reserved(guc_prefix: &str) {
 
     #[cfg(any(feature = "pg15", feature = "pg16", feature = "pg17"))]
     unsafe {
+        use pgrx::pg_sys::AsPgCStr;
         pgrx::pg_sys::MarkGUCPrefixReserved(guc_prefix.as_pg_cstr())
     }
 }

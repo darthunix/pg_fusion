@@ -1,6 +1,6 @@
 [package]
 name = "pg_fusion"
-version = "0.0.0"
+version = "24.0.0"
 edition = "2021"
 
 [lib]
@@ -11,7 +11,7 @@ name = "pgrx_embed_pg_fusion"
 path = "./src/bin/pgrx_embed.rs"
 
 [features]
-default = ["pg13"]
+default = ["pg17"]
 pg12 = ["pgrx/pg12", "pgrx-tests/pg12" ]
 pg13 = ["pgrx/pg13", "pgrx-tests/pg13" ]
 pg14 = ["pgrx/pg14", "pgrx-tests/pg14" ]
@@ -21,10 +21,10 @@ pg17 = ["pgrx/pg17", "pgrx-tests/pg17" ]
 pg_test = []
 
 [dependencies]
-pgrx = "=0.12.6"
+pgrx = "0.12"
 
 [dev-dependencies]
-pgrx-tests = "=0.12.6"
+pgrx-tests = "0.12"
 
 [profile.dev]
 panic = "unwind"
