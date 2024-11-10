@@ -1,3 +1,4 @@
+use crate::ipc::init_shmem;
 use pgrx::bgworkers::{BackgroundWorker, BackgroundWorkerBuilder, SignalWakeFlags};
 use pgrx::prelude::*;
 
@@ -8,12 +9,6 @@ pub(crate) fn init_datafusion_worker() {
         .set_library("pg_fusion")
         .enable_shmem_access(Some(init_shmem))
         .load();
-}
-
-#[pg_guard]
-#[no_mangle]
-pub unsafe extern "C" fn init_shmem() {
-    log!("DataFusion worker is initializing shared memory");
 }
 
 #[pg_guard]
