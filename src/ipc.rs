@@ -1,4 +1,7 @@
+use libc::c_void;
+use pgrx::pg_sys::ShmemAlloc;
 use pgrx::prelude::*;
+use std::cell::OnceCell;
 use std::mem::{align_of, size_of};
 use std::ops::Range;
 use std::ptr::write;
@@ -6,6 +9,7 @@ use std::slice::from_raw_parts_mut;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 pub(crate) const MOCKED_MAX_BACKENDS: u32 = 10;
+static mut PROC_FREE_LIST_PTR: OnceCell<*mut c_void> = OnceCell::new();
 
 /// The change of MaxBackends value requires cluster restart.
 /// So, it is safe to use it as a constant on startup.
@@ -19,22 +23,23 @@ fn max_backends() -> u32 {
     MOCKED_MAX_BACKENDS
 }
 
-type ProcNumber = u32;
+pub(crate) type SlotNumber = u32;
 
 #[repr(C)]
-pub(crate) struct ProcFreeList {
+#[derive(Debug)]
+pub(crate) struct SlotFreeList {
     locked: *mut AtomicBool,
     len: *mut u32,
-    list: *mut [ProcNumber],
+    list: *mut [SlotNumber],
     buffer: *mut u8,
     size: usize,
 }
 
-impl ProcFreeList {
+impl SlotFreeList {
     pub(crate) fn estimated_size() -> usize {
         let Range { start, end: _ } = Self::range1();
         let Range { start: _, end } = Self::range2();
-        end - start + max_backends() as usize * size_of::<ProcNumber>()
+        end - start + max_backends() as usize * size_of::<SlotNumber>()
     }
 
     #[cfg(any(test, feature = "pg_test"))]
@@ -50,8 +55,8 @@ impl ProcFreeList {
         let len = buffer[range2.clone()].as_mut_ptr() as *mut u32;
         let list = unsafe {
             from_raw_parts_mut(
-                buffer[range2.end..].as_ptr() as *mut ProcNumber,
-                max_backends() as usize * size_of::<ProcNumber>(),
+                buffer[range2.end..].as_ptr() as *mut SlotNumber,
+                max_backends() as usize * size_of::<SlotNumber>(),
             )
         };
         Self {
@@ -75,9 +80,9 @@ impl ProcFreeList {
             write(buffer[range2.clone()].as_mut_ptr() as *mut u32, len);
             for i in 0..len as usize {
                 write(
-                    buffer[range2.end + i * size_of::<ProcNumber>()
-                        ..range2.end + (i + 1) * size_of::<ProcNumber>()]
-                        .as_mut_ptr() as *mut ProcNumber,
+                    buffer[range2.end + i * size_of::<SlotNumber>()
+                        ..range2.end + (i + 1) * size_of::<SlotNumber>()]
+                        .as_mut_ptr() as *mut SlotNumber,
                     i as u32,
                 );
             }
@@ -94,7 +99,7 @@ impl ProcFreeList {
         aligned_offsets::<u32>(end)
     }
 
-    pub(crate) fn pop(&mut self) -> Option<ProcNumber> {
+    pub(crate) fn pop(&mut self) -> Option<SlotNumber> {
         unsafe {
             loop {
                 if let Ok(_) = (*self.locked).compare_exchange(
@@ -109,17 +114,17 @@ impl ProcFreeList {
                         return None;
                     }
 
-                    let list_ptr = self.list as *mut ProcNumber;
-                    let proc = *list_ptr.add(len as usize - 1);
+                    let list_ptr = self.list as *mut SlotNumber;
+                    let slot = *list_ptr.add(len as usize - 1);
                     *self.len -= 1;
                     (*self.locked).store(false, Ordering::Relaxed);
-                    return Some(proc);
+                    return Some(slot);
                 }
             }
         }
     }
 
-    pub(crate) fn push(&mut self, proc: ProcNumber) {
+    pub(crate) fn push(&mut self, slot: SlotNumber) {
         unsafe {
             loop {
                 if let Ok(_) = (*self.locked).compare_exchange(
@@ -132,10 +137,10 @@ impl ProcFreeList {
                     let len = *self.len;
                     if len >= max_backends() {
                         (*self.locked).store(false, Ordering::Release);
-                        panic!("ProcFreeList is full");
+                        panic!("SlotFreeList is full");
                     }
-                    let list_ptr = self.list as *mut ProcNumber;
-                    *list_ptr.add(len as usize) = proc;
+                    let list_ptr = self.list as *mut SlotNumber;
+                    *list_ptr.add(len as usize) = slot;
                     *self.len += 1;
                     (*self.locked).store(false, Ordering::Release);
                     break;
@@ -151,10 +156,23 @@ fn aligned_offsets<T>(ptr: usize) -> Range<usize> {
     ptr + lpad..ptr + lpad + size_of::<T>()
 }
 
+pub(crate) fn slot_free_list() -> SlotFreeList {
+    // We initialize this pointer only once on postmaster shared
+    // memory initialization, when no backends exist yet. That is
+    // why no read-write concurrency problems can happen and it is
+    // safe to read without any locks.
+    let ptr = unsafe { *PROC_FREE_LIST_PTR.get().unwrap() };
+    SlotFreeList::new(ptr as *mut u8, SlotFreeList::estimated_size())
+}
+
 #[pg_guard]
 #[no_mangle]
 pub unsafe extern "C" fn init_shmem() {
-    log!("DataFusion worker is initializing shared memory");
+    PROC_FREE_LIST_PTR
+        .set(ShmemAlloc(SlotFreeList::estimated_size()))
+        .unwrap();
+    let free_list = slot_free_list();
+    log!("DataFusion worker has initialized shared memory: {free_list:?}");
 }
 
 #[cfg(any(test, feature = "pg_test"))]
@@ -174,9 +192,9 @@ mod tests {
     }
 
     #[pg_test]
-    fn test_proc_free_list() {
-        assert_eq!(ProcFreeList::estimated_size(), 48);
-        let mut list = unsafe { ProcFreeList::new(addr_of_mut!(BUFFER) as *mut u8, BUFFER.len()) };
+    fn test_slot_free_list() {
+        assert_eq!(SlotFreeList::estimated_size(), 48);
+        let mut list = unsafe { SlotFreeList::new(addr_of_mut!(BUFFER) as *mut u8, BUFFER.len()) };
         let mut expected_buf = [0; 50];
         set_bytes(&mut expected_buf, &[1, 2, 3, 48, 49], 1);
         set_bytes(&mut expected_buf, &[4], 10);
