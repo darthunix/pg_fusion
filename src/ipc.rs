@@ -1,5 +1,5 @@
 use libc::c_void;
-use pgrx::pg_sys::ShmemAlloc;
+use pgrx::pg_sys::{on_proc_exit, Datum, ShmemAlloc};
 use pgrx::prelude::*;
 use std::cell::OnceCell;
 use std::mem::{align_of, size_of};
@@ -8,8 +8,8 @@ use std::ptr::write;
 use std::slice::from_raw_parts_mut;
 use std::sync::atomic::{AtomicBool, Ordering};
 
-pub(crate) const MOCKED_MAX_BACKENDS: u32 = 10;
 static mut PROC_FREE_LIST_PTR: OnceCell<*mut c_void> = OnceCell::new();
+pub(crate) static mut CURRENT_SLOT: OnceCell<SlotHandler> = OnceCell::new();
 
 /// The change of MaxBackends value requires cluster restart.
 /// So, it is safe to use it as a constant on startup.
@@ -20,7 +20,7 @@ fn max_backends() -> u32 {
         pgrx::pg_sys::MaxBackends as u32
     }
     #[cfg(any(test, feature = "pg_test"))]
-    MOCKED_MAX_BACKENDS
+    10
 }
 
 pub(crate) type SlotNumber = u32;
@@ -47,7 +47,7 @@ impl SlotFreeList {
         unsafe { from_raw_parts_mut(self.buffer, self.size) }
     }
 
-    fn from_bytes(ptr: *mut u8, size: usize) -> Self {
+    pub(crate) fn from_bytes(ptr: *mut u8, size: usize) -> Self {
         assert!(size >= Self::estimated_size());
         let buffer = unsafe { from_raw_parts_mut(ptr, size) };
         let locked = buffer[Self::range1()].as_mut_ptr() as *mut AtomicBool;
@@ -68,7 +68,7 @@ impl SlotFreeList {
         }
     }
 
-    pub(crate) fn new(ptr: *mut u8, size: usize) -> Self {
+    fn init(ptr: *mut u8, size: usize) {
         unsafe {
             let buffer = from_raw_parts_mut(ptr, size);
             write(
@@ -87,7 +87,6 @@ impl SlotFreeList {
                 );
             }
         }
-        Self::from_bytes(ptr, size)
     }
 
     fn range1() -> Range<usize> {
@@ -157,12 +156,45 @@ fn aligned_offsets<T>(ptr: usize) -> Range<usize> {
 }
 
 pub(crate) fn slot_free_list() -> SlotFreeList {
-    // We initialize this pointer only once on postmaster shared
+    // We initialize this pointer exactly once on postmaster shared
     // memory initialization, when no backends exist yet. That is
     // why no read-write concurrency problems can happen and it is
     // safe to read without any locks.
     let ptr = unsafe { *PROC_FREE_LIST_PTR.get().unwrap() };
-    SlotFreeList::new(ptr as *mut u8, SlotFreeList::estimated_size())
+    SlotFreeList::from_bytes(ptr as *mut u8, SlotFreeList::estimated_size())
+}
+
+pub(crate) struct SlotHandler(SlotNumber);
+
+impl SlotHandler {
+    pub(crate) fn new() -> Self {
+        let mut free_slots = slot_free_list();
+        let id = free_slots.pop().unwrap();
+        debug1!("Slot {} is allocated", id);
+        unsafe { on_proc_exit(Some(backend_cleanup), Datum::null()) };
+        SlotHandler(id)
+    }
+
+    pub(crate) fn id(&self) -> SlotNumber {
+        self.0
+    }
+}
+
+impl Drop for SlotHandler {
+    fn drop(&mut self) {
+        let id = self.id();
+        let mut free_slots = slot_free_list();
+        free_slots.push(id);
+        debug1!("Slot {} is freed", id);
+    }
+}
+
+#[pg_guard]
+#[no_mangle]
+pub unsafe extern "C" fn backend_cleanup(_code: i32, _args: Datum) {
+    if let Some(slot) = CURRENT_SLOT.take() {
+        drop(slot);
+    }
 }
 
 #[pg_guard]
@@ -171,8 +203,8 @@ pub unsafe extern "C" fn init_shmem() {
     PROC_FREE_LIST_PTR
         .set(ShmemAlloc(SlotFreeList::estimated_size()))
         .unwrap();
-    let free_list = slot_free_list();
-    log!("DataFusion worker has initialized shared memory: {free_list:?}");
+    let ptr = unsafe { *PROC_FREE_LIST_PTR.get().unwrap() };
+    SlotFreeList::init(ptr as *mut u8, SlotFreeList::estimated_size());
 }
 
 #[cfg(any(test, feature = "pg_test"))]
@@ -194,7 +226,10 @@ mod tests {
     #[pg_test]
     fn test_slot_free_list() {
         assert_eq!(SlotFreeList::estimated_size(), 48);
-        let mut list = unsafe { SlotFreeList::new(addr_of_mut!(BUFFER) as *mut u8, BUFFER.len()) };
+        let ptr = addr_of_mut!(BUFFER) as *mut u8;
+        let len = unsafe { BUFFER.len() };
+        SlotFreeList::init(ptr, len);
+        let mut list = SlotFreeList::from_bytes(ptr, len);
         let mut expected_buf = [0; 50];
         set_bytes(&mut expected_buf, &[1, 2, 3, 48, 49], 1);
         set_bytes(&mut expected_buf, &[4], 10);

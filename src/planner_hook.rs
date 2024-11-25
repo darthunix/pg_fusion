@@ -4,9 +4,14 @@ use pg_sys::{
 use pgrx::prelude::*;
 use std::ffi::{c_char, c_int, CStr};
 
+use crate::ipc::{SlotHandler, CURRENT_SLOT};
 use crate::ENABLE_DATAFUSION;
 
 static mut PREV_PLANNER_HOOK: planner_hook_type = None;
+
+fn current_slot() -> &'static SlotHandler {
+    unsafe { CURRENT_SLOT.get_or_init(|| SlotHandler::new()) }
+}
 
 #[pg_guard]
 #[no_mangle]
@@ -33,6 +38,8 @@ extern "C" fn datafusion_planner_hook(
             "DataFusion planner hook called for query: {:?}",
             pattern.to_str().unwrap()
         );
+        let slot_id = current_slot().id();
+        info!("Slot id: {slot_id}");
     }
     unsafe {
         if let Some(prev_hook) = PREV_PLANNER_HOOK {
