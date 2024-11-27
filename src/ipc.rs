@@ -8,6 +8,7 @@ use std::ptr::write;
 use std::slice::from_raw_parts_mut;
 use std::sync::atomic::{AtomicBool, Ordering};
 
+const DATA_SIZE: usize = 8 * 1024;
 static mut PROC_FREE_LIST_PTR: OnceCell<*mut c_void> = OnceCell::new();
 pub(crate) static mut CURRENT_SLOT: OnceCell<SlotHandler> = OnceCell::new();
 
@@ -189,6 +190,73 @@ impl Drop for SlotHandler {
     }
 }
 
+#[repr(C)]
+pub(crate) struct Slot {
+    locked: *mut AtomicBool,
+    data: *mut [u8; DATA_SIZE],
+}
+
+impl Slot {
+    fn range1() -> Range<usize> {
+        aligned_offsets::<AtomicBool>(0)
+    }
+
+    fn range2() -> Range<usize> {
+        let Range { start: _, end } = Self::range1();
+        aligned_offsets::<[u8; DATA_SIZE]>(end)
+    }
+
+    pub(crate) fn estimated_size() -> usize {
+        let Range { start, end: _ } = Self::range1();
+        let Range { start: _, end } = Self::range2();
+        end - start
+    }
+
+    pub(crate) fn from_bytes(ptr: *mut u8, size: usize) -> Self {
+        assert!(size >= Self::estimated_size());
+        let buffer = unsafe { from_raw_parts_mut(ptr, size) };
+        let locked = buffer[Self::range1()].as_mut_ptr() as *mut AtomicBool;
+        let data = buffer[Self::range2()].as_mut_ptr() as *mut [u8; DATA_SIZE];
+        Self { locked, data }
+    }
+
+    pub(crate) fn init(ptr: *mut u8, size: usize) {
+        unsafe {
+            let buffer = from_raw_parts_mut(ptr, size);
+            write(
+                buffer[Self::range1()].as_mut_ptr() as *mut AtomicBool,
+                AtomicBool::new(false),
+            );
+        }
+    }
+
+    pub(crate) fn lock(&self) -> bool {
+        unsafe {
+            if let Ok(_) =
+                (*self.locked).compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed)
+            {
+                true
+            } else {
+                false
+            }
+        }
+    }
+
+    pub(crate) fn unlock(&self) {
+        unsafe {
+            (*self.locked).store(false, Ordering::Release);
+        }
+    }
+
+    pub(crate) fn data(&self) -> &[u8; DATA_SIZE] {
+        unsafe { &*self.data }
+    }
+
+    pub(crate) fn data_mut(&mut self) -> &mut [u8; DATA_SIZE] {
+        unsafe { &mut *self.data }
+    }
+}
+
 #[pg_guard]
 #[no_mangle]
 pub unsafe extern "C" fn backend_cleanup(_code: i32, _args: Datum) {
@@ -215,7 +283,8 @@ mod tests {
 
     use super::*;
 
-    static mut BUFFER: [u8; 50] = [1; 50];
+    static mut FREE_LIST_BUFFER: [u8; 50] = [1; 50];
+    static mut SLOT_BUFFER: [u8; 8193] = [1; 8193];
 
     fn set_bytes(buf: &mut [u8], positions: &[usize], value: u8) {
         for &pos in positions {
@@ -226,8 +295,8 @@ mod tests {
     #[pg_test]
     fn test_slot_free_list() {
         assert_eq!(SlotFreeList::estimated_size(), 48);
-        let ptr = addr_of_mut!(BUFFER) as *mut u8;
-        let len = unsafe { BUFFER.len() };
+        let ptr = addr_of_mut!(FREE_LIST_BUFFER) as *mut u8;
+        let len = unsafe { FREE_LIST_BUFFER.len() };
         SlotFreeList::init(ptr, len);
         let mut list = SlotFreeList::from_bytes(ptr, len);
         let mut expected_buf = [0; 50];
@@ -250,5 +319,25 @@ mod tests {
         assert_eq!(list.pop(), None);
         list.push(1);
         assert_eq!(list.pop(), Some(1));
+    }
+
+    #[pg_test]
+    fn test_slot() {
+        assert_eq!(Slot::estimated_size(), 8193);
+        let ptr = addr_of_mut!(SLOT_BUFFER) as *mut u8;
+        let len = unsafe { SLOT_BUFFER.len() };
+        Slot::init(ptr, len);
+        let mut slot = Slot::from_bytes(ptr, len);
+        assert_eq!(slot.lock(), true);
+        assert_eq!(slot.lock(), false);
+        unsafe {
+            assert_eq!(&SLOT_BUFFER[0..1], &[1]);
+            write(slot.data_mut(), [1; DATA_SIZE]);
+            assert_eq!(&SLOT_BUFFER[1..], [1; DATA_SIZE]);
+        }
+        slot.unlock();
+        unsafe {
+            assert_eq!(&SLOT_BUFFER[0..1], &[0]);
+        }
     }
 }
