@@ -32,8 +32,6 @@ pub(crate) struct SlotFreeList {
     locked: *mut AtomicBool,
     len: *mut u32,
     list: *mut [SlotNumber],
-    buffer: *mut u8,
-    size: usize,
 }
 
 impl SlotFreeList {
@@ -41,11 +39,6 @@ impl SlotFreeList {
         let Range { start, end: _ } = Self::range1();
         let Range { start: _, end } = Self::range2();
         end - start + max_backends() as usize * size_of::<SlotNumber>()
-    }
-
-    #[cfg(any(test, feature = "pg_test"))]
-    pub(crate) fn buffer(&self) -> &[u8] {
-        unsafe { from_raw_parts_mut(self.buffer, self.size) }
     }
 
     pub(crate) fn from_bytes(ptr: *mut u8, size: usize) -> Self {
@@ -60,13 +53,7 @@ impl SlotFreeList {
                 max_backends() as usize * size_of::<SlotNumber>(),
             )
         };
-        Self {
-            locked,
-            len,
-            list,
-            buffer: ptr,
-            size,
-        }
+        Self { locked, len, list }
     }
 
     fn init(ptr: *mut u8, size: usize) {
@@ -312,7 +299,9 @@ mod tests {
         set_bytes(&mut expected_buf, &[36], 7);
         set_bytes(&mut expected_buf, &[40], 8);
         set_bytes(&mut expected_buf, &[44], 9);
-        assert_eq!(list.buffer(), &expected_buf);
+        unsafe {
+            assert_eq!(FREE_LIST_BUFFER, expected_buf);
+        }
         for i in (0..max_backends()).rev() {
             assert_eq!(list.pop(), Some(i));
         }
