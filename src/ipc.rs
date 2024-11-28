@@ -2,15 +2,16 @@ use libc::c_void;
 use pgrx::pg_sys::{on_proc_exit, Datum, ShmemAlloc};
 use pgrx::prelude::*;
 use std::cell::OnceCell;
+use std::io::{Error, ErrorKind, Result, Write};
 use std::mem::{align_of, size_of};
 use std::ops::Range;
 use std::ptr::write;
 use std::slice::from_raw_parts_mut;
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 
-const DATA_SIZE: usize = 8 * 1024;
 static mut SLOT_FREE_LIST_PTR: OnceCell<*mut c_void> = OnceCell::new();
 static mut BUS_PTR: OnceCell<*mut c_void> = OnceCell::new();
+pub(crate) const DATA_SIZE: usize = 8 * 1024;
 pub(crate) static mut CURRENT_SLOT: OnceCell<SlotHandler> = OnceCell::new();
 
 /// The change of MaxBackends value requires cluster restart.
@@ -189,6 +190,24 @@ pub(crate) struct Slot {
     data: *mut [u8; DATA_SIZE],
 }
 
+impl Write for Slot {
+    fn write(&mut self, buf: &[u8]) -> Result<usize> {
+        let len = buf.len();
+        if len > DATA_SIZE {
+            return Err(Error::new(
+                ErrorKind::InvalidInput,
+                "Data size exceeds slot capacity",
+            ));
+        }
+        self.data_mut().copy_from_slice(buf);
+        Ok(len)
+    }
+
+    fn flush(&mut self) -> Result<()> {
+        Ok(())
+    }
+}
+
 impl Slot {
     pub(crate) fn range1() -> Range<usize> {
         aligned_offsets::<AtomicBool>(0)
@@ -318,12 +337,17 @@ impl Bus {
             None
         }
     }
+
+    pub(crate) fn new() -> Self {
+        let ptr = unsafe { *BUS_PTR.get().unwrap() };
+        Self::from_bytes(ptr as *mut u8, Self::estimated_size())
+    }
 }
 
 #[pg_guard]
 #[no_mangle]
 pub unsafe extern "C" fn backend_cleanup(_code: i32, _args: Datum) {
-    let mut bus = Bus::from_bytes(*BUS_PTR.get().unwrap() as *mut u8, Bus::estimated_size());
+    let mut bus = Bus::new();
     if let Some(handler) = CURRENT_SLOT.take() {
         let slot = bus.slot_raw(handler.id());
         if handler.id() == slot.holder() {
