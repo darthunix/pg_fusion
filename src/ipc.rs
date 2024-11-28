@@ -6,10 +6,11 @@ use std::mem::{align_of, size_of};
 use std::ops::Range;
 use std::ptr::write;
 use std::slice::from_raw_parts_mut;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 
 const DATA_SIZE: usize = 8 * 1024;
-static mut PROC_FREE_LIST_PTR: OnceCell<*mut c_void> = OnceCell::new();
+static mut SLOT_FREE_LIST_PTR: OnceCell<*mut c_void> = OnceCell::new();
+static mut BUS_PTR: OnceCell<*mut c_void> = OnceCell::new();
 pub(crate) static mut CURRENT_SLOT: OnceCell<SlotHandler> = OnceCell::new();
 
 /// The change of MaxBackends value requires cluster restart.
@@ -22,6 +23,11 @@ fn max_backends() -> u32 {
     }
     #[cfg(any(test, feature = "pg_test"))]
     10
+}
+
+#[inline]
+fn worker_id() -> u32 {
+    max_backends()
 }
 
 pub(crate) type SlotNumber = u32;
@@ -147,7 +153,7 @@ pub(crate) fn slot_free_list() -> SlotFreeList {
     // memory initialization, when no backends exist yet. That is
     // why no read-write concurrency problems can happen and it is
     // safe to read without any locks.
-    let ptr = unsafe { *PROC_FREE_LIST_PTR.get().unwrap() };
+    let ptr = unsafe { *SLOT_FREE_LIST_PTR.get().unwrap() };
     SlotFreeList::from_bytes(ptr as *mut u8, SlotFreeList::estimated_size())
 }
 
@@ -179,22 +185,28 @@ impl Drop for SlotHandler {
 #[repr(C)]
 pub(crate) struct Slot {
     locked: *mut AtomicBool,
+    holder: *mut AtomicU32,
     data: *mut [u8; DATA_SIZE],
 }
 
 impl Slot {
-    fn range1() -> Range<usize> {
+    pub(crate) fn range1() -> Range<usize> {
         aligned_offsets::<AtomicBool>(0)
     }
 
-    fn range2() -> Range<usize> {
+    pub(crate) fn range2() -> Range<usize> {
         let Range { start: _, end } = Self::range1();
+        aligned_offsets::<AtomicU32>(end)
+    }
+
+    pub(crate) fn range3() -> Range<usize> {
+        let Range { start: _, end } = Self::range2();
         aligned_offsets::<[u8; DATA_SIZE]>(end)
     }
 
     pub(crate) fn estimated_size() -> usize {
         let Range { start, end: _ } = Self::range1();
-        let Range { start: _, end } = Self::range2();
+        let Range { start: _, end } = Self::range3();
         end - start
     }
 
@@ -202,8 +214,13 @@ impl Slot {
         assert!(size >= Self::estimated_size());
         let buffer = unsafe { from_raw_parts_mut(ptr, size) };
         let locked = buffer[Self::range1()].as_mut_ptr() as *mut AtomicBool;
-        let data = buffer[Self::range2()].as_mut_ptr() as *mut [u8; DATA_SIZE];
-        Self { locked, data }
+        let holder = buffer[Self::range2()].as_mut_ptr() as *mut AtomicU32;
+        let data = buffer[Self::range3()].as_mut_ptr() as *mut [u8; DATA_SIZE];
+        Self {
+            locked,
+            holder,
+            data,
+        }
     }
 
     pub(crate) fn init(ptr: *mut u8, size: usize) {
@@ -213,7 +230,15 @@ impl Slot {
                 buffer[Self::range1()].as_mut_ptr() as *mut AtomicBool,
                 AtomicBool::new(false),
             );
+            write(
+                buffer[Self::range2()].as_mut_ptr() as *mut AtomicU32,
+                AtomicU32::new(worker_id()),
+            );
         }
+    }
+
+    pub(crate) fn holder(&self) -> u32 {
+        unsafe { (*self.holder).load(Ordering::Relaxed) }
     }
 
     pub(crate) fn lock(&self) -> bool {
@@ -221,6 +246,11 @@ impl Slot {
             if let Ok(_) =
                 (*self.locked).compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed)
             {
+                let id = match CURRENT_SLOT.get() {
+                    Some(slot) => slot.id(),
+                    None => worker_id(),
+                };
+                (*self.holder).store(id, Ordering::Relaxed);
                 true
             } else {
                 false
@@ -230,6 +260,7 @@ impl Slot {
 
     pub(crate) fn unlock(&self) {
         unsafe {
+            (*self.holder).store(worker_id(), Ordering::Release);
             (*self.locked).store(false, Ordering::Release);
         }
     }
@@ -270,13 +301,17 @@ impl Bus {
         Self { slots }
     }
 
-    pub(crate) fn slot(&mut self, id: SlotNumber) -> Option<Slot> {
+    fn slot_raw(&mut self, id: SlotNumber) -> Slot {
         assert!(id < max_backends());
         let slot_ptr = unsafe {
             let ptr = self.slots as *mut u8;
             ptr.add(id as usize * Slot::estimated_size())
         };
-        let slot = Slot::from_bytes(slot_ptr, Slot::estimated_size());
+        Slot::from_bytes(slot_ptr, Slot::estimated_size())
+    }
+
+    pub(crate) fn slot(&mut self, id: SlotNumber) -> Option<Slot> {
+        let slot = self.slot_raw(id);
         if slot.lock() {
             Some(slot)
         } else {
@@ -288,19 +323,29 @@ impl Bus {
 #[pg_guard]
 #[no_mangle]
 pub unsafe extern "C" fn backend_cleanup(_code: i32, _args: Datum) {
-    if let Some(slot) = CURRENT_SLOT.take() {
-        drop(slot);
+    let mut bus = Bus::from_bytes(*BUS_PTR.get().unwrap() as *mut u8, Bus::estimated_size());
+    if let Some(handler) = CURRENT_SLOT.take() {
+        let slot = bus.slot_raw(handler.id());
+        if handler.id() == slot.holder() {
+            slot.unlock();
+        }
+
+        drop(handler);
     }
 }
 
 #[pg_guard]
 #[no_mangle]
 pub unsafe extern "C" fn init_shmem() {
-    PROC_FREE_LIST_PTR
+    SLOT_FREE_LIST_PTR
         .set(ShmemAlloc(SlotFreeList::estimated_size()))
         .unwrap();
-    let ptr = unsafe { *PROC_FREE_LIST_PTR.get().unwrap() };
-    SlotFreeList::init(ptr as *mut u8, SlotFreeList::estimated_size());
+    let list_ptr = unsafe { *SLOT_FREE_LIST_PTR.get().unwrap() };
+    SlotFreeList::init(list_ptr as *mut u8, SlotFreeList::estimated_size());
+
+    BUS_PTR.set(ShmemAlloc(Bus::estimated_size())).unwrap();
+    let bus_ptr = unsafe { *BUS_PTR.get().unwrap() };
+    Bus::init(bus_ptr as *mut u8, Bus::estimated_size());
 }
 
 #[cfg(any(test, feature = "pg_test"))]
@@ -311,9 +356,10 @@ mod tests {
 
     use super::*;
 
+    const SLOT_SIZE: usize = 8200;
     static mut FREE_LIST_BUFFER: [u8; 50] = [1; 50];
-    static mut SLOT_BUFFER: [u8; 8193] = [1; 8193];
-    static mut BUS_BUFFER: [u8; 8193 * 10] = [1; 8193 * 10];
+    static mut SLOT_BUFFER: [u8; SLOT_SIZE] = [1; SLOT_SIZE];
+    static mut BUS_BUFFER: [u8; SLOT_SIZE * 10] = [1; SLOT_SIZE * 10];
 
     fn set_bytes(buf: &mut [u8], positions: &[usize], value: u8) {
         for &pos in positions {
@@ -354,7 +400,7 @@ mod tests {
 
     #[pg_test]
     fn test_slot() {
-        assert_eq!(Slot::estimated_size(), 8193);
+        assert_eq!(Slot::estimated_size(), SLOT_SIZE);
         let ptr = addr_of_mut!(SLOT_BUFFER) as *mut u8;
         let len = unsafe { SLOT_BUFFER.len() };
         Slot::init(ptr, len);
@@ -362,13 +408,13 @@ mod tests {
         assert_eq!(slot.lock(), true);
         assert_eq!(slot.lock(), false);
         unsafe {
-            assert_eq!(&SLOT_BUFFER[0..1], &[1]);
+            assert_eq!(&SLOT_BUFFER[Slot::range1()], &[1]);
             write(slot.data_mut(), [1; DATA_SIZE]);
-            assert_eq!(&SLOT_BUFFER[1..], [1; DATA_SIZE]);
+            assert_eq!(&SLOT_BUFFER[Slot::range3()], [1; DATA_SIZE]);
         }
         slot.unlock();
         unsafe {
-            assert_eq!(&SLOT_BUFFER[0..1], &[0]);
+            assert_eq!(&SLOT_BUFFER[Slot::range1()], &[0]);
         }
     }
 
