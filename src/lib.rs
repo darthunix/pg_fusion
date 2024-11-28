@@ -6,6 +6,7 @@ use worker::init_datafusion_worker;
 
 mod ipc;
 mod planner_hook;
+mod protocol;
 mod worker;
 
 pgrx::pg_module_magic!();
