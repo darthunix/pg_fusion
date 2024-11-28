@@ -27,7 +27,6 @@ fn max_backends() -> u32 {
 pub(crate) type SlotNumber = u32;
 
 #[repr(C)]
-#[derive(Debug)]
 pub(crate) struct SlotFreeList {
     locked: *mut AtomicBool,
     len: *mut u32,
@@ -244,6 +243,48 @@ impl Slot {
     }
 }
 
+pub(crate) struct Bus {
+    slots: *mut Slot,
+}
+
+impl Bus {
+    pub(crate) fn estimated_size() -> usize {
+        Slot::estimated_size() * max_backends() as usize
+    }
+
+    pub(crate) fn init(ptr: *mut u8, size: usize) -> Self {
+        assert!(size >= Self::estimated_size());
+        for i in 0..max_backends() as usize {
+            Slot::init(
+                unsafe { ptr.add(i * Slot::estimated_size()) },
+                Slot::estimated_size(),
+            );
+        }
+        let slots = ptr as *mut Slot;
+        Self { slots }
+    }
+
+    pub(crate) fn from_bytes(ptr: *mut u8, size: usize) -> Self {
+        let buffer = unsafe { from_raw_parts_mut(ptr, size) };
+        let slots = buffer.as_mut_ptr() as *mut Slot;
+        Self { slots }
+    }
+
+    pub(crate) fn slot(&mut self, id: SlotNumber) -> Option<Slot> {
+        assert!(id < max_backends());
+        let slot_ptr = unsafe {
+            let ptr = self.slots as *mut u8;
+            ptr.add(id as usize * Slot::estimated_size())
+        };
+        let slot = Slot::from_bytes(slot_ptr, Slot::estimated_size());
+        if slot.lock() {
+            Some(slot)
+        } else {
+            None
+        }
+    }
+}
+
 #[pg_guard]
 #[no_mangle]
 pub unsafe extern "C" fn backend_cleanup(_code: i32, _args: Datum) {
@@ -272,6 +313,7 @@ mod tests {
 
     static mut FREE_LIST_BUFFER: [u8; 50] = [1; 50];
     static mut SLOT_BUFFER: [u8; 8193] = [1; 8193];
+    static mut BUS_BUFFER: [u8; 8193 * 10] = [1; 8193 * 10];
 
     fn set_bytes(buf: &mut [u8], positions: &[usize], value: u8) {
         for &pos in positions {
@@ -327,6 +369,33 @@ mod tests {
         slot.unlock();
         unsafe {
             assert_eq!(&SLOT_BUFFER[0..1], &[0]);
+        }
+    }
+
+    #[pg_test]
+    fn test_bus() {
+        let ptr = addr_of_mut!(BUS_BUFFER) as *mut u8;
+        let len = unsafe { BUS_BUFFER.len() };
+        Bus::init(ptr, len);
+        let slot_size = Slot::estimated_size();
+        assert_eq!(Bus::estimated_size(), slot_size * 10);
+        for i in 0..max_backends() as usize {
+            unsafe {
+                let slot_ptr = BUS_BUFFER.as_ptr().add(i * slot_size);
+                assert_eq!(slot_ptr, &BUS_BUFFER[i * slot_size] as *const u8);
+                assert_eq!(BUS_BUFFER[i * slot_size], 0);
+            }
+        }
+        let mut bus = Bus::from_bytes(ptr, len);
+        for i in 0..max_backends() {
+            let slot = bus.slot(i);
+            assert_eq!(slot.is_some(), true);
+            let mut slot = slot.unwrap();
+            assert_eq!(slot.lock(), false);
+            slot.unlock();
+            unsafe {
+                assert_eq!(BUS_BUFFER[i as usize * slot_size], 0);
+            }
         }
     }
 }
