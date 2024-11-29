@@ -1,5 +1,5 @@
 use libc::c_void;
-use pgrx::pg_sys::{on_proc_exit, Datum, ShmemAlloc};
+use pgrx::pg_sys::{on_proc_exit, Datum, MyProcNumber, ShmemAlloc};
 use pgrx::prelude::*;
 use std::cell::OnceCell;
 use std::io::{Error, ErrorKind, Result, Write};
@@ -7,10 +7,11 @@ use std::mem::{align_of, size_of};
 use std::ops::Range;
 use std::ptr::write;
 use std::slice::from_raw_parts_mut;
-use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI32, Ordering};
 
 static mut SLOT_FREE_LIST_PTR: OnceCell<*mut c_void> = OnceCell::new();
 static mut BUS_PTR: OnceCell<*mut c_void> = OnceCell::new();
+pub(crate) const INVALID_PROC_NUMBER: i32 = -1;
 pub(crate) const DATA_SIZE: usize = 8 * 1024;
 pub(crate) static mut CURRENT_SLOT: OnceCell<SlotHandler> = OnceCell::new();
 
@@ -24,11 +25,6 @@ fn max_backends() -> u32 {
     }
     #[cfg(any(test, feature = "pg_test"))]
     10
-}
-
-#[inline]
-fn worker_id() -> u32 {
-    max_backends()
 }
 
 pub(crate) type SlotNumber = u32;
@@ -186,7 +182,8 @@ impl Drop for SlotHandler {
 #[repr(C)]
 pub(crate) struct Slot {
     locked: *mut AtomicBool,
-    holder: *mut AtomicU32,
+    holder: *mut AtomicI32,
+    owner: *mut AtomicI32,
     data: *mut [u8; DATA_SIZE],
 }
 
@@ -215,17 +212,22 @@ impl Slot {
 
     pub(crate) fn range2() -> Range<usize> {
         let Range { start: _, end } = Self::range1();
-        aligned_offsets::<AtomicU32>(end)
+        aligned_offsets::<AtomicI32>(end)
     }
 
     pub(crate) fn range3() -> Range<usize> {
         let Range { start: _, end } = Self::range2();
+        aligned_offsets::<AtomicI32>(end)
+    }
+
+    pub(crate) fn range4() -> Range<usize> {
+        let Range { start: _, end } = Self::range3();
         aligned_offsets::<[u8; DATA_SIZE]>(end)
     }
 
     pub(crate) fn estimated_size() -> usize {
         let Range { start, end: _ } = Self::range1();
-        let Range { start: _, end } = Self::range3();
+        let Range { start: _, end } = Self::range4();
         end - start
     }
 
@@ -233,11 +235,13 @@ impl Slot {
         assert!(size >= Self::estimated_size());
         let buffer = unsafe { from_raw_parts_mut(ptr, size) };
         let locked = buffer[Self::range1()].as_mut_ptr() as *mut AtomicBool;
-        let holder = buffer[Self::range2()].as_mut_ptr() as *mut AtomicU32;
-        let data = buffer[Self::range3()].as_mut_ptr() as *mut [u8; DATA_SIZE];
+        let holder = buffer[Self::range2()].as_mut_ptr() as *mut AtomicI32;
+        let owner = buffer[Self::range3()].as_mut_ptr() as *mut AtomicI32;
+        let data = buffer[Self::range4()].as_mut_ptr() as *mut [u8; DATA_SIZE];
         Self {
             locked,
             holder,
+            owner,
             data,
         }
     }
@@ -250,14 +254,18 @@ impl Slot {
                 AtomicBool::new(false),
             );
             write(
-                buffer[Self::range2()].as_mut_ptr() as *mut AtomicU32,
-                AtomicU32::new(worker_id()),
+                buffer[Self::range2()].as_mut_ptr() as *mut AtomicI32,
+                AtomicI32::new(INVALID_PROC_NUMBER),
             );
         }
     }
 
-    pub(crate) fn holder(&self) -> u32 {
+    pub(crate) fn holder(&self) -> i32 {
         unsafe { (*self.holder).load(Ordering::Relaxed) }
+    }
+
+    pub(crate) fn owner(&self) -> i32 {
+        unsafe { (*self.owner).load(Ordering::Relaxed) }
     }
 
     pub(crate) fn lock(&self) -> bool {
@@ -265,11 +273,7 @@ impl Slot {
             if let Ok(_) =
                 (*self.locked).compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed)
             {
-                let id = match CURRENT_SLOT.get() {
-                    Some(slot) => slot.id(),
-                    None => worker_id(),
-                };
-                (*self.holder).store(id, Ordering::Relaxed);
+                (*self.holder).store(MyProcNumber, Ordering::Relaxed);
                 true
             } else {
                 false
@@ -279,7 +283,7 @@ impl Slot {
 
     pub(crate) fn unlock(&self) {
         unsafe {
-            (*self.holder).store(worker_id(), Ordering::Release);
+            (*self.holder).store(INVALID_PROC_NUMBER, Ordering::Release);
             (*self.locked).store(false, Ordering::Release);
         }
     }
@@ -350,7 +354,7 @@ pub unsafe extern "C" fn backend_cleanup(_code: i32, _args: Datum) {
     let mut bus = Bus::new();
     if let Some(handler) = CURRENT_SLOT.take() {
         let slot = bus.slot_raw(handler.id());
-        if handler.id() == slot.holder() {
+        if slot.owner() == slot.holder() {
             slot.unlock();
         }
 
@@ -380,7 +384,7 @@ mod tests {
 
     use super::*;
 
-    const SLOT_SIZE: usize = 8200;
+    const SLOT_SIZE: usize = 8204;
     static mut FREE_LIST_BUFFER: [u8; 50] = [1; 50];
     static mut SLOT_BUFFER: [u8; SLOT_SIZE] = [1; SLOT_SIZE];
     static mut BUS_BUFFER: [u8; SLOT_SIZE * 10] = [1; SLOT_SIZE * 10];
@@ -434,7 +438,7 @@ mod tests {
         unsafe {
             assert_eq!(&SLOT_BUFFER[Slot::range1()], &[1]);
             write(slot.data_mut(), [1; DATA_SIZE]);
-            assert_eq!(&SLOT_BUFFER[Slot::range3()], [1; DATA_SIZE]);
+            assert_eq!(&SLOT_BUFFER[Slot::range4()], [1; DATA_SIZE]);
         }
         slot.unlock();
         unsafe {
