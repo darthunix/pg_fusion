@@ -2,7 +2,8 @@ use libc::c_void;
 use pgrx::pg_sys::{on_proc_exit, Datum, MyProcNumber, ShmemAlloc};
 use pgrx::prelude::*;
 use std::cell::OnceCell;
-use std::io::{Error, ErrorKind, Result, Write};
+use std::cmp::min;
+use std::io::{Error, ErrorKind, Read, Result, Write};
 use std::mem::{align_of, size_of};
 use std::ops::Range;
 use std::ptr::write;
@@ -139,7 +140,7 @@ impl SlotFreeList {
     }
 }
 
-fn aligned_offsets<T>(ptr: usize) -> Range<usize> {
+pub(crate) fn aligned_offsets<T>(ptr: usize) -> Range<usize> {
     let align = align_of::<T>();
     let lpad = (align - ptr % align) % align;
     ptr + lpad..ptr + lpad + size_of::<T>()
@@ -187,21 +188,9 @@ pub(crate) struct Slot {
     data: *mut [u8; DATA_SIZE],
 }
 
-impl Write for Slot {
-    fn write(&mut self, buf: &[u8]) -> Result<usize> {
-        let len = buf.len();
-        if len > DATA_SIZE {
-            return Err(Error::new(
-                ErrorKind::InvalidInput,
-                "Data size exceeds slot capacity",
-            ));
-        }
-        self.data_mut().copy_from_slice(buf);
-        Ok(len)
-    }
-
-    fn flush(&mut self) -> Result<()> {
-        Ok(())
+impl From<SlotStream> for Slot {
+    fn from(value: SlotStream) -> Self {
+        value.inner
     }
 }
 
@@ -297,6 +286,51 @@ impl Slot {
     }
 }
 
+pub(crate) struct SlotStream {
+    pos: usize,
+    inner: Slot,
+}
+
+impl From<Slot> for SlotStream {
+    fn from(value: Slot) -> Self {
+        SlotStream {
+            pos: 0,
+            inner: value,
+        }
+    }
+}
+
+impl Write for SlotStream {
+    fn write(&mut self, buf: &[u8]) -> Result<usize> {
+        let len = buf.len();
+        if len > DATA_SIZE - self.pos {
+            return Err(Error::new(
+                ErrorKind::InvalidInput,
+                "Data size exceeds slot capacity",
+            ));
+        }
+        let slot_data = &mut self.inner.data_mut()[self.pos..self.pos + len];
+        slot_data.copy_from_slice(buf);
+        self.pos += len;
+        Ok(len)
+    }
+
+    fn flush(&mut self) -> Result<()> {
+        Ok(())
+    }
+}
+
+impl Read for SlotStream {
+    fn read(&mut self, buf: &mut [u8]) -> Result<usize> {
+        let remaining = DATA_SIZE - self.pos;
+        let len = min(remaining, buf.len());
+        let slot_data = &self.inner.data()[self.pos..self.pos + len];
+        buf.copy_from_slice(slot_data);
+        self.pos += len;
+        Ok(len)
+    }
+}
+
 pub(crate) struct Bus {
     slots: *mut Slot,
 }
@@ -324,7 +358,7 @@ impl Bus {
         Self { slots }
     }
 
-    fn slot_raw(&mut self, id: SlotNumber) -> Slot {
+    pub(crate) fn slot(&mut self, id: SlotNumber) -> Slot {
         assert!(id < max_backends());
         let slot_ptr = unsafe {
             let ptr = self.slots as *mut u8;
@@ -333,8 +367,8 @@ impl Bus {
         Slot::from_bytes(slot_ptr, Slot::estimated_size())
     }
 
-    pub(crate) fn slot(&mut self, id: SlotNumber) -> Option<Slot> {
-        let slot = self.slot_raw(id);
+    pub(crate) fn slot_locked(&mut self, id: SlotNumber) -> Option<Slot> {
+        let slot = self.slot(id);
         if slot.lock() {
             Some(slot)
         } else {
@@ -346,6 +380,37 @@ impl Bus {
         let ptr = unsafe { *BUS_PTR.get().unwrap() };
         Self::from_bytes(ptr as *mut u8, Self::estimated_size())
     }
+
+    pub(crate) fn into_iter(self) -> BusIter {
+        BusIter::from(self)
+    }
+}
+
+pub(crate) struct BusIter {
+    pos: SlotNumber,
+    inner: Bus,
+}
+
+impl From<Bus> for BusIter {
+    fn from(value: Bus) -> Self {
+        Self {
+            pos: 0,
+            inner: value,
+        }
+    }
+}
+
+impl Iterator for BusIter {
+    type Item = Option<Slot>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        if self.pos >= max_backends() {
+            return None;
+        }
+        let res = self.inner.slot_locked(self.pos);
+        self.pos += 1;
+        Some(res)
+    }
 }
 
 #[pg_guard]
@@ -353,7 +418,7 @@ impl Bus {
 pub unsafe extern "C" fn backend_cleanup(_code: i32, _args: Datum) {
     let mut bus = Bus::new();
     if let Some(handler) = CURRENT_SLOT.take() {
-        let slot = bus.slot_raw(handler.id());
+        let slot = bus.slot(handler.id());
         if slot.owner() == slot.holder() {
             slot.unlock();
         }
@@ -385,6 +450,7 @@ mod tests {
     use super::*;
 
     const SLOT_SIZE: usize = 8204;
+    //FIXME: make these buffers local
     static mut FREE_LIST_BUFFER: [u8; 50] = [1; 50];
     static mut SLOT_BUFFER: [u8; SLOT_SIZE] = [1; SLOT_SIZE];
     static mut BUS_BUFFER: [u8; SLOT_SIZE * 10] = [1; SLOT_SIZE * 10];
@@ -447,6 +513,39 @@ mod tests {
     }
 
     #[pg_test]
+    fn test_slot_stream() {
+        let mut buffer: [u8; SLOT_SIZE] = [1; SLOT_SIZE];
+        let ptr = addr_of_mut!(buffer) as *mut u8;
+        let len = buffer.len();
+        Slot::init(ptr, len);
+        let slot = Slot::from_bytes(ptr, len);
+        slot.lock();
+        let mut stream = SlotStream::from(slot);
+        let data = [42; 10];
+        let len = stream.write(&data).unwrap();
+        assert_eq!(len, 10);
+        let len = stream.write(&data).unwrap();
+        assert_eq!(len, 10);
+        let slot = Slot::from(stream);
+        assert_eq!(slot.data()[0..10], data);
+        assert_eq!(slot.data()[10..20], data);
+        assert_eq!(slot.data()[20..30], [1; 10]);
+        let mut stream = SlotStream::from(slot);
+        let mut consumed: [u8; 10] = [0; 10];
+        let len = stream.read(&mut consumed).unwrap();
+        assert_eq!(len, 10);
+        assert_eq!(data, consumed);
+        let len = stream.read(&mut consumed).unwrap();
+        assert_eq!(len, 10);
+        assert_eq!(data, consumed);
+        let len = stream.read(&mut consumed).unwrap();
+        assert_eq!(len, 10);
+        assert_eq!([1; 10], consumed);
+        let slot = Slot::from(stream);
+        slot.unlock();
+    }
+
+    #[pg_test]
     fn test_bus() {
         let ptr = addr_of_mut!(BUS_BUFFER) as *mut u8;
         let len = unsafe { BUS_BUFFER.len() };
@@ -462,9 +561,9 @@ mod tests {
         }
         let mut bus = Bus::from_bytes(ptr, len);
         for i in 0..max_backends() {
-            let slot = bus.slot(i);
+            let slot = bus.slot_locked(i);
             assert_eq!(slot.is_some(), true);
-            let mut slot = slot.unwrap();
+            let slot = slot.unwrap();
             assert_eq!(slot.lock(), false);
             slot.unlock();
             unsafe {
