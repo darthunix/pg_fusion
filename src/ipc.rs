@@ -183,8 +183,7 @@ impl Drop for SlotHandler {
 pub(crate) struct Slot {
     locked: *mut AtomicBool,
     holder: *mut AtomicI32,
-    owner_number: *mut AtomicI32,
-    owner_pid: *mut AtomicI32,
+    owner: *mut AtomicI32,
     data: *mut [u8; DATA_SIZE],
 }
 
@@ -223,17 +222,12 @@ impl Slot {
 
     pub(crate) fn range4() -> Range<usize> {
         let Range { start: _, end } = Self::range3();
-        aligned_offsets::<AtomicI32>(end)
-    }
-
-    pub(crate) fn range5() -> Range<usize> {
-        let Range { start: _, end } = Self::range4();
         aligned_offsets::<[u8; DATA_SIZE]>(end)
     }
 
     pub(crate) fn estimated_size() -> usize {
         let Range { start, end: _ } = Self::range1();
-        let Range { start: _, end } = Self::range5();
+        let Range { start: _, end } = Self::range4();
         end - start
     }
 
@@ -242,14 +236,12 @@ impl Slot {
         let buffer = unsafe { from_raw_parts_mut(ptr, size) };
         let locked = buffer[Self::range1()].as_mut_ptr() as *mut AtomicBool;
         let holder = buffer[Self::range2()].as_mut_ptr() as *mut AtomicI32;
-        let owner_number = buffer[Self::range3()].as_mut_ptr() as *mut AtomicI32;
-        let owner_pid = buffer[Self::range4()].as_mut_ptr() as *mut AtomicI32;
-        let data = buffer[Self::range5()].as_mut_ptr() as *mut [u8; DATA_SIZE];
+        let owner = buffer[Self::range3()].as_mut_ptr() as *mut AtomicI32;
+        let data = buffer[Self::range4()].as_mut_ptr() as *mut [u8; DATA_SIZE];
         Self {
             locked,
             holder,
-            owner_number,
-            owner_pid,
+            owner,
             data,
         }
     }
@@ -272,12 +264,8 @@ impl Slot {
         unsafe { (*self.holder).load(Ordering::Relaxed) }
     }
 
-    pub(crate) fn owner_number(&self) -> i32 {
-        unsafe { (*self.owner_number).load(Ordering::Relaxed) }
-    }
-
-    pub(crate) fn owner_pid(&self) -> i32 {
-        unsafe { (*self.owner_pid).load(Ordering::Relaxed) }
+    pub(crate) fn owner(&self) -> i32 {
+        unsafe { (*self.owner).load(Ordering::Relaxed) }
     }
 
     pub(crate) fn lock(&self) -> bool {
@@ -366,7 +354,7 @@ pub unsafe extern "C" fn backend_cleanup(_code: i32, _args: Datum) {
     let mut bus = Bus::new();
     if let Some(handler) = CURRENT_SLOT.take() {
         let slot = bus.slot_raw(handler.id());
-        if slot.owner_number() == slot.holder() {
+        if slot.owner() == slot.holder() {
             slot.unlock();
         }
 
@@ -396,7 +384,7 @@ mod tests {
 
     use super::*;
 
-    const SLOT_SIZE: usize = 8208;
+    const SLOT_SIZE: usize = 8204;
     static mut FREE_LIST_BUFFER: [u8; 50] = [1; 50];
     static mut SLOT_BUFFER: [u8; SLOT_SIZE] = [1; SLOT_SIZE];
     static mut BUS_BUFFER: [u8; SLOT_SIZE * 10] = [1; SLOT_SIZE * 10];
@@ -450,7 +438,7 @@ mod tests {
         unsafe {
             assert_eq!(&SLOT_BUFFER[Slot::range1()], &[1]);
             write(slot.data_mut(), [1; DATA_SIZE]);
-            assert_eq!(&SLOT_BUFFER[Slot::range5()], [1; DATA_SIZE]);
+            assert_eq!(&SLOT_BUFFER[Slot::range4()], [1; DATA_SIZE]);
         }
         slot.unlock();
         unsafe {
