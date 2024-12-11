@@ -135,7 +135,8 @@ pub(crate) fn send(
 }
 
 pub(crate) fn read_header(stream: &mut SlotStream) -> Header {
-    let mut buffer: [u8; Header::estimate_size()] = [0; Header::estimate_size()];
-    stream.read_exact(&mut buffer).unwrap();
-    Header::from_bytes(&buffer)
+    let buffer = stream.look_ahead(Header::estimate_size()).unwrap();
+    let header = Header::from_bytes(&buffer);
+    stream.rewind(Header::estimate_size()).unwrap();
+    header
 }
