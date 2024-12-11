@@ -1,4 +1,5 @@
-use crate::ipc::{init_shmem, Bus, Slot};
+use crate::ipc::{init_shmem, Bus, Slot, SlotStream};
+use crate::protocol::read_header;
 use pgrx::bgworkers::{BackgroundWorker, BackgroundWorkerBuilder, SignalWakeFlags};
 use pgrx::pg_sys::{MyProcNumber, ProcNumber};
 use pgrx::prelude::*;
@@ -28,12 +29,12 @@ pub extern "C" fn worker_main(_arg: pg_sys::Datum) {
     BackgroundWorker::attach_signal_handlers(SignalWakeFlags::SIGHUP | SignalWakeFlags::SIGTERM);
     while BackgroundWorker::wait_latch(None) {
         log!("DataFusion worker is running");
-        for slot in Bus::new().into_iter() {
-            let Some(slot) = slot else {
+        for locked_slot in Bus::new().into_iter() {
+            let Some(slot) = locked_slot else {
                 continue;
             };
-
-            slot.unlock();
+            let mut stream = SlotStream::from(slot);
+            let header = read_header(&mut stream);
         }
     }
 }
