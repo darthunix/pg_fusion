@@ -257,6 +257,10 @@ impl Slot {
         unsafe { (*self.owner).load(Ordering::Relaxed) }
     }
 
+    pub(crate) fn is_locked(&self) -> bool {
+        unsafe { (*self.locked).load(Ordering::Relaxed) }
+    }
+
     pub(crate) fn lock(&self) -> bool {
         unsafe {
             if let Ok(_) =
@@ -286,9 +290,34 @@ impl Slot {
     }
 }
 
+impl Drop for Slot {
+    fn drop(&mut self) {
+        if self.is_locked() {
+            self.unlock();
+        }
+    }
+}
+
 pub(crate) struct SlotStream {
     pos: usize,
     inner: Slot,
+}
+
+impl SlotStream {
+    pub(crate) fn rewind(&mut self, len: usize) -> Result<()> {
+        if len > DATA_SIZE - self.pos {
+            return Err(Error::new(ErrorKind::InvalidInput, "Cannot rewind"));
+        }
+        self.pos += len;
+        Ok(())
+    }
+
+    pub(crate) fn look_ahead(&self, len: usize) -> Result<&[u8]> {
+        if len > DATA_SIZE - self.pos {
+            return Err(Error::new(ErrorKind::InvalidInput, "Cannot look ahead"));
+        }
+        Ok(&self.inner.data()[self.pos..self.pos + len])
+    }
 }
 
 impl From<Slot> for SlotStream {
@@ -516,9 +545,8 @@ mod tests {
     fn test_slot_stream() {
         let mut buffer: [u8; SLOT_SIZE] = [1; SLOT_SIZE];
         let ptr = addr_of_mut!(buffer) as *mut u8;
-        let len = buffer.len();
-        Slot::init(ptr, len);
-        let slot = Slot::from_bytes(ptr, len);
+        Slot::init(ptr, buffer.len());
+        let slot = Slot::from_bytes(ptr, buffer.len());
         slot.lock();
         let mut stream = SlotStream::from(slot);
         let data = [42; 10];
@@ -527,6 +555,7 @@ mod tests {
         let len = stream.write(&data).unwrap();
         assert_eq!(len, 10);
         let slot = Slot::from(stream);
+        assert_eq!(slot.is_locked(), true);
         assert_eq!(slot.data()[0..10], data);
         assert_eq!(slot.data()[10..20], data);
         assert_eq!(slot.data()[20..30], [1; 10]);
@@ -541,8 +570,14 @@ mod tests {
         let len = stream.read(&mut consumed).unwrap();
         assert_eq!(len, 10);
         assert_eq!([1; 10], consumed);
-        let slot = Slot::from(stream);
-        slot.unlock();
+
+        // Test slot is unlocked on drop
+        {
+            let slot = Slot::from(stream);
+            assert_eq!(slot.is_locked(), true);
+        }
+        let slot = Slot::from_bytes(ptr, buffer.len());
+        assert_eq!(slot.is_locked(), false);
     }
 
     #[pg_test]
