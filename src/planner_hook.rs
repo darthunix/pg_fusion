@@ -1,6 +1,7 @@
 use pg_sys::{
-    planner_hook, planner_hook_type, standard_planner, ParamListInfo, PlannedStmt, Query,
+    planner_hook, planner_hook_type, standard_planner, ParamListInfo, Plan, PlannedStmt, Query,
 };
+use pgrx::pg_sys::CustomScan;
 use pgrx::prelude::*;
 use std::ffi::{c_char, c_int, CStr};
 
@@ -49,3 +50,10 @@ extern "C" fn datafusion_planner_hook(
         }
     }
 }
+
+// #[pg_guard]
+// fn create_plan(pattern: String) -> CustomScan {
+//     let mut node = CustomScan::new();
+//
+//     node
+// }

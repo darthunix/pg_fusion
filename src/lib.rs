@@ -4,6 +4,8 @@ use pgrx::{GucContext, GucFlags, GucRegistry, GucSetting};
 use planner_hook::init_datafusion_planner_hook;
 use worker::init_datafusion_worker;
 
+mod data;
+mod error;
 mod ipc;
 mod planner_hook;
 mod protocol;
