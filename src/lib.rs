@@ -7,6 +7,7 @@ use worker::init_datafusion_worker;
 mod data;
 mod error;
 mod ipc;
+mod node;
 mod planner_hook;
 mod protocol;
 mod worker;
