@@ -1,7 +1,7 @@
 use std::char;
 
-use anyhow::{bail, Result};
 use crate::error::FusionError;
+use anyhow::{bail, Result};
 use datafusion::common::arrow::array::types::IntervalMonthDayNano;
 use datafusion::common::{ParamValues, ScalarValue};
 use pgrx::datum::{Date, FromDatum, Interval, Time, Timestamp};
@@ -64,5 +64,5 @@ pub(crate) fn repack_params(param_list: ParamListInfo) -> Result<ParamValues> {
         let value = datum_to_scalar(param.value, param.ptype, param.isnull)?;
         values.push(value);
     }
-    Ok(values.into())
+    Ok(ParamValues::List(values))
 }

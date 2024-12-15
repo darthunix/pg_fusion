@@ -1,10 +1,13 @@
+use anyhow::Result;
 use pg_sys::{
-    planner_hook, planner_hook_type, standard_planner, ParamListInfo, Plan, PlannedStmt, Query,
+    list_make2_impl, planner_hook, planner_hook_type, standard_planner, ListCell, NodeTag,
+    ParamListInfo, Plan, PlannedStmt, Query,
 };
 use pgrx::pg_sys::CustomScan;
 use pgrx::prelude::*;
-use std::ffi::{c_char, c_int, CStr};
+use std::ffi::{c_char, c_int, c_void, CStr};
 
+use crate::data::repack_params;
 use crate::ipc::{SlotHandler, CURRENT_SLOT};
 use crate::ENABLE_DATAFUSION;
 
@@ -51,9 +54,17 @@ extern "C" fn datafusion_planner_hook(
     }
 }
 
-// #[pg_guard]
-// fn create_plan(pattern: String) -> CustomScan {
-//     let mut node = CustomScan::new();
-//
-//     node
-// }
+#[pg_guard]
+fn create_plan(pattern: *const c_char, pg_params: ParamListInfo) -> Result<CustomScan> {
+    let mut node = CustomScan::default();
+    let df_params = Box::new(repack_params(pg_params)?);
+    let lc_query = ListCell {
+        ptr_value: pattern as *mut c_void,
+    };
+    let lc_params = ListCell {
+        ptr_value: Box::into_raw(df_params) as *mut c_void,
+    };
+    node.custom_private = unsafe { list_make2_impl(NodeTag::T_List, lc_query, lc_params) };
+
+    Ok(node)
+}
