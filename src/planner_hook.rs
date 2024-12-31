@@ -57,12 +57,11 @@ extern "C" fn datafusion_planner_hook(
 #[pg_guard]
 fn create_plan(pattern: *const c_char, pg_params: ParamListInfo) -> Result<CustomScan> {
     let mut node = CustomScan::default();
-    let df_params = Box::new(repack_params(pg_params)?);
     let lc_query = ListCell {
         ptr_value: pattern as *mut c_void,
     };
     let lc_params = ListCell {
-        ptr_value: Box::into_raw(df_params) as *mut c_void,
+        ptr_value: pg_params as *mut c_void,
     };
     node.custom_private = unsafe { list_make2_impl(NodeTag::T_List, lc_query, lc_params) };
 
