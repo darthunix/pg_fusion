@@ -1,55 +1,78 @@
+use libc::c_void;
 use pgrx::pg_sys::{
     palloc0, pfree, CustomExecMethods, CustomScan, CustomScanMethods, CustomScanState, EState,
-    ExplainState, List, Node, NodeTag, ParamListInfo, RegisterCustomScanMethods, TupleTableSlot,
+    ExplainState, List, ListCell, Node, NodeTag, ParamListInfo, RegisterCustomScanMethods,
+    TupleTableSlot,
 };
-use pgrx::{pg_guard, pg_schema};
-use std::cell::OnceCell;
+use pgrx::{info, pg_guard, pg_schema};
 use std::ffi::c_char;
 
-static mut SCAN_METHODS: OnceCell<CustomScanMethods> = OnceCell::new();
-static mut EXEC_METHODS: OnceCell<CustomExecMethods> = OnceCell::new();
+thread_local! {
+    static SCAN_METHODS: CustomScanMethods = CustomScanMethods {
+        CustomName: b"DataFusionScan\0".as_ptr() as *const c_char,
+        CreateCustomScanState: Some(create_df_scan_state),
+    };
+    static EXEC_METHODS: CustomExecMethods = CustomExecMethods {
+        CustomName: b"DataFusionScan\0".as_ptr() as *const c_char,
+        BeginCustomScan: Some(begin_df_scan),
+        ExecCustomScan: Some(exec_df_scan),
+        EndCustomScan: Some(end_df_scan),
+        ReScanCustomScan: None,
+        MarkPosCustomScan: None,
+        RestrPosCustomScan: None,
+        EstimateDSMCustomScan: None,
+        InitializeDSMCustomScan: None,
+        ReInitializeDSMCustomScan: None,
+        InitializeWorkerCustomScan: None,
+        ShutdownCustomScan: None,
+        ExplainCustomScan: Some(explain_df_scan),
+    };
+}
 
 #[pg_guard]
 #[no_mangle]
-pub(crate) extern "C" fn init_df_methods() {
+pub(crate) extern "C" fn init_datafusion_methods() {
     unsafe {
-        EXEC_METHODS
-            .set(CustomExecMethods {
-                CustomName: b"DataFusionScan\0".as_ptr() as *const i8,
-                BeginCustomScan: Some(begin_df_scan),
-                ExecCustomScan: Some(exec_df_scan),
-                EndCustomScan: Some(end_df_scan),
-                ReScanCustomScan: None,
-                MarkPosCustomScan: None,
-                RestrPosCustomScan: None,
-                EstimateDSMCustomScan: None,
-                InitializeDSMCustomScan: None,
-                ReInitializeDSMCustomScan: None,
-                InitializeWorkerCustomScan: None,
-                ShutdownCustomScan: None,
-                ExplainCustomScan: Some(explain_df_scan),
-            })
-            .unwrap();
-
-        SCAN_METHODS
-            .set(CustomScanMethods {
-                CustomName: b"DataFusionScan\0".as_ptr() as *const i8,
-                CreateCustomScanState: Some(create_df_scan_state),
-            })
-            .unwrap();
-        RegisterCustomScanMethods(SCAN_METHODS.get().unwrap());
+        RegisterCustomScanMethods(scan_methods());
     }
+}
+
+pub(crate) fn scan_methods() -> *const CustomScanMethods {
+    SCAN_METHODS.with(|m| &*m as *const CustomScanMethods)
+}
+
+pub(crate) fn exec_methods() -> *const CustomExecMethods {
+    EXEC_METHODS.with(|m| &*m as *const CustomExecMethods)
 }
 
 #[repr(C)]
 struct ScanState {
     css: CustomScanState,
-    pattern: *const c_char,
+    pattern: *mut c_char,
     params: ParamListInfo,
 }
 
 unsafe extern "C" fn create_df_scan_state(cscan: *mut CustomScan) -> *mut Node {
-    todo!()
+    let list = (*cscan).custom_private;
+    let pattern = (*list_nth(list, 0)).ptr_value as *mut c_char;
+    info!("pattern: {:?}", pattern);
+    let params = (*list_nth(list, 1)).ptr_value as ParamListInfo;
+    let mut css = CustomScanState::default();
+    css.methods = exec_methods();
+    let state = ScanState {
+        css,
+        pattern,
+        params,
+    };
+    let mut node = PgNode::empty(std::mem::size_of::<ScanState>());
+    node.set_tag(NodeTag::T_CustomScanState);
+    node.set_data(unsafe {
+        std::slice::from_raw_parts(
+            &state as *const _ as *const u8,
+            std::mem::size_of::<ScanState>(),
+        )
+    });
+    node.mut_node()
 }
 
 unsafe extern "C" fn begin_df_scan(node: *mut CustomScanState, estate: *mut EState, eflags: i32) {
@@ -72,34 +95,13 @@ unsafe extern "C" fn explain_df_scan(
     todo!()
 }
 
-#[repr(C)]
-struct CustomScanStateNode {
-    tag: NodeTag,
-    state: ScanState,
-}
-
-impl CustomScanStateNode {
-    fn to_node(state: ScanState) -> *mut Node {
-        let size = std::mem::size_of::<CustomScanStateNode>();
-        let mut pg_node = PgNode::empty(size);
-        pg_node.set_tag(NodeTag::T_CustomScanState);
-        pg_node.set_data(unsafe {
-            std::slice::from_raw_parts(
-                &state as *const _ as *const u8,
-                std::mem::size_of::<ScanState>(),
-            )
-        });
-        pg_node.mut_node()
-    }
-}
-
-struct PgNode {
+pub(crate) struct PgNode {
     size: usize,
     node: *mut Node,
 }
 
 impl PgNode {
-    fn empty(data_size: usize) -> Self {
+    pub(crate) fn empty(data_size: usize) -> Self {
         let size = std::mem::size_of::<Node>() + data_size;
         let buf_ptr = unsafe { palloc0(size) };
         PgNode {
@@ -108,13 +110,13 @@ impl PgNode {
         }
     }
 
-    fn set_tag(&mut self, tag: NodeTag) {
+    pub(crate) fn set_tag(&mut self, tag: NodeTag) {
         unsafe {
             (*self.node).type_ = tag;
         }
     }
 
-    fn set_data(&mut self, data: &[u8]) {
+    pub(crate) fn set_data(&mut self, data: &[u8]) {
         assert!(data.len() <= self.size - std::mem::size_of::<Node>());
         unsafe {
             let buf = std::slice::from_raw_parts_mut(self.node as *mut u8, self.size);
@@ -122,15 +124,23 @@ impl PgNode {
         }
     }
 
-    fn data(&self) -> &[u8] {
+    pub(crate) fn data(&self) -> &[u8] {
         unsafe {
             let buf = std::slice::from_raw_parts(self.node as *const u8, self.size);
             &buf[std::mem::size_of::<Node>()..]
         }
     }
 
-    fn mut_node(&self) -> *mut Node {
+    pub(crate) fn mut_node(&self) -> *mut Node {
         self.node
+    }
+}
+
+fn list_nth(list: *mut List, n: i32) -> *mut ListCell {
+    assert_ne!(list, std::ptr::null_mut());
+    unsafe {
+        assert!(n >= 0 && n < (*list).length);
+        (*list).elements.offset(n as isize)
     }
 }
 

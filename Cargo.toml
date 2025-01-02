@@ -12,12 +12,14 @@ path = "./src/bin/pgrx_embed.rs"
 
 [features]
 default = ["pg17"]
-pg17 = ["pgrx/pg17", "pgrx-tests/pg17" ]
+pg17 = ["pgrx/pg17", "pgrx-tests/pg17"]
 pg_test = []
 
 [dependencies]
 anyhow = "1.0"
-datafusion = "43.0"
+datafusion = "44.0"
+datafusion-sql = "44.0"
+fasthash = "0.4"
 libc = "0.2"
 pgrx = "0.12"
 thiserror = "2.0"
