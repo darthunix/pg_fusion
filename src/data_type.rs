@@ -3,18 +3,15 @@ use anyhow::{bail, Result};
 use datafusion::arrow::datatypes::DataType;
 use datafusion::common::arrow::array::types::IntervalMonthDayNano;
 use datafusion::common::arrow::datatypes::Field;
-use datafusion::common::{ParamValues, ScalarValue};
-use datafusion::logical_expr::LogicalPlan;
+use datafusion::common::ScalarValue;
 use libc::c_void;
 use pgrx::datum::{Date, FromDatum, Interval, Time, Timestamp};
-use pgrx::pg_schema;
 use pgrx::pg_sys::SysCacheIdentifier::TYPEOID;
 use pgrx::pg_sys::{
-    self, list_append_unique_ptr, makeTargetEntry, makeVar, palloc0, Datum, Expr, List, NodeTag,
+    self, list_append_unique_ptr, makeTargetEntry, makeVar, palloc0, Datum, Expr, List,
     ParamListInfo, TargetEntry, GETSTRUCT,
 };
 use std::char;
-use std::ffi::c_char;
 
 fn datum_to_scalar(datum: Datum, ptype: pg_sys::Oid, is_null: bool) -> Result<ScalarValue> {
     unsafe {
@@ -132,7 +129,7 @@ pub(crate) fn repack_output(columns: &[Field]) -> *mut List {
 }
 
 #[cfg(any(test, feature = "pg_test"))]
-#[pg_schema]
+#[pgrx::pg_schema]
 mod tests {
     use pgrx::pg_sys;
     use pgrx::prelude::*;

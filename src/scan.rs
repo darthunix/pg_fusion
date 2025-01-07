@@ -1,10 +1,9 @@
-use libc::c_void;
 use pgrx::pg_sys::{
-    palloc0, pfree, CustomExecMethods, CustomScan, CustomScanMethods, CustomScanState, EState,
+    palloc0, CustomExecMethods, CustomScan, CustomScanMethods, CustomScanState, EState,
     ExplainState, List, ListCell, Node, NodeTag, ParamListInfo, RegisterCustomScanMethods,
     TupleTableSlot,
 };
-use pgrx::{info, pg_guard, pg_schema};
+use pgrx::{info, pg_guard};
 use std::ffi::c_char;
 
 thread_local! {
@@ -145,7 +144,7 @@ fn list_nth(list: *mut List, n: i32) -> *mut ListCell {
 }
 
 #[cfg(any(test, feature = "pg_test"))]
-#[pg_schema]
+#[pgrx::pg_schema]
 mod tests {
     use super::*;
     use pgrx::prelude::*;
@@ -160,7 +159,7 @@ mod tests {
         assert_eq!(pg_node.data(), data.as_slice());
         unsafe {
             let ptr = pg_node.mut_node() as *mut c_void;
-            pfree(ptr);
+            pg_sys::pfree(ptr);
         }
     }
 }

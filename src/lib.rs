@@ -1,17 +1,17 @@
 use fasthash::Seed;
-use node::init_datafusion_methods;
 use pgrx::pg_sys::AsPgCStr;
 use pgrx::prelude::*;
 use pgrx::{GucContext, GucFlags, GucRegistry, GucSetting};
 use planner_hook::init_datafusion_planner_hook;
+use scan::init_datafusion_methods;
 use worker::init_datafusion_worker;
 
 mod data_type;
 mod error;
 mod ipc;
-mod node;
 mod planner_hook;
 mod protocol;
+mod scan;
 mod sql;
 mod worker;
 
