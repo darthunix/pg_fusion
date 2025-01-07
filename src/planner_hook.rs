@@ -1,17 +1,16 @@
-use anyhow::Result;
 use pg_sys::{
     list_make2_impl, planner_hook, planner_hook_type, standard_planner, ListCell, NodeTag,
     ParamListInfo, Plan, PlannedStmt, Query,
 };
 use pgrx::pg_sys::CmdType::CMD_SELECT;
-use pgrx::pg_sys::{palloc0, CustomScan, Node};
+use pgrx::pg_sys::{palloc0, CustomScan};
 use pgrx::prelude::*;
 use std::ffi::{c_char, c_int, c_void, CStr};
 use std::mem::size_of;
 use std::ptr::null_mut;
 
 use crate::ipc::{SlotHandler, CURRENT_SLOT};
-use crate::node::{scan_methods, PgNode};
+use crate::scan::scan_methods;
 use crate::{ENABLE_DATAFUSION, SEED};
 
 static mut PREV_PLANNER_HOOK: planner_hook_type = None;
