@@ -8,6 +8,7 @@ use worker::init_datafusion_worker;
 
 mod data_type;
 mod error;
+pub mod fsm;
 mod ipc;
 mod planner_hook;
 mod protocol;
