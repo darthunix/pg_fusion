@@ -44,6 +44,7 @@ impl SlotFreeList {
         end - start + max_backends() as usize * size_of::<SlotNumber>()
     }
 
+    #[allow(clippy::size_of_in_element_count)]
     pub(crate) fn from_bytes(ptr: *mut u8, size: usize) -> Self {
         assert!(size >= Self::estimated_size());
         let buffer = unsafe { from_raw_parts_mut(ptr, size) };
