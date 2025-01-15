@@ -1,45 +1,68 @@
 use rust_fsm::*;
 
 pub enum BackendState {
-    CustomScanBuilder,
+    CreatedCustomScan,
     Failed,
-    Initial,
+    Initialized,
     MetadataProvider,
 }
 
-pub enum Input {
-    Bind,
+pub enum BackendEvent {
     Error,
-    Parse,
+    Compile,
+    MetadataLookup,
+    Resolved,
 }
 
-pub enum Output {}
+pub enum BackendOutput {}
 
 state_machine! {
-    #[state_machine(input(crate::fsm::Input), state(crate::fsm::BackendState), output(crate::fsm::Output))]
-    pub backend(Initial)
+    #[state_machine(input(crate::fsm::BackendEvent), state(crate::fsm::BackendState), output(crate::fsm::BackendOutput))]
+    pub backend(Initialized)
 
-    Initial(Error) => Failed,
-    Initial(Parse) => MetadataProvider,
-    MetadataProvider(Error) => Failed,
-    MetadataProvider(Bind) => CustomScanBuilder,
-    CustomScanBuilder(Error) => Failed,
+    Initialized => {
+        Error => Failed,
+        Compile => MetadataProvider,
+    },
+    MetadataProvider => {
+        Error => Failed,
+        MetadataLookup => MetadataProvider,
+        Resolved => CreatedCustomScan,
+    },
+}
+
+pub enum ExecutorEvent {
+    Bind,
+    Error,
+    Metadata,
+    NeedLookup,
+    Parse,
+    Resolved,
+}
+
+pub enum ExecutorOutput {
+    WaitingLookup,
 }
 
 pub enum ExecutorState {
-    BasePlanBuilder,
-    Failed,
-    Initial,
-    LogicalPlanBuilder,
+    ResolvingMetadata,
+    CreatedLogicalPlan,
+    Initialized,
 }
 
 state_machine! {
-    #[state_machine(input(crate::fsm::Input), state(crate::fsm::ExecutorState), output(crate::fsm::Output))]
-    pub executor(Initial)
+    #[state_machine(input(crate::fsm::ExecutorEvent), state(crate::fsm::ExecutorState), output(crate::fsm::ExecutorOutput))]
+    pub executor(Initialized)
 
-    Initial(Error) => Failed,
-    Initial(Parse) => BasePlanBuilder,
-    BasePlanBuilder(Error) => Failed,
-    BasePlanBuilder(Bind) => LogicalPlanBuilder,
-    LogicalPlanBuilder(Error) => Failed,
+    Initialized(Parse) => ResolvingMetadata,
+    ResolvingMetadata => {
+        Error => Initialized,
+        Metadata => ResolvingMetadata,
+        NeedLookup => ResolvingMetadata[WaitingLookup],
+        Resolved => CreatedLogicalPlan,
+    },
+    CreatedLogicalPlan => {
+        Bind => CreatedLogicalPlan,
+        Error => Initialized,
+    }
 }

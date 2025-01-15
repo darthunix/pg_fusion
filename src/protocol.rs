@@ -7,7 +7,7 @@ use std::ops::Range;
 use std::slice::from_raw_parts;
 
 #[repr(C)]
-#[derive(Clone, Default)]
+#[derive(Clone, Default, PartialEq)]
 pub(crate) enum Direction {
     #[default]
     ToWorker = 0,
@@ -15,16 +15,17 @@ pub(crate) enum Direction {
 }
 
 #[repr(C)]
-#[derive(Clone, Default)]
+#[derive(Clone, Debug, Default)]
 pub(crate) enum Packet {
     Ack = 0,
+    Error = 1,
     #[default]
-    None = 1,
-    Query = 2,
+    None = 2,
+    Parse = 3,
 }
 
 #[repr(C)]
-#[derive(Clone, Default)]
+#[derive(Clone, Default, Debug, PartialEq)]
 pub(crate) enum Flag {
     More = 0,
     #[default]
@@ -34,10 +35,10 @@ pub(crate) enum Flag {
 #[repr(C)]
 #[derive(Default)]
 pub(crate) struct Header {
-    direction: Direction,
-    packet: Packet,
-    length: u16,
-    flag: Flag,
+    pub(crate) direction: Direction,
+    pub(crate) packet: Packet,
+    pub(crate) length: u16,
+    pub(crate) flag: Flag,
 }
 
 impl Header {
@@ -105,14 +106,15 @@ fn signal(slot_id: SlotNumber, direction: Direction) {
 #[allow(clippy::unused_io_amount)]
 pub(crate) fn send(
     slot_id: SlotNumber,
+    mut stream: SlotStream,
     direction: Direction,
     packet: Packet,
     flag: Flag,
     payload: &[u8],
-) -> bool {
+) {
     // FIXME: split into multiple messages if the payload is too large.
     if payload.len() > Header::payload_max_size() {
-        panic!("Query too large");
+        panic!("payload is too long");
     }
     let length = payload.len() as u16;
     let header = Header {
@@ -122,17 +124,14 @@ pub(crate) fn send(
         flag,
     };
     let header_bytes = header.as_bytes();
-    let mut bus = Bus::new();
-    let Some(slot) = bus.slot_locked(slot_id) else {
-        return false;
-    };
-    let mut stream = SlotStream::from(slot);
-    stream.write(header_bytes).expect("Failed to write header");
-    stream.write(payload).expect("Failed to write payload");
-    let slot = Slot::from(stream);
-    slot.unlock();
+    let stream_ptr = &mut stream;
+    stream_ptr.flush().expect("Failed to flush stream");
+    stream_ptr
+        .write(header_bytes)
+        .expect("Failed to write header");
+    stream_ptr.write(payload).expect("Failed to write payload");
+    let _guard = Slot::from(stream);
     signal(slot_id, direction);
-    true
 }
 
 pub(crate) fn read_header(stream: &mut SlotStream) -> Header {

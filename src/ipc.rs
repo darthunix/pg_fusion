@@ -19,7 +19,7 @@ pub(crate) static mut CURRENT_SLOT: OnceCell<SlotHandler> = OnceCell::new();
 /// The change of MaxBackends value requires cluster restart.
 /// So, it is safe to use it as a constant on startup.
 #[inline]
-fn max_backends() -> u32 {
+pub(crate) fn max_backends() -> u32 {
     #[cfg(not(any(test, feature = "pg_test")))]
     unsafe {
         pgrx::pg_sys::MaxBackends as u32
