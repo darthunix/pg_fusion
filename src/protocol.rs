@@ -2,9 +2,9 @@ use crate::ipc::{aligned_offsets, Bus, Slot, SlotNumber, SlotStream, DATA_SIZE};
 use crate::worker::worker_id;
 use pgrx::pg_sys::ProcSendSignal;
 use pgrx::prelude::*;
-use std::io::{Read, Write};
+use std::io::Write;
 use std::ops::Range;
-use std::slice::{from_raw_parts, from_raw_parts_mut};
+use std::slice::from_raw_parts;
 
 #[repr(C)]
 #[derive(Clone, Default)]
@@ -102,6 +102,7 @@ fn signal(slot_id: SlotNumber, direction: Direction) {
     }
 }
 
+#[allow(clippy::unused_io_amount)]
 pub(crate) fn send(
     slot_id: SlotNumber,
     direction: Direction,
