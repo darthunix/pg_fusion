@@ -1,3 +1,5 @@
+use crate::protocol::Packet;
+use pgrx::prelude::*;
 use rust_fsm::*;
 
 pub enum BackendState {
@@ -11,7 +13,7 @@ pub enum BackendEvent {
     Error,
     Compile,
     MetadataLookup,
-    Resolved,
+    Save,
 }
 
 pub enum BackendOutput {}
@@ -27,42 +29,66 @@ state_machine! {
     MetadataProvider => {
         Error => Failed,
         MetadataLookup => MetadataProvider,
-        Resolved => CreatedCustomScan,
+        Save => CreatedCustomScan,
     },
 }
 
+#[derive(Debug)]
 pub enum ExecutorEvent {
     Bind,
     Error,
+    Lookup,
     Metadata,
-    NeedLookup,
     Parse,
-    Resolved,
+    Save,
+    SpuriousWakeup,
 }
 
+impl From<&Packet> for ExecutorEvent {
+    fn from(packet: &Packet) -> Self {
+        match packet {
+            Packet::Error => Self::Error,
+            Packet::Parse => Self::Parse,
+            Packet::None => Self::SpuriousWakeup,
+        }
+    }
+}
+
+#[derive(Debug)]
 pub enum ExecutorOutput {
-    WaitingLookup,
+    BindParameters,
+    BuildAst,
+    Compile,
+    Flush,
+    ProcessMetadata,
+    RequestMetadata,
+    SaveBasePlan,
+    Sleep,
 }
 
 pub enum ExecutorState {
-    ResolvingMetadata,
-    CreatedLogicalPlan,
+    BasePlan,
     Initialized,
+    LogicalPlan,
 }
 
 state_machine! {
     #[state_machine(input(crate::fsm::ExecutorEvent), state(crate::fsm::ExecutorState), output(crate::fsm::ExecutorOutput))]
     pub executor(Initialized)
 
-    Initialized(Parse) => ResolvingMetadata,
-    ResolvingMetadata => {
-        Error => Initialized,
-        Metadata => ResolvingMetadata,
-        NeedLookup => ResolvingMetadata[WaitingLookup],
-        Resolved => CreatedLogicalPlan,
+    Initialized => {
+        SpuriousWakeup => Initialized[Sleep],
+        Parse => BasePlan[BuildAst],
     },
-    CreatedLogicalPlan => {
-        Bind => CreatedLogicalPlan,
-        Error => Initialized,
+    BasePlan => {
+        Error => Initialized[Flush],
+        Metadata => BasePlan[Compile],
+        Lookup => BasePlan[RequestMetadata],
+        SpuriousWakeup => BasePlan[Sleep],
+        Save => LogicalPlan[SaveBasePlan],
+    },
+    LogicalPlan => {
+        Bind => LogicalPlan[BindParameters],
+        Error => Initialized[Flush]
     }
 }

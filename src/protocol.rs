@@ -15,13 +15,12 @@ pub(crate) enum Direction {
 }
 
 #[repr(C)]
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug, Default, PartialEq)]
 pub(crate) enum Packet {
-    Ack = 0,
     Error = 1,
+    Parse = 2,
     #[default]
-    None = 2,
-    Parse = 3,
+    None = 0,
 }
 
 #[repr(C)]
