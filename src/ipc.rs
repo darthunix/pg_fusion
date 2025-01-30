@@ -361,6 +361,8 @@ impl Read for SlotStream {
     }
 }
 
+unsafe impl Send for SlotStream {}
+
 pub(crate) struct Bus {
     slots: *mut Slot,
 }

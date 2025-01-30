@@ -4,4 +4,6 @@ use thiserror::Error;
 pub(crate) enum FusionError {
     #[error("Unsupported type: {0}")]
     UnsupportedType(String),
+    #[error("Failed to parse the query: {0}")]
+    ParseQuery(String),
 }
