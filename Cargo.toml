@@ -22,6 +22,7 @@ datafusion-sql = "44.0"
 fasthash = "0.4"
 libc = "0.2"
 pgrx = "0.12"
+rmp = "0.8"
 rust-fsm = { version = "0.7", features = ["diagram"] }
 thiserror = "2.0"
 tokio = { version = "1.42", features = ["full"] }

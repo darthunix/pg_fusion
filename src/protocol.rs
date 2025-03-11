@@ -1,29 +1,57 @@
-use crate::ipc::{aligned_offsets, Bus, Slot, SlotNumber, SlotStream, DATA_SIZE};
+use crate::error::FusionError;
+use crate::ipc::{Bus, Slot, SlotNumber, SlotStream, DATA_SIZE};
 use crate::worker::worker_id;
+use anyhow::Result;
 use pgrx::pg_sys::ProcSendSignal;
 use pgrx::prelude::*;
-use std::io::Write;
-use std::ops::Range;
-use std::slice::from_raw_parts;
+use rmp::decode::{read_bin_len, read_pfix, read_u16};
+use rmp::encode::{write_bin, write_pfix, write_u16};
 
-#[repr(C)]
-#[derive(Clone, Default, PartialEq)]
+#[repr(u8)]
+#[derive(Clone, Debug, Default, PartialEq)]
 pub(crate) enum Direction {
     #[default]
     ToWorker = 0,
     FromWorker = 1,
 }
 
-#[repr(C)]
+impl TryFrom<u8> for Direction {
+    type Error = FusionError;
+
+    fn try_from(value: u8) -> Result<Self, Self::Error> {
+        assert!(value < 128);
+        match value {
+            0 => Ok(Direction::ToWorker),
+            1 => Ok(Direction::FromWorker),
+            _ => Err(FusionError::DeserializeDirection(value)),
+        }
+    }
+}
+
+#[repr(u8)]
 #[derive(Clone, Debug, Default, PartialEq)]
 pub(crate) enum Packet {
-    Error = 1,
+    Failure = 1,
     Parse = 2,
     #[default]
     None = 0,
 }
 
-#[repr(C)]
+impl TryFrom<u8> for Packet {
+    type Error = FusionError;
+
+    fn try_from(value: u8) -> Result<Self, Self::Error> {
+        assert!(value < 128);
+        match value {
+            0 => Ok(Packet::None),
+            1 => Ok(Packet::Failure),
+            2 => Ok(Packet::Parse),
+            _ => Err(FusionError::DeserializePacket(value)),
+        }
+    }
+}
+
+#[repr(u8)]
 #[derive(Clone, Default, Debug, PartialEq)]
 pub(crate) enum Flag {
     More = 0,
@@ -31,62 +59,35 @@ pub(crate) enum Flag {
     Last = 1,
 }
 
-#[repr(C)]
-#[derive(Default)]
+impl TryFrom<u8> for Flag {
+    type Error = FusionError;
+
+    fn try_from(value: u8) -> Result<Self, Self::Error> {
+        assert!(value < 128);
+        match value {
+            0 => Ok(Flag::More),
+            1 => Ok(Flag::Last),
+            _ => Err(FusionError::DeserializeFlag(value)),
+        }
+    }
+}
+
+#[derive(Default, Debug, PartialEq)]
 pub(crate) struct Header {
     pub(crate) direction: Direction,
     pub(crate) packet: Packet,
-    pub(crate) length: u16,
     pub(crate) flag: Flag,
+    pub(crate) length: u16,
 }
 
 impl Header {
     const fn estimate_size() -> usize {
-        std::mem::size_of::<Self>()
+        // direction (1 byte) + packet(1 byte) + flag (1 byte) + length (3 bytes)
+        1 + 1 + 1 + 3
     }
 
     const fn payload_max_size() -> usize {
         DATA_SIZE - Self::estimate_size()
-    }
-
-    fn range1() -> Range<usize> {
-        aligned_offsets::<Direction>(0)
-    }
-
-    fn range2() -> Range<usize> {
-        let Range { start: _, end } = Self::range1();
-        aligned_offsets::<Packet>(end)
-    }
-
-    fn range3() -> Range<usize> {
-        let Range { start: _, end } = Self::range2();
-        aligned_offsets::<u16>(end)
-    }
-
-    fn range4() -> Range<usize> {
-        let Range { start: _, end } = Self::range3();
-        aligned_offsets::<Flag>(end)
-    }
-
-    fn as_bytes(&self) -> &[u8] {
-        unsafe { from_raw_parts(self as *const Self as *const u8, Self::estimate_size()) }
-    }
-
-    pub(crate) fn from_bytes(buffer: &[u8]) -> Self {
-        assert_eq!(Self::estimate_size(), buffer.len());
-        unsafe {
-            let direction = buffer[Self::range1()].as_ptr() as *const Direction;
-            let packet = buffer[Self::range2()].as_ptr() as *const Packet;
-            let length = buffer[Self::range3()].as_ptr() as *const u16;
-            let flag = buffer[Self::range4()].as_ptr() as *const Flag;
-            let header = Header {
-                direction: (&*direction).clone(),
-                packet: (&*packet).clone(),
-                length: *length,
-                flag: (&*flag).clone(),
-            };
-            header
-        }
     }
 }
 
@@ -102,40 +103,116 @@ fn signal(slot_id: SlotNumber, direction: Direction) {
     }
 }
 
-#[allow(clippy::unused_io_amount)]
-pub(crate) fn send(
-    slot_id: SlotNumber,
-    mut stream: SlotStream,
-    direction: Direction,
-    packet: Packet,
-    flag: Flag,
-    payload: &[u8],
-) {
-    // FIXME: split into multiple messages if the payload is too large.
-    if payload.len() > Header::payload_max_size() {
-        panic!("payload is too long");
-    }
-    let length = payload.len() as u16;
-    let header = Header {
-        direction: direction.clone(),
+pub(crate) fn consume_header(stream: &mut SlotStream) -> Result<Header> {
+    assert_eq!(stream.position(), 0);
+    let direction = Direction::try_from(read_pfix(stream)?)?;
+    let packet = Packet::try_from(read_pfix(stream)?)?;
+    let flag = Flag::try_from(read_pfix(stream)?)?;
+    let length = read_u16(stream)?;
+    Ok(Header {
+        direction,
         packet,
-        length,
         flag,
-    };
-    let header_bytes = header.as_bytes();
-    let stream_ptr = &mut stream;
-    stream_ptr.flush().expect("Failed to flush stream");
-    stream_ptr
-        .write(header_bytes)
-        .expect("Failed to write header");
-    stream_ptr.write(payload).expect("Failed to write payload");
-    let _guard = Slot::from(stream);
-    signal(slot_id, direction);
+        length,
+    })
 }
 
-pub(crate) fn read_header(stream: &mut SlotStream) -> Header {
-    let buffer = stream.look_ahead(Header::estimate_size()).unwrap();
-    let header = Header::from_bytes(&buffer);
-    stream.rewind(Header::estimate_size()).unwrap();
-    header
+pub(crate) fn write_header(stream: &mut SlotStream, header: &Header) -> Result<()> {
+    write_pfix(stream, header.direction.to_owned() as u8)?;
+    write_pfix(stream, header.packet.to_owned() as u8)?;
+    write_pfix(stream, header.flag.to_owned() as u8)?;
+    write_u16(stream, header.length.to_owned())?;
+    Ok(())
+}
+
+/// Reads the query from the stream, but leaves the stream position at the beginning of the query.
+/// It is required to return the reference to the query bytes without copying them. It is the
+/// caller's responsibility to move the stream position to the end of the query.
+///
+/// Returns the query and its length.
+pub(crate) fn read_query(stream: &mut SlotStream) -> Result<(&str, u32)> {
+    let len = read_bin_len(stream)?;
+    let buf = stream.look_ahead(len as usize)?;
+    let query = std::str::from_utf8(buf)?;
+    Ok((query, len))
+}
+
+pub(crate) fn write_query(stream: &mut SlotStream, query: &str) -> Result<()> {
+    let data = query.as_bytes();
+    write_bin(stream, data)?;
+    Ok(())
+}
+
+fn prepare_query(stream: &mut SlotStream, query: &str) -> Result<()> {
+    // slot: header - bin marker - bin length - query bytes
+    let data = query.as_bytes();
+    let length = 1 + 1 + data.len();
+    if length > Header::payload_max_size() {
+        return Err(FusionError::PayloadTooLarge(data.len()).into());
+    }
+    let header = Header {
+        direction: Direction::ToWorker,
+        packet: Packet::Parse,
+        length: length as u16,
+        flag: Flag::Last,
+    };
+    write_header(stream, &header)?;
+    write_query(stream, query)?;
+    Ok(())
+}
+
+pub(crate) fn send_query(slot_id: SlotNumber, mut stream: SlotStream, query: &str) -> Result<()> {
+    prepare_query(&mut stream, query)?;
+    // Unlock the slot after writing the query.
+    let _guard = Slot::from(stream);
+    signal(slot_id, Direction::ToWorker);
+    Ok(())
+}
+
+#[cfg(any(test, feature = "pg_test"))]
+#[pg_schema]
+mod tests {
+    use super::*;
+    use std::ptr::addr_of_mut;
+
+    const SLOT_SIZE: usize = 8204;
+
+    #[pg_test]
+    fn test_header() {
+        let header = Header {
+            direction: Direction::ToWorker,
+            packet: Packet::None,
+            length: 42,
+            flag: Flag::Last,
+        };
+        let mut slot_buf: [u8; SLOT_SIZE] = [1; SLOT_SIZE];
+        let ptr = addr_of_mut!(slot_buf) as *mut u8;
+        Slot::init(ptr, slot_buf.len());
+        let slot = Slot::from_bytes(ptr, slot_buf.len());
+        let mut stream: SlotStream = slot.into();
+        write_header(&mut stream, &header).unwrap();
+        stream.reset();
+        let new_header = consume_header(&mut stream).unwrap();
+        assert_eq!(header, new_header);
+    }
+
+    #[pg_test]
+    fn test_query() {
+        let mut slot_buf: [u8; SLOT_SIZE] = [1; SLOT_SIZE];
+        let ptr = addr_of_mut!(slot_buf) as *mut u8;
+        Slot::init(ptr, slot_buf.len());
+        let slot = Slot::from_bytes(ptr, slot_buf.len());
+        let sql = "SELECT 1";
+        let mut stream: SlotStream = slot.into();
+        prepare_query(&mut stream, sql).unwrap();
+        stream.reset();
+        let header = consume_header(&mut stream).unwrap();
+        assert_eq!(header.direction, Direction::ToWorker);
+        assert_eq!(header.packet, Packet::Parse);
+        assert_eq!(header.flag, Flag::Last);
+        assert_eq!(header.length, 2 + sql.len() as u16);
+        let (query, len) = read_query(&mut stream).unwrap();
+        assert_eq!(query, sql);
+        assert_eq!(len as usize, sql.len());
+    }
 }

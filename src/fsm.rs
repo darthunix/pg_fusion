@@ -1,5 +1,4 @@
 use crate::protocol::Packet;
-use pgrx::prelude::*;
 use rust_fsm::*;
 
 pub enum BackendState {
@@ -46,7 +45,7 @@ pub enum ExecutorEvent {
 impl From<&Packet> for ExecutorEvent {
     fn from(packet: &Packet) -> Self {
         match packet {
-            Packet::Error => Self::Error,
+            Packet::Failure => Self::Error,
             Packet::Parse => Self::Parse,
             Packet::None => Self::SpuriousWakeup,
         }

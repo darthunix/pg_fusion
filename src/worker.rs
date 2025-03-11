@@ -2,7 +2,7 @@ use crate::error::FusionError;
 use crate::fsm::executor::StateMachine;
 use crate::fsm::{ExecutorEvent, ExecutorOutput};
 use crate::ipc::{init_shmem, max_backends, Bus, SlotNumber, SlotStream};
-use crate::protocol::{read_header, Direction, Flag, Header};
+use crate::protocol::{consume_header, read_query, Direction, Flag, Header, Packet};
 use anyhow::Result;
 use datafusion::execution::SessionStateBuilder;
 use datafusion_sql::parser::{DFParser, Statement};
@@ -97,7 +97,7 @@ pub extern "C" fn worker_main(_arg: pg_sys::Datum) {
                     continue;
                 };
                 let mut stream = SlotStream::from(slot);
-                let header = read_header(&mut stream);
+                let header = consume_header(&mut stream).expect("Failed to consume header");
                 if header.direction == Direction::FromWorker {
                     continue;
                 }
@@ -154,10 +154,10 @@ pub extern "C" fn worker_main(_arg: pg_sys::Datum) {
 }
 
 async fn parse(header: Header, mut stream: SlotStream) -> Result<TaskResult> {
+    assert_eq!(header.packet, Packet::Parse);
     // TODO: handle long queries that span multiple packets.
     assert_eq!(header.flag, Flag::Last);
-    let buffer = stream.look_ahead(header.length as usize)?;
-    let query = std::str::from_utf8(buffer)?;
+    let (query, _) = read_query(&mut stream)?;
     log!("Received query: {}", query);
 
     let stmts = DFParser::parse_sql(query)?;

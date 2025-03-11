@@ -6,4 +6,12 @@ pub(crate) enum FusionError {
     UnsupportedType(String),
     #[error("Failed to parse the query: {0}")]
     ParseQuery(String),
+    #[error("Payload is too large: {0} bytes")]
+    PayloadTooLarge(usize),
+    #[error("Failed to deserialize direction: {0}")]
+    DeserializeDirection(u8),
+    #[error("Failed to deserialize packet: {0}")]
+    DeserializePacket(u8),
+    #[error("Failed to deserialize flag: {0}")]
+    DeserializeFlag(u8),
 }

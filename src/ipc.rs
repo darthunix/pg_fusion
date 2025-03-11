@@ -319,6 +319,14 @@ impl SlotStream {
         }
         Ok(&self.inner.data()[self.pos..self.pos + len])
     }
+
+    pub(crate) fn position(&self) -> usize {
+        self.pos
+    }
+
+    pub(crate) fn reset(&mut self) {
+        self.pos = 0;
+    }
 }
 
 impl From<Slot> for SlotStream {
