@@ -26,7 +26,7 @@ impl TryFrom<u8> for Direction {
         match value {
             0 => Ok(Direction::ToWorker),
             1 => Ok(Direction::FromWorker),
-            _ => Err(FusionError::DeserializeDirection(value)),
+            _ => Err(FusionError::DeserializeU8("direction".to_string(), value)),
         }
     }
 }
@@ -49,7 +49,7 @@ impl TryFrom<u8> for Packet {
             0 => Ok(Packet::None),
             1 => Ok(Packet::Failure),
             2 => Ok(Packet::Parse),
-            _ => Err(FusionError::DeserializePacket(value)),
+            _ => Err(FusionError::DeserializeU8("packet".to_string(), value)),
         }
     }
 }
@@ -70,7 +70,7 @@ impl TryFrom<u8> for Flag {
         match value {
             0 => Ok(Flag::More),
             1 => Ok(Flag::Last),
-            _ => Err(FusionError::DeserializeFlag(value)),
+            _ => Err(FusionError::DeserializeU8("flag".to_string(), value)),
         }
     }
 }
