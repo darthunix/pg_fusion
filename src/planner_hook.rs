@@ -9,8 +9,8 @@ use std::ffi::{c_char, c_int, c_void, CStr};
 use std::mem::size_of;
 use std::ptr::null_mut;
 
+use crate::backend::scan_methods;
 use crate::ipc::{SlotHandler, CURRENT_SLOT};
-use crate::scan::scan_methods;
 use crate::{ENABLE_DATAFUSION, SEED};
 
 static mut PREV_PLANNER_HOOK: planner_hook_type = None;

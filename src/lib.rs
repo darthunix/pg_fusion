@@ -1,18 +1,18 @@
+use backend::init_datafusion_methods;
 use fasthash::Seed;
 use pgrx::pg_sys::AsPgCStr;
 use pgrx::prelude::*;
 use pgrx::{GucContext, GucFlags, GucRegistry, GucSetting};
 use planner_hook::init_datafusion_planner_hook;
-use scan::init_datafusion_methods;
 use worker::init_datafusion_worker;
 
+mod backend;
 mod data_type;
 mod error;
 pub mod fsm;
 mod ipc;
 mod planner_hook;
 mod protocol;
-mod scan;
 mod sql;
 mod worker;
 
