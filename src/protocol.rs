@@ -2,10 +2,13 @@ use crate::error::FusionError;
 use crate::ipc::{Bus, Slot, SlotNumber, SlotStream, DATA_SIZE};
 use crate::worker::worker_id;
 use anyhow::Result;
+use datafusion_sql::TableReference;
 use pgrx::pg_sys::ProcSendSignal;
 use pgrx::prelude::*;
 use rmp::decode::{read_bin_len, read_pfix, read_u16};
-use rmp::encode::{write_bin, write_pfix, write_u16};
+use rmp::encode::{
+    write_array_len, write_bin, write_bin_len, write_pfix, write_str, write_u16, RmpWrite,
+};
 
 #[repr(u8)]
 #[derive(Clone, Debug, Default, PartialEq)]
@@ -166,6 +169,45 @@ pub(crate) fn send_query(slot_id: SlotNumber, mut stream: SlotStream, query: &st
     // Unlock the slot after writing the query.
     let _guard = Slot::from(stream);
     signal(slot_id, Direction::ToWorker);
+    Ok(())
+}
+
+/// Writes a table as null-terminated strings to the stream.
+/// It would be used by the Rust wrappers to the C code, so
+/// if we serialize the table and schema as null-terminated
+/// strings, we can avoid copying on deserialization.
+#[inline]
+fn write_table(stream: &mut SlotStream, table: &TableReference) -> Result<()> {
+    match table {
+        TableReference::Bare { table } => {
+            write_array_len(stream, 1)?;
+            let table_len = u32::try_from(table.len())?;
+            write_bin_len(stream, table_len + 1)?;
+            stream.write_bytes(table.as_bytes())?;
+            write_pfix(stream, 0)?;
+        }
+        TableReference::Full { schema, table, .. } | TableReference::Partial { schema, table } => {
+            write_array_len(stream, 2)?;
+            let schema_len = u32::try_from(schema.len())?;
+            write_bin_len(stream, schema_len + 1)?;
+            stream.write_bytes(schema.as_bytes())?;
+            write_pfix(stream, 0)?;
+            let table_len = u32::try_from(table.len())?;
+            write_bin_len(stream, table_len + 1)?;
+            stream.write_bytes(table.as_bytes())?;
+            write_pfix(stream, 0)?;
+        }
+    }
+    Ok(())
+}
+
+pub(crate) fn write_tables(stream: &mut SlotStream, tables: &[&TableReference]) -> Result<()> {
+    let length = u32::try_from(tables.len())?;
+    assert!(length > 0);
+    write_array_len(stream, length)?;
+    for table in tables {
+        write_table(stream, table)?;
+    }
     Ok(())
 }
 
