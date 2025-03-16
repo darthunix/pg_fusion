@@ -1,5 +1,6 @@
 use thiserror::Error;
 
+// TODO: replace String with SmolStr
 #[derive(Error, Debug)]
 pub(crate) enum FusionError {
     #[error("Unsupported type: {0}")]

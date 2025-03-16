@@ -1,36 +1,6 @@
-use crate::protocol::Packet;
+use crate::{error::FusionError, protocol::Packet};
+use anyhow::Result as AnyResult;
 use rust_fsm::*;
-
-pub enum BackendState {
-    CreatedCustomScan,
-    Failed,
-    Initialized,
-    MetadataProvider,
-}
-
-pub enum BackendEvent {
-    Error,
-    Compile,
-    MetadataLookup,
-    Save,
-}
-
-pub enum BackendOutput {}
-
-state_machine! {
-    #[state_machine(input(crate::fsm::BackendEvent), state(crate::fsm::BackendState), output(crate::fsm::BackendOutput))]
-    pub backend(Initialized)
-
-    Initialized => {
-        Error => Failed,
-        Compile => MetadataProvider,
-    },
-    MetadataProvider => {
-        Error => Failed,
-        MetadataLookup => MetadataProvider,
-        Save => CreatedCustomScan,
-    },
-}
 
 #[derive(Debug)]
 pub enum ExecutorEvent {
@@ -42,12 +12,18 @@ pub enum ExecutorEvent {
     SpuriousWakeup,
 }
 
-impl From<&Packet> for ExecutorEvent {
-    fn from(packet: &Packet) -> Self {
+impl TryFrom<&Packet> for ExecutorEvent {
+    type Error = FusionError;
+
+    fn try_from(packet: &Packet) -> Result<Self, FusionError> {
         match packet {
-            Packet::Failure => Self::Error,
-            Packet::Parse => Self::Parse,
-            Packet::None => Self::SpuriousWakeup,
+            Packet::Failure => Ok(Self::Error),
+            Packet::Metadata => Ok(Self::Metadata),
+            Packet::Parse => Ok(Self::Parse),
+            _ => Err(FusionError::DeserializeU8(
+                "executor event".to_string(),
+                packet.clone() as u8,
+            )),
         }
     }
 }

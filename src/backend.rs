@@ -1,10 +1,16 @@
+use libc::c_long;
 use pgrx::pg_sys::{
-    palloc0, CustomExecMethods, CustomScan, CustomScanMethods, CustomScanState, EState,
-    ExplainState, List, ListCell, Node, NodeTag, ParamListInfo, RegisterCustomScanMethods,
-    TupleTableSlot,
+    error, palloc0, CustomExecMethods, CustomScan, CustomScanMethods, CustomScanState, EState,
+    ExplainState, List, ListCell, MyLatch, Node, NodeTag, ParamListInfo, RegisterCustomScanMethods,
+    ResetLatch, TupleTableSlot, WaitLatch, PG_WAIT_EXTENSION, WL_LATCH_SET, WL_POSTMASTER_DEATH,
+    WL_TIMEOUT,
 };
-use pgrx::{info, pg_guard};
+use pgrx::{check_for_interrupts, pg_guard};
 use std::ffi::c_char;
+use std::time::Duration;
+
+use crate::ipc::{Bus, SlotHandler, SlotNumber, SlotStream, CURRENT_SLOT};
+use crate::protocol::{consume_header, send_query, Direction, Packet};
 
 thread_local! {
     static SCAN_METHODS: CustomScanMethods = CustomScanMethods {
@@ -47,22 +53,64 @@ pub(crate) fn exec_methods() -> *const CustomExecMethods {
 #[repr(C)]
 struct ScanState {
     css: CustomScanState,
-    pattern: *mut c_char,
-    params: ParamListInfo,
 }
 
+fn my_slot() -> SlotNumber {
+    unsafe { CURRENT_SLOT.get_or_init(SlotHandler::new).id() }
+}
+
+#[pg_guard]
+#[no_mangle]
 unsafe extern "C" fn create_df_scan_state(cscan: *mut CustomScan) -> *mut Node {
     let list = (*cscan).custom_private;
     let pattern = (*list_nth(list, 0)).ptr_value as *mut c_char;
-    info!("pattern: {:?}", pattern);
     let params = (*list_nth(list, 1)).ptr_value as ParamListInfo;
-    let mut css = CustomScanState::default();
-    css.methods = exec_methods();
-    let state = ScanState {
-        css,
-        pattern,
-        params,
+    let mut stream = None;
+    loop {
+        wait_latch(None);
+        let Some(slot) = Bus::new().slot_locked(my_slot()) else {
+            continue;
+        };
+        stream = Some(SlotStream::from(slot));
+        break;
+    }
+    let query = std::ffi::CStr::from_ptr(pattern)
+        .to_str()
+        .expect("Expected a zero-terminated string");
+    if let Err(err) = send_query(
+        my_slot(),
+        stream.expect("Failed to acquire a slot stream"),
+        query,
+    ) {
+        error!("Failed to send the query: {}", err);
+    }
+    // TODO: loop with wait_latch until the FSM is in the DataProvider state.
+    loop {
+        wait_latch(None);
+        let Some(slot) = Bus::new().slot_locked(my_slot()) else {
+            continue;
+        };
+        let mut stream = SlotStream::from(slot);
+        let header = consume_header(&mut stream).expect("Failed to consume header");
+        if header.direction == Direction::ToWorker {
+            continue;
+        }
+        match header.packet {
+            Packet::Failure => {
+                // TODO: read the query message and return to the user.
+                error!("Failed to execute the query");
+            }
+            Packet::Metadata => unimplemented!(),
+            Packet::None => continue,
+            Packet::Plan => break,
+            _ => error!("Unexpected packet: {:?}", header.packet),
+        }
+    }
+    let css = CustomScanState {
+        methods: exec_methods(),
+        ..Default::default()
     };
+    let state = ScanState { css };
     let mut node = PgNode::empty(std::mem::size_of::<ScanState>());
     node.set_tag(NodeTag::T_CustomScanState);
     node.set_data(unsafe {
@@ -92,6 +140,24 @@ unsafe extern "C" fn explain_df_scan(
     es: *mut ExplainState,
 ) {
     todo!()
+}
+
+fn wait_latch(timeout: Option<Duration>) {
+    let timeout: c_long = timeout
+        .map(|t| t.as_millis().try_into().unwrap())
+        .unwrap_or(0);
+    let events = WL_LATCH_SET | WL_TIMEOUT | WL_POSTMASTER_DEATH;
+    let rc = unsafe {
+        let rc = WaitLatch(MyLatch, events as i32, timeout, PG_WAIT_EXTENSION);
+        ResetLatch(MyLatch);
+        rc
+    };
+    check_for_interrupts!();
+    if rc & WL_TIMEOUT as i32 != 0 {
+        error!("Waiting latch timeout exceeded");
+    } else if rc & WL_POSTMASTER_DEATH as i32 != 0 {
+        panic!("Postmaster is dead");
+    }
 }
 
 pub(crate) struct PgNode {

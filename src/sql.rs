@@ -3,6 +3,8 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use datafusion::arrow::datatypes::DataType;
+use datafusion::arrow::datatypes::SchemaRef;
+use datafusion::common::DFSchemaRef;
 use datafusion::common::ScalarValue;
 use datafusion::config::ConfigOptions;
 use datafusion::error::DataFusionError;
@@ -18,6 +20,8 @@ use datafusion_sql::planner::SqlToRel;
 use datafusion_sql::sqlparser::dialect::PostgreSqlDialect;
 use datafusion_sql::sqlparser::parser::Parser;
 use datafusion_sql::TableReference;
+use pgrx::pg_sys::Oid;
+use smol_str::SmolStr;
 
 // fn sql_to_logical_plan(
 //     sql: &str,
@@ -38,6 +42,21 @@ use datafusion_sql::TableReference;
 //
 //     Ok(plan)
 // }
+
+pub(crate) struct Table {
+    oid: Oid,
+    schema: SchemaRef,
+}
+
+impl TableSource for Table {
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
+    }
+
+    fn schema(&self) -> SchemaRef {
+        Arc::clone(&self.schema)
+    }
+}
 
 struct Builtin {
     option: ConfigOptions,
@@ -74,7 +93,7 @@ impl Builtin {
 
 struct Catalog {
     builtin: Arc<Builtin>,
-    tables: HashMap<String, Arc<dyn TableSource>>,
+    tables: HashMap<SmolStr, Arc<dyn TableSource>>,
 }
 
 impl ContextProvider for Catalog {

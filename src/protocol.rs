@@ -6,16 +6,14 @@ use datafusion_sql::TableReference;
 use pgrx::pg_sys::ProcSendSignal;
 use pgrx::prelude::*;
 use rmp::decode::{read_bin_len, read_pfix, read_u16};
-use rmp::encode::{
-    write_array_len, write_bin, write_bin_len, write_pfix, write_str, write_u16, RmpWrite,
-};
+use rmp::encode::{write_array_len, write_bin, write_bin_len, write_pfix, write_u16, RmpWrite};
 
 #[repr(u8)]
 #[derive(Clone, Debug, Default, PartialEq)]
 pub(crate) enum Direction {
     #[default]
     ToWorker = 0,
-    FromWorker = 1,
+    ToBackend = 1,
 }
 
 impl TryFrom<u8> for Direction {
@@ -25,7 +23,7 @@ impl TryFrom<u8> for Direction {
         assert!(value < 128);
         match value {
             0 => Ok(Direction::ToWorker),
-            1 => Ok(Direction::FromWorker),
+            1 => Ok(Direction::ToBackend),
             _ => Err(FusionError::DeserializeU8("direction".to_string(), value)),
         }
     }
@@ -34,10 +32,12 @@ impl TryFrom<u8> for Direction {
 #[repr(u8)]
 #[derive(Clone, Debug, Default, PartialEq)]
 pub(crate) enum Packet {
-    Failure = 1,
-    Parse = 2,
     #[default]
     None = 0,
+    Failure = 1,
+    Metadata = 2,
+    Parse = 3,
+    Plan = 4,
 }
 
 impl TryFrom<u8> for Packet {
@@ -99,7 +99,7 @@ fn signal(slot_id: SlotNumber, direction: Direction) {
         Direction::ToWorker => {
             unsafe { ProcSendSignal(worker_id()) };
         }
-        Direction::FromWorker => {
+        Direction::ToBackend => {
             let id = Bus::new().slot(slot_id).owner();
             unsafe { ProcSendSignal(id) };
         }

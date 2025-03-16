@@ -98,11 +98,11 @@ pub extern "C" fn worker_main(_arg: pg_sys::Datum) {
                 };
                 let mut stream = SlotStream::from(slot);
                 let header = consume_header(&mut stream).expect("Failed to consume header");
-                if header.direction == Direction::FromWorker {
+                if header.direction == Direction::ToBackend {
                     continue;
                 }
                 let machine = &mut ctx.states[id];
-                let event = ExecutorEvent::from(&header.packet);
+                let event = ExecutorEvent::try_from(&header.packet).expect("Failed to convert packet to event");
                 let Ok(output) = machine.consume(&event) else {
                     log!("Failed to consume event: {:?}", event);
                     // FIXME: reset the state machine and send an error message.
