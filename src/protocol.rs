@@ -5,8 +5,10 @@ use anyhow::Result;
 use datafusion_sql::TableReference;
 use pgrx::pg_sys::ProcSendSignal;
 use pgrx::prelude::*;
-use rmp::decode::{read_bin_len, read_pfix, read_u16};
-use rmp::encode::{write_array_len, write_bin, write_bin_len, write_pfix, write_u16, RmpWrite};
+use rmp::decode::{read_bin_len, read_pfix, read_str_len, read_u16};
+use rmp::encode::{
+    write_array_len, write_bin, write_bin_len, write_pfix, write_str, write_u16, RmpWrite,
+};
 
 #[repr(u8)]
 #[derive(Clone, Debug, Default, PartialEq)]
@@ -34,10 +36,11 @@ impl TryFrom<u8> for Direction {
 pub(crate) enum Packet {
     #[default]
     None = 0,
-    Failure = 1,
-    Metadata = 2,
-    Parse = 3,
-    Plan = 4,
+    Bind = 1,
+    Failure = 2,
+    Metadata = 3,
+    Parse = 4,
+    Plan = 5,
 }
 
 impl TryFrom<u8> for Packet {
@@ -47,8 +50,11 @@ impl TryFrom<u8> for Packet {
         assert!(value < 128);
         match value {
             0 => Ok(Packet::None),
-            1 => Ok(Packet::Failure),
-            2 => Ok(Packet::Parse),
+            1 => Ok(Packet::Bind),
+            2 => Ok(Packet::Failure),
+            3 => Ok(Packet::Metadata),
+            4 => Ok(Packet::Parse),
+            5 => Ok(Packet::Plan),
             _ => Err(FusionError::DeserializeU8("packet".to_string(), value)),
         }
     }
@@ -134,24 +140,18 @@ pub(crate) fn write_header(stream: &mut SlotStream, header: &Header) -> Result<(
 ///
 /// Returns the query and its length.
 pub(crate) fn read_query(stream: &mut SlotStream) -> Result<(&str, u32)> {
-    let len = read_bin_len(stream)?;
+    let len = read_str_len(stream)?;
     let buf = stream.look_ahead(len as usize)?;
     let query = std::str::from_utf8(buf)?;
     Ok((query, len))
 }
 
-pub(crate) fn write_query(stream: &mut SlotStream, query: &str) -> Result<()> {
-    let data = query.as_bytes();
-    write_bin(stream, data)?;
-    Ok(())
-}
-
 fn prepare_query(stream: &mut SlotStream, query: &str) -> Result<()> {
+    stream.reset();
     // slot: header - bin marker - bin length - query bytes
-    let data = query.as_bytes();
-    let length = 1 + 1 + data.len();
+    let length = 1 + 1 + query.len();
     if length > Header::payload_max_size() {
-        return Err(FusionError::PayloadTooLarge(data.len()).into());
+        return Err(FusionError::PayloadTooLarge(query.len()).into());
     }
     let header = Header {
         direction: Direction::ToWorker,
@@ -160,7 +160,7 @@ fn prepare_query(stream: &mut SlotStream, query: &str) -> Result<()> {
         flag: Flag::Last,
     };
     write_header(stream, &header)?;
-    write_query(stream, query)?;
+    write_str(stream, query)?;
     Ok(())
 }
 
@@ -169,6 +169,44 @@ pub(crate) fn send_query(slot_id: SlotNumber, mut stream: SlotStream, query: &st
     // Unlock the slot after writing the query.
     let _guard = Slot::from(stream);
     signal(slot_id, Direction::ToWorker);
+    Ok(())
+}
+
+pub fn read_error(stream: &mut SlotStream) -> Result<String> {
+    let len = read_str_len(stream)?;
+    let buf = stream.look_ahead(len as usize)?;
+    let message = std::str::from_utf8(buf)?.to_string();
+    Ok(message)
+}
+
+fn prepare_error(stream: &mut SlotStream, message: &str) -> Result<()> {
+    stream.reset();
+    let length = 1 + 1 + u32::try_from(message.len())?;
+    let header = Header {
+        direction: Direction::ToBackend,
+        packet: Packet::Failure,
+        length: length as u16,
+        flag: Flag::Last,
+    };
+    write_header(stream, &header)?;
+    write_str(stream, message)?;
+    Ok(())
+}
+
+pub(crate) fn send_error(slot_id: SlotNumber, mut stream: SlotStream, message: &str) -> Result<()> {
+    prepare_error(&mut stream, message)?;
+    // Unlock the slot after writing the error message.
+    let _guard = Slot::from(stream);
+    signal(slot_id, Direction::ToBackend);
+    Ok(())
+}
+
+#[inline]
+fn write_c_str(stream: &mut SlotStream, s: &str) -> Result<()> {
+    let len = u32::try_from(s.len())?;
+    write_bin_len(stream, len + 1)?;
+    stream.write_bytes(s.as_bytes())?;
+    write_pfix(stream, 0)?;
     Ok(())
 }
 
@@ -181,21 +219,12 @@ fn write_table(stream: &mut SlotStream, table: &TableReference) -> Result<()> {
     match table {
         TableReference::Bare { table } => {
             write_array_len(stream, 1)?;
-            let table_len = u32::try_from(table.len())?;
-            write_bin_len(stream, table_len + 1)?;
-            stream.write_bytes(table.as_bytes())?;
-            write_pfix(stream, 0)?;
+            write_c_str(stream, table)?;
         }
         TableReference::Full { schema, table, .. } | TableReference::Partial { schema, table } => {
             write_array_len(stream, 2)?;
-            let schema_len = u32::try_from(schema.len())?;
-            write_bin_len(stream, schema_len + 1)?;
-            stream.write_bytes(schema.as_bytes())?;
-            write_pfix(stream, 0)?;
-            let table_len = u32::try_from(table.len())?;
-            write_bin_len(stream, table_len + 1)?;
-            stream.write_bytes(table.as_bytes())?;
-            write_pfix(stream, 0)?;
+            write_c_str(stream, schema)?;
+            write_c_str(stream, table)?;
         }
     }
     Ok(())
@@ -256,5 +285,24 @@ mod tests {
         let (query, len) = read_query(&mut stream).unwrap();
         assert_eq!(query, sql);
         assert_eq!(len as usize, sql.len());
+    }
+
+    #[pg_test]
+    fn test_error() {
+        let mut slot_buf: [u8; SLOT_SIZE] = [1; SLOT_SIZE];
+        let ptr = addr_of_mut!(slot_buf) as *mut u8;
+        Slot::init(ptr, slot_buf.len());
+        let slot = Slot::from_bytes(ptr, slot_buf.len());
+        let message = "An error occurred";
+        let mut stream: SlotStream = slot.into();
+        prepare_error(&mut stream, message).unwrap();
+        stream.reset();
+        let header = consume_header(&mut stream).unwrap();
+        assert_eq!(header.direction, Direction::ToBackend);
+        assert_eq!(header.packet, Packet::Failure);
+        assert_eq!(header.flag, Flag::Last);
+        assert_eq!(header.length, 2 + message.len() as u16);
+        let error = read_error(&mut stream).unwrap();
+        assert_eq!(error, message);
     }
 }

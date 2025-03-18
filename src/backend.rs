@@ -10,7 +10,7 @@ use std::ffi::c_char;
 use std::time::Duration;
 
 use crate::ipc::{Bus, SlotHandler, SlotNumber, SlotStream, CURRENT_SLOT};
-use crate::protocol::{consume_header, send_query, Direction, Packet};
+use crate::protocol::{consume_header, read_error, send_query, Direction, Packet};
 
 thread_local! {
     static SCAN_METHODS: CustomScanMethods = CustomScanMethods {
@@ -84,7 +84,6 @@ unsafe extern "C" fn create_df_scan_state(cscan: *mut CustomScan) -> *mut Node {
     ) {
         error!("Failed to send the query: {}", err);
     }
-    // TODO: loop with wait_latch until the FSM is in the DataProvider state.
     loop {
         wait_latch(None);
         let Some(slot) = Bus::new().slot_locked(my_slot()) else {
@@ -97,13 +96,14 @@ unsafe extern "C" fn create_df_scan_state(cscan: *mut CustomScan) -> *mut Node {
         }
         match header.packet {
             Packet::Failure => {
-                // TODO: read the query message and return to the user.
-                error!("Failed to execute the query");
+                let msg = read_error(&mut stream).expect("Failed to read the error message");
+                error!("Failed to compile the query: {}", msg);
             }
+            Packet::Bind => unimplemented!(),
             Packet::Metadata => unimplemented!(),
             Packet::None => continue,
             Packet::Plan => break,
-            _ => error!("Unexpected packet: {:?}", header.packet),
+            _ => error!("Unexpected packet in backend: {:?}", header.packet),
         }
     }
     let css = CustomScanState {

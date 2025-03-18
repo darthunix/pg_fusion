@@ -2,7 +2,7 @@ use crate::error::FusionError;
 use crate::fsm::executor::StateMachine;
 use crate::fsm::{ExecutorEvent, ExecutorOutput};
 use crate::ipc::{init_shmem, max_backends, Bus, SlotNumber, SlotStream};
-use crate::protocol::{consume_header, read_query, Direction, Flag, Header, Packet};
+use crate::protocol::{consume_header, read_query, send_error, Direction, Flag, Header, Packet};
 use anyhow::Result;
 use datafusion::execution::SessionStateBuilder;
 use datafusion_sql::parser::{DFParser, Statement};
@@ -10,6 +10,7 @@ use datafusion_sql::TableReference;
 use pgrx::bgworkers::{BackgroundWorker, BackgroundWorkerBuilder, SignalWakeFlags};
 use pgrx::pg_sys::{MyProcNumber, ProcNumber};
 use pgrx::prelude::*;
+use smol_str::format_smolstr;
 use std::cell::OnceCell;
 use tokio::runtime::Builder;
 use tokio::task::JoinHandle;
@@ -32,7 +33,6 @@ pub(crate) fn init_datafusion_worker() {
 }
 
 enum TaskResult {
-    None,
     Parsing((Statement, Vec<TableReference>)),
 }
 
@@ -90,8 +90,8 @@ pub extern "C" fn worker_main(_arg: pg_sys::Datum) {
         .unwrap();
 
     rt.block_on(async {
+        log!("DataFusion worker is running");
         while BackgroundWorker::wait_latch(None) {
-            log!("DataFusion worker is running");
             for (id, locked_slot) in Bus::new().into_iter().enumerate() {
                 let Some(slot) = locked_slot else {
                     continue;
@@ -103,9 +103,13 @@ pub extern "C" fn worker_main(_arg: pg_sys::Datum) {
                 }
                 let machine = &mut ctx.states[id];
                 let event = ExecutorEvent::try_from(&header.packet).expect("Failed to convert packet to event");
+                let slot_id = u32::try_from(id).expect("Failed to convert slot id to u32");
                 let Ok(output) = machine.consume(&event) else {
-                    log!("Failed to consume event: {:?}", event);
-                    // FIXME: reset the state machine and send an error message.
+                    ctx.states[id] = StateMachine::default();
+                    let msg = format_smolstr!("Failed to consume event: {:?}", event);
+                    if let Err(err) = send_error(slot_id, stream, &msg) {
+                        warning!("Failed to send the error message: {}", err);
+                    };
                     continue;
                 };
                 let handle = match output {
@@ -116,36 +120,35 @@ pub extern "C" fn worker_main(_arg: pg_sys::Datum) {
                         panic!("Unexpected output");
                     }
                 };
-                let task_id = u32::try_from(id).expect("Failed to convert slot id to u32");
-                ctx.tasks.push((task_id, handle));
+                ctx.tasks.push((slot_id, handle));
             }
-        }
-        for (id, task) in ctx.tasks {
-            let task_result = task.await.expect("Failed to await task");
-            let Ok(result) = task_result else {
-                log!("An error occurred while processing the task");
-                // FIXME: reset the state machine and send an error message.
-                continue;
-            };
-            match result {
-                TaskResult::None => continue,
-                TaskResult::Parsing((stmt, tables)) => {
-                    ctx.statements[id as usize] = Some(stmt);
-                    let machine = &mut ctx.states[id as usize];
-                    if tables.is_empty() {
-                        // We don't need any table metadata for this query.
-                        // So, we can simply compile the statement into a logical plan.
-                        let event = ExecutorEvent::Metadata;
-                        machine
-                            .consume(&event)
-                            .expect("Failed to consume Metadata event");
-                        // TODO: compile the statement into a logical plan.
-                    } else if !request_metadata(id, tables) {
-                        log!("Looks like current backend dies and the slot is acquired by another backend");
-                        let event = ExecutorEvent::Error;
-                        machine
-                            .consume(&event)
-                            .expect("Failed to consume Error event");
+            for (id, task) in &mut ctx.tasks {
+                let result = task.await.expect("Failed to await task");
+                match result {
+                    Ok(TaskResult::Parsing((stmt, tables))) => {
+                        ctx.statements[*id as usize] = Some(stmt);
+                        let machine = &mut ctx.states[*id as usize];
+                        if tables.is_empty() {
+                            // We don't need any table metadata for this query.
+                            // So, we can simply compile the statement into a logical plan.
+                            let event = ExecutorEvent::Metadata;
+                            machine
+                                .consume(&event)
+                                .expect("Failed to consume Metadata event");
+                            // TODO: compile the statement into a logical plan.
+                        } else if !request_metadata(*id, tables) {
+                            log!("Looks like current backend dies and the slot is acquired by another backend");
+                            let event = ExecutorEvent::Error;
+                            machine
+                                .consume(&event)
+                                .expect("Failed to consume Error event");
+                        }
+                    }
+                    Err(err) => {
+                        let msg = format_smolstr!("Failed to execute a task: {:?}", err);
+                        if let Err(err) = send_error(*id, SlotStream::from(Bus::new().slot(*id)), &msg) {
+                            warning!("Failed to send the error message: {}", err);
+                        }
                     }
                 }
             }
@@ -171,19 +174,43 @@ async fn parse(header: Header, mut stream: SlotStream) -> Result<TaskResult> {
     Ok(TaskResult::Parsing((stmt, tables)))
 }
 
-fn request_metadata(id: SlotNumber, tables: Vec<TableReference>) -> bool {
+#[inline]
+fn slot_warning() {
     // The slot should be locked before sending the response.
     // Normally this operation can not fail because its backend
     // is waiting for response and should not hold any locks.
     // But if it does it means that the old backend was terminated
     // and some other one acquired the same slot. So, fsm should
     // be reset to initial value.
+    warning!(
+        "{} {} {} {}",
+        "Failed to lock the slot for error response.",
+        "Looks like the old backend was terminated",
+        "and the slot is acquired by another backend.",
+        "The state machine will be reset to the initial state.",
+    );
+}
+
+fn response_error(id: SlotNumber, message: &str) -> bool {
     let Some(slot) = Bus::new().slot_locked(id) else {
-        log!("Failed to lock the slot for table metadata response");
+        slot_warning();
+        return false;
+    };
+    let stream = SlotStream::from(slot);
+    if let Err(err) = send_error(id, stream, message) {
+        warning!("Failed to send the error message: {}", err);
+        return false;
+    }
+    true
+}
+
+fn request_metadata(id: SlotNumber, tables: Vec<TableReference>) -> bool {
+    let Some(slot) = Bus::new().slot_locked(id) else {
+        slot_warning();
         return false;
     };
     let mut stream = SlotStream::from(slot);
-    // TODO: serialize table references with protobuf(?)
+    // TODO: serialize table references.
 
     true
 }
