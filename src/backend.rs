@@ -63,8 +63,8 @@ unsafe extern "C" fn create_df_scan_state(cscan: *mut CustomScan) -> *mut Node {
     let params = (*list_nth(list, 1)).ptr_value as ParamListInfo;
     let mut stream = None;
     loop {
-        wait_latch(None);
         let Some(slot) = Bus::new().slot_locked(my_slot()) else {
+            wait_latch(None);
             continue;
         };
         stream = Some(SlotStream::from(slot));
@@ -81,13 +81,14 @@ unsafe extern "C" fn create_df_scan_state(cscan: *mut CustomScan) -> *mut Node {
         error!("Failed to send the query: {}", err);
     }
     loop {
-        wait_latch(None);
         let Some(slot) = Bus::new().slot_locked(my_slot()) else {
+            wait_latch(None);
             continue;
         };
         let mut stream = SlotStream::from(slot);
         let header = consume_header(&mut stream).expect("Failed to consume header");
-        if header.direction == Direction::ToWorker {
+        if header.direction != Direction::ToBackend {
+            wait_latch(None);
             continue;
         }
         match header.packet {
@@ -97,7 +98,6 @@ unsafe extern "C" fn create_df_scan_state(cscan: *mut CustomScan) -> *mut Node {
             }
             Packet::Bind => unimplemented!(),
             Packet::Metadata => unimplemented!(),
-            Packet::None => continue,
             Packet::Plan => break,
             _ => error!("Unexpected packet in backend: {:?}", header.packet),
         }
