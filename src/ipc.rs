@@ -28,6 +28,11 @@ pub(crate) fn max_backends() -> u32 {
     10
 }
 
+#[inline]
+pub(crate) fn my_slot() -> SlotNumber {
+    unsafe { CURRENT_SLOT.get_or_init(SlotHandler::new).id() }
+}
+
 pub(crate) type SlotNumber = u32;
 
 #[repr(C)]

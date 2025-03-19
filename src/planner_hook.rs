@@ -10,14 +10,10 @@ use std::mem::size_of;
 use std::ptr::null_mut;
 
 use crate::backend::scan_methods;
-use crate::ipc::{SlotHandler, CURRENT_SLOT};
+use crate::ipc::my_slot;
 use crate::{ENABLE_DATAFUSION, SEED};
 
 static mut PREV_PLANNER_HOOK: planner_hook_type = None;
-
-fn current_slot() -> &'static SlotHandler {
-    unsafe { CURRENT_SLOT.get_or_init(|| SlotHandler::new()) }
-}
 
 #[pg_guard]
 #[no_mangle]
@@ -44,7 +40,7 @@ extern "C" fn datafusion_planner_hook(
             "DataFusion planner hook called for query: {:?}",
             pattern.to_str().unwrap()
         );
-        let slot_id = current_slot().id();
+        let slot_id = my_slot();
         info!("Slot id: {slot_id}");
         return df_planner(query_string, boundparams);
     }

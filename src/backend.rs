@@ -9,7 +9,7 @@ use pgrx::{check_for_interrupts, pg_guard};
 use std::ffi::c_char;
 use std::time::Duration;
 
-use crate::ipc::{Bus, SlotHandler, SlotNumber, SlotStream, CURRENT_SLOT};
+use crate::ipc::{my_slot, Bus, SlotHandler, SlotNumber, SlotStream, CURRENT_SLOT};
 use crate::protocol::{consume_header, read_error, send_query, Direction, Packet};
 
 thread_local! {
@@ -53,10 +53,6 @@ pub(crate) fn exec_methods() -> *const CustomExecMethods {
 #[repr(C)]
 struct ScanState {
     css: CustomScanState,
-}
-
-fn my_slot() -> SlotNumber {
-    unsafe { CURRENT_SLOT.get_or_init(SlotHandler::new).id() }
 }
 
 #[pg_guard]
