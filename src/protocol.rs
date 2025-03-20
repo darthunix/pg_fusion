@@ -5,10 +5,8 @@ use anyhow::Result;
 use datafusion_sql::TableReference;
 use pgrx::pg_sys::ProcSendSignal;
 use pgrx::prelude::*;
-use rmp::decode::{read_bin_len, read_pfix, read_str_len, read_u16};
-use rmp::encode::{
-    write_array_len, write_bin, write_bin_len, write_pfix, write_str, write_u16, RmpWrite,
-};
+use rmp::decode::{read_pfix, read_str_len, read_u16};
+use rmp::encode::{write_array_len, write_bin_len, write_pfix, write_str, write_u16, RmpWrite};
 
 #[repr(u8)]
 #[derive(Clone, Debug, Default, PartialEq)]

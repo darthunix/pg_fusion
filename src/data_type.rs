@@ -1,4 +1,5 @@
 use crate::error::FusionError;
+use crate::ipc::SlotStream;
 use anyhow::{bail, Result};
 use datafusion::arrow::datatypes::DataType;
 use datafusion::common::arrow::array::types::IntervalMonthDayNano;
@@ -11,6 +12,15 @@ use pgrx::pg_sys::{
     self, list_append_unique_ptr, makeTargetEntry, makeVar, palloc0, Datum, Expr, List,
     ParamListInfo, TargetEntry, GETSTRUCT,
 };
+use rmp::decode::{
+    read_array_len, read_bool, read_f32, read_f64, read_i16, read_i32, read_i64, read_str_len,
+    RmpRead,
+};
+use rmp::encode::{
+    write_array_len, write_bool, write_f32, write_f64, write_i16, write_i32, write_i64, write_pfix,
+    write_str, RmpWrite,
+};
+use rmp::Marker;
 use std::char;
 
 fn datum_to_scalar(datum: Datum, ptype: pg_sys::Oid, is_null: bool) -> Result<ScalarValue> {
@@ -62,22 +72,10 @@ fn datum_to_scalar(datum: Datum, ptype: pg_sys::Oid, is_null: bool) -> Result<Sc
     }
 }
 
-pub(crate) fn repack_params(param_list: ParamListInfo) -> Result<Vec<ScalarValue>> {
-    let num_params = unsafe { (*param_list).numParams } as usize;
-    let mut values: Vec<ScalarValue> = Vec::with_capacity(num_params);
-    let params = unsafe { (*param_list).params.as_slice(num_params) };
-    for param in params {
-        let value = datum_to_scalar(param.value, param.ptype, param.isnull)?;
-        values.push(value);
-    }
-    Ok(values)
-}
-
 fn type_to_oid(type_: &DataType) -> pg_sys::Oid {
     match type_ {
         DataType::Boolean => pg_sys::BOOLOID,
         DataType::Utf8 => pg_sys::TEXTOID,
-        DataType::Int8 => pg_sys::INT8OID,
         DataType::Int16 => pg_sys::INT2OID,
         DataType::Int32 => pg_sys::INT4OID,
         DataType::Int64 => pg_sys::INT8OID,
@@ -89,6 +87,272 @@ fn type_to_oid(type_: &DataType) -> pg_sys::Oid {
         DataType::Interval(_) => pg_sys::INTERVALOID,
         _ => unimplemented!(),
     }
+}
+
+#[repr(u8)]
+enum EncodedType {
+    Boolean = 0,
+    Utf8 = 1,
+    Int16 = 2,
+    Int32 = 3,
+    Int64 = 4,
+    Float32 = 5,
+    Float64 = 6,
+    Date32 = 7,
+    Time64 = 8,
+    Timestamp = 9,
+    Interval = 10,
+}
+
+impl TryFrom<u8> for EncodedType {
+    type Error = FusionError;
+
+    fn try_from(value: u8) -> Result<Self, Self::Error> {
+        match value {
+            0 => Ok(EncodedType::Boolean),
+            1 => Ok(EncodedType::Utf8),
+            2 => Ok(EncodedType::Int16),
+            3 => Ok(EncodedType::Int32),
+            4 => Ok(EncodedType::Int64),
+            5 => Ok(EncodedType::Float32),
+            6 => Ok(EncodedType::Float64),
+            7 => Ok(EncodedType::Date32),
+            8 => Ok(EncodedType::Time64),
+            9 => Ok(EncodedType::Timestamp),
+            10 => Ok(EncodedType::Interval),
+            _ => Err(FusionError::DeserializeU8(
+                "encoded type".to_string(),
+                value,
+            )),
+        }
+    }
+}
+
+#[inline]
+fn write_scalar_value(stream: &mut SlotStream, value: &ScalarValue) -> Result<()> {
+    let write_null = |stream: &mut SlotStream| -> Result<()> {
+        // Though it is not a valid msgpack, we use it to represent null values
+        // as we don't want to waste bytes for additional marker.
+        stream.write_u8(Marker::Null.to_u8())?;
+        Ok(())
+    };
+    match value {
+        ScalarValue::Boolean(v) => {
+            write_pfix(stream, EncodedType::Boolean as u8)?;
+            match v {
+                Some(v) => write_bool(stream, *v)?,
+                None => write_null(stream)?,
+            }
+        }
+        ScalarValue::Utf8(v) => {
+            write_pfix(stream, EncodedType::Utf8 as u8)?;
+            match v {
+                Some(v) => write_str(stream, v)?,
+                None => write_null(stream)?,
+            }
+        }
+        ScalarValue::Int16(v) => {
+            write_pfix(stream, EncodedType::Int16 as u8)?;
+            match v {
+                Some(v) => write_i16(stream, *v)?,
+                None => write_null(stream)?,
+            }
+        }
+        ScalarValue::Int32(v) => {
+            write_pfix(stream, EncodedType::Int32 as u8)?;
+            match v {
+                Some(v) => write_i32(stream, *v)?,
+                None => write_null(stream)?,
+            }
+        }
+        ScalarValue::Int64(v) => {
+            write_pfix(stream, EncodedType::Int64 as u8)?;
+            match v {
+                Some(v) => write_i64(stream, *v)?,
+                None => write_null(stream)?,
+            }
+        }
+        ScalarValue::Float32(v) => {
+            write_pfix(stream, EncodedType::Float32 as u8)?;
+            match v {
+                Some(v) => write_f32(stream, *v)?,
+                None => write_null(stream)?,
+            }
+        }
+        ScalarValue::Float64(v) => {
+            write_pfix(stream, EncodedType::Float64 as u8)?;
+            match v {
+                Some(v) => write_f64(stream, *v)?,
+                None => write_null(stream)?,
+            }
+        }
+        ScalarValue::Date32(v) => {
+            write_pfix(stream, EncodedType::Date32 as u8)?;
+            match v {
+                Some(v) => write_i32(stream, *v)?,
+                None => write_null(stream)?,
+            }
+        }
+        ScalarValue::IntervalMonthDayNano(v) => {
+            write_pfix(stream, EncodedType::Interval as u8)?;
+            match v {
+                Some(v) => {
+                    write_i32(stream, v.months)?;
+                    write_i32(stream, v.days)?;
+                    write_i64(stream, v.nanoseconds)?;
+                }
+                None => write_null(stream)?,
+            }
+        }
+        ScalarValue::Time64Microsecond(v) => {
+            write_pfix(stream, EncodedType::Time64 as u8)?;
+            match v {
+                Some(v) => write_i64(stream, *v)?,
+                None => write_null(stream)?,
+            }
+        }
+        _ => return Err(FusionError::UnsupportedType(format!("{value:?}")).into()),
+    }
+    Ok(())
+}
+
+pub(crate) fn write_params(param_list: ParamListInfo, stream: &mut SlotStream) -> Result<()> {
+    let num_params = unsafe { (*param_list).numParams } as usize;
+    write_array_len(stream, u32::try_from(num_params)?)?;
+    let params = unsafe { (*param_list).params.as_slice(num_params) };
+    for param in params {
+        let value = datum_to_scalar(param.value, param.ptype, param.isnull)?;
+        write_scalar_value(stream, &value)?;
+    }
+    Ok(())
+}
+
+#[inline]
+fn read_scalar_value(stream: &mut SlotStream) -> Result<ScalarValue> {
+    let etype = stream.read_u8()?;
+    let value = match EncodedType::try_from(etype)? {
+        EncodedType::Boolean => {
+            let marker = stream.look_ahead(size_of::<u8>())?[0];
+            if marker == u8::from(Marker::Null) {
+                let _ = stream.read_u8()?;
+                ScalarValue::Boolean(None)
+            } else {
+                ScalarValue::Boolean(Some(read_bool(stream)?))
+            }
+        }
+        EncodedType::Utf8 => {
+            let marker = stream.look_ahead(size_of::<u8>())?[0];
+            if marker == u8::from(Marker::Null) {
+                let _ = stream.read_u8()?;
+                ScalarValue::Utf8(None)
+            } else {
+                let len = read_str_len(stream)?;
+                let mut buf: Vec<u8> = vec![0; len as usize];
+                stream.read_exact_buf(&mut buf)?;
+                let s = unsafe { String::from_utf8_unchecked(buf) };
+                ScalarValue::Utf8(Some(s))
+            }
+        }
+        EncodedType::Int16 => {
+            let marker = stream.look_ahead(size_of::<u8>())?[0];
+            if marker == u8::from(Marker::Null) {
+                let _ = stream.read_u8()?;
+                ScalarValue::Int16(None)
+            } else {
+                ScalarValue::Int16(Some(read_i16(stream)?))
+            }
+        }
+        EncodedType::Int32 => {
+            let marker = stream.look_ahead(size_of::<u8>())?[0];
+            if marker == u8::from(Marker::Null) {
+                let _ = stream.read_u8()?;
+                ScalarValue::Int32(None)
+            } else {
+                ScalarValue::Int32(Some(read_i32(stream)? as i32))
+            }
+        }
+        EncodedType::Int64 => {
+            let marker = stream.look_ahead(size_of::<u8>())?[0];
+            if marker == u8::from(Marker::Null) {
+                let _ = stream.read_u8()?;
+                ScalarValue::Int64(None)
+            } else {
+                ScalarValue::Int64(Some(read_i64(stream)? as i64))
+            }
+        }
+        EncodedType::Float32 => {
+            let marker = stream.look_ahead(size_of::<u8>())?[0];
+            if marker == u8::from(Marker::Null) {
+                let _ = stream.read_u8()?;
+                ScalarValue::Float32(None)
+            } else {
+                ScalarValue::Float32(Some(read_f32(stream)?))
+            }
+        }
+        EncodedType::Float64 => {
+            let marker = stream.look_ahead(size_of::<u8>())?[0];
+            if marker == u8::from(Marker::Null) {
+                let _ = stream.read_u8()?;
+                ScalarValue::Float64(None)
+            } else {
+                ScalarValue::Float64(Some(read_f64(stream)? as f64))
+            }
+        }
+        EncodedType::Date32 => {
+            let marker = stream.look_ahead(size_of::<u8>())?[0];
+            if marker == u8::from(Marker::Null) {
+                let _ = stream.read_u8()?;
+                ScalarValue::Date32(None)
+            } else {
+                ScalarValue::Date32(Some(read_i32(stream)?))
+            }
+        }
+        EncodedType::Interval => {
+            let marker = stream.look_ahead(size_of::<u8>())?[0];
+            if marker == u8::from(Marker::Null) {
+                let _ = stream.read_u8()?;
+                ScalarValue::IntervalMonthDayNano(None)
+            } else {
+                let months = read_i32(stream)?;
+                let days = read_i32(stream)?;
+                let nanoseconds = read_i64(stream)?;
+                ScalarValue::IntervalMonthDayNano(Some(IntervalMonthDayNano {
+                    months,
+                    days,
+                    nanoseconds,
+                }))
+            }
+        }
+        EncodedType::Time64 => {
+            let marker = stream.look_ahead(size_of::<u8>())?[0];
+            if marker == u8::from(Marker::Null) {
+                let _ = stream.read_u8()?;
+                ScalarValue::Time64Microsecond(None)
+            } else {
+                ScalarValue::Time64Microsecond(Some(read_i64(stream)?))
+            }
+        }
+        EncodedType::Timestamp => {
+            let marker = stream.look_ahead(size_of::<u8>())?[0];
+            if marker == u8::from(Marker::Null) {
+                let _ = stream.read_u8()?;
+                ScalarValue::TimestampMicrosecond(None, None)
+            } else {
+                ScalarValue::TimestampMicrosecond(Some(read_i64(stream)?), None)
+            }
+        }
+    };
+    Ok(value)
+}
+
+pub(crate) fn read_params(stream: &mut SlotStream) -> Result<Vec<ScalarValue>> {
+    let len = read_array_len(stream)?;
+    let mut params = Vec::with_capacity(len as usize);
+    for _ in 0..len {
+        let value = read_scalar_value(stream)?;
+        params.push(value);
+    }
+    Ok(params)
 }
 
 fn filed_to_target_entry(field: Field, position: i16) -> *mut TargetEntry {
@@ -134,7 +398,11 @@ mod tests {
     use pgrx::pg_sys;
     use pgrx::prelude::*;
 
+    use crate::ipc::Slot;
+
     use super::*;
+    use std::ptr::addr_of_mut;
+    const SLOT_SIZE: usize = 8204;
 
     #[pg_test]
     fn test_df_to_pg_column_convertion() {
@@ -151,5 +419,55 @@ mod tests {
         let name = unsafe { std::ffi::CStr::from_ptr(entry.resname) };
         assert_eq!(name.to_str().unwrap(), "test");
         assert!(!entry.resjunk);
+    }
+
+    #[pg_test]
+    fn test_scalar_value_serialization() {
+        let mut slot_buf: [u8; SLOT_SIZE] = [1; SLOT_SIZE];
+        let ptr = addr_of_mut!(slot_buf) as *mut u8;
+        Slot::init(ptr, slot_buf.len());
+        let slot = Slot::from_bytes(ptr, slot_buf.len());
+        let mut stream: SlotStream = slot.into();
+        let check = |stream: &mut SlotStream, value: ScalarValue| {
+            stream.reset();
+            write_scalar_value(stream, &value).expect("failed to write scalar value");
+            stream.reset();
+            let new_value = read_scalar_value(stream).expect("failed to read scalar value");
+            assert_eq!(value, new_value);
+        };
+        check(&mut stream, ScalarValue::Boolean(None));
+        check(&mut stream, ScalarValue::Boolean(Some(false)));
+        check(&mut stream, ScalarValue::Boolean(Some(true)));
+        check(&mut stream, ScalarValue::Utf8(None));
+        check(&mut stream, ScalarValue::Utf8(Some("test".to_string())));
+        check(&mut stream, ScalarValue::Utf8(Some("".to_string())));
+        check(&mut stream, ScalarValue::Int16(None));
+        check(&mut stream, ScalarValue::Int16(Some(42)));
+        check(&mut stream, ScalarValue::Int16(Some(-42)));
+        check(&mut stream, ScalarValue::Int32(None));
+        check(&mut stream, ScalarValue::Int32(Some(42)));
+        check(&mut stream, ScalarValue::Int32(Some(-42)));
+        check(&mut stream, ScalarValue::Int64(None));
+        check(&mut stream, ScalarValue::Int64(Some(42)));
+        check(&mut stream, ScalarValue::Int64(Some(-42)));
+        check(&mut stream, ScalarValue::Float32(None));
+        check(&mut stream, ScalarValue::Float32(Some(42.0)));
+        check(&mut stream, ScalarValue::Float32(Some(-42.0)));
+        check(&mut stream, ScalarValue::Float64(None));
+        check(&mut stream, ScalarValue::Float64(Some(42.0)));
+        check(&mut stream, ScalarValue::Date32(None));
+        check(&mut stream, ScalarValue::Date32(Some(42)));
+        check(&mut stream, ScalarValue::Date32(Some(-42)));
+        check(&mut stream, ScalarValue::IntervalMonthDayNano(None));
+        check(
+            &mut stream,
+            ScalarValue::IntervalMonthDayNano(Some(IntervalMonthDayNano {
+                months: 1,
+                days: 10,
+                nanoseconds: 666,
+            })),
+        );
+        check(&mut stream, ScalarValue::Time64Microsecond(None));
+        check(&mut stream, ScalarValue::Time64Microsecond(Some(42)));
     }
 }
