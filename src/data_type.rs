@@ -10,20 +10,23 @@ use pgrx::datum::{Date, FromDatum, Interval, Time, Timestamp};
 use pgrx::pg_sys::SysCacheIdentifier::TYPEOID;
 use pgrx::pg_sys::{
     self, list_append_unique_ptr, makeTargetEntry, makeVar, palloc0, Datum, Expr, List,
-    ParamListInfo, TargetEntry, GETSTRUCT,
+    TargetEntry, GETSTRUCT,
 };
 use rmp::decode::{
-    read_array_len, read_bool, read_f32, read_f64, read_i16, read_i32, read_i64, read_str_len,
-    RmpRead,
+    read_bool, read_f32, read_f64, read_i16, read_i32, read_i64, read_str_len, RmpRead,
 };
 use rmp::encode::{
-    write_array_len, write_bool, write_f32, write_f64, write_i16, write_i32, write_i64, write_pfix,
-    write_str, RmpWrite,
+    write_bool, write_f32, write_f64, write_i16, write_i32, write_i64, write_pfix, write_str,
+    RmpWrite,
 };
 use rmp::Marker;
 use std::char;
 
-fn datum_to_scalar(datum: Datum, ptype: pg_sys::Oid, is_null: bool) -> Result<ScalarValue> {
+pub(crate) fn datum_to_scalar(
+    datum: Datum,
+    ptype: pg_sys::Oid,
+    is_null: bool,
+) -> Result<ScalarValue> {
     unsafe {
         match ptype {
             pg_sys::BOOLOID => Ok(ScalarValue::Boolean(bool::from_datum(datum, is_null))),
@@ -129,7 +132,7 @@ impl TryFrom<u8> for EncodedType {
 }
 
 #[inline]
-fn write_scalar_value(stream: &mut SlotStream, value: &ScalarValue) -> Result<()> {
+pub(crate) fn write_scalar_value(stream: &mut SlotStream, value: &ScalarValue) -> Result<()> {
     let write_null = |stream: &mut SlotStream| -> Result<()> {
         // Though it is not a valid msgpack, we use it to represent null values
         // as we don't want to waste bytes for additional marker.
@@ -216,19 +219,8 @@ fn write_scalar_value(stream: &mut SlotStream, value: &ScalarValue) -> Result<()
     Ok(())
 }
 
-pub(crate) fn write_params(param_list: ParamListInfo, stream: &mut SlotStream) -> Result<()> {
-    let num_params = unsafe { (*param_list).numParams } as usize;
-    write_array_len(stream, u32::try_from(num_params)?)?;
-    let params = unsafe { (*param_list).params.as_slice(num_params) };
-    for param in params {
-        let value = datum_to_scalar(param.value, param.ptype, param.isnull)?;
-        write_scalar_value(stream, &value)?;
-    }
-    Ok(())
-}
-
 #[inline]
-fn read_scalar_value(stream: &mut SlotStream) -> Result<ScalarValue> {
+pub(crate) fn read_scalar_value(stream: &mut SlotStream) -> Result<ScalarValue> {
     let etype = stream.read_u8()?;
     let value = match EncodedType::try_from(etype)? {
         EncodedType::Boolean => {
@@ -343,16 +335,6 @@ fn read_scalar_value(stream: &mut SlotStream) -> Result<ScalarValue> {
         }
     };
     Ok(value)
-}
-
-pub(crate) fn read_params(stream: &mut SlotStream) -> Result<Vec<ScalarValue>> {
-    let len = read_array_len(stream)?;
-    let mut params = Vec::with_capacity(len as usize);
-    for _ in 0..len {
-        let value = read_scalar_value(stream)?;
-        params.push(value);
-    }
-    Ok(params)
 }
 
 fn filed_to_target_entry(field: Field, position: i16) -> *mut TargetEntry {

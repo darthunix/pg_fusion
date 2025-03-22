@@ -7,6 +7,7 @@ pub enum ExecutorEvent {
     Bind,
     Error,
     Metadata,
+    Parameter,
     Parse,
     Save,
     SpuriousWakeup,

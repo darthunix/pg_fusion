@@ -60,7 +60,9 @@ struct ScanState {
 unsafe extern "C" fn create_df_scan_state(cscan: *mut CustomScan) -> *mut Node {
     let list = (*cscan).custom_private;
     let pattern = (*list_nth(list, 0)).ptr_value as *mut c_char;
-    let params = (*list_nth(list, 1)).ptr_value as ParamListInfo;
+    let param_list = (*list_nth(list, 1)).ptr_value as ParamListInfo;
+    let num_params = unsafe { (*param_list).numParams } as usize;
+    let params = unsafe { (*param_list).params.as_slice(num_params) };
     let mut stream = None;
     loop {
         let Some(slot) = Bus::new().slot_locked(my_slot()) else {

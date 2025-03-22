@@ -1,11 +1,13 @@
+use crate::data_type::{datum_to_scalar, read_scalar_value, write_scalar_value};
 use crate::error::FusionError;
 use crate::ipc::{Bus, Slot, SlotNumber, SlotStream, DATA_SIZE};
 use crate::worker::worker_id;
 use anyhow::Result;
+use datafusion::scalar::ScalarValue;
 use datafusion_sql::TableReference;
-use pgrx::pg_sys::ProcSendSignal;
+use pgrx::pg_sys::{ParamExternData, ProcSendSignal};
 use pgrx::prelude::*;
-use rmp::decode::{read_pfix, read_str_len, read_u16};
+use rmp::decode::{read_array_len, read_pfix, read_str_len, read_u16};
 use rmp::encode::{write_array_len, write_bin_len, write_pfix, write_str, write_u16, RmpWrite};
 
 #[repr(u8)]
@@ -38,7 +40,8 @@ pub(crate) enum Packet {
     Failure = 2,
     Metadata = 3,
     Parse = 4,
-    Plan = 5,
+    Parameter = 5,
+    Plan = 6,
 }
 
 impl TryFrom<u8> for Packet {
@@ -52,7 +55,8 @@ impl TryFrom<u8> for Packet {
             2 => Ok(Packet::Failure),
             3 => Ok(Packet::Metadata),
             4 => Ok(Packet::Parse),
-            5 => Ok(Packet::Plan),
+            5 => Ok(Packet::Parameter),
+            6 => Ok(Packet::Plan),
             _ => Err(FusionError::DeserializeU8("packet".to_string(), value)),
         }
     }
@@ -170,7 +174,54 @@ pub(crate) fn send_query(slot_id: SlotNumber, mut stream: SlotStream, query: &st
     Ok(())
 }
 
-pub fn read_error(stream: &mut SlotStream) -> Result<String> {
+fn prepare_params(stream: &mut SlotStream, params: &[ParamExternData]) -> Result<()> {
+    stream.reset();
+    // We don't know the length of the parameters yet. So we write an invalid header
+    // to replace it with the correct one later.
+    write_header(stream, &Header::default())?;
+    let pos_init = stream.position();
+    write_array_len(stream, u32::try_from(params.len())?)?;
+    for param in params {
+        let value = datum_to_scalar(param.value, param.ptype, param.isnull)?;
+        write_scalar_value(stream, &value)?;
+    }
+    let pos_final = stream.position();
+    let length = u16::try_from(pos_final - pos_init)?;
+    let header = Header {
+        direction: Direction::ToWorker,
+        packet: Packet::Parameter,
+        length,
+        flag: Flag::Last,
+    };
+    stream.reset();
+    write_header(stream, &header)?;
+    stream.rewind(length as usize)?;
+    Ok(())
+}
+
+pub(crate) fn read_params(stream: &mut SlotStream) -> Result<Vec<ScalarValue>> {
+    let len = read_array_len(stream)?;
+    let mut params = Vec::with_capacity(len as usize);
+    for _ in 0..len {
+        let value = read_scalar_value(stream)?;
+        params.push(value);
+    }
+    Ok(params)
+}
+
+pub(crate) fn send_params(
+    slot_id: SlotNumber,
+    mut stream: SlotStream,
+    params: &[ParamExternData],
+) -> Result<()> {
+    prepare_params(&mut stream, params)?;
+    // Unlock the slot after writing the parameters.
+    let _guard = Slot::from(stream);
+    signal(slot_id, Direction::ToWorker);
+    Ok(())
+}
+
+pub(crate) fn read_error(stream: &mut SlotStream) -> Result<String> {
     let len = read_str_len(stream)?;
     let buf = stream.look_ahead(len as usize)?;
     let message = std::str::from_utf8(buf)?.to_string();
@@ -241,6 +292,8 @@ pub(crate) fn write_tables(stream: &mut SlotStream, tables: &[&TableReference]) 
 #[cfg(any(test, feature = "pg_test"))]
 #[pg_schema]
 mod tests {
+    use pgrx::pg_sys::Datum;
+
     use super::*;
     use std::ptr::addr_of_mut;
 
@@ -283,6 +336,37 @@ mod tests {
         let (query, len) = read_query(&mut stream).unwrap();
         assert_eq!(query, sql);
         assert_eq!(len as usize, sql.len());
+    }
+
+    #[pg_test]
+    fn test_params() {
+        let mut slot_buf: [u8; SLOT_SIZE] = [1; SLOT_SIZE];
+        let ptr = addr_of_mut!(slot_buf) as *mut u8;
+        Slot::init(ptr, slot_buf.len());
+        let slot = Slot::from_bytes(ptr, slot_buf.len());
+        let mut stream: SlotStream = slot.into();
+        let p1 = ParamExternData {
+            value: Datum::from(1),
+            ptype: pg_sys::INT4OID,
+            isnull: false,
+            pflags: 0,
+        };
+        let p2 = ParamExternData {
+            value: Datum::from(0),
+            ptype: pg_sys::INT4OID,
+            isnull: true,
+            pflags: 0,
+        };
+        prepare_params(&mut stream, &[p1, p2]).unwrap();
+        stream.reset();
+        let header = consume_header(&mut stream).unwrap();
+        assert_eq!(header.direction, Direction::ToWorker);
+        assert_eq!(header.packet, Packet::Parameter);
+        assert_eq!(header.flag, Flag::Last);
+        let params = read_params(&mut stream).unwrap();
+        assert_eq!(params.len(), 2);
+        assert_eq!(params[0], ScalarValue::Int32(Some(1)));
+        assert_eq!(params[1], ScalarValue::Int32(None));
     }
 
     #[pg_test]
