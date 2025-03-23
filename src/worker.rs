@@ -1,7 +1,7 @@
 use crate::error::FusionError;
 use crate::fsm::executor::StateMachine;
 use crate::fsm::ExecutorOutput;
-use crate::ipc::{init_shmem, max_backends, Bus, SlotNumber, SlotStream};
+use crate::ipc::{init_shmem, max_backends, Bus, SlotNumber, SlotStream, INVALID_SLOT_NUMBER};
 use crate::protocol::{consume_header, read_query, send_error, Direction, Flag, Header, Packet};
 use anyhow::Result;
 use datafusion::execution::SessionStateBuilder;
@@ -10,7 +10,7 @@ use datafusion_sql::TableReference;
 use pgrx::bgworkers::{BackgroundWorker, BackgroundWorkerBuilder, SignalWakeFlags};
 use pgrx::pg_sys::{MyProcNumber, ProcNumber};
 use pgrx::prelude::*;
-use smol_str::format_smolstr;
+use smol_str::{format_smolstr, SmolStr};
 use std::cell::OnceCell;
 use tokio::runtime::Builder;
 use tokio::task::JoinHandle;
@@ -88,6 +88,8 @@ pub extern "C" fn worker_main(_arg: pg_sys::Datum) {
         .build()
         .unwrap();
     let mut do_retry = false;
+    let mut slots_with_error: Vec<(SlotNumber, SmolStr)> =
+        vec![(INVALID_SLOT_NUMBER, "".into()); max_backends() as usize];
 
     rt.block_on(async {
         log!("DataFusion worker is running");
@@ -105,15 +107,18 @@ pub extern "C" fn worker_main(_arg: pg_sys::Datum) {
                 let machine = &mut ctx.states[id];
                 let slot_id = u32::try_from(id).expect("Failed to convert slot id to u32");
                 let Ok(output) = machine.consume(&header.packet) else {
-                    ctx.states[id] = StateMachine::default();
                     let msg = format_smolstr!("Failed to consume event: {:?}", &header.packet);
-                    if let Err(err) = send_error(slot_id, stream, &msg) {
-                        warning!("Failed to send the error message: {}", err);
-                    };
+                    response_error(slot_id, &mut ctx, stream, &msg);
                     continue;
                 };
                 let handle = match output {
                     Some(ExecutorOutput::Parse) => tokio::spawn(parse(header, stream)),
+                    Some(ExecutorOutput::Flush) => {
+                        ctx.flush(slot_id);
+                        continue;
+                    }
+                    Some(ExecutorOutput::Compile) => todo!(),
+                    Some(ExecutorOutput::Bind) => todo!(),
                     _ => {
                         log!("Unexpected output: {:?}", output);
                         panic!("Unexpected output");
@@ -137,28 +142,30 @@ pub extern "C" fn worker_main(_arg: pg_sys::Datum) {
                 let result = task.await.expect("Failed to await task");
                 match result {
                     Ok(TaskResult::Parsing((stmt, tables))) => {
-                        let mut stream = wait_stream(*id);
                         if tables.is_empty() {
                             // We don't need any table metadata for this query.
                             // So, we can generate a fake metadata event and proceed to the next
                             // step.
                             do_retry = true;
-                            // TODO: send a fake metadata event to the slot.
-                        } else if !request_metadata(*id, tables) {
-                            log!("Looks like current backend dies and the slot is acquired by another backend");
-                            ctx.statements[*id as usize] = Some(stmt);
-                            let machine = &mut ctx.states[*id as usize];
-                            machine
-                                .consume(&Packet::Failure)
-                                .expect("Failed to consume Error event");
+                            // TODO: write a fake metadata event to the slot to consume on the next
+                            // iteration.
+                            todo!();
+                        } else {
+                            todo!();
                         }
                     }
                     Err(err) => {
                         let msg = format_smolstr!("Failed to execute a task: {:?}", err);
-                        if let Err(err) = send_error(*id, SlotStream::from(Bus::new().slot(*id)), &msg) {
-                            warning!("Failed to send the error message: {}", err);
-                        }
+                        // We already hold a mutable reference to the worker context,
+                        // so this is a hack to avoid borrow checker complaints.
+                        slots_with_error[*id as usize] = (*id, msg);
                     }
+                }
+            }
+            for (slot_id, msg) in &slots_with_error {
+                if *slot_id != INVALID_SLOT_NUMBER {
+                    let stream = wait_stream(*slot_id);
+                    response_error(*slot_id, &mut ctx, stream, msg);
                 }
             }
         }
@@ -200,26 +207,9 @@ fn slot_warning() {
     );
 }
 
-fn response_error(id: SlotNumber, message: &str) -> bool {
-    let Some(slot) = Bus::new().slot_locked(id) else {
-        slot_warning();
-        return false;
-    };
-    let stream = SlotStream::from(slot);
+fn response_error(id: SlotNumber, ctx: &mut WorkerContext, stream: SlotStream, message: &str) {
+    ctx.flush(id);
     if let Err(err) = send_error(id, stream, message) {
         warning!("Failed to send the error message: {}", err);
-        return false;
     }
-    true
-}
-
-fn request_metadata(id: SlotNumber, tables: Vec<TableReference>) -> bool {
-    let Some(slot) = Bus::new().slot_locked(id) else {
-        slot_warning();
-        return false;
-    };
-    let mut stream = SlotStream::from(slot);
-    // TODO: serialize table references.
-
-    true
 }

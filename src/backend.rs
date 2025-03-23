@@ -95,7 +95,7 @@ unsafe extern "C" fn create_df_scan_state(cscan: *mut CustomScan) -> *mut Node {
                 let msg = read_error(&mut stream).expect("Failed to read the error message");
                 error!("Failed to compile the query: {}", msg);
             }
-            Packet::Metadata => unimplemented!(),
+            Packet::Metadata => todo!(),
             Packet::Ack => break,
             _ => error!("Unexpected packet in backend: {:?}", header.packet),
         }
