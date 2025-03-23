@@ -10,7 +10,7 @@ use std::ffi::c_char;
 use std::time::Duration;
 
 use crate::ipc::{my_slot, Bus, SlotHandler, SlotNumber, SlotStream, CURRENT_SLOT};
-use crate::protocol::{consume_header, read_error, send_query, Direction, Packet};
+use crate::protocol::{consume_header, read_error, send_params, send_query, Direction, Packet};
 
 thread_local! {
     static SCAN_METHODS: CustomScanMethods = CustomScanMethods {
@@ -58,28 +58,25 @@ struct ScanState {
 #[pg_guard]
 #[no_mangle]
 unsafe extern "C" fn create_df_scan_state(cscan: *mut CustomScan) -> *mut Node {
+    let wait_stream = || -> SlotStream {
+        let stream;
+        loop {
+            let Some(slot) = Bus::new().slot_locked(my_slot()) else {
+                wait_latch(None);
+                continue;
+            };
+            stream = Some(SlotStream::from(slot));
+            break;
+        }
+        stream.expect("Failed to acquire a slot stream")
+    };
     let list = (*cscan).custom_private;
     let pattern = (*list_nth(list, 0)).ptr_value as *mut c_char;
-    let param_list = (*list_nth(list, 1)).ptr_value as ParamListInfo;
-    let num_params = unsafe { (*param_list).numParams } as usize;
-    let params = unsafe { (*param_list).params.as_slice(num_params) };
-    let mut stream = None;
-    loop {
-        let Some(slot) = Bus::new().slot_locked(my_slot()) else {
-            wait_latch(None);
-            continue;
-        };
-        stream = Some(SlotStream::from(slot));
-        break;
-    }
+    let stream = wait_stream();
     let query = std::ffi::CStr::from_ptr(pattern)
         .to_str()
         .expect("Expected a zero-terminated string");
-    if let Err(err) = send_query(
-        my_slot(),
-        stream.expect("Failed to acquire a slot stream"),
-        query,
-    ) {
+    if let Err(err) = send_query(my_slot(), stream, query) {
         error!("Failed to send the query: {}", err);
     }
     loop {
@@ -98,10 +95,18 @@ unsafe extern "C" fn create_df_scan_state(cscan: *mut CustomScan) -> *mut Node {
                 let msg = read_error(&mut stream).expect("Failed to read the error message");
                 error!("Failed to compile the query: {}", msg);
             }
-            Packet::Bind => unimplemented!(),
             Packet::Metadata => unimplemented!(),
-            Packet::Plan => break,
+            Packet::Ack => break,
             _ => error!("Unexpected packet in backend: {:?}", header.packet),
+        }
+    }
+    let param_list = (*list_nth(list, 1)).ptr_value as ParamListInfo;
+    let num_params = unsafe { (*param_list).numParams } as usize;
+    if num_params > 0 {
+        let params = unsafe { (*param_list).params.as_slice(num_params) };
+        let stream = wait_stream();
+        if let Err(err) = send_params(my_slot(), stream, params) {
+            error!("Failed to send the parameter list: {}", err);
         }
     }
     let css = CustomScanState {

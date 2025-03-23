@@ -7,7 +7,7 @@ use datafusion::scalar::ScalarValue;
 use datafusion_sql::TableReference;
 use pgrx::pg_sys::{ParamExternData, ProcSendSignal};
 use pgrx::prelude::*;
-use rmp::decode::{read_array_len, read_pfix, read_str_len, read_u16};
+use rmp::decode::{read_array_len, read_bin_len, read_pfix, read_str_len, read_u16};
 use rmp::encode::{write_array_len, write_bin_len, write_pfix, write_str, write_u16, RmpWrite};
 
 #[repr(u8)]
@@ -33,15 +33,13 @@ impl TryFrom<u8> for Direction {
 
 #[repr(u8)]
 #[derive(Clone, Debug, Default, PartialEq)]
-pub(crate) enum Packet {
+pub enum Packet {
     #[default]
-    None = 0,
+    Ack = 0,
     Bind = 1,
     Failure = 2,
     Metadata = 3,
     Parse = 4,
-    Parameter = 5,
-    Plan = 6,
 }
 
 impl TryFrom<u8> for Packet {
@@ -50,13 +48,11 @@ impl TryFrom<u8> for Packet {
     fn try_from(value: u8) -> Result<Self, Self::Error> {
         assert!(value < 128);
         match value {
-            0 => Ok(Packet::None),
+            0 => Ok(Packet::Ack),
             1 => Ok(Packet::Bind),
             2 => Ok(Packet::Failure),
             3 => Ok(Packet::Metadata),
             4 => Ok(Packet::Parse),
-            5 => Ok(Packet::Parameter),
-            6 => Ok(Packet::Plan),
             _ => Err(FusionError::DeserializeU8("packet".to_string(), value)),
         }
     }
@@ -189,7 +185,7 @@ fn prepare_params(stream: &mut SlotStream, params: &[ParamExternData]) -> Result
     let length = u16::try_from(pos_final - pos_init)?;
     let header = Header {
         direction: Direction::ToWorker,
-        packet: Packet::Parameter,
+        packet: Packet::Bind,
         length,
         flag: Flag::Last,
     };
@@ -259,12 +255,13 @@ fn write_c_str(stream: &mut SlotStream, s: &str) -> Result<()> {
     Ok(())
 }
 
-/// Writes a table as null-terminated strings to the stream.
-/// It would be used by the Rust wrappers to the C code, so
-/// if we serialize the table and schema as null-terminated
-/// strings, we can avoid copying on deserialization.
+/// Writes a table reference as null-terminated strings to
+/// the stream. It would be used by the Rust wrappers to the
+/// C code, so if we serialize the table and schema as
+/// null-terminated strings, we can avoid copying on
+/// deserialization.
 #[inline]
-fn write_table(stream: &mut SlotStream, table: &TableReference) -> Result<()> {
+fn write_table_ref(stream: &mut SlotStream, table: &TableReference) -> Result<()> {
     match table {
         TableReference::Bare { table } => {
             write_array_len(stream, 1)?;
@@ -279,22 +276,47 @@ fn write_table(stream: &mut SlotStream, table: &TableReference) -> Result<()> {
     Ok(())
 }
 
-pub(crate) fn write_tables(stream: &mut SlotStream, tables: &[&TableReference]) -> Result<()> {
-    let length = u32::try_from(tables.len())?;
-    assert!(length > 0);
-    write_array_len(stream, length)?;
+fn prepare_table_refs(stream: &mut SlotStream, tables: &[&TableReference]) -> Result<()> {
+    stream.reset();
+    // We don't know the length of the tables yet. So we write an invalid header
+    // to replace it with the correct one later.
+    write_header(stream, &Header::default())?;
+    let pos_init = stream.position();
+    write_array_len(stream, u32::try_from(tables.len())?)?;
     for table in tables {
-        write_table(stream, table)?;
+        write_table_ref(stream, table)?;
     }
+    let pos_final = stream.position();
+    let length = u16::try_from(pos_final - pos_init)?;
+    let header = Header {
+        direction: Direction::ToBackend,
+        packet: Packet::Metadata,
+        length,
+        flag: Flag::Last,
+    };
+    stream.reset();
+    write_header(stream, &header)?;
+    stream.rewind(length as usize)?;
+    Ok(())
+}
+
+pub(crate) fn send_table_refs(
+    slot_id: SlotNumber,
+    mut stream: SlotStream,
+    tables: &[&TableReference],
+) -> Result<()> {
+    prepare_table_refs(&mut stream, tables)?;
+    // Unlock the slot after writing the table references.
+    let _guard = Slot::from(stream);
+    signal(slot_id, Direction::ToWorker);
     Ok(())
 }
 
 #[cfg(any(test, feature = "pg_test"))]
 #[pg_schema]
 mod tests {
-    use pgrx::pg_sys::Datum;
-
     use super::*;
+    use pgrx::pg_sys::Datum;
     use std::ptr::addr_of_mut;
 
     const SLOT_SIZE: usize = 8204;
@@ -303,7 +325,7 @@ mod tests {
     fn test_header() {
         let header = Header {
             direction: Direction::ToWorker,
-            packet: Packet::None,
+            packet: Packet::Ack,
             length: 42,
             flag: Flag::Last,
         };
@@ -361,7 +383,7 @@ mod tests {
         stream.reset();
         let header = consume_header(&mut stream).unwrap();
         assert_eq!(header.direction, Direction::ToWorker);
-        assert_eq!(header.packet, Packet::Parameter);
+        assert_eq!(header.packet, Packet::Bind);
         assert_eq!(header.flag, Flag::Last);
         let params = read_params(&mut stream).unwrap();
         assert_eq!(params.len(), 2);
@@ -386,5 +408,47 @@ mod tests {
         assert_eq!(header.length, 2 + message.len() as u16);
         let error = read_error(&mut stream).unwrap();
         assert_eq!(error, message);
+    }
+
+    #[pg_test]
+    fn test_table_request() {
+        let mut slot_buf: [u8; SLOT_SIZE] = [1; SLOT_SIZE];
+        let ptr = addr_of_mut!(slot_buf) as *mut u8;
+        Slot::init(ptr, slot_buf.len());
+        let slot = Slot::from_bytes(ptr, slot_buf.len());
+        let mut stream: SlotStream = slot.into();
+        let t1 = TableReference::bare("table1");
+        let t2 = TableReference::partial("schema", "table2");
+        let tables = vec![&t1, &t2];
+        prepare_table_refs(&mut stream, &tables).unwrap();
+        stream.reset();
+        let header = consume_header(&mut stream).unwrap();
+        assert_eq!(header.direction, Direction::ToBackend);
+        assert_eq!(header.packet, Packet::Metadata);
+        assert_eq!(header.flag, Flag::Last);
+
+        // check table deserialization
+        let table_num = read_array_len(&mut stream).unwrap();
+        assert_eq!(table_num, 2);
+        // table1
+        let elem_num = read_array_len(&mut stream).unwrap();
+        assert_eq!(elem_num, 1);
+        let t1_len = read_bin_len(&mut stream).unwrap();
+        assert_eq!(t1_len as usize, "table1".len() + 1);
+        let t1 = stream.look_ahead(t1_len as usize).unwrap();
+        assert_eq!(t1, b"table1\0");
+        stream.rewind(t1_len as usize).unwrap();
+        // schema.table2
+        let elem_num = read_array_len(&mut stream).unwrap();
+        assert_eq!(elem_num, 2);
+        let s_len = read_bin_len(&mut stream).unwrap();
+        assert_eq!(s_len as usize, "schema".len() + 1);
+        let s = stream.look_ahead(s_len as usize).unwrap();
+        assert_eq!(s, b"schema\0");
+        stream.rewind(s_len as usize).unwrap();
+        let t2_len = read_bin_len(&mut stream).unwrap();
+        assert_eq!(t2_len as usize, "table2".len() + 1);
+        let t2 = stream.look_ahead(t2_len as usize).unwrap();
+        assert_eq!(t2, b"table2\0");
     }
 }

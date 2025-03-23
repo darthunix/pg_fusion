@@ -2,7 +2,7 @@ use thiserror::Error;
 
 // TODO: replace String with SmolStr
 #[derive(Error, Debug)]
-pub(crate) enum FusionError {
+pub enum FusionError {
     #[error("Unsupported type: {0}")]
     UnsupportedType(String),
     #[error("Failed to parse the query: {0}")]
