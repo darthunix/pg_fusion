@@ -2,6 +2,7 @@ use std::cell::OnceCell;
 use std::collections::HashMap;
 use std::sync::Arc;
 
+use ahash::AHashMap;
 use datafusion::arrow::datatypes::DataType;
 use datafusion::arrow::datatypes::SchemaRef;
 use datafusion::common::DFSchemaRef;
@@ -93,7 +94,7 @@ impl Builtin {
 
 struct Catalog {
     builtin: Arc<Builtin>,
-    tables: HashMap<SmolStr, Arc<dyn TableSource>>,
+    tables: AHashMap<SmolStr, Arc<dyn TableSource>>,
 }
 
 impl ContextProvider for Catalog {

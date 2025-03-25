@@ -1,14 +1,16 @@
-use crate::data_type::{datum_to_scalar, read_scalar_value, write_scalar_value};
+use crate::data_type::{datum_to_scalar, read_scalar_value, write_scalar_value, EncodedType};
 use crate::error::FusionError;
 use crate::ipc::{Bus, Slot, SlotNumber, SlotStream, DATA_SIZE};
 use crate::worker::worker_id;
 use anyhow::Result;
 use datafusion::scalar::ScalarValue;
 use datafusion_sql::TableReference;
-use pgrx::pg_sys::{ParamExternData, ProcSendSignal};
+use pgrx::pg_sys::{Oid, ParamExternData, ProcSendSignal};
 use pgrx::prelude::*;
 use rmp::decode::{read_array_len, read_bin_len, read_pfix, read_str_len, read_u16};
-use rmp::encode::{write_array_len, write_bin_len, write_pfix, write_str, write_u16, RmpWrite};
+use rmp::encode::{
+    write_array_len, write_bin_len, write_bool, write_pfix, write_str, write_u16, RmpWrite,
+};
 
 #[repr(u8)]
 #[derive(Clone, Debug, Default, PartialEq)]
@@ -26,7 +28,10 @@ impl TryFrom<u8> for Direction {
         match value {
             0 => Ok(Direction::ToWorker),
             1 => Ok(Direction::ToBackend),
-            _ => Err(FusionError::DeserializeU8("direction".to_string(), value)),
+            _ => Err(FusionError::Deserialize(
+                "direction".to_string(),
+                value.into(),
+            )),
         }
     }
 }
@@ -53,7 +58,7 @@ impl TryFrom<u8> for Packet {
             2 => Ok(Packet::Failure),
             3 => Ok(Packet::Metadata),
             4 => Ok(Packet::Parse),
-            _ => Err(FusionError::DeserializeU8("packet".to_string(), value)),
+            _ => Err(FusionError::Deserialize("packet".to_string(), value.into())),
         }
     }
 }
@@ -74,7 +79,7 @@ impl TryFrom<u8> for Flag {
         match value {
             0 => Ok(Flag::More),
             1 => Ok(Flag::Last),
-            _ => Err(FusionError::DeserializeU8("flag".to_string(), value)),
+            _ => Err(FusionError::Deserialize("flag".to_string(), value.into())),
         }
     }
 }
@@ -110,6 +115,8 @@ fn signal(slot_id: SlotNumber, direction: Direction) {
     }
 }
 
+// HEADER
+
 pub(crate) fn consume_header(stream: &mut SlotStream) -> Result<Header> {
     assert_eq!(stream.position(), 0);
     let direction = Direction::try_from(read_pfix(stream)?)?;
@@ -131,6 +138,8 @@ pub(crate) fn write_header(stream: &mut SlotStream, header: &Header) -> Result<(
     write_u16(stream, header.length.to_owned())?;
     Ok(())
 }
+
+// PARSE
 
 /// Reads the query from the stream, but leaves the stream position at the beginning of the query.
 /// It is required to return the reference to the query bytes without copying them. It is the
@@ -169,6 +178,8 @@ pub(crate) fn send_query(slot_id: SlotNumber, mut stream: SlotStream, query: &st
     signal(slot_id, Direction::ToWorker);
     Ok(())
 }
+
+// BIND
 
 fn prepare_params(stream: &mut SlotStream, params: &[ParamExternData]) -> Result<()> {
     stream.reset();
@@ -217,6 +228,8 @@ pub(crate) fn send_params(
     Ok(())
 }
 
+// FAILURE
+
 pub(crate) fn read_error(stream: &mut SlotStream) -> Result<String> {
     let len = read_str_len(stream)?;
     let buf = stream.look_ahead(len as usize)?;
@@ -255,6 +268,8 @@ fn write_c_str(stream: &mut SlotStream, s: &str) -> Result<()> {
     Ok(())
 }
 
+// METADATA
+
 /// Writes a table reference as null-terminated strings to
 /// the stream. It would be used by the Rust wrappers to the
 /// C code, so if we serialize the table and schema as
@@ -276,7 +291,10 @@ fn write_table_ref(stream: &mut SlotStream, table: &TableReference) -> Result<()
     Ok(())
 }
 
-fn prepare_table_refs(stream: &mut SlotStream, tables: &[&TableReference]) -> Result<()> {
+pub(crate) fn prepare_table_refs(
+    stream: &mut SlotStream,
+    tables: &[&TableReference],
+) -> Result<()> {
     stream.reset();
     // We don't know the length of the tables yet. So we write an invalid header
     // to replace it with the correct one later.
@@ -309,6 +327,19 @@ pub(crate) fn send_table_refs(
     // Unlock the slot after writing the table references.
     let _guard = Slot::from(stream);
     signal(slot_id, Direction::ToWorker);
+    Ok(())
+}
+
+#[inline]
+pub(crate) fn write_column(
+    stream: &mut SlotStream,
+    column: &str,
+    is_null: bool,
+    etype: EncodedType,
+) -> Result<()> {
+    write_str(stream, column)?;
+    write_bool(stream, is_null)?;
+    write_pfix(stream, etype as u8)?;
     Ok(())
 }
 

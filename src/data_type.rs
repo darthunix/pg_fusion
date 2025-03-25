@@ -93,7 +93,7 @@ fn type_to_oid(type_: &DataType) -> pg_sys::Oid {
 }
 
 #[repr(u8)]
-enum EncodedType {
+pub(crate) enum EncodedType {
     Boolean = 0,
     Utf8 = 1,
     Int16 = 2,
@@ -123,9 +123,33 @@ impl TryFrom<u8> for EncodedType {
             8 => Ok(EncodedType::Time64),
             9 => Ok(EncodedType::Timestamp),
             10 => Ok(EncodedType::Interval),
-            _ => Err(FusionError::DeserializeU8(
+            _ => Err(FusionError::Deserialize(
                 "encoded type".to_string(),
-                value,
+                value.into(),
+            )),
+        }
+    }
+}
+
+impl TryFrom<pg_sys::Oid> for EncodedType {
+    type Error = FusionError;
+
+    fn try_from(value: pg_sys::Oid) -> Result<Self, Self::Error> {
+        match value {
+            pg_sys::BOOLOID => Ok(EncodedType::Boolean),
+            pg_sys::TEXTOID => Ok(EncodedType::Utf8),
+            pg_sys::INT2OID => Ok(EncodedType::Int16),
+            pg_sys::INT4OID => Ok(EncodedType::Int32),
+            pg_sys::INT8OID => Ok(EncodedType::Int64),
+            pg_sys::FLOAT4OID => Ok(EncodedType::Float32),
+            pg_sys::FLOAT8OID => Ok(EncodedType::Float64),
+            pg_sys::DATEOID => Ok(EncodedType::Date32),
+            pg_sys::TIMEOID => Ok(EncodedType::Time64),
+            pg_sys::TIMESTAMPOID => Ok(EncodedType::Timestamp),
+            pg_sys::INTERVALOID => Ok(EncodedType::Interval),
+            _ => Err(FusionError::Deserialize(
+                "encoded type".to_string(),
+                value.as_u32().into(),
             )),
         }
     }

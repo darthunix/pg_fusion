@@ -10,5 +10,9 @@ pub enum FusionError {
     #[error("Payload is too large: {0} bytes")]
     PayloadTooLarge(usize),
     #[error("Failed to deserialize {0}: {1}")]
-    DeserializeU8(String, u8),
+    Deserialize(String, u64),
+    #[error("{0} not found: {1}")]
+    NotFound(String, String),
+    #[error("{0} name is not valid: {1}")]
+    InvalidName(String, String),
 }

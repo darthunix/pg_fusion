@@ -1,14 +1,19 @@
+use anyhow::Result as AnyResult;
 use libc::c_long;
 use pgrx::pg_sys::{
-    error, palloc0, CustomExecMethods, CustomScan, CustomScanMethods, CustomScanState, EState,
-    ExplainState, List, ListCell, MyLatch, Node, NodeTag, ParamListInfo, RegisterCustomScanMethods,
-    ResetLatch, TupleTableSlot, WaitLatch, PG_WAIT_EXTENSION, WL_LATCH_SET, WL_POSTMASTER_DEATH,
-    WL_TIMEOUT,
+    error, fetch_search_path_array, get_namespace_oid, get_relname_relid, palloc0,
+    CustomExecMethods, CustomScan, CustomScanMethods, CustomScanState, EState, ExplainState,
+    InvalidOid, List, ListCell, MyLatch, Node, NodeTag, Oid, ParamListInfo,
+    RegisterCustomScanMethods, ResetLatch, TupleTableSlot, WaitLatch, PG_WAIT_EXTENSION,
+    WL_LATCH_SET, WL_POSTMASTER_DEATH, WL_TIMEOUT,
 };
 use pgrx::{check_for_interrupts, pg_guard};
+use rmp::decode::{read_array_len, read_bin_len};
+use smallvec::{smallvec, SmallVec};
 use std::ffi::c_char;
 use std::time::Duration;
 
+use crate::error::FusionError;
 use crate::ipc::{my_slot, Bus, SlotHandler, SlotNumber, SlotStream, CURRENT_SLOT};
 use crate::protocol::{consume_header, read_error, send_params, send_query, Direction, Packet};
 
@@ -145,6 +150,74 @@ unsafe extern "C" fn explain_df_scan(
     todo!()
 }
 
+// We expect that the header is already consumed and the packet type is `Packet::Metadata`.
+fn table_oids(stream: &mut SlotStream) -> AnyResult<SmallVec<[Oid; 16]>> {
+    let table_not_found = |c_table_name: &[u8]| -> Result<(), FusionError> {
+        assert!(!c_table_name.is_empty());
+        let table_name = c_table_name[..c_table_name.len() - 1].as_ref();
+        match std::str::from_utf8(table_name) {
+            Ok(name) => Err(FusionError::NotFound("Table".into(), name.into())),
+            Err(_) => Err(FusionError::NotFound(
+                "Table".into(),
+                format!("{:?}", table_name),
+            )),
+        }
+    };
+    let table_num = read_array_len(stream)?;
+    let mut oids: SmallVec<[Oid; 16]> = SmallVec::with_capacity(table_num as usize);
+    for _ in 0..table_num {
+        let elem_num = read_array_len(stream)?;
+        match elem_num {
+            1 => {
+                let table_len = read_bin_len(stream)?;
+                let table_name = stream.look_ahead(table_len as usize)?;
+                let mut search_path: [Oid; 16] = [InvalidOid; 16];
+                let path_len = unsafe {
+                    fetch_search_path_array(search_path.as_mut_ptr(), search_path.len() as i32)
+                };
+                let path = &search_path[..path_len as usize];
+                let mut rel_oid = InvalidOid;
+                for ns_oid in path {
+                    rel_oid =
+                        unsafe { get_relname_relid(table_name.as_ptr() as *const c_char, *ns_oid) };
+                    if rel_oid != InvalidOid {
+                        oids.push(rel_oid);
+                        break;
+                    }
+                }
+                if rel_oid == InvalidOid {
+                    table_not_found(table_name)?;
+                }
+                stream.rewind(table_len as usize)?;
+            }
+            2 => {
+                let schema_len = read_bin_len(stream)?;
+                let schema_name = stream.look_ahead(schema_len as usize)?;
+                // Through an error if schema name not found.
+                let ns_oid =
+                    unsafe { get_namespace_oid(schema_name.as_ptr() as *const c_char, false) };
+                stream.rewind(schema_len as usize)?;
+                let table_len = read_bin_len(stream)?;
+                let table_name = stream.look_ahead(table_len as usize)?;
+                let rel_oid =
+                    unsafe { get_relname_relid(table_name.as_ptr() as *const c_char, ns_oid) };
+                if rel_oid == InvalidOid {
+                    table_not_found(table_name)?;
+                }
+                stream.rewind(table_len as usize)?;
+                oids.push(rel_oid);
+            }
+            _ => {
+                return Err(FusionError::InvalidName(
+                    "Table".into(),
+                    "support only 'schema.table' format".into(),
+                ))?
+            }
+        }
+    }
+    Ok(oids)
+}
+
 fn wait_latch(timeout: Option<Duration>) {
     let timeout: c_long = timeout
         .map(|t| t.as_millis().try_into().unwrap())
@@ -215,9 +288,17 @@ fn list_nth(list: *mut List, n: i32) -> *mut ListCell {
 #[cfg(any(test, feature = "pg_test"))]
 #[pgrx::pg_schema]
 mod tests {
+    use crate::ipc::Slot;
+    use crate::protocol::prepare_table_refs;
+
     use super::*;
+    use datafusion_sql::TableReference;
     use pgrx::prelude::*;
+    use pgrx::spi::Spi;
     use std::ffi::c_void;
+    use std::ptr::addr_of_mut;
+
+    const SLOT_SIZE: usize = 8204;
 
     #[pg_test]
     fn test_node() {
@@ -230,5 +311,46 @@ mod tests {
             let ptr = pg_node.mut_node() as *mut c_void;
             pg_sys::pfree(ptr);
         }
+    }
+
+    #[pg_test]
+    fn test_table_oids() {
+        Spi::run("create table if not exists t1(a int, b text);").unwrap();
+        Spi::run("create schema if not exists s1;").unwrap();
+        Spi::run("create table if not exists s1.t2(a int, b text);").unwrap();
+        let t1_oid = Spi::get_one::<Oid>("select 't1'::regclass::oid;")
+            .unwrap()
+            .unwrap();
+        let t2_oid = Spi::get_one::<Oid>("select 's1.t2'::regclass::oid;")
+            .unwrap()
+            .unwrap();
+
+        let mut slot_buf: [u8; SLOT_SIZE] = [1; SLOT_SIZE];
+        let ptr = addr_of_mut!(slot_buf) as *mut u8;
+        Slot::init(ptr, slot_buf.len());
+        let slot = Slot::from_bytes(ptr, slot_buf.len());
+        let mut stream: SlotStream = slot.into();
+
+        // Check valid tables.
+        let t1 = TableReference::bare("t1");
+        let t2 = TableReference::partial("s1", "t2");
+        let tables = vec![&t1, &t2];
+        prepare_table_refs(&mut stream, &tables).unwrap();
+        stream.reset();
+        let _ = consume_header(&mut stream).unwrap();
+        let oids = table_oids(&mut stream).unwrap();
+        assert_eq!(oids.len(), 2);
+        assert_eq!(oids[0], t1_oid);
+        assert_eq!(oids[1], t2_oid);
+        stream.reset();
+
+        // Check invalid table.
+        let t3 = TableReference::bare("t3");
+        let tables = vec![&t3];
+        prepare_table_refs(&mut stream, &tables).unwrap();
+        stream.reset();
+        let _ = consume_header(&mut stream).unwrap();
+        let err = table_oids(&mut stream).unwrap_err();
+        assert_eq!(err.to_string(), "Table not found: t3");
     }
 }

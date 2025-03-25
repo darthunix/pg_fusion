@@ -16,6 +16,7 @@ pg17 = ["pgrx/pg17", "pgrx-tests/pg17"]
 pg_test = []
 
 [dependencies]
+ahash = "0.8"
 anyhow = "1.0"
 datafusion = "44.0"
 datafusion-sql = "44.0"
@@ -24,6 +25,7 @@ libc = "0.2"
 pgrx = "0.12"
 rmp = "0.8"
 rust-fsm = { version = "0.7", features = ["diagram"] }
+smallvec = { version = "1.14", features = ["const_generics", "union"] }
 smol_str = "0.3"
 thiserror = "2.0"
 tokio = { version = "1.42", features = ["full"] }
