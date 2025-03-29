@@ -1,7 +1,7 @@
 use anyhow::Result as AnyResult;
 use libc::c_long;
 use pgrx::pg_sys::{
-    error, fetch_search_path_array, get_namespace_oid, get_relname_relid, palloc0,
+    self, error, fetch_search_path_array, get_namespace_oid, get_relname_relid, palloc0,
     CustomExecMethods, CustomScan, CustomScanMethods, CustomScanState, EState, ExplainState,
     InvalidOid, List, ListCell, MyLatch, Node, NodeTag, Oid, ParamListInfo,
     RegisterCustomScanMethods, ResetLatch, TupleTableSlot, WaitLatch, PG_WAIT_EXTENSION,
@@ -9,12 +9,12 @@ use pgrx::pg_sys::{
 };
 use pgrx::{check_for_interrupts, pg_guard};
 use rmp::decode::{read_array_len, read_bin_len};
-use smallvec::{smallvec, SmallVec};
+use smallvec::SmallVec;
 use std::ffi::c_char;
 use std::time::Duration;
 
 use crate::error::FusionError;
-use crate::ipc::{my_slot, Bus, SlotHandler, SlotNumber, SlotStream, CURRENT_SLOT};
+use crate::ipc::{my_slot, Bus, SlotStream};
 use crate::protocol::{consume_header, read_error, send_params, send_query, Direction, Packet};
 
 thread_local! {
