@@ -15,7 +15,11 @@ use std::time::Duration;
 
 use crate::error::FusionError;
 use crate::ipc::{my_slot, Bus, SlotStream};
-use crate::protocol::{consume_header, read_error, send_params, send_query, Direction, Packet};
+use crate::protocol::{
+    consume_header, read_error, send_metadata, send_params, send_query, Direction, Packet,
+};
+
+const BACKEND_WAIT_TIMEOUT: Duration = Duration::from_millis(100);
 
 thread_local! {
     static SCAN_METHODS: CustomScanMethods = CustomScanMethods {
@@ -67,7 +71,7 @@ unsafe extern "C" fn create_df_scan_state(cscan: *mut CustomScan) -> *mut Node {
         let stream;
         loop {
             let Some(slot) = Bus::new().slot_locked(my_slot()) else {
-                wait_latch(None);
+                wait_latch(Some(BACKEND_WAIT_TIMEOUT));
                 continue;
             };
             stream = Some(SlotStream::from(slot));
@@ -84,15 +88,18 @@ unsafe extern "C" fn create_df_scan_state(cscan: *mut CustomScan) -> *mut Node {
     if let Err(err) = send_query(my_slot(), stream, query) {
         error!("Failed to send the query: {}", err);
     }
+    let mut skip_wait = true;
     loop {
+        if !skip_wait {
+            wait_latch(Some(BACKEND_WAIT_TIMEOUT));
+            skip_wait = false;
+        }
         let Some(slot) = Bus::new().slot_locked(my_slot()) else {
-            wait_latch(None);
             continue;
         };
         let mut stream = SlotStream::from(slot);
         let header = consume_header(&mut stream).expect("Failed to consume header");
         if header.direction != Direction::ToBackend {
-            wait_latch(None);
             continue;
         }
         match header.packet {
@@ -100,7 +107,12 @@ unsafe extern "C" fn create_df_scan_state(cscan: *mut CustomScan) -> *mut Node {
                 let msg = read_error(&mut stream).expect("Failed to read the error message");
                 error!("Failed to compile the query: {}", msg);
             }
-            Packet::Metadata => todo!(),
+            Packet::Metadata => {
+                let oids = table_oids(&mut stream).expect("Failed to read table OIDs");
+                if let Err(err) = send_metadata(my_slot(), stream, &oids) {
+                    error!("Failed to send the table metadata: {}", err);
+                }
+            }
             Packet::Ack => break,
             _ => error!("Unexpected packet in backend: {:?}", header.packet),
         }
@@ -334,7 +346,7 @@ mod tests {
         // Check valid tables.
         let t1 = TableReference::bare("t1");
         let t2 = TableReference::partial("s1", "t2");
-        let tables = vec![&t1, &t2];
+        let tables = vec![t1, t2];
         prepare_table_refs(&mut stream, &tables).unwrap();
         stream.reset();
         let _ = consume_header(&mut stream).unwrap();
@@ -346,7 +358,7 @@ mod tests {
 
         // Check invalid table.
         let t3 = TableReference::bare("t3");
-        let tables = vec![&t3];
+        let tables = vec![t3];
         prepare_table_refs(&mut stream, &tables).unwrap();
         stream.reset();
         let _ = consume_header(&mut stream).unwrap();

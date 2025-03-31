@@ -293,10 +293,7 @@ fn write_table_ref(stream: &mut SlotStream, table: &TableReference) -> Result<()
     Ok(())
 }
 
-pub(crate) fn prepare_table_refs(
-    stream: &mut SlotStream,
-    tables: &[&TableReference],
-) -> Result<()> {
+pub(crate) fn prepare_table_refs(stream: &mut SlotStream, tables: &[TableReference]) -> Result<()> {
     stream.reset();
     // We don't know the length of the tables yet. So we write an invalid header
     // to replace it with the correct one later.
@@ -323,7 +320,7 @@ pub(crate) fn prepare_table_refs(
 pub(crate) fn send_table_refs(
     slot_id: SlotNumber,
     mut stream: SlotStream,
-    tables: &[&TableReference],
+    tables: &[TableReference],
 ) -> Result<()> {
     prepare_table_refs(&mut stream, tables)?;
     // Unlock the slot after writing the table references.
@@ -500,7 +497,7 @@ mod tests {
         let mut stream: SlotStream = slot.into();
         let t1 = TableReference::bare("table1");
         let t2 = TableReference::partial("schema", "table2");
-        let tables = vec![&t1, &t2];
+        let tables = vec![t1, t2];
         prepare_table_refs(&mut stream, &tables).unwrap();
         stream.reset();
         let header = consume_header(&mut stream).unwrap();

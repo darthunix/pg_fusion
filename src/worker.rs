@@ -2,7 +2,10 @@ use crate::error::FusionError;
 use crate::fsm::executor::StateMachine;
 use crate::fsm::ExecutorOutput;
 use crate::ipc::{init_shmem, max_backends, Bus, SlotNumber, SlotStream, INVALID_SLOT_NUMBER};
-use crate::protocol::{consume_header, read_query, send_error, Direction, Flag, Header, Packet};
+use crate::protocol::{
+    consume_header, prepare_metadata, read_query, send_error, send_table_refs, Direction, Flag,
+    Header, Packet,
+};
 use anyhow::Result;
 use datafusion::execution::SessionStateBuilder;
 use datafusion_sql::parser::{DFParser, Statement};
@@ -12,12 +15,14 @@ use pgrx::pg_sys::{MyProcNumber, ProcNumber};
 use pgrx::prelude::*;
 use smol_str::{format_smolstr, SmolStr};
 use std::cell::OnceCell;
+use std::time::Duration;
 use tokio::runtime::Builder;
 use tokio::task::JoinHandle;
 
 static mut WORKER_NUMBER: OnceCell<ProcNumber> = OnceCell::new();
 // FIXME: This should be configurable.
 const TOKIO_THREAD_NUMBER: usize = 1;
+const WORKER_WAIT_TIMEOUT: Duration = Duration::from_micros(100);
 
 pub(crate) fn worker_id() -> ProcNumber {
     unsafe { *WORKER_NUMBER.get().unwrap() }
@@ -93,7 +98,7 @@ pub extern "C" fn worker_main(_arg: pg_sys::Datum) {
 
     rt.block_on(async {
         log!("DataFusion worker is running");
-        while do_retry || BackgroundWorker::wait_latch(None) {
+        while do_retry || BackgroundWorker::wait_latch(Some(WORKER_WAIT_TIMEOUT)) {
             do_retry = false;
             for (id, locked_slot) in Bus::new().into_iter().enumerate() {
                 let Some(slot) = locked_slot else {
@@ -142,17 +147,19 @@ pub extern "C" fn worker_main(_arg: pg_sys::Datum) {
                 let result = task.await.expect("Failed to await task");
                 match result {
                     Ok(TaskResult::Parsing((stmt, tables))) => {
+                        let mut stream = wait_stream(*id);
                         if tables.is_empty() {
                             // We don't need any table metadata for this query.
-                            // So, we can generate a fake metadata event and proceed to the next
-                            // step.
+                            // So, write a fake metadata packet to the slot and proceed it
+                            // in the next iteration.
                             do_retry = true;
-                            // TODO: write a fake metadata event to the slot to consume on the next
-                            // iteration.
-                            todo!();
+                            prepare_metadata(&[], &mut stream)
+                                .expect("Failed to prepare empty metadata");
                         } else {
-                            todo!();
+                            send_table_refs(*id, stream, tables.as_slice())
+                                .expect("Failed to reqest table references");
                         }
+                        ctx.statements[*id as usize] = Some(stmt);
                     }
                     Err(err) => {
                         let msg = format_smolstr!("Failed to execute a task: {:?}", err);
