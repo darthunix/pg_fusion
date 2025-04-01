@@ -42,11 +42,10 @@ impl TryFrom<u8> for Direction {
 #[derive(Clone, Debug, Default, PartialEq)]
 pub enum Packet {
     #[default]
-    Ack = 0,
-    Bind = 1,
-    Failure = 2,
-    Metadata = 3,
-    Parse = 4,
+    Bind = 0,
+    Failure = 1,
+    Metadata = 2,
+    Parse = 3,
 }
 
 impl TryFrom<u8> for Packet {
@@ -55,11 +54,10 @@ impl TryFrom<u8> for Packet {
     fn try_from(value: u8) -> Result<Self, Self::Error> {
         assert!(value < 128);
         match value {
-            0 => Ok(Packet::Ack),
-            1 => Ok(Packet::Bind),
-            2 => Ok(Packet::Failure),
-            3 => Ok(Packet::Metadata),
-            4 => Ok(Packet::Parse),
+            0 => Ok(Packet::Bind),
+            1 => Ok(Packet::Failure),
+            2 => Ok(Packet::Metadata),
+            3 => Ok(Packet::Parse),
             _ => Err(FusionError::Deserialize("packet".to_string(), value.into())),
         }
     }
@@ -230,6 +228,21 @@ pub(crate) fn send_params(
     Ok(())
 }
 
+pub(crate) fn request_params(slot_id: SlotNumber, mut stream: SlotStream) -> Result<()> {
+    stream.reset();
+    let header = Header {
+        direction: Direction::ToBackend,
+        packet: Packet::Bind,
+        length: 0,
+        flag: Flag::Last,
+    };
+    write_header(&mut stream, &header)?;
+    // Unlock the slot after writing the parameters.
+    let _guard = Slot::from(stream);
+    signal(slot_id, Direction::ToBackend);
+    Ok(())
+}
+
 // FAILURE
 
 pub(crate) fn read_error(stream: &mut SlotStream) -> Result<String> {
@@ -334,21 +347,23 @@ pub(crate) fn send_table_refs(
 fn serialize_table(rel_oid: Oid, stream: &mut SlotStream) -> Result<()> {
     // The destructor will release the lock.
     let rel = unsafe { PgRelation::with_lock(rel_oid, pg_sys::AccessShareLock as i32) };
+    write_u32(stream, rel_oid.as_u32())?;
+    write_str(stream, rel.namespace())?;
+    write_str(stream, rel.name())?;
     let tuple_desc = rel.tuple_desc();
     let attr_num = u32::try_from(tuple_desc.iter().filter(|a| !a.is_dropped()).count())?;
-    write_u32(stream, rel_oid.as_u32())?;
     write_array_len(stream, attr_num)?;
     for attr in tuple_desc.iter() {
         if attr.is_dropped() {
             continue;
         }
-        let etype = EncodedType::try_from(attr.type_oid().value())?;
-        let is_nullable = !attr.attnotnull;
-        let name = attr.name();
         write_array_len(stream, 3)?;
-        write_str(stream, name)?;
+        let etype = EncodedType::try_from(attr.type_oid().value())?;
         write_u8(stream, etype as u8)?;
+        let is_nullable = !attr.attnotnull;
         write_bool(stream, is_nullable)?;
+        let name = attr.name();
+        write_str(stream, name)?;
     }
     Ok(())
 }
@@ -403,7 +418,7 @@ mod tests {
     fn test_header() {
         let header = Header {
             direction: Direction::ToWorker,
-            packet: Packet::Ack,
+            packet: Packet::Parse,
             length: 42,
             flag: Flag::Last,
         };
@@ -556,31 +571,39 @@ mod tests {
         // t1
         let oid = read_u32(&mut stream).unwrap();
         assert_eq!(oid, t1_oid.as_u32());
+        let ns_len = read_str_len(&mut stream).unwrap();
+        let ns = stream.look_ahead(ns_len as usize).unwrap();
+        assert_eq!(ns, b"public");
+        stream.rewind(ns_len as usize).unwrap();
+        let name_len = read_str_len(&mut stream).unwrap();
+        let name = stream.look_ahead(name_len as usize).unwrap();
+        assert_eq!(name, b"t1");
+        stream.rewind(name_len as usize).unwrap();
         let attr_num = read_array_len(&mut stream).unwrap();
         assert_eq!(attr_num, 2);
         // a
         let elem_num = read_array_len(&mut stream).unwrap();
         assert_eq!(elem_num, 3);
+        let etype = read_u8(&mut stream).unwrap();
+        assert_eq!(etype, EncodedType::Int32 as u8);
+        let is_nullable = read_bool(&mut stream).unwrap();
+        assert!(!is_nullable);
         let name_len = read_str_len(&mut stream).unwrap();
         assert_eq!(name_len, "a".len() as u32);
         let name = stream.look_ahead(name_len as usize).unwrap();
         assert_eq!(name, b"a");
         stream.rewind(name_len as usize).unwrap();
-        let etype = read_u8(&mut stream).unwrap();
-        assert_eq!(etype, EncodedType::Int32 as u8);
-        let is_nullable = read_bool(&mut stream).unwrap();
-        assert!(!is_nullable);
         // b
         let elem_num = read_array_len(&mut stream).unwrap();
         assert_eq!(elem_num, 3);
+        let etype = read_u8(&mut stream).unwrap();
+        assert_eq!(etype, EncodedType::Utf8 as u8);
+        let is_nullable = read_bool(&mut stream).unwrap();
+        assert!(is_nullable);
         let name_len = read_str_len(&mut stream).unwrap();
         assert_eq!(name_len, "b".len() as u32);
         let name = stream.look_ahead(name_len as usize).unwrap();
         assert_eq!(name, b"b");
         stream.rewind(name_len as usize).unwrap();
-        let etype = read_u8(&mut stream).unwrap();
-        assert_eq!(etype, EncodedType::Utf8 as u8);
-        let is_nullable = read_bool(&mut stream).unwrap();
-        assert!(is_nullable);
     }
 }

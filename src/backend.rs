@@ -113,18 +113,16 @@ unsafe extern "C" fn create_df_scan_state(cscan: *mut CustomScan) -> *mut Node {
                     error!("Failed to send the table metadata: {}", err);
                 }
             }
-            Packet::Ack => break,
-            _ => error!("Unexpected packet in backend: {:?}", header.packet),
+            Packet::Bind => break,
+            Packet::Parse => error!("Unexpected packet in backend: {:?}", header.packet),
         }
     }
     let param_list = (*list_nth(list, 1)).ptr_value as ParamListInfo;
     let num_params = unsafe { (*param_list).numParams } as usize;
-    if num_params > 0 {
-        let params = unsafe { (*param_list).params.as_slice(num_params) };
-        let stream = wait_stream();
-        if let Err(err) = send_params(my_slot(), stream, params) {
-            error!("Failed to send the parameter list: {}", err);
-        }
+    let params = unsafe { (*param_list).params.as_slice(num_params) };
+    let stream = wait_stream();
+    if let Err(err) = send_params(my_slot(), stream, params) {
+        error!("Failed to send the parameter list: {}", err);
     }
     let css = CustomScanState {
         methods: exec_methods(),

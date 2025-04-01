@@ -3,18 +3,22 @@ use crate::fsm::executor::StateMachine;
 use crate::fsm::ExecutorOutput;
 use crate::ipc::{init_shmem, max_backends, Bus, SlotNumber, SlotStream, INVALID_SLOT_NUMBER};
 use crate::protocol::{
-    consume_header, prepare_metadata, read_query, send_error, send_table_refs, Direction, Flag,
-    Header, Packet,
+    consume_header, prepare_metadata, read_params, read_query, request_params, send_error,
+    send_table_refs, Direction, Flag, Header, Packet,
 };
+use crate::sql::Catalog;
 use anyhow::Result;
 use datafusion::execution::SessionStateBuilder;
+use datafusion::logical_expr::LogicalPlan;
 use datafusion_sql::parser::{DFParser, Statement};
+use datafusion_sql::planner::SqlToRel;
 use datafusion_sql::TableReference;
 use pgrx::bgworkers::{BackgroundWorker, BackgroundWorkerBuilder, SignalWakeFlags};
 use pgrx::pg_sys::{MyProcNumber, ProcNumber};
 use pgrx::prelude::*;
 use smol_str::{format_smolstr, SmolStr};
 use std::cell::OnceCell;
+use std::process::id;
 use std::time::Duration;
 use tokio::runtime::Builder;
 use tokio::task::JoinHandle;
@@ -39,11 +43,14 @@ pub(crate) fn init_datafusion_worker() {
 
 enum TaskResult {
     Parsing((Statement, Vec<TableReference>)),
+    Compilation(LogicalPlan),
+    Bind(LogicalPlan),
 }
 
 struct WorkerContext {
     statements: Vec<Option<Statement>>,
     states: Vec<StateMachine>,
+    logical_plans: Vec<Option<LogicalPlan>>,
     tasks: Vec<(SlotNumber, JoinHandle<Result<TaskResult>>)>,
 }
 
@@ -53,13 +60,16 @@ impl WorkerContext {
         let tasks = Vec::with_capacity(capacity);
         let mut states = Vec::with_capacity(capacity);
         let mut statements = Vec::with_capacity(capacity);
+        let mut logical_plans = Vec::with_capacity(capacity);
         for _ in 0..capacity {
             states.push(StateMachine::new());
             statements.push(None);
+            logical_plans.push(None);
         }
         Self {
             statements,
             states,
+            logical_plans,
             tasks,
         }
     }
@@ -122,12 +132,17 @@ pub extern "C" fn worker_main(_arg: pg_sys::Datum) {
                         ctx.flush(slot_id);
                         continue;
                     }
-                    Some(ExecutorOutput::Compile) => todo!(),
-                    Some(ExecutorOutput::Bind) => todo!(),
-                    _ => {
-                        log!("Unexpected output: {:?}", output);
-                        panic!("Unexpected output");
+                    Some(ExecutorOutput::Compile) => {
+                        let stmt = std::mem::take(&mut ctx.statements[id])
+                            .expect("Failed to take statement");
+                        tokio::spawn(compile(header, stream, stmt))
                     }
+                    Some(ExecutorOutput::Bind) => {
+                        let plan = std::mem::take(&mut ctx.logical_plans[id])
+                            .expect("Failed to take logical plan");
+                        tokio::spawn(bind(header, stream, plan))
+                    }
+                    None => unreachable!("Empty output in the worker state machine"),
                 };
                 ctx.tasks.push((slot_id, handle));
             }
@@ -160,6 +175,14 @@ pub extern "C" fn worker_main(_arg: pg_sys::Datum) {
                                 .expect("Failed to reqest table references");
                         }
                         ctx.statements[*id as usize] = Some(stmt);
+                    }
+                    Ok(TaskResult::Compilation(plan)) => {
+                        let stream = wait_stream(*id);
+                        request_params(*id, stream).expect("Failed to request parameters");
+                        ctx.logical_plans[*id as usize] = Some(plan);
+                    }
+                    Ok(TaskResult::Bind(plan)) => {
+                        ctx.logical_plans[*id as usize] = Some(plan);
                     }
                     Err(err) => {
                         let msg = format_smolstr!("Failed to execute a task: {:?}", err);
@@ -195,6 +218,27 @@ async fn parse(header: Header, mut stream: SlotStream) -> Result<TaskResult> {
     let state = SessionStateBuilder::new().build();
     let tables = state.resolve_table_references(&stmt)?;
     Ok(TaskResult::Parsing((stmt, tables)))
+}
+
+async fn compile(header: Header, mut stream: SlotStream, stmt: Statement) -> Result<TaskResult> {
+    assert_eq!(header.packet, Packet::Metadata);
+    assert_eq!(header.direction, Direction::ToWorker);
+    let catalog = Catalog::from_stream(&mut stream)?;
+    let planner = SqlToRel::new(&catalog);
+    let base_plan = planner.statement_to_plan(stmt)?;
+    Ok(TaskResult::Compilation(base_plan))
+}
+
+async fn bind(
+    header: Header,
+    mut stream: SlotStream,
+    base_plan: LogicalPlan,
+) -> Result<TaskResult> {
+    assert_eq!(header.packet, Packet::Bind);
+    assert_eq!(header.direction, Direction::ToWorker);
+    let params = read_params(&mut stream)?;
+    let plan = base_plan.with_param_values(params)?;
+    Ok(TaskResult::Bind(plan))
 }
 
 #[inline]

@@ -1,7 +1,7 @@
 use crate::error::FusionError;
 use crate::ipc::SlotStream;
 use anyhow::{bail, Result};
-use datafusion::arrow::datatypes::DataType;
+use datafusion::arrow::datatypes::{DataType, IntervalUnit, TimeUnit};
 use datafusion::common::arrow::array::types::IntervalMonthDayNano;
 use datafusion::common::arrow::datatypes::Field;
 use datafusion::common::ScalarValue;
@@ -105,6 +105,24 @@ pub(crate) enum EncodedType {
     Time64 = 8,
     Timestamp = 9,
     Interval = 10,
+}
+
+impl EncodedType {
+    pub(crate) fn to_arrow(&self) -> DataType {
+        match self {
+            EncodedType::Boolean => DataType::Boolean,
+            EncodedType::Utf8 => DataType::Utf8,
+            EncodedType::Int16 => DataType::Int16,
+            EncodedType::Int32 => DataType::Int32,
+            EncodedType::Int64 => DataType::Int64,
+            EncodedType::Float32 => DataType::Float32,
+            EncodedType::Float64 => DataType::Float64,
+            EncodedType::Date32 => DataType::Date32,
+            EncodedType::Time64 => DataType::Time64(TimeUnit::Microsecond),
+            EncodedType::Timestamp => DataType::Timestamp(TimeUnit::Microsecond, None),
+            EncodedType::Interval => DataType::Interval(IntervalUnit::MonthDayNano),
+        }
+    }
 }
 
 impl TryFrom<u8> for EncodedType {

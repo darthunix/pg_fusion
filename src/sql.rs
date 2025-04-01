@@ -1,12 +1,8 @@
-use std::cell::OnceCell;
-use std::collections::HashMap;
-use std::sync::Arc;
-
+use crate::data_type::EncodedType;
+use crate::ipc::SlotStream;
 use ahash::AHashMap;
-use datafusion::arrow::datatypes::DataType;
-use datafusion::arrow::datatypes::SchemaRef;
-use datafusion::common::DFSchemaRef;
-use datafusion::common::ScalarValue;
+use anyhow::Result;
+use datafusion::arrow::datatypes::{DataType, Field, Schema, SchemaRef};
 use datafusion::config::ConfigOptions;
 use datafusion::error::DataFusionError;
 use datafusion::error::Result as DataFusionResult;
@@ -16,34 +12,22 @@ use datafusion::functions_aggregate::all_default_aggregate_functions;
 use datafusion::functions_window::all_default_window_functions;
 use datafusion::logical_expr::planner::ContextProvider;
 use datafusion::logical_expr::planner::ExprPlanner;
-use datafusion::logical_expr::{AggregateUDF, LogicalPlan, ScalarUDF, TableSource, WindowUDF};
-use datafusion_sql::planner::SqlToRel;
-use datafusion_sql::sqlparser::dialect::PostgreSqlDialect;
-use datafusion_sql::sqlparser::parser::Parser;
+use datafusion::logical_expr::{AggregateUDF, ScalarUDF, TableSource, WindowUDF};
 use datafusion_sql::TableReference;
+use once_cell::sync::Lazy;
 use pgrx::pg_sys::Oid;
+use rmp::decode::read_array_len;
+use rmp::decode::read_bool;
+use rmp::decode::read_str_len;
+use rmp::decode::{read_u32, read_u8};
 use smol_str::SmolStr;
+use std::collections::HashMap;
+use std::str::from_utf8;
+use std::sync::Arc;
 
-// fn sql_to_logical_plan(
-//     sql: &str,
-//     params: Vec<ScalarValue>,
-// ) -> Result<LogicalPlan, DataFusionError> {
-//     let dialect = PostgreSqlDialect {};
-//     let ast = Parser::parse_sql(&dialect, sql).map_err(|e| DataFusionError::SQL(e, None))?;
-//     assert_eq!(ast.len(), 1);
-//     let statement = ast.into_iter().next().expect("ast is not empty");
-//
-//     // Cash metadata provider in a static variable to avoid re-allocation on each query.
-//     let base_plan = CATALOG.with(|catalog| {
-//         let catalog = catalog.get_or_init(Builtin::new);
-//         let sql_to_rel = SqlToRel::new(catalog);
-//         sql_to_rel.sql_statement_to_plan(statement)
-//     })?;
-//     let plan = base_plan.with_param_values(params)?;
-//
-//     Ok(plan)
-// }
+static BUILDIN: Lazy<Arc<Builtin>> = Lazy::new(|| Arc::new(Builtin::new()));
 
+#[derive(PartialEq, Eq, Hash)]
 pub(crate) struct Table {
     oid: Oid,
     schema: SchemaRef,
@@ -92,28 +76,78 @@ impl Builtin {
     }
 }
 
-struct Catalog {
+pub(crate) struct Catalog {
     builtin: Arc<Builtin>,
-    tables: AHashMap<SmolStr, Arc<dyn TableSource>>,
+    tables: AHashMap<TableReference, Arc<dyn TableSource>>,
+}
+
+impl Catalog {
+    pub(crate) fn from_stream(stream: &mut SlotStream) -> Result<Self> {
+        // The header should be consumed before calling this function.
+        let table_num = read_array_len(stream)?;
+        let mut tables = AHashMap::with_capacity(table_num as usize);
+        for _ in 0..table_num {
+            let oid = read_u32(stream)?;
+            let ns_len = read_str_len(stream)?;
+            let ns_bytes = stream.look_ahead(ns_len as usize)?;
+            let schema = SmolStr::from(from_utf8(ns_bytes)?);
+            stream.rewind(ns_len as usize)?;
+            let name_len = read_str_len(stream)?;
+            let name_bytes = stream.look_ahead(name_len as usize)?;
+            let name = from_utf8(name_bytes)?;
+            let table_ref = TableReference::partial(schema.as_str(), name);
+            stream.rewind(name_len as usize)?;
+            let column_num = read_array_len(stream)?;
+            let mut fields = Vec::with_capacity(column_num as usize);
+            for _ in 0..column_num {
+                let elem_num = read_array_len(stream)?;
+                assert_eq!(elem_num, 3);
+                let etype = read_u8(stream)?;
+                let df_type = EncodedType::try_from(etype)?.to_arrow();
+                let is_nullable = read_bool(stream)?;
+                let name_len = read_str_len(stream)?;
+                let name_bytes = stream.look_ahead(name_len as usize)?;
+                let name = from_utf8(name_bytes)?;
+                let field = Field::new(name, df_type, is_nullable);
+                fields.push(field);
+            }
+            let schema = Schema::new(fields);
+            let table = Table {
+                oid: Oid::from(oid),
+                schema: Arc::new(schema),
+            };
+            tables.insert(table_ref, Arc::new(table) as Arc<dyn TableSource>);
+        }
+        Ok(Self {
+            builtin: Arc::clone(&*BUILDIN),
+            tables,
+        })
+    }
 }
 
 impl ContextProvider for Catalog {
-    fn get_table_source(&self, name: TableReference) -> DataFusionResult<Arc<dyn TableSource>> {
-        match self.tables.get(name.table()) {
+    fn get_table_source(&self, table: TableReference) -> DataFusionResult<Arc<dyn TableSource>> {
+        match self.tables.get(&table) {
             Some(table) => Ok(Arc::clone(table)),
-            _ => Err(DataFusionError::Plan(format!(
-                "Table not found: {}",
-                name.table()
-            ))),
+            _ => {
+                let schema = match table.schema() {
+                    Some(schema) => &format!("{schema}."),
+                    _ => table.table(),
+                };
+                Err(DataFusionError::Plan(format!(
+                    "Table not found: {schema}{}",
+                    table.table()
+                )))
+            }
         }
     }
 
     fn get_function_meta(&self, name: &str) -> Option<Arc<ScalarUDF>> {
-        self.builtin.scalar_udf.get(name).map(|f| Arc::clone(f))
+        self.builtin.scalar_udf.get(name).map(Arc::clone)
     }
 
     fn get_aggregate_meta(&self, name: &str) -> Option<Arc<AggregateUDF>> {
-        self.builtin.agg_udf.get(name).map(|f| Arc::clone(f))
+        self.builtin.agg_udf.get(name).map(Arc::clone)
     }
 
     fn get_variable_type(&self, _variable_names: &[String]) -> Option<DataType> {
@@ -121,7 +155,7 @@ impl ContextProvider for Catalog {
     }
 
     fn get_window_meta(&self, name: &str) -> Option<Arc<WindowUDF>> {
-        self.builtin.window_udf.get(name).map(|f| Arc::clone(f))
+        self.builtin.window_udf.get(name).map(Arc::clone)
     }
 
     fn options(&self) -> &ConfigOptions {
