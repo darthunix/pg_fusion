@@ -16,7 +16,8 @@ use std::time::Duration;
 use crate::error::FusionError;
 use crate::ipc::{my_slot, Bus, SlotStream};
 use crate::protocol::{
-    consume_header, read_error, send_metadata, send_params, send_query, Direction, Packet,
+    consume_header, read_error, send_metadata, send_params, send_query, Direction, NeedSchema,
+    Packet,
 };
 
 const BACKEND_WAIT_TIMEOUT: Duration = Duration::from_millis(100);
@@ -161,7 +162,7 @@ unsafe extern "C" fn explain_df_scan(
 }
 
 // We expect that the header is already consumed and the packet type is `Packet::Metadata`.
-fn table_oids(stream: &mut SlotStream) -> AnyResult<SmallVec<[Oid; 16]>> {
+fn table_oids(stream: &mut SlotStream) -> AnyResult<SmallVec<[(Oid, NeedSchema); 16]>> {
     let table_not_found = |c_table_name: &[u8]| -> Result<(), FusionError> {
         assert!(!c_table_name.is_empty());
         let table_name = c_table_name[..c_table_name.len() - 1].as_ref();
@@ -174,7 +175,7 @@ fn table_oids(stream: &mut SlotStream) -> AnyResult<SmallVec<[Oid; 16]>> {
         }
     };
     let table_num = read_array_len(stream)?;
-    let mut oids: SmallVec<[Oid; 16]> = SmallVec::with_capacity(table_num as usize);
+    let mut oids: SmallVec<[(Oid, NeedSchema); 16]> = SmallVec::with_capacity(table_num as usize);
     for _ in 0..table_num {
         let elem_num = read_array_len(stream)?;
         match elem_num {
@@ -191,7 +192,7 @@ fn table_oids(stream: &mut SlotStream) -> AnyResult<SmallVec<[Oid; 16]>> {
                     rel_oid =
                         unsafe { get_relname_relid(table_name.as_ptr() as *const c_char, *ns_oid) };
                     if rel_oid != InvalidOid {
-                        oids.push(rel_oid);
+                        oids.push((rel_oid, false));
                         break;
                     }
                 }
@@ -215,7 +216,7 @@ fn table_oids(stream: &mut SlotStream) -> AnyResult<SmallVec<[Oid; 16]>> {
                     table_not_found(table_name)?;
                 }
                 stream.rewind(table_len as usize)?;
-                oids.push(rel_oid);
+                oids.push((rel_oid, true));
             }
             _ => {
                 return Err(FusionError::InvalidName(
@@ -350,8 +351,8 @@ mod tests {
         let _ = consume_header(&mut stream).unwrap();
         let oids = table_oids(&mut stream).unwrap();
         assert_eq!(oids.len(), 2);
-        assert_eq!(oids[0], t1_oid);
-        assert_eq!(oids[1], t2_oid);
+        assert_eq!(oids[0], (t1_oid, false));
+        assert_eq!(oids[1], (t2_oid, true));
         stream.reset();
 
         // Check invalid table.

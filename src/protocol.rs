@@ -344,12 +344,19 @@ pub(crate) fn send_table_refs(
 
 #[inline]
 #[pg_guard]
-fn serialize_table(rel_oid: Oid, stream: &mut SlotStream) -> Result<()> {
+fn serialize_table(rel_oid: Oid, need_schema: bool, stream: &mut SlotStream) -> Result<()> {
     // The destructor will release the lock.
     let rel = unsafe { PgRelation::with_lock(rel_oid, pg_sys::AccessShareLock as i32) };
-    write_u32(stream, rel_oid.as_u32())?;
-    write_str(stream, rel.namespace())?;
-    write_str(stream, rel.name())?;
+    if need_schema {
+        write_array_len(stream, 3)?;
+        write_u32(stream, rel_oid.as_u32())?;
+        write_str(stream, rel.namespace())?;
+        write_str(stream, rel.name())?;
+    } else {
+        write_array_len(stream, 2)?;
+        write_u32(stream, rel_oid.as_u32())?;
+        write_str(stream, rel.name())?;
+    }
     let tuple_desc = rel.tuple_desc();
     let attr_num = u32::try_from(tuple_desc.iter().filter(|a| !a.is_dropped()).count())?;
     write_array_len(stream, attr_num)?;
@@ -368,15 +375,20 @@ fn serialize_table(rel_oid: Oid, stream: &mut SlotStream) -> Result<()> {
     Ok(())
 }
 
-pub(crate) fn prepare_metadata(rel_oids: &[Oid], stream: &mut SlotStream) -> Result<()> {
+pub(crate) type NeedSchema = bool;
+
+pub(crate) fn prepare_metadata(
+    rel_oids: &[(Oid, NeedSchema)],
+    stream: &mut SlotStream,
+) -> Result<()> {
     stream.reset();
     // We don't know the length of the table metadata yet. So we write
     // an invalid header to replace it with the correct one later.
     write_header(stream, &Header::default())?;
     let pos_init = stream.position();
     write_array_len(stream, rel_oids.len() as u32)?;
-    for &rel_oid in rel_oids {
-        serialize_table(rel_oid, stream)?;
+    for &(rel_oid, need_schema) in rel_oids {
+        serialize_table(rel_oid, need_schema, stream)?;
     }
     let pos_final = stream.position();
     let length = u16::try_from(pos_final - pos_init)?;
@@ -395,7 +407,7 @@ pub(crate) fn prepare_metadata(rel_oids: &[Oid], stream: &mut SlotStream) -> Res
 pub(crate) fn send_metadata(
     slot_id: SlotNumber,
     mut stream: SlotStream,
-    rel_oids: &[Oid],
+    rel_oids: &[(Oid, NeedSchema)],
 ) -> Result<()> {
     prepare_metadata(rel_oids, &mut stream)?;
     // Unlock the slot after writing the metadata.
@@ -548,7 +560,12 @@ mod tests {
     #[pg_test]
     fn test_metadata_response() {
         Spi::run("create table if not exists t1(a int not null, b text);").unwrap();
+        Spi::run("create schema if not exists s1;").unwrap();
+        Spi::run("create table if not exists s1.t2(a int);").unwrap();
         let t1_oid = Spi::get_one::<Oid>("select 't1'::regclass::oid;")
+            .unwrap()
+            .unwrap();
+        let t2_oid = Spi::get_one::<Oid>("select 's1.t2'::regclass::oid;")
             .unwrap()
             .unwrap();
 
@@ -558,7 +575,7 @@ mod tests {
         let slot = Slot::from_bytes(ptr, slot_buf.len());
         let mut stream: SlotStream = slot.into();
 
-        prepare_metadata(&[t1_oid], &mut stream).unwrap();
+        prepare_metadata(&[(t1_oid, false), (t2_oid, true)], &mut stream).unwrap();
         stream.reset();
         let header = consume_header(&mut stream).unwrap();
         assert_eq!(header.direction, Direction::ToWorker);
@@ -567,14 +584,12 @@ mod tests {
 
         // Check table metadata deserialization
         let table_num = read_array_len(&mut stream).unwrap();
-        assert_eq!(table_num, 1);
+        assert_eq!(table_num, 2);
         // t1
+        let name_part_num = read_array_len(&mut stream).unwrap();
+        assert_eq!(name_part_num, 2);
         let oid = read_u32(&mut stream).unwrap();
         assert_eq!(oid, t1_oid.as_u32());
-        let ns_len = read_str_len(&mut stream).unwrap();
-        let ns = stream.look_ahead(ns_len as usize).unwrap();
-        assert_eq!(ns, b"public");
-        stream.rewind(ns_len as usize).unwrap();
         let name_len = read_str_len(&mut stream).unwrap();
         let name = stream.look_ahead(name_len as usize).unwrap();
         assert_eq!(name, b"t1");
@@ -604,6 +619,36 @@ mod tests {
         assert_eq!(name_len, "b".len() as u32);
         let name = stream.look_ahead(name_len as usize).unwrap();
         assert_eq!(name, b"b");
+        stream.rewind(name_len as usize).unwrap();
+
+        // s1.t2
+        let name_part_num = read_array_len(&mut stream).unwrap();
+        assert_eq!(name_part_num, 3);
+        let oid = read_u32(&mut stream).unwrap();
+        assert_eq!(oid, t2_oid.as_u32());
+        let ns_len = read_str_len(&mut stream).unwrap();
+        assert_eq!(ns_len, "s1".len() as u32);
+        let ns = stream.look_ahead(ns_len as usize).unwrap();
+        assert_eq!(ns, b"s1");
+        stream.rewind(ns_len as usize).unwrap();
+        let name_len = read_str_len(&mut stream).unwrap();
+        assert_eq!(name_len, "t2".len() as u32);
+        let name = stream.look_ahead(name_len as usize).unwrap();
+        assert_eq!(name, b"t2");
+        stream.rewind(name_len as usize).unwrap();
+        let attr_num = read_array_len(&mut stream).unwrap();
+        assert_eq!(attr_num, 1);
+        // a
+        let elem_num = read_array_len(&mut stream).unwrap();
+        assert_eq!(elem_num, 3);
+        let etype = read_u8(&mut stream).unwrap();
+        assert_eq!(etype, EncodedType::Int32 as u8);
+        let is_nullable = read_bool(&mut stream).unwrap();
+        assert!(is_nullable);
+        let name_len = read_str_len(&mut stream).unwrap();
+        assert_eq!(name_len, "a".len() as u32);
+        let name = stream.look_ahead(name_len as usize).unwrap();
+        assert_eq!(name, b"a");
         stream.rewind(name_len as usize).unwrap();
     }
 }

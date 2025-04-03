@@ -87,15 +87,23 @@ impl Catalog {
         let table_num = read_array_len(stream)?;
         let mut tables = AHashMap::with_capacity(table_num as usize);
         for _ in 0..table_num {
+            let name_part_num = read_array_len(stream)?;
+            assert!(name_part_num == 2 || name_part_num == 3);
             let oid = read_u32(stream)?;
-            let ns_len = read_str_len(stream)?;
-            let ns_bytes = stream.look_ahead(ns_len as usize)?;
-            let schema = SmolStr::from(from_utf8(ns_bytes)?);
-            stream.rewind(ns_len as usize)?;
+            let mut schema = None;
+            if name_part_num == 3 {
+                let ns_len = read_str_len(stream)?;
+                let ns_bytes = stream.look_ahead(ns_len as usize)?;
+                schema = Some(SmolStr::new(from_utf8(ns_bytes)?));
+                stream.rewind(ns_len as usize)?;
+            }
             let name_len = read_str_len(stream)?;
             let name_bytes = stream.look_ahead(name_len as usize)?;
             let name = from_utf8(name_bytes)?;
-            let table_ref = TableReference::partial(schema.as_str(), name);
+            let table_ref = match schema {
+                Some(schema) => TableReference::partial(schema, name),
+                None => TableReference::bare(name),
+            };
             stream.rewind(name_len as usize)?;
             let column_num = read_array_len(stream)?;
             let mut fields = Vec::with_capacity(column_num as usize);
