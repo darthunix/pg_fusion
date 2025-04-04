@@ -1,7 +1,9 @@
 use crate::error::FusionError;
 use crate::fsm::executor::StateMachine;
 use crate::fsm::ExecutorOutput;
-use crate::ipc::{init_shmem, max_backends, Bus, SlotNumber, SlotStream, INVALID_SLOT_NUMBER};
+use crate::ipc::{
+    init_shmem, max_backends, set_worker_id, Bus, SlotNumber, SlotStream, INVALID_SLOT_NUMBER,
+};
 use crate::protocol::{
     consume_header, prepare_metadata, read_params, read_query, request_params, send_error,
     send_table_refs, Direction, Flag, Header, Packet,
@@ -14,23 +16,16 @@ use datafusion_sql::parser::{DFParser, Statement};
 use datafusion_sql::planner::SqlToRel;
 use datafusion_sql::TableReference;
 use pgrx::bgworkers::{BackgroundWorker, BackgroundWorkerBuilder, SignalWakeFlags};
-use pgrx::pg_sys::{MyProcNumber, ProcNumber};
+use pgrx::pg_sys::MyProcNumber;
 use pgrx::prelude::*;
 use smol_str::{format_smolstr, SmolStr};
-use std::cell::OnceCell;
-use std::process::id;
 use std::time::Duration;
 use tokio::runtime::Builder;
 use tokio::task::JoinHandle;
 
-static mut WORKER_NUMBER: OnceCell<ProcNumber> = OnceCell::new();
 // FIXME: This should be configurable.
 const TOKIO_THREAD_NUMBER: usize = 1;
-const WORKER_WAIT_TIMEOUT: Duration = Duration::from_micros(100);
-
-pub(crate) fn worker_id() -> ProcNumber {
-    unsafe { *WORKER_NUMBER.get().unwrap() }
-}
+const WORKER_WAIT_TIMEOUT: Duration = Duration::from_millis(100);
 
 #[pg_guard]
 pub(crate) fn init_datafusion_worker() {
@@ -92,9 +87,7 @@ impl WorkerContext {
 #[pg_guard]
 #[no_mangle]
 pub extern "C" fn worker_main(_arg: pg_sys::Datum) {
-    unsafe {
-        WORKER_NUMBER.set(MyProcNumber).unwrap();
-    }
+    unsafe { set_worker_id(MyProcNumber) };
     BackgroundWorker::attach_signal_handlers(SignalWakeFlags::SIGHUP | SignalWakeFlags::SIGTERM);
     let mut ctx = WorkerContext::new();
     let rt = Builder::new_multi_thread()

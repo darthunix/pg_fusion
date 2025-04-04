@@ -113,9 +113,11 @@ unsafe extern "C" fn create_df_scan_state(cscan: *mut CustomScan) -> *mut Node {
                 if let Err(err) = send_metadata(my_slot(), stream, &oids) {
                     error!("Failed to send the table metadata: {}", err);
                 }
+                break;
             }
-            Packet::Bind => break,
-            Packet::Parse => error!("Unexpected packet in backend: {:?}", header.packet),
+            Packet::Bind | Packet::Parse => {
+                error!("Unexpected packet in backend: {:?}", header.packet)
+            }
         }
     }
     let param_list = (*list_nth(list, 1)).ptr_value as ParamListInfo;

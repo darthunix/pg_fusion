@@ -1,5 +1,5 @@
 use libc::c_void;
-use pgrx::pg_sys::{on_proc_exit, Datum, MyProcNumber, ShmemAlloc};
+use pgrx::pg_sys::{on_proc_exit, Datum, MyProcNumber, ProcNumber, ShmemAlloc};
 use pgrx::prelude::*;
 use std::cell::OnceCell;
 use std::cmp::min;
@@ -12,6 +12,7 @@ use std::sync::atomic::{AtomicBool, AtomicI32, Ordering};
 
 static mut SLOT_FREE_LIST_PTR: OnceCell<*mut c_void> = OnceCell::new();
 static mut BUS_PTR: OnceCell<*mut c_void> = OnceCell::new();
+static mut WORKER_PID_PTR: OnceCell<*mut c_void> = OnceCell::new();
 pub(crate) const INVALID_SLOT_NUMBER: SlotNumber = u32::MAX;
 pub(crate) const INVALID_PROC_NUMBER: i32 = -1;
 pub(crate) const DATA_SIZE: usize = 8 * 1024;
@@ -459,6 +460,16 @@ impl Iterator for BusIter {
     }
 }
 
+pub(crate) fn worker_id() -> ProcNumber {
+    let ptr = unsafe { *WORKER_PID_PTR.get().unwrap() as *mut AtomicI32 };
+    unsafe { (*ptr).load(Ordering::Relaxed) }
+}
+
+pub(crate) fn set_worker_id(id: ProcNumber) {
+    let ptr = unsafe { *WORKER_PID_PTR.get().unwrap() as *mut AtomicI32 };
+    unsafe { (*ptr).store(id, Ordering::Relaxed) }
+}
+
 #[pg_guard]
 #[no_mangle]
 pub unsafe extern "C" fn backend_cleanup(_code: i32, _args: Datum) {
@@ -485,6 +496,11 @@ pub unsafe extern "C" fn init_shmem() {
     BUS_PTR.set(ShmemAlloc(Bus::estimated_size())).unwrap();
     let bus_ptr = unsafe { *BUS_PTR.get().unwrap() };
     Bus::init(bus_ptr as *mut u8, Bus::estimated_size());
+
+    WORKER_PID_PTR
+        .set(ShmemAlloc(size_of::<AtomicI32>()))
+        .unwrap();
+    set_worker_id(INVALID_PROC_NUMBER);
 }
 
 #[cfg(any(test, feature = "pg_test"))]

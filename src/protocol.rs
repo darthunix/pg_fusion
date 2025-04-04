@@ -3,9 +3,8 @@ use std::sync::Arc;
 
 use crate::data_type::{datum_to_scalar, read_scalar_value, write_scalar_value, EncodedType};
 use crate::error::FusionError;
-use crate::ipc::{Bus, Slot, SlotNumber, SlotStream, DATA_SIZE};
+use crate::ipc::{worker_id, Bus, Slot, SlotNumber, SlotStream, DATA_SIZE};
 use crate::sql::Table;
-use crate::worker::worker_id;
 use ahash::AHashMap;
 use anyhow::Result;
 use datafusion::arrow::datatypes::{Field, Schema};
