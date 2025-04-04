@@ -1,8 +1,8 @@
-use crate::data_type::EncodedType;
 use crate::ipc::SlotStream;
+use crate::protocol::consume_metadata;
 use ahash::AHashMap;
 use anyhow::Result;
-use datafusion::arrow::datatypes::{DataType, Field, Schema, SchemaRef};
+use datafusion::arrow::datatypes::{DataType, SchemaRef};
 use datafusion::config::ConfigOptions;
 use datafusion::error::DataFusionError;
 use datafusion::error::Result as DataFusionResult;
@@ -16,21 +16,21 @@ use datafusion::logical_expr::{AggregateUDF, ScalarUDF, TableSource, WindowUDF};
 use datafusion_sql::TableReference;
 use once_cell::sync::Lazy;
 use pgrx::pg_sys::Oid;
-use rmp::decode::read_array_len;
-use rmp::decode::read_bool;
-use rmp::decode::read_str_len;
-use rmp::decode::{read_u32, read_u8};
-use smol_str::SmolStr;
 use std::collections::HashMap;
-use std::str::from_utf8;
 use std::sync::Arc;
 
 static BUILDIN: Lazy<Arc<Builtin>> = Lazy::new(|| Arc::new(Builtin::new()));
 
 #[derive(PartialEq, Eq, Hash)]
 pub(crate) struct Table {
-    oid: Oid,
-    schema: SchemaRef,
+    pub(crate) oid: Oid,
+    pub(crate) schema: SchemaRef,
+}
+
+impl Table {
+    pub(crate) fn new(oid: Oid, schema: SchemaRef) -> Self {
+        Self { oid, schema }
+    }
 }
 
 impl TableSource for Table {
@@ -83,52 +83,9 @@ pub(crate) struct Catalog {
 
 impl Catalog {
     pub(crate) fn from_stream(stream: &mut SlotStream) -> Result<Self> {
-        // The header should be consumed before calling this function.
-        let table_num = read_array_len(stream)?;
-        let mut tables = AHashMap::with_capacity(table_num as usize);
-        for _ in 0..table_num {
-            let name_part_num = read_array_len(stream)?;
-            assert!(name_part_num == 2 || name_part_num == 3);
-            let oid = read_u32(stream)?;
-            let mut schema = None;
-            if name_part_num == 3 {
-                let ns_len = read_str_len(stream)?;
-                let ns_bytes = stream.look_ahead(ns_len as usize)?;
-                schema = Some(SmolStr::new(from_utf8(ns_bytes)?));
-                stream.rewind(ns_len as usize)?;
-            }
-            let name_len = read_str_len(stream)?;
-            let name_bytes = stream.look_ahead(name_len as usize)?;
-            let name = from_utf8(name_bytes)?;
-            let table_ref = match schema {
-                Some(schema) => TableReference::partial(schema, name),
-                None => TableReference::bare(name),
-            };
-            stream.rewind(name_len as usize)?;
-            let column_num = read_array_len(stream)?;
-            let mut fields = Vec::with_capacity(column_num as usize);
-            for _ in 0..column_num {
-                let elem_num = read_array_len(stream)?;
-                assert_eq!(elem_num, 3);
-                let etype = read_u8(stream)?;
-                let df_type = EncodedType::try_from(etype)?.to_arrow();
-                let is_nullable = read_bool(stream)?;
-                let name_len = read_str_len(stream)?;
-                let name_bytes = stream.look_ahead(name_len as usize)?;
-                let name = from_utf8(name_bytes)?;
-                let field = Field::new(name, df_type, is_nullable);
-                fields.push(field);
-            }
-            let schema = Schema::new(fields);
-            let table = Table {
-                oid: Oid::from(oid),
-                schema: Arc::new(schema),
-            };
-            tables.insert(table_ref, Arc::new(table) as Arc<dyn TableSource>);
-        }
         Ok(Self {
             builtin: Arc::clone(&*BUILDIN),
-            tables,
+            tables: consume_metadata(stream)?,
         })
     }
 }

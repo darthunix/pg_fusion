@@ -1,18 +1,28 @@
+use std::str::from_utf8;
+use std::sync::Arc;
+
 use crate::data_type::{datum_to_scalar, read_scalar_value, write_scalar_value, EncodedType};
 use crate::error::FusionError;
 use crate::ipc::{Bus, Slot, SlotNumber, SlotStream, DATA_SIZE};
+use crate::sql::Table;
 use crate::worker::worker_id;
+use ahash::AHashMap;
 use anyhow::Result;
+use datafusion::arrow::datatypes::{Field, Schema};
+use datafusion::logical_expr::TableSource;
 use datafusion::scalar::ScalarValue;
 use datafusion_sql::TableReference;
 use pgrx::pg_sys::{Oid, ParamExternData, ProcSendSignal};
 use pgrx::prelude::*;
 use pgrx::{pg_guard, PgRelation};
-use rmp::decode::{read_array_len, read_bin_len, read_pfix, read_str_len, read_u16, read_u8};
+use rmp::decode::{
+    read_array_len, read_bin_len, read_bool, read_pfix, read_str_len, read_u16, read_u32, read_u8,
+};
 use rmp::encode::{
     write_array_len, write_bin_len, write_bool, write_pfix, write_str, write_u16, write_u32,
     write_u8, RmpWrite,
 };
+use smol_str::SmolStr;
 
 #[repr(u8)]
 #[derive(Clone, Debug, Default, PartialEq)]
@@ -416,10 +426,59 @@ pub(crate) fn send_metadata(
     Ok(())
 }
 
+#[inline]
+pub(crate) fn consume_metadata(
+    stream: &mut SlotStream,
+) -> Result<AHashMap<TableReference, Arc<dyn TableSource>>> {
+    // The header should be consumed before calling this function.
+    let table_num = read_array_len(stream)?;
+    let mut tables = AHashMap::with_capacity(table_num as usize);
+    for _ in 0..table_num {
+        let name_part_num = read_array_len(stream)?;
+        assert!(name_part_num == 2 || name_part_num == 3);
+        let oid = read_u32(stream)?;
+        let mut schema = None;
+        if name_part_num == 3 {
+            let ns_len = read_str_len(stream)?;
+            let ns_bytes = stream.look_ahead(ns_len as usize)?;
+            schema = Some(SmolStr::new(from_utf8(ns_bytes)?));
+            stream.rewind(ns_len as usize)?;
+        }
+        let name_len = read_str_len(stream)?;
+        let name_bytes = stream.look_ahead(name_len as usize)?;
+        let name = from_utf8(name_bytes)?;
+        let table_ref = match schema {
+            Some(schema) => TableReference::partial(schema, name),
+            None => TableReference::bare(name),
+        };
+        stream.rewind(name_len as usize)?;
+        let column_num = read_array_len(stream)?;
+        let mut fields = Vec::with_capacity(column_num as usize);
+        for _ in 0..column_num {
+            let elem_num = read_array_len(stream)?;
+            assert_eq!(elem_num, 3);
+            let etype = read_u8(stream)?;
+            let df_type = EncodedType::try_from(etype)?.to_arrow();
+            let is_nullable = read_bool(stream)?;
+            let name_len = read_str_len(stream)?;
+            let name_bytes = stream.look_ahead(name_len as usize)?;
+            let name = from_utf8(name_bytes)?;
+            let field = Field::new(name, df_type, is_nullable);
+            stream.rewind(name_len as usize)?;
+            fields.push(field);
+        }
+        let schema = Schema::new(fields);
+        let table = Table::new(Oid::from(oid), Arc::new(schema));
+        tables.insert(table_ref, Arc::new(table) as Arc<dyn TableSource>);
+    }
+    Ok(tables)
+}
+
 #[cfg(any(test, feature = "pg_test"))]
 #[pg_schema]
 mod tests {
     use super::*;
+    use datafusion::arrow::datatypes::DataType;
     use pgrx::pg_sys::{Datum, Oid};
     use rmp::decode::{read_bool, read_u32};
     use std::ptr::addr_of_mut;
@@ -650,5 +709,48 @@ mod tests {
         let name = stream.look_ahead(name_len as usize).unwrap();
         assert_eq!(name, b"a");
         stream.rewind(name_len as usize).unwrap();
+    }
+    #[pg_test]
+    fn test_metadata_to_tables() {
+        Spi::run("create table if not exists t1(a int not null, b text);").unwrap();
+        Spi::run("create schema if not exists s1;").unwrap();
+        Spi::run("create table if not exists s1.t2(a int);").unwrap();
+        let t1_oid = Spi::get_one::<Oid>("select 't1'::regclass::oid;")
+            .unwrap()
+            .unwrap();
+        let t2_oid = Spi::get_one::<Oid>("select 's1.t2'::regclass::oid;")
+            .unwrap()
+            .unwrap();
+
+        let mut slot_buf: [u8; SLOT_SIZE] = [1; SLOT_SIZE];
+        let ptr = addr_of_mut!(slot_buf) as *mut u8;
+        Slot::init(ptr, slot_buf.len());
+        let slot = Slot::from_bytes(ptr, slot_buf.len());
+        let mut stream: SlotStream = slot.into();
+
+        prepare_metadata(&[(t1_oid, false), (t2_oid, true)], &mut stream).unwrap();
+        stream.reset();
+        let header = consume_header(&mut stream).unwrap();
+        assert_eq!(header.direction, Direction::ToWorker);
+        assert_eq!(header.packet, Packet::Metadata);
+        assert_eq!(header.flag, Flag::Last);
+
+        let tables = consume_metadata(&mut stream).unwrap();
+        assert_eq!(tables.len(), 2);
+        // t1
+        let t1 = tables.get(&TableReference::bare("t1")).unwrap();
+        assert_eq!(t1.schema().fields().len(), 2);
+        assert_eq!(t1.schema().field(0).name(), "a");
+        assert_eq!(t1.schema().field(1).name(), "b");
+        assert_eq!(t1.schema().field(0).data_type(), &DataType::Int32);
+        assert_eq!(t1.schema().field(1).data_type(), &DataType::Utf8);
+        assert!(!t1.schema().field(0).is_nullable());
+        assert!(t1.schema().field(1).is_nullable());
+        // s1.t2
+        let t2 = tables.get(&TableReference::partial("s1", "t2")).unwrap();
+        assert_eq!(t2.schema().fields().len(), 1);
+        assert_eq!(t2.schema().field(0).name(), "a");
+        assert_eq!(t2.schema().field(0).data_type(), &DataType::Int32);
+        assert!(t2.schema().field(0).is_nullable());
     }
 }
