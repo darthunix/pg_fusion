@@ -104,6 +104,10 @@ unsafe extern "C" fn create_df_scan_state(cscan: *mut CustomScan) -> *mut Node {
             continue;
         }
         match header.packet {
+            Packet::None => {
+                // No data, just continue waiting.
+                continue;
+            }
             Packet::Failure => {
                 let msg = read_error(&mut stream).expect("Failed to read the error message");
                 error!("Failed to compile the query: {}", msg);

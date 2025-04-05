@@ -6,7 +6,7 @@ use crate::ipc::{
 };
 use crate::protocol::{
     consume_header, prepare_metadata, read_params, read_query, request_params, send_error,
-    send_table_refs, Direction, Flag, Header, Packet,
+    send_table_refs, write_header, Direction, Flag, Header, Packet,
 };
 use crate::sql::Catalog;
 use anyhow::Result;
@@ -84,6 +84,21 @@ impl WorkerContext {
     }
 }
 
+fn init_slots() -> Result<()> {
+    for locked_slot in Bus::new().into_iter().flatten() {
+        let mut stream = SlotStream::from(locked_slot);
+        stream.reset();
+        let header = Header {
+            direction: Direction::ToBackend,
+            packet: Packet::None,
+            length: 0,
+            flag: Flag::Last,
+        };
+        write_header(&mut stream, &header)?;
+    }
+    Ok(())
+}
+
 #[pg_guard]
 #[no_mangle]
 pub extern "C" fn worker_main(_arg: pg_sys::Datum) {
@@ -98,10 +113,13 @@ pub extern "C" fn worker_main(_arg: pg_sys::Datum) {
     let mut do_retry = false;
     let mut slots_with_error: Vec<(SlotNumber, SmolStr)> =
         vec![(INVALID_SLOT_NUMBER, "".into()); max_backends() as usize];
+    init_slots().expect("Failed to initialize slots");
 
-    rt.block_on(async {
-        log!("DataFusion worker is running");
-        while do_retry || BackgroundWorker::wait_latch(Some(WORKER_WAIT_TIMEOUT)) {
+    log!("DataFusion worker is running");
+    while do_retry || BackgroundWorker::wait_latch(Some(WORKER_WAIT_TIMEOUT)) {
+        // Do not use any pgrx API in this loop: it is multithreaded while PostgreSQL
+        // functions can work only in the main thread.
+        rt.block_on(async {
             do_retry = false;
             for (id, locked_slot) in Bus::new().into_iter().enumerate() {
                 let Some(slot) = locked_slot else {
@@ -191,8 +209,8 @@ pub extern "C" fn worker_main(_arg: pg_sys::Datum) {
                     response_error(*slot_id, &mut ctx, stream, msg);
                 }
             }
-        }
-    });
+        });
+    }
 }
 
 async fn parse(header: Header, mut stream: SlotStream) -> Result<TaskResult> {
@@ -200,7 +218,6 @@ async fn parse(header: Header, mut stream: SlotStream) -> Result<TaskResult> {
     // TODO: handle long queries that span multiple packets.
     assert_eq!(header.flag, Flag::Last);
     let (query, _) = read_query(&mut stream)?;
-    log!("Received query: {}", query);
 
     let stmts = DFParser::parse_sql(query)?;
     let Some(stmt) = stmts.into_iter().next() else {
@@ -234,26 +251,7 @@ async fn bind(
     Ok(TaskResult::Bind(plan))
 }
 
-#[inline]
-fn slot_warning() {
-    // The slot should be locked before sending the response.
-    // Normally this operation can not fail because its backend
-    // is waiting for response and should not hold any locks.
-    // But if it does it means that the old backend was terminated
-    // and some other one acquired the same slot. So, fsm should
-    // be reset to initial value.
-    warning!(
-        "{} {} {} {}",
-        "Failed to lock the slot for error response.",
-        "Looks like the old backend was terminated",
-        "and the slot is acquired by another backend.",
-        "The state machine will be reset to the initial state.",
-    );
-}
-
 fn response_error(id: SlotNumber, ctx: &mut WorkerContext, stream: SlotStream, message: &str) {
     ctx.flush(id);
-    if let Err(err) = send_error(id, stream, message) {
-        warning!("Failed to send the error message: {}", err);
-    }
+    send_error(id, stream, message).expect("Failed to send error response");
 }

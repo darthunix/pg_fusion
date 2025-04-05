@@ -51,10 +51,11 @@ impl TryFrom<u8> for Direction {
 #[derive(Clone, Debug, Default, PartialEq)]
 pub enum Packet {
     #[default]
-    Bind = 0,
-    Failure = 1,
-    Metadata = 2,
-    Parse = 3,
+    None = 0,
+    Bind = 1,
+    Failure = 2,
+    Metadata = 3,
+    Parse = 4,
 }
 
 impl TryFrom<u8> for Packet {
@@ -63,10 +64,11 @@ impl TryFrom<u8> for Packet {
     fn try_from(value: u8) -> Result<Self, Self::Error> {
         assert!(value < 128);
         match value {
-            0 => Ok(Packet::Bind),
-            1 => Ok(Packet::Failure),
-            2 => Ok(Packet::Metadata),
-            3 => Ok(Packet::Parse),
+            0 => Ok(Packet::None),
+            1 => Ok(Packet::Bind),
+            2 => Ok(Packet::Failure),
+            3 => Ok(Packet::Metadata),
+            4 => Ok(Packet::Parse),
             _ => Err(FusionError::Deserialize("packet".to_string(), value.into())),
         }
     }
