@@ -164,7 +164,7 @@ pub(crate) fn read_query(stream: &mut SlotStream) -> Result<(&str, u32)> {
     Ok((query, len))
 }
 
-fn prepare_query(stream: &mut SlotStream, query: &str) -> Result<()> {
+pub(crate) fn prepare_query(stream: &mut SlotStream, query: &str) -> Result<()> {
     stream.reset();
     // slot: header - bin marker - bin length - query bytes
     let length = 1 + 1 + query.len();
@@ -478,13 +478,12 @@ pub(crate) fn consume_metadata(
 #[cfg(any(test, feature = "pg_test"))]
 #[pg_schema]
 mod tests {
+    use crate::ipc::tests::{make_slot, SLOT_SIZE};
+
     use super::*;
     use datafusion::arrow::datatypes::DataType;
     use pgrx::pg_sys::{Datum, Oid};
     use rmp::decode::{read_bool, read_u32};
-    use std::ptr::addr_of_mut;
-
-    const SLOT_SIZE: usize = 8204;
 
     #[pg_test]
     fn test_header() {
@@ -495,10 +494,7 @@ mod tests {
             flag: Flag::Last,
         };
         let mut slot_buf: [u8; SLOT_SIZE] = [1; SLOT_SIZE];
-        let ptr = addr_of_mut!(slot_buf) as *mut u8;
-        Slot::init(ptr, slot_buf.len());
-        let slot = Slot::from_bytes(ptr, slot_buf.len());
-        let mut stream: SlotStream = slot.into();
+        let mut stream: SlotStream = make_slot(&mut slot_buf).into();
         write_header(&mut stream, &header).unwrap();
         stream.reset();
         let new_header = consume_header(&mut stream).unwrap();
@@ -508,11 +504,8 @@ mod tests {
     #[pg_test]
     fn test_query() {
         let mut slot_buf: [u8; SLOT_SIZE] = [1; SLOT_SIZE];
-        let ptr = addr_of_mut!(slot_buf) as *mut u8;
-        Slot::init(ptr, slot_buf.len());
-        let slot = Slot::from_bytes(ptr, slot_buf.len());
+        let mut stream: SlotStream = make_slot(&mut slot_buf).into();
         let sql = "SELECT 1";
-        let mut stream: SlotStream = slot.into();
         prepare_query(&mut stream, sql).unwrap();
         stream.reset();
         let header = consume_header(&mut stream).unwrap();
@@ -528,10 +521,7 @@ mod tests {
     #[pg_test]
     fn test_params() {
         let mut slot_buf: [u8; SLOT_SIZE] = [1; SLOT_SIZE];
-        let ptr = addr_of_mut!(slot_buf) as *mut u8;
-        Slot::init(ptr, slot_buf.len());
-        let slot = Slot::from_bytes(ptr, slot_buf.len());
-        let mut stream: SlotStream = slot.into();
+        let mut stream: SlotStream = make_slot(&mut slot_buf).into();
         let p1 = ParamExternData {
             value: Datum::from(1),
             ptype: pg_sys::INT4OID,
@@ -559,11 +549,8 @@ mod tests {
     #[pg_test]
     fn test_error() {
         let mut slot_buf: [u8; SLOT_SIZE] = [1; SLOT_SIZE];
-        let ptr = addr_of_mut!(slot_buf) as *mut u8;
-        Slot::init(ptr, slot_buf.len());
-        let slot = Slot::from_bytes(ptr, slot_buf.len());
+        let mut stream: SlotStream = make_slot(&mut slot_buf).into();
         let message = "An error occurred";
-        let mut stream: SlotStream = slot.into();
         prepare_error(&mut stream, message).unwrap();
         stream.reset();
         let header = consume_header(&mut stream).unwrap();
@@ -578,10 +565,7 @@ mod tests {
     #[pg_test]
     fn test_table_request() {
         let mut slot_buf: [u8; SLOT_SIZE] = [1; SLOT_SIZE];
-        let ptr = addr_of_mut!(slot_buf) as *mut u8;
-        Slot::init(ptr, slot_buf.len());
-        let slot = Slot::from_bytes(ptr, slot_buf.len());
-        let mut stream: SlotStream = slot.into();
+        let mut stream: SlotStream = make_slot(&mut slot_buf).into();
         let t1 = TableReference::bare("table1");
         let t2 = TableReference::partial("schema", "table2");
         let tables = vec![t1, t2];
@@ -630,10 +614,7 @@ mod tests {
             .unwrap();
 
         let mut slot_buf: [u8; SLOT_SIZE] = [1; SLOT_SIZE];
-        let ptr = addr_of_mut!(slot_buf) as *mut u8;
-        Slot::init(ptr, slot_buf.len());
-        let slot = Slot::from_bytes(ptr, slot_buf.len());
-        let mut stream: SlotStream = slot.into();
+        let mut stream: SlotStream = make_slot(&mut slot_buf).into();
 
         prepare_metadata(&[(t1_oid, false), (t2_oid, true)], &mut stream).unwrap();
         stream.reset();
@@ -711,6 +692,7 @@ mod tests {
         assert_eq!(name, b"a");
         stream.rewind(name_len as usize).unwrap();
     }
+
     #[pg_test]
     fn test_metadata_to_tables() {
         Spi::run("create table if not exists t1(a int not null, b text);").unwrap();
@@ -724,10 +706,7 @@ mod tests {
             .unwrap();
 
         let mut slot_buf: [u8; SLOT_SIZE] = [1; SLOT_SIZE];
-        let ptr = addr_of_mut!(slot_buf) as *mut u8;
-        Slot::init(ptr, slot_buf.len());
-        let slot = Slot::from_bytes(ptr, slot_buf.len());
-        let mut stream: SlotStream = slot.into();
+        let mut stream: SlotStream = make_slot(&mut slot_buf).into();
 
         prepare_metadata(&[(t1_oid, false), (t2_oid, true)], &mut stream).unwrap();
         stream.reset();

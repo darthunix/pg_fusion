@@ -26,6 +26,7 @@ use tokio::task::JoinHandle;
 // FIXME: This should be configurable.
 const TOKIO_THREAD_NUMBER: usize = 1;
 const WORKER_WAIT_TIMEOUT: Duration = Duration::from_millis(100);
+const SLOT_WAIT_TIMEOUT: Duration = Duration::from_millis(1);
 
 #[pg_guard]
 pub(crate) fn init_datafusion_worker() {
@@ -102,7 +103,6 @@ fn init_slots() -> Result<()> {
 #[pg_guard]
 #[no_mangle]
 pub extern "C" fn worker_main(_arg: pg_sys::Datum) {
-    unsafe { set_worker_id(MyProcNumber) };
     BackgroundWorker::attach_signal_handlers(SignalWakeFlags::SIGHUP | SignalWakeFlags::SIGTERM);
     let mut ctx = WorkerContext::new();
     let rt = Builder::new_multi_thread()
@@ -111,31 +111,41 @@ pub extern "C" fn worker_main(_arg: pg_sys::Datum) {
         .build()
         .unwrap();
     let mut do_retry = false;
-    let mut slots_with_error: Vec<(SlotNumber, SmolStr)> =
-        vec![(INVALID_SLOT_NUMBER, "".into()); max_backends() as usize];
+    let mut errors: Vec<Option<SmolStr>> = vec![None; max_backends() as usize];
     init_slots().expect("Failed to initialize slots");
+    unsafe { set_worker_id(MyProcNumber) };
 
     log!("DataFusion worker is running");
     while do_retry || BackgroundWorker::wait_latch(Some(WORKER_WAIT_TIMEOUT)) {
-        // Do not use any pgrx API in this loop: it is multithreaded while PostgreSQL
-        // functions can work only in the main thread.
+        // Do not use any pgrx API in this loop: tokio has a multithreaded runtime,
+        // while PostgreSQL functions can work only in single thread processes.
         rt.block_on(async {
             do_retry = false;
+            // Process packets from the slots.
             for (id, locked_slot) in Bus::new().into_iter().enumerate() {
                 let Some(slot) = locked_slot else {
                     continue;
                 };
                 let mut stream = SlotStream::from(slot);
-                let header = consume_header(&mut stream).expect("Failed to consume header");
+                let header = match consume_header(&mut stream) {
+                    Ok(header) => header,
+                    Err(err) => {
+                        errors[id] = Some(format_smolstr!("Failed to consume header: {:?}", err));
+                        continue;
+                    }
+                };
                 if header.direction == Direction::ToBackend {
                     continue;
                 }
                 let machine = &mut ctx.states[id];
                 let slot_id = u32::try_from(id).expect("Failed to convert slot id to u32");
-                let Ok(output) = machine.consume(&header.packet) else {
-                    let msg = format_smolstr!("Failed to consume event: {:?}", &header.packet);
-                    response_error(slot_id, &mut ctx, stream, &msg);
-                    continue;
+                let output = match machine.consume(&header.packet) {
+                    Ok(output) => output,
+                    Err(err) => {
+                        let msg = format_smolstr!("Failed to change machine state: {:?}", err);
+                        errors[id] = Some(msg);
+                        continue;
+                    }
                 };
                 let handle = match output {
                     Some(ExecutorOutput::Parse) => tokio::spawn(parse(header, stream)),
@@ -144,43 +154,40 @@ pub extern "C" fn worker_main(_arg: pg_sys::Datum) {
                         continue;
                     }
                     Some(ExecutorOutput::Compile) => {
-                        let stmt = std::mem::take(&mut ctx.statements[id])
-                            .expect("Failed to take statement");
+                        let Some(stmt) = std::mem::take(&mut ctx.statements[id]) else {
+                            errors[id] = Some(format_smolstr!("No statement found for slot: {id}"));
+                            continue;
+                        };
                         tokio::spawn(compile(header, stream, stmt))
                     }
                     Some(ExecutorOutput::Bind) => {
-                        let plan = std::mem::take(&mut ctx.logical_plans[id])
-                            .expect("Failed to take logical plan");
+                        let Some(plan) = std::mem::take(&mut ctx.logical_plans[id]) else {
+                            errors[id] =
+                                Some(format_smolstr!("No logical plan found for slot: {id}"));
+                            continue;
+                        };
                         tokio::spawn(bind(header, stream, plan))
                     }
                     None => unreachable!("Empty output in the worker state machine"),
                 };
                 ctx.tasks.push((slot_id, handle));
             }
-            let wait_stream = |slot_id: u32| -> SlotStream {
-                let stream;
-                loop {
-                    let Some(slot) = Bus::new().slot_locked(slot_id) else {
-                        BackgroundWorker::wait_latch(None);
-                        continue;
-                    };
-                    stream = Some(SlotStream::from(slot));
-                    break;
-                }
-                stream.expect("Failed to acquire a slot stream")
-            };
+            // Wait for the tasks to finish and process their results.
             for (id, task) in &mut ctx.tasks {
                 let result = task.await.expect("Failed to await task");
                 match result {
                     Ok(TaskResult::Parsing((stmt, tables))) => {
-                        let mut stream = wait_stream(*id);
+                        let mut stream = wait_stream(*id).await;
                         if tables.is_empty() {
                             // We don't need any table metadata for this query.
                             // So, write a fake metadata packet to the slot and proceed it
                             // in the next iteration.
                             do_retry = true;
-                            prepare_metadata(&[], &mut stream)
-                                .expect("Failed to prepare empty metadata");
+                            if let Err(err) = prepare_metadata(&[], &mut stream) {
+                                errors[*id as usize] =
+                                    Some(format_smolstr!("Failed to prepare metadata: {:?}", err));
+                                continue;
+                            }
                         } else {
                             send_table_refs(*id, stream, tables.as_slice())
                                 .expect("Failed to reqest table references");
@@ -188,33 +195,57 @@ pub extern "C" fn worker_main(_arg: pg_sys::Datum) {
                         ctx.statements[*id as usize] = Some(stmt);
                     }
                     Ok(TaskResult::Compilation(plan)) => {
-                        let stream = wait_stream(*id);
-                        request_params(*id, stream).expect("Failed to request parameters");
+                        let stream = wait_stream(*id).await;
+                        if let Err(err) = request_params(*id, stream) {
+                            errors[*id as usize] =
+                                Some(format_smolstr!("Failed to request params: {:?}", err));
+                            continue;
+                        }
                         ctx.logical_plans[*id as usize] = Some(plan);
                     }
                     Ok(TaskResult::Bind(plan)) => {
                         ctx.logical_plans[*id as usize] = Some(plan);
                     }
                     Err(err) => {
-                        let msg = format_smolstr!("Failed to execute a task: {:?}", err);
-                        // We already hold a mutable reference to the worker context,
-                        // so this is a hack to avoid borrow checker complaints.
-                        slots_with_error[*id as usize] = (*id, msg);
+                        errors[*id as usize] =
+                            Some(format_smolstr!("Failed to execute task: {:?}", err))
                     }
                 }
             }
-            for (slot_id, msg) in &slots_with_error {
-                if *slot_id != INVALID_SLOT_NUMBER {
-                    let stream = wait_stream(*slot_id);
-                    response_error(*slot_id, &mut ctx, stream, msg);
-                }
-            }
         });
+        // Process errors in the main PostgreSQL thread.
+        for (slot_id, msg) in errors.iter_mut().enumerate() {
+            if let Some(msg) = msg {
+                let stream;
+                loop {
+                    let Some(slot) = Bus::new().slot_locked(slot_id as u32) else {
+                        BackgroundWorker::wait_latch(Some(SLOT_WAIT_TIMEOUT));
+                        continue;
+                    };
+                    stream = SlotStream::from(slot);
+                    break;
+                }
+                response_error(slot_id as u32, &mut ctx, stream, msg);
+            }
+            *msg = None;
+        }
+    }
+}
+
+#[inline(always)]
+async fn wait_stream(slot_id: u32) -> SlotStream {
+    loop {
+        let Some(slot) = Bus::new().slot_locked(slot_id) else {
+            tokio::time::sleep(SLOT_WAIT_TIMEOUT).await;
+            continue;
+        };
+        return SlotStream::from(slot);
     }
 }
 
 async fn parse(header: Header, mut stream: SlotStream) -> Result<TaskResult> {
     assert_eq!(header.packet, Packet::Parse);
+    assert_eq!(header.direction, Direction::ToWorker);
     // TODO: handle long queries that span multiple packets.
     assert_eq!(header.flag, Flag::Last);
     let (query, _) = read_query(&mut stream)?;
@@ -254,4 +285,34 @@ async fn bind(
 fn response_error(id: SlotNumber, ctx: &mut WorkerContext, stream: SlotStream, message: &str) {
     ctx.flush(id);
     send_error(id, stream, message).expect("Failed to send error response");
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::ipc::tests::{make_slot, SLOT_SIZE};
+    use crate::protocol::prepare_query;
+
+    #[tokio::test]
+    async fn test_parse() {
+        let mut buffer: [u8; SLOT_SIZE] = [0; SLOT_SIZE];
+        let mut stream: SlotStream = make_slot(&mut buffer).into();
+        let sql = "SELECT * FROM foo";
+        prepare_query(&mut stream, sql).unwrap();
+        stream.reset();
+        let header = consume_header(&mut stream).unwrap();
+        let result = parse(header, stream).await.expect("Failed to parse query");
+        let TaskResult::Parsing((stmt, tables)) = result else {
+            panic!("Expected parsing result");
+        };
+        let expected_stmt = DFParser::parse_sql(sql)
+            .expect("Failed to parse SQL")
+            .into_iter()
+            .next()
+            .expect("Failed to get statement");
+        assert_eq!(stmt, expected_stmt);
+        assert_eq!(tables.len(), 1);
+        let expected_table = TableReference::bare("foo");
+        assert_eq!(tables[0], expected_table);
+    }
 }

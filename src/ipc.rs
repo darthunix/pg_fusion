@@ -505,22 +505,26 @@ pub unsafe extern "C" fn init_shmem() {
 
 #[cfg(any(test, feature = "pg_test"))]
 #[pg_schema]
-mod tests {
+pub(crate) mod tests {
     use pgrx::prelude::*;
     use std::ptr::addr_of_mut;
 
     use super::*;
 
-    const SLOT_SIZE: usize = 8204;
-    //FIXME: make these buffers local
+    pub const SLOT_SIZE: usize = 8204;
     static mut FREE_LIST_BUFFER: [u8; 50] = [1; 50];
-    static mut SLOT_BUFFER: [u8; SLOT_SIZE] = [1; SLOT_SIZE];
-    static mut BUS_BUFFER: [u8; SLOT_SIZE * 10] = [1; SLOT_SIZE * 10];
 
     fn set_bytes(buf: &mut [u8], positions: &[usize], value: u8) {
         for &pos in positions {
             buf[pos] = value;
         }
+    }
+
+    #[inline(always)]
+    pub(crate) fn make_slot(bytes: &mut [u8]) -> Slot {
+        let ptr = addr_of_mut!(*bytes) as *mut u8;
+        Slot::init(ptr, bytes.len());
+        Slot::from_bytes(ptr, bytes.len())
     }
 
     #[pg_test]
@@ -557,29 +561,23 @@ mod tests {
     #[pg_test]
     fn test_slot() {
         assert_eq!(Slot::estimated_size(), SLOT_SIZE);
-        let ptr = addr_of_mut!(SLOT_BUFFER) as *mut u8;
-        let len = unsafe { SLOT_BUFFER.len() };
-        Slot::init(ptr, len);
-        let mut slot = Slot::from_bytes(ptr, len);
-        assert_eq!(slot.lock(), true);
-        assert_eq!(slot.lock(), false);
+        let mut slot_buf: [u8; SLOT_SIZE] = [1; SLOT_SIZE];
+        let mut slot = make_slot(&mut slot_buf);
+        assert!(slot.lock());
+        assert!(!slot.lock());
         unsafe {
-            assert_eq!(&SLOT_BUFFER[Slot::range1()], &[1]);
+            assert_eq!(&slot_buf[Slot::range1()], &[1]);
             write(slot.data_mut(), [1; DATA_SIZE]);
-            assert_eq!(&SLOT_BUFFER[Slot::range4()], [1; DATA_SIZE]);
+            assert_eq!(&slot_buf[Slot::range4()], [1; DATA_SIZE]);
         }
         slot.unlock();
-        unsafe {
-            assert_eq!(&SLOT_BUFFER[Slot::range1()], &[0]);
-        }
+        assert_eq!(&slot_buf[Slot::range1()], &[0]);
     }
 
     #[pg_test]
     fn test_slot_stream() {
         let mut buffer: [u8; SLOT_SIZE] = [1; SLOT_SIZE];
-        let ptr = addr_of_mut!(buffer) as *mut u8;
-        Slot::init(ptr, buffer.len());
-        let slot = Slot::from_bytes(ptr, buffer.len());
+        let slot = make_slot(&mut buffer);
         slot.lock();
         let mut stream = SlotStream::from(slot);
         let data = [42; 10];
@@ -588,7 +586,7 @@ mod tests {
         let len = stream.write(&data).unwrap();
         assert_eq!(len, 10);
         let slot = Slot::from(stream);
-        assert_eq!(slot.is_locked(), true);
+        assert!(slot.is_locked());
         assert_eq!(slot.data()[0..10], data);
         assert_eq!(slot.data()[10..20], data);
         assert_eq!(slot.data()[20..30], [1; 10]);
@@ -607,36 +605,36 @@ mod tests {
         // Test slot is unlocked on drop
         {
             let slot = Slot::from(stream);
-            assert_eq!(slot.is_locked(), true);
+            assert!(slot.is_locked());
         }
+        let ptr = addr_of_mut!(buffer) as *mut u8;
         let slot = Slot::from_bytes(ptr, buffer.len());
-        assert_eq!(slot.is_locked(), false);
+        assert!(!slot.is_locked());
     }
 
     #[pg_test]
     fn test_bus() {
-        let ptr = addr_of_mut!(BUS_BUFFER) as *mut u8;
-        let len = unsafe { BUS_BUFFER.len() };
+        let mut buffer: [u8; SLOT_SIZE * 10] = [1; SLOT_SIZE * 10];
+        let ptr = addr_of_mut!(buffer) as *mut u8;
+        let len = buffer.len();
         Bus::init(ptr, len);
         let slot_size = Slot::estimated_size();
         assert_eq!(Bus::estimated_size(), slot_size * 10);
         for i in 0..max_backends() as usize {
             unsafe {
-                let slot_ptr = BUS_BUFFER.as_ptr().add(i * slot_size);
-                assert_eq!(slot_ptr, &BUS_BUFFER[i * slot_size] as *const u8);
-                assert_eq!(BUS_BUFFER[i * slot_size], 0);
+                let slot_ptr = buffer.as_ptr().add(i * slot_size);
+                assert_eq!(slot_ptr, &buffer[i * slot_size] as *const u8);
+                assert_eq!(buffer[i * slot_size], 0);
             }
         }
         let mut bus = Bus::from_bytes(ptr, len);
         for i in 0..max_backends() {
             let slot = bus.slot_locked(i);
-            assert_eq!(slot.is_some(), true);
+            assert!(slot.is_some());
             let slot = slot.unwrap();
-            assert_eq!(slot.lock(), false);
+            assert!(!slot.lock());
             slot.unlock();
-            unsafe {
-                assert_eq!(BUS_BUFFER[i as usize * slot_size], 0);
-            }
+            assert_eq!(buffer[i as usize * slot_size], 0);
         }
     }
 }
