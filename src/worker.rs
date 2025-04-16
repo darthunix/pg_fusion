@@ -1,9 +1,7 @@
 use crate::error::FusionError;
 use crate::fsm::executor::StateMachine;
 use crate::fsm::ExecutorOutput;
-use crate::ipc::{
-    init_shmem, max_backends, set_worker_id, Bus, SlotNumber, SlotStream, INVALID_SLOT_NUMBER,
-};
+use crate::ipc::{init_shmem, max_backends, set_worker_id, Bus, SlotNumber, SlotStream};
 use crate::protocol::{
     consume_header, prepare_metadata, read_params, read_query, request_params, send_error,
     send_table_refs, write_header, Direction, Flag, Header, Packet,
@@ -289,7 +287,11 @@ fn response_error(id: SlotNumber, ctx: &mut WorkerContext, stream: SlotStream, m
 
 #[cfg(test)]
 mod tests {
+    use datafusion::scalar::ScalarValue;
+    use rmp::encode::{write_array_len, write_bool, write_str, write_u32, write_u8};
+
     use super::*;
+    use crate::data_type::{write_scalar_value, EncodedType};
     use crate::ipc::tests::{make_slot, SLOT_SIZE};
     use crate::protocol::prepare_query;
 
@@ -314,5 +316,119 @@ mod tests {
         assert_eq!(tables.len(), 1);
         let expected_table = TableReference::bare("foo");
         assert_eq!(tables[0], expected_table);
+    }
+
+    fn mock_foo_meta(stream: &mut SlotStream) {
+        stream.reset();
+        write_header(stream, &Header::default()).unwrap();
+        let pos_init = stream.position();
+        // amount of tables
+        write_array_len(stream, 1).unwrap();
+        // table foo
+        write_array_len(stream, 2).unwrap();
+        // oid
+        write_u32(stream, 42).unwrap();
+        // name
+        write_str(stream, "foo").unwrap();
+        // amount of columns
+        write_array_len(stream, 2).unwrap();
+        // column a
+        write_array_len(stream, 3).unwrap();
+        // type Int32
+        write_u8(stream, EncodedType::Int32 as u8).unwrap();
+        // nullable
+        write_bool(stream, true).unwrap();
+        // name
+        write_str(stream, "a").unwrap();
+        // column b
+        write_array_len(stream, 3).unwrap();
+        // type Utf8
+        write_u8(stream, EncodedType::Utf8 as u8).unwrap();
+        // not nullable
+        write_bool(stream, false).unwrap();
+        // name
+        write_str(stream, "b").unwrap();
+        let pos_final = stream.position();
+        let length = u16::try_from(pos_final - pos_init).unwrap();
+        let header = Header {
+            direction: Direction::ToWorker,
+            packet: Packet::Metadata,
+            length,
+            flag: Flag::Last,
+        };
+        stream.reset();
+        write_header(stream, &header).unwrap();
+        stream.rewind(length as usize).unwrap();
+    }
+
+    fn mock_a_param(stream: &mut SlotStream) {
+        stream.reset();
+        write_header(stream, &Header::default()).unwrap();
+        let pos_init = stream.position();
+        // amount of params
+        write_array_len(stream, 1).unwrap();
+        // a
+        write_scalar_value(stream, &ScalarValue::Int32(Some(1)))
+            .expect("Failed to write scalar value");
+        let pos_final = stream.position();
+        let length = u16::try_from(pos_final - pos_init).unwrap();
+        let header = Header {
+            direction: Direction::ToWorker,
+            packet: Packet::Bind,
+            length,
+            flag: Flag::Last,
+        };
+        stream.reset();
+        write_header(stream, &header).unwrap();
+        stream.rewind(length as usize).unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_compile_and_bind() {
+        let mut buffer: [u8; SLOT_SIZE] = [0; SLOT_SIZE];
+
+        // Test compilation of a query.
+        let mut stream: SlotStream = make_slot(&mut buffer).into();
+        mock_foo_meta(&mut stream);
+        stream.reset();
+        let header = consume_header(&mut stream).unwrap();
+        let sql = "SELECT * FROM foo WHERE a = $1";
+        let stmt = DFParser::parse_sql(sql)
+            .expect("Failed to parse SQL")
+            .into_iter()
+            .next()
+            .expect("Failed to get statement");
+        let result = compile(header, stream, stmt)
+            .await
+            .expect("Failed to compile query");
+        let TaskResult::Compilation(plan) = result else {
+            panic!("Expected compilation result");
+        };
+        let explain = format_smolstr!("{}", plan.display_indent_schema());
+        assert_eq!(
+            explain,
+            r#"Projection: * [a:Int32;N, b:Utf8]
+  Filter: foo.a = $1 [a:Int32;N, b:Utf8]
+    TableScan: foo [a:Int32;N, b:Utf8]"#,
+        );
+
+        // Now we need to bind the parameters.
+        let mut stream: SlotStream = make_slot(&mut buffer).into();
+        mock_a_param(&mut stream);
+        stream.reset();
+        let header = consume_header(&mut stream).unwrap();
+        let result = bind(header, stream, plan)
+            .await
+            .expect("Failed to bind parameters");
+        let TaskResult::Bind(plan) = result else {
+            panic!("Expected bind result");
+        };
+        let explain = format_smolstr!("{}", plan.display_indent_schema());
+        assert_eq!(
+            explain,
+            r#"Projection: * [a:Int32;N, b:Utf8]
+  Filter: foo.a = Int32(1) [a:Int32;N, b:Utf8]
+    TableScan: foo [a:Int32;N, b:Utf8]"#,
+        );
     }
 }

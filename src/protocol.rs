@@ -15,7 +15,7 @@ use pgrx::pg_sys::{Oid, ParamExternData, ProcSendSignal};
 use pgrx::prelude::*;
 use pgrx::{pg_guard, PgRelation};
 use rmp::decode::{
-    read_array_len, read_bin_len, read_bool, read_pfix, read_str_len, read_u16, read_u32, read_u8,
+    read_array_len, read_bool, read_pfix, read_str_len, read_u16, read_u32, read_u8,
 };
 use rmp::encode::{
     write_array_len, write_bin_len, write_bool, write_pfix, write_str, write_u16, write_u32,
@@ -192,7 +192,7 @@ pub(crate) fn send_query(slot_id: SlotNumber, mut stream: SlotStream, query: &st
 
 // BIND
 
-fn prepare_params(stream: &mut SlotStream, params: &[ParamExternData]) -> Result<()> {
+pub(crate) fn prepare_params(stream: &mut SlotStream, params: &[ParamExternData]) -> Result<()> {
     stream.reset();
     // We don't know the length of the parameters yet. So we write an invalid header
     // to replace it with the correct one later.
@@ -483,7 +483,7 @@ mod tests {
     use super::*;
     use datafusion::arrow::datatypes::DataType;
     use pgrx::pg_sys::{Datum, Oid};
-    use rmp::decode::{read_bool, read_u32};
+    use rmp::decode::{read_bin_len, read_bool, read_u32};
 
     #[pg_test]
     fn test_header() {

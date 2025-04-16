@@ -1,7 +1,7 @@
 use anyhow::Result as AnyResult;
 use libc::c_long;
 use pgrx::pg_sys::{
-    self, error, fetch_search_path_array, get_namespace_oid, get_relname_relid, palloc0,
+    error, fetch_search_path_array, get_namespace_oid, get_relname_relid, palloc0,
     CustomExecMethods, CustomScan, CustomScanMethods, CustomScanState, EState, ExplainState,
     InvalidOid, List, ListCell, MyLatch, Node, NodeTag, Oid, ParamListInfo,
     RegisterCustomScanMethods, ResetLatch, TupleTableSlot, WaitLatch, PG_WAIT_EXTENSION,
@@ -310,6 +310,7 @@ mod tests {
 
     use super::*;
     use datafusion_sql::TableReference;
+    use pgrx::pg_sys;
     use pgrx::prelude::*;
     use pgrx::spi::Spi;
     use std::ffi::c_void;

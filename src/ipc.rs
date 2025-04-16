@@ -13,7 +13,6 @@ use std::sync::atomic::{AtomicBool, AtomicI32, Ordering};
 static mut SLOT_FREE_LIST_PTR: OnceCell<*mut c_void> = OnceCell::new();
 static mut BUS_PTR: OnceCell<*mut c_void> = OnceCell::new();
 static mut WORKER_PID_PTR: OnceCell<*mut c_void> = OnceCell::new();
-pub(crate) const INVALID_SLOT_NUMBER: SlotNumber = u32::MAX;
 pub(crate) const INVALID_PROC_NUMBER: i32 = -1;
 pub(crate) const DATA_SIZE: usize = 8 * 1024;
 pub(crate) static mut CURRENT_SLOT: OnceCell<SlotHandler> = OnceCell::new();
