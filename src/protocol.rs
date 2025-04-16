@@ -415,6 +415,20 @@ pub(crate) fn prepare_metadata(
     Ok(())
 }
 
+pub(crate) fn prepare_empty_metadata(stream: &mut SlotStream) -> Result<()> {
+    stream.reset();
+    let header = Header {
+        direction: Direction::ToWorker,
+        packet: Packet::Metadata,
+        // The length of a zero element array in msgpack.
+        length: size_of::<u8>() as u16,
+        flag: Flag::Last,
+    };
+    write_header(stream, &header)?;
+    write_array_len(stream, 0)?;
+    Ok(())
+}
+
 pub(crate) fn send_metadata(
     slot_id: SlotNumber,
     mut stream: SlotStream,

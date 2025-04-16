@@ -1,9 +1,11 @@
 use crate::error::FusionError;
 use crate::fsm::executor::StateMachine;
 use crate::fsm::ExecutorOutput;
-use crate::ipc::{init_shmem, max_backends, set_worker_id, Bus, SlotNumber, SlotStream};
+use crate::ipc::{
+    init_shmem, max_backends, set_worker_id, Bus, SlotNumber, SlotStream, INVALID_PROC_NUMBER,
+};
 use crate::protocol::{
-    consume_header, prepare_metadata, read_params, read_query, request_params, send_error,
+    consume_header, prepare_empty_metadata, read_params, read_query, request_params, send_error,
     send_table_refs, write_header, Direction, Flag, Header, Packet,
 };
 use crate::sql::Catalog;
@@ -181,7 +183,7 @@ pub extern "C" fn worker_main(_arg: pg_sys::Datum) {
                             // So, write a fake metadata packet to the slot and proceed it
                             // in the next iteration.
                             do_retry = true;
-                            if let Err(err) = prepare_metadata(&[], &mut stream) {
+                            if let Err(err) = prepare_empty_metadata(&mut stream) {
                                 errors[*id as usize] =
                                     Some(format_smolstr!("Failed to prepare metadata: {:?}", err));
                                 continue;
@@ -228,6 +230,7 @@ pub extern "C" fn worker_main(_arg: pg_sys::Datum) {
             *msg = None;
         }
     }
+    set_worker_id(INVALID_PROC_NUMBER);
 }
 
 #[inline(always)]
@@ -429,6 +432,32 @@ mod tests {
             r#"Projection: * [a:Int32;N, b:Utf8]
   Filter: foo.a = Int32(1) [a:Int32;N, b:Utf8]
     TableScan: foo [a:Int32;N, b:Utf8]"#,
+        );
+    }
+
+    #[tokio::test]
+    async fn test_compile_empty_tables() {
+        let mut buffer: [u8; SLOT_SIZE] = [0; SLOT_SIZE];
+        let mut stream: SlotStream = make_slot(&mut buffer).into();
+        prepare_empty_metadata(&mut stream).unwrap();
+        stream.reset();
+        let header = consume_header(&mut stream).unwrap();
+        let sql = "SELECT 1";
+        let stmt = DFParser::parse_sql(sql)
+            .expect("Failed to parse SQL")
+            .into_iter()
+            .next()
+            .expect("Failed to get statement");
+        let result = compile(header, stream, stmt)
+            .await
+            .expect("Failed to compile query");
+        let TaskResult::Compilation(plan) = result else {
+            panic!("Expected compilation result");
+        };
+        let explain = format_smolstr!("{}", plan.display_indent_schema());
+        assert_eq!(
+            explain,
+            "Projection: Int64(1) [Int64(1):Int64]\n  EmptyRelation []",
         );
     }
 }
