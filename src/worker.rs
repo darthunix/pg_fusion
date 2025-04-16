@@ -28,6 +28,9 @@ const TOKIO_THREAD_NUMBER: usize = 1;
 const WORKER_WAIT_TIMEOUT: Duration = Duration::from_millis(100);
 const SLOT_WAIT_TIMEOUT: Duration = Duration::from_millis(1);
 
+// POSTGRES WORLD
+// Do not use any async functions in this part of the code.
+
 #[pg_guard]
 pub(crate) fn init_datafusion_worker() {
     BackgroundWorkerBuilder::new("datafusion")
@@ -100,6 +103,14 @@ fn init_slots() -> Result<()> {
     Ok(())
 }
 
+fn response_error(id: SlotNumber, ctx: &mut WorkerContext, stream: SlotStream, message: &str) {
+    ctx.flush(id);
+    send_error(id, stream, message).expect("Failed to send error response");
+}
+
+// POSTGRES - ASYNC BRIDGE
+// The place where async world meets the postgres world.
+
 #[pg_guard]
 #[no_mangle]
 pub extern "C" fn worker_main(_arg: pg_sys::Datum) {
@@ -117,103 +128,12 @@ pub extern "C" fn worker_main(_arg: pg_sys::Datum) {
 
     log!("DataFusion worker is running");
     while do_retry || BackgroundWorker::wait_latch(Some(WORKER_WAIT_TIMEOUT)) {
-        // Do not use any pgrx API in this loop: tokio has a multithreaded runtime,
-        // while PostgreSQL functions can work only in single thread processes.
         rt.block_on(async {
             do_retry = false;
-            // Process packets from the slots.
-            for (id, locked_slot) in Bus::new().into_iter().enumerate() {
-                let Some(slot) = locked_slot else {
-                    continue;
-                };
-                let mut stream = SlotStream::from(slot);
-                let header = match consume_header(&mut stream) {
-                    Ok(header) => header,
-                    Err(err) => {
-                        errors[id] = Some(format_smolstr!("Failed to consume header: {:?}", err));
-                        continue;
-                    }
-                };
-                if header.direction == Direction::ToBackend {
-                    continue;
-                }
-                let machine = &mut ctx.states[id];
-                let slot_id = u32::try_from(id).expect("Failed to convert slot id to u32");
-                let output = match machine.consume(&header.packet) {
-                    Ok(output) => output,
-                    Err(err) => {
-                        let msg = format_smolstr!("Failed to change machine state: {:?}", err);
-                        errors[id] = Some(msg);
-                        continue;
-                    }
-                };
-                let handle = match output {
-                    Some(ExecutorOutput::Parse) => tokio::spawn(parse(header, stream)),
-                    Some(ExecutorOutput::Flush) => {
-                        ctx.flush(slot_id);
-                        continue;
-                    }
-                    Some(ExecutorOutput::Compile) => {
-                        let Some(stmt) = std::mem::take(&mut ctx.statements[id]) else {
-                            errors[id] = Some(format_smolstr!("No statement found for slot: {id}"));
-                            continue;
-                        };
-                        tokio::spawn(compile(header, stream, stmt))
-                    }
-                    Some(ExecutorOutput::Bind) => {
-                        let Some(plan) = std::mem::take(&mut ctx.logical_plans[id]) else {
-                            errors[id] =
-                                Some(format_smolstr!("No logical plan found for slot: {id}"));
-                            continue;
-                        };
-                        tokio::spawn(bind(header, stream, plan))
-                    }
-                    None => unreachable!("Empty output in the worker state machine"),
-                };
-                ctx.tasks.push((slot_id, handle));
-            }
-            // Wait for the tasks to finish and process their results.
-            for (id, task) in &mut ctx.tasks {
-                let result = task.await.expect("Failed to await task");
-                match result {
-                    Ok(TaskResult::Parsing((stmt, tables))) => {
-                        let mut stream = wait_stream(*id).await;
-                        if tables.is_empty() {
-                            // We don't need any table metadata for this query.
-                            // So, write a fake metadata packet to the slot and proceed it
-                            // in the next iteration.
-                            do_retry = true;
-                            if let Err(err) = prepare_empty_metadata(&mut stream) {
-                                errors[*id as usize] =
-                                    Some(format_smolstr!("Failed to prepare metadata: {:?}", err));
-                                continue;
-                            }
-                        } else {
-                            send_table_refs(*id, stream, tables.as_slice())
-                                .expect("Failed to reqest table references");
-                        }
-                        ctx.statements[*id as usize] = Some(stmt);
-                    }
-                    Ok(TaskResult::Compilation(plan)) => {
-                        let stream = wait_stream(*id).await;
-                        if let Err(err) = request_params(*id, stream) {
-                            errors[*id as usize] =
-                                Some(format_smolstr!("Failed to request params: {:?}", err));
-                            continue;
-                        }
-                        ctx.logical_plans[*id as usize] = Some(plan);
-                    }
-                    Ok(TaskResult::Bind(plan)) => {
-                        ctx.logical_plans[*id as usize] = Some(plan);
-                    }
-                    Err(err) => {
-                        errors[*id as usize] =
-                            Some(format_smolstr!("Failed to execute task: {:?}", err))
-                    }
-                }
-            }
+            create_tasks(&mut ctx, &mut errors, &mut do_retry).await;
+            wait_results(&mut ctx, &mut errors, &mut do_retry).await;
         });
-        // Process errors in the main PostgreSQL thread.
+        // Process errors returned by the tasks.
         for (slot_id, msg) in errors.iter_mut().enumerate() {
             if let Some(msg) = msg {
                 let stream;
@@ -231,6 +151,113 @@ pub extern "C" fn worker_main(_arg: pg_sys::Datum) {
         }
     }
     set_worker_id(INVALID_PROC_NUMBER);
+}
+
+// ASYNC WORLD
+// Do not use any pgrx symbols in async functions. Tokio has a multithreaded
+// runtime, while postgres functions can work only in single thread.
+
+/// Process packets from the slots and create tasks for them.
+async fn create_tasks(
+    ctx: &mut WorkerContext,
+    errors: &mut [Option<SmolStr>],
+    do_retry: &mut bool,
+) {
+    for (id, locked_slot) in Bus::new().into_iter().enumerate() {
+        let Some(slot) = locked_slot else {
+            continue;
+        };
+        let mut stream = SlotStream::from(slot);
+        let header = match consume_header(&mut stream) {
+            Ok(header) => header,
+            Err(err) => {
+                errors[id] = Some(format_smolstr!("Failed to consume header: {:?}", err));
+                continue;
+            }
+        };
+        if header.direction == Direction::ToBackend {
+            continue;
+        }
+        let machine = &mut ctx.states[id];
+        let slot_id = u32::try_from(id).expect("Failed to convert slot id to u32");
+        let output = match machine.consume(&header.packet) {
+            Ok(output) => output,
+            Err(err) => {
+                let msg = format_smolstr!("Failed to change machine state: {:?}", err);
+                errors[id] = Some(msg);
+                continue;
+            }
+        };
+        let handle = match output {
+            Some(ExecutorOutput::Parse) => tokio::spawn(parse(header, stream)),
+            Some(ExecutorOutput::Flush) => {
+                ctx.flush(slot_id);
+                continue;
+            }
+            Some(ExecutorOutput::Compile) => {
+                let Some(stmt) = std::mem::take(&mut ctx.statements[id]) else {
+                    errors[id] = Some(format_smolstr!("No statement found for slot: {id}"));
+                    continue;
+                };
+                tokio::spawn(compile(header, stream, stmt))
+            }
+            Some(ExecutorOutput::Bind) => {
+                let Some(plan) = std::mem::take(&mut ctx.logical_plans[id]) else {
+                    errors[id] = Some(format_smolstr!("No logical plan found for slot: {id}"));
+                    continue;
+                };
+                tokio::spawn(bind(header, stream, plan))
+            }
+            None => unreachable!("Empty output in the worker state machine"),
+        };
+        ctx.tasks.push((slot_id, handle));
+    }
+}
+
+/// Wait for the tasks to finish and process their results.
+async fn wait_results(
+    ctx: &mut WorkerContext,
+    errors: &mut [Option<SmolStr>],
+    do_retry: &mut bool,
+) {
+    for (id, task) in &mut ctx.tasks {
+        let result = task.await.expect("Failed to await task");
+        match result {
+            Ok(TaskResult::Parsing((stmt, tables))) => {
+                let mut stream = wait_stream(*id).await;
+                if tables.is_empty() {
+                    // We don't need any table metadata for this query.
+                    // So, write a fake metadata packet to the slot and proceed it
+                    // in the next iteration.
+                    *do_retry = true;
+                    if let Err(err) = prepare_empty_metadata(&mut stream) {
+                        errors[*id as usize] =
+                            Some(format_smolstr!("Failed to prepare metadata: {:?}", err));
+                        continue;
+                    }
+                } else {
+                    send_table_refs(*id, stream, tables.as_slice())
+                        .expect("Failed to reqest table references");
+                }
+                ctx.statements[*id as usize] = Some(stmt);
+            }
+            Ok(TaskResult::Compilation(plan)) => {
+                let stream = wait_stream(*id).await;
+                if let Err(err) = request_params(*id, stream) {
+                    errors[*id as usize] =
+                        Some(format_smolstr!("Failed to request params: {:?}", err));
+                    continue;
+                }
+                ctx.logical_plans[*id as usize] = Some(plan);
+            }
+            Ok(TaskResult::Bind(plan)) => {
+                ctx.logical_plans[*id as usize] = Some(plan);
+            }
+            Err(err) => {
+                errors[*id as usize] = Some(format_smolstr!("Failed to execute task: {:?}", err))
+            }
+        }
+    }
 }
 
 #[inline(always)]
@@ -281,11 +308,6 @@ async fn bind(
     let params = read_params(&mut stream)?;
     let plan = base_plan.with_param_values(params)?;
     Ok(TaskResult::Bind(plan))
-}
-
-fn response_error(id: SlotNumber, ctx: &mut WorkerContext, stream: SlotStream, message: &str) {
-    ctx.flush(id);
-    send_error(id, stream, message).expect("Failed to send error response");
 }
 
 #[cfg(test)]
