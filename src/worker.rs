@@ -5,8 +5,8 @@ use crate::ipc::{
     init_shmem, max_backends, set_worker_id, Bus, SlotNumber, SlotStream, INVALID_PROC_NUMBER,
 };
 use crate::protocol::{
-    consume_header, prepare_empty_metadata, read_params, read_query, request_params, send_error,
-    send_table_refs, write_header, Direction, Flag, Header, Packet,
+    consume_header, prepare_empty_metadata, prepare_table_refs, read_params, read_query,
+    request_params, send_error, signal, write_header, Direction, Flag, Header, Packet,
 };
 use crate::sql::Catalog;
 use anyhow::Result;
@@ -122,7 +122,9 @@ pub extern "C" fn worker_main(_arg: pg_sys::Datum) {
         .build()
         .unwrap();
     let mut do_retry = false;
-    let mut errors: Vec<Option<SmolStr>> = vec![None; max_backends() as usize];
+    let capacity = max_backends() as usize;
+    let mut errors: Vec<Option<SmolStr>> = vec![None; capacity];
+    let mut signals: Vec<bool> = vec![false; capacity];
     init_slots().expect("Failed to initialize slots");
     unsafe { set_worker_id(MyProcNumber) };
 
@@ -130,8 +132,8 @@ pub extern "C" fn worker_main(_arg: pg_sys::Datum) {
     while do_retry || BackgroundWorker::wait_latch(Some(WORKER_WAIT_TIMEOUT)) {
         rt.block_on(async {
             do_retry = false;
-            create_tasks(&mut ctx, &mut errors, &mut do_retry).await;
-            wait_results(&mut ctx, &mut errors, &mut do_retry).await;
+            create_tasks(&mut ctx, &mut errors).await;
+            wait_results(&mut ctx, &mut errors, &mut signals, &mut do_retry).await;
         });
         // Process errors returned by the tasks.
         for (slot_id, msg) in errors.iter_mut().enumerate() {
@@ -149,6 +151,14 @@ pub extern "C" fn worker_main(_arg: pg_sys::Datum) {
             }
             *msg = None;
         }
+        // Signal backends about new messages.
+        for (id, do_signal) in signals.iter_mut().enumerate() {
+            let slot_id = id as u32;
+            if *do_signal {
+                signal(slot_id, Direction::ToBackend);
+                *do_signal = false;
+            }
+        }
     }
     set_worker_id(INVALID_PROC_NUMBER);
 }
@@ -158,11 +168,7 @@ pub extern "C" fn worker_main(_arg: pg_sys::Datum) {
 // runtime, while postgres functions can work only in single thread.
 
 /// Process packets from the slots and create tasks for them.
-async fn create_tasks(
-    ctx: &mut WorkerContext,
-    errors: &mut [Option<SmolStr>],
-    do_retry: &mut bool,
-) {
+async fn create_tasks(ctx: &mut WorkerContext, errors: &mut [Option<SmolStr>]) {
     for (id, locked_slot) in Bus::new().into_iter().enumerate() {
         let Some(slot) = locked_slot else {
             continue;
@@ -218,6 +224,7 @@ async fn create_tasks(
 async fn wait_results(
     ctx: &mut WorkerContext,
     errors: &mut [Option<SmolStr>],
+    signals: &mut [bool],
     do_retry: &mut bool,
 ) {
     for (id, task) in &mut ctx.tasks {
@@ -230,23 +237,37 @@ async fn wait_results(
                     // So, write a fake metadata packet to the slot and proceed it
                     // in the next iteration.
                     *do_retry = true;
-                    if let Err(err) = prepare_empty_metadata(&mut stream) {
-                        errors[*id as usize] =
-                            Some(format_smolstr!("Failed to prepare metadata: {:?}", err));
-                        continue;
+                    match prepare_empty_metadata(&mut stream) {
+                        Ok(()) => signals[*id as usize] = true,
+                        Err(err) => {
+                            errors[*id as usize] =
+                                Some(format_smolstr!("Failed to prepare metadata: {:?}", err));
+                            continue;
+                        }
                     }
                 } else {
-                    send_table_refs(*id, stream, tables.as_slice())
-                        .expect("Failed to reqest table references");
+                    match prepare_table_refs(&mut stream, tables.as_slice()) {
+                        Ok(()) => signals[*id as usize] = true,
+                        Err(err) => {
+                            errors[*id as usize] = Some(format_smolstr!(
+                                "Failed to prepare table references: {:?}",
+                                err
+                            ));
+                            continue;
+                        }
+                    }
                 }
                 ctx.statements[*id as usize] = Some(stmt);
             }
             Ok(TaskResult::Compilation(plan)) => {
-                let stream = wait_stream(*id).await;
-                if let Err(err) = request_params(*id, stream) {
-                    errors[*id as usize] =
-                        Some(format_smolstr!("Failed to request params: {:?}", err));
-                    continue;
+                let mut stream = wait_stream(*id).await;
+                match request_params(&mut stream) {
+                    Ok(()) => signals[*id as usize] = true,
+                    Err(err) => {
+                        errors[*id as usize] =
+                            Some(format_smolstr!("Failed to request params: {:?}", err));
+                        continue;
+                    }
                 }
                 ctx.logical_plans[*id as usize] = Some(plan);
             }

@@ -114,7 +114,7 @@ impl Header {
     }
 }
 
-fn signal(slot_id: SlotNumber, direction: Direction) {
+pub(crate) fn signal(slot_id: SlotNumber, direction: Direction) {
     match direction {
         Direction::ToWorker => {
             unsafe { ProcSendSignal(worker_id()) };
@@ -239,7 +239,7 @@ pub(crate) fn send_params(
     Ok(())
 }
 
-pub(crate) fn request_params(slot_id: SlotNumber, mut stream: SlotStream) -> Result<()> {
+pub(crate) fn request_params(stream: &mut SlotStream) -> Result<()> {
     stream.reset();
     let header = Header {
         direction: Direction::ToBackend,
@@ -247,10 +247,7 @@ pub(crate) fn request_params(slot_id: SlotNumber, mut stream: SlotStream) -> Res
         length: 0,
         flag: Flag::Last,
     };
-    write_header(&mut stream, &header)?;
-    // Unlock the slot after writing the parameters.
-    let _guard = Slot::from(stream);
-    signal(slot_id, Direction::ToBackend);
+    write_header(stream, &header)?;
     Ok(())
 }
 
@@ -338,18 +335,6 @@ pub(crate) fn prepare_table_refs(stream: &mut SlotStream, tables: &[TableReferen
     stream.reset();
     write_header(stream, &header)?;
     stream.rewind(length as usize)?;
-    Ok(())
-}
-
-pub(crate) fn send_table_refs(
-    slot_id: SlotNumber,
-    mut stream: SlotStream,
-    tables: &[TableReference],
-) -> Result<()> {
-    prepare_table_refs(&mut stream, tables)?;
-    // Unlock the slot after writing the table references.
-    let _guard = Slot::from(stream);
-    signal(slot_id, Direction::ToWorker);
     Ok(())
 }
 
