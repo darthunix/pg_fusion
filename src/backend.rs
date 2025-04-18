@@ -3,7 +3,7 @@ use libc::c_long;
 use pgrx::pg_sys::{
     error, fetch_search_path_array, get_namespace_oid, get_relname_relid, palloc0,
     CustomExecMethods, CustomScan, CustomScanMethods, CustomScanState, EState, ExplainState,
-    InvalidOid, List, ListCell, MyLatch, Node, NodeTag, Oid, ParamListInfo,
+    InvalidOid, List, ListCell, MyLatch, MyProcNumber, Node, NodeTag, Oid, ParamListInfo,
     RegisterCustomScanMethods, ResetLatch, TupleTableSlot, WaitLatch, PG_WAIT_EXTENSION,
     WL_LATCH_SET, WL_POSTMASTER_DEATH, WL_TIMEOUT,
 };
@@ -68,10 +68,11 @@ struct ScanState {
 #[pg_guard]
 #[no_mangle]
 unsafe extern "C" fn create_df_scan_state(cscan: *mut CustomScan) -> *mut Node {
+    let my_proc_number = unsafe { MyProcNumber };
     let wait_stream = || -> SlotStream {
         let stream;
         loop {
-            let Some(slot) = Bus::new().slot_locked(my_slot()) else {
+            let Some(slot) = Bus::new().slot_locked(my_slot(), my_proc_number) else {
                 wait_latch(Some(BACKEND_WAIT_TIMEOUT));
                 continue;
             };
@@ -95,7 +96,7 @@ unsafe extern "C" fn create_df_scan_state(cscan: *mut CustomScan) -> *mut Node {
             wait_latch(Some(BACKEND_WAIT_TIMEOUT));
             skip_wait = false;
         }
-        let Some(slot) = Bus::new().slot_locked(my_slot()) else {
+        let Some(slot) = Bus::new().slot_locked(my_slot(), my_proc_number) else {
             continue;
         };
         let mut stream = SlotStream::from(slot);

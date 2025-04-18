@@ -11,7 +11,7 @@ use std::slice::from_raw_parts_mut;
 use std::sync::atomic::{AtomicBool, AtomicI32, Ordering};
 
 static mut SLOT_FREE_LIST_PTR: OnceCell<*mut c_void> = OnceCell::new();
-static mut BUS_PTR: OnceCell<*mut c_void> = OnceCell::new();
+pub(crate) static mut BUS_PTR: OnceCell<*mut c_void> = OnceCell::new();
 static mut WORKER_PID_PTR: OnceCell<*mut c_void> = OnceCell::new();
 pub(crate) const INVALID_PROC_NUMBER: i32 = -1;
 pub(crate) const DATA_SIZE: usize = 8 * 1024;
@@ -268,17 +268,23 @@ impl Slot {
         unsafe { (*self.locked).load(Ordering::Relaxed) }
     }
 
-    pub(crate) fn lock(&self) -> bool {
+    pub(crate) fn lock(&self, holder: i32) -> bool {
         unsafe {
-            if let Ok(_) =
-                (*self.locked).compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed)
+            if (*self.locked)
+                .compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed)
+                .is_ok()
             {
-                (*self.holder).store(MyProcNumber, Ordering::Relaxed);
+                (*self.holder).store(holder, Ordering::Relaxed);
                 true
             } else {
                 false
             }
         }
+    }
+
+    pub(crate) fn pg_lock(&self) -> bool {
+        let holder = unsafe { MyProcNumber };
+        self.lock(holder)
     }
 
     pub(crate) fn unlock(&self) {
@@ -413,9 +419,9 @@ impl Bus {
         Slot::from_bytes(slot_ptr, Slot::estimated_size())
     }
 
-    pub(crate) fn slot_locked(&mut self, id: SlotNumber) -> Option<Slot> {
+    pub(crate) fn slot_locked(&mut self, id: SlotNumber, holder: i32) -> Option<Slot> {
         let slot = self.slot(id);
-        if slot.lock() {
+        if slot.lock(holder) {
             Some(slot)
         } else {
             None
@@ -427,21 +433,23 @@ impl Bus {
         Self::from_bytes(ptr as *mut u8, Self::estimated_size())
     }
 
-    pub(crate) fn into_iter(self) -> BusIter {
-        BusIter::from(self)
+    pub(crate) fn into_iter(self, holder: i32) -> BusIter {
+        BusIter::new(self, holder)
     }
 }
 
 pub(crate) struct BusIter {
     pos: SlotNumber,
     inner: Bus,
+    holder: i32,
 }
 
-impl From<Bus> for BusIter {
-    fn from(value: Bus) -> Self {
+impl BusIter {
+    pub(crate) fn new(bus: Bus, holder: i32) -> Self {
         Self {
             pos: 0,
-            inner: value,
+            inner: bus,
+            holder,
         }
     }
 }
@@ -453,7 +461,7 @@ impl Iterator for BusIter {
         if self.pos >= max_backends() {
             return None;
         }
-        let res = self.inner.slot_locked(self.pos);
+        let res = self.inner.slot_locked(self.pos, self.holder);
         self.pos += 1;
         Some(res)
     }
@@ -562,8 +570,8 @@ pub(crate) mod tests {
         assert_eq!(Slot::estimated_size(), SLOT_SIZE);
         let mut slot_buf: [u8; SLOT_SIZE] = [1; SLOT_SIZE];
         let mut slot = make_slot(&mut slot_buf);
-        assert!(slot.lock());
-        assert!(!slot.lock());
+        assert!(slot.pg_lock());
+        assert!(!slot.pg_lock());
         unsafe {
             assert_eq!(&slot_buf[Slot::range1()], &[1]);
             write(slot.data_mut(), [1; DATA_SIZE]);
@@ -577,7 +585,7 @@ pub(crate) mod tests {
     fn test_slot_stream() {
         let mut buffer: [u8; SLOT_SIZE] = [1; SLOT_SIZE];
         let slot = make_slot(&mut buffer);
-        slot.lock();
+        slot.pg_lock();
         let mut stream = SlotStream::from(slot);
         let data = [42; 10];
         let len = stream.write(&data).unwrap();
@@ -626,12 +634,13 @@ pub(crate) mod tests {
                 assert_eq!(buffer[i * slot_size], 0);
             }
         }
+        let my_proc_number = unsafe { MyProcNumber };
         let mut bus = Bus::from_bytes(ptr, len);
         for i in 0..max_backends() {
-            let slot = bus.slot_locked(i);
+            let slot = bus.slot_locked(i, my_proc_number);
             assert!(slot.is_some());
             let slot = slot.unwrap();
-            assert!(!slot.lock());
+            assert!(!slot.pg_lock());
             slot.unlock();
             assert_eq!(buffer[i as usize * slot_size], 0);
         }

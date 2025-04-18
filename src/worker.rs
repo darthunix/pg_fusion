@@ -54,8 +54,7 @@ struct WorkerContext {
 }
 
 impl WorkerContext {
-    fn new() -> Self {
-        let capacity = max_backends() as usize;
+    fn with_capacity(capacity: usize) -> Self {
         let tasks = Vec::with_capacity(capacity);
         let mut states = Vec::with_capacity(capacity);
         let mut statements = Vec::with_capacity(capacity);
@@ -88,8 +87,8 @@ impl WorkerContext {
     }
 }
 
-fn init_slots() -> Result<()> {
-    for locked_slot in Bus::new().into_iter().flatten() {
+fn init_slots(holder: i32) -> Result<()> {
+    for locked_slot in Bus::new().into_iter(holder).flatten() {
         let mut stream = SlotStream::from(locked_slot);
         stream.reset();
         let header = Header {
@@ -115,32 +114,41 @@ fn response_error(id: SlotNumber, ctx: &mut WorkerContext, stream: SlotStream, m
 #[no_mangle]
 pub extern "C" fn worker_main(_arg: pg_sys::Datum) {
     BackgroundWorker::attach_signal_handlers(SignalWakeFlags::SIGHUP | SignalWakeFlags::SIGTERM);
-    let mut ctx = WorkerContext::new();
+    let capacity = max_backends() as usize;
+    let mut ctx = WorkerContext::with_capacity(capacity);
     let rt = Builder::new_multi_thread()
         .worker_threads(TOKIO_THREAD_NUMBER)
         .enable_all()
         .build()
         .unwrap();
     let mut do_retry = false;
-    let capacity = max_backends() as usize;
     let mut errors: Vec<Option<SmolStr>> = vec![None; capacity];
     let mut signals: Vec<bool> = vec![false; capacity];
-    init_slots().expect("Failed to initialize slots");
-    unsafe { set_worker_id(MyProcNumber) };
+    let worker_proc_number = unsafe { MyProcNumber };
+    init_slots(worker_proc_number).expect("Failed to initialize slots");
+    set_worker_id(worker_proc_number);
 
     log!("DataFusion worker is running");
     while do_retry || BackgroundWorker::wait_latch(Some(WORKER_WAIT_TIMEOUT)) {
         rt.block_on(async {
             do_retry = false;
-            create_tasks(&mut ctx, &mut errors).await;
-            wait_results(&mut ctx, &mut errors, &mut signals, &mut do_retry).await;
+            create_tasks(&mut ctx, &mut errors, worker_proc_number).await;
+            wait_results(
+                &mut ctx,
+                &mut errors,
+                &mut signals,
+                &mut do_retry,
+                worker_proc_number,
+            )
+            .await;
         });
         // Process errors returned by the tasks.
         for (slot_id, msg) in errors.iter_mut().enumerate() {
             if let Some(msg) = msg {
                 let stream;
                 loop {
-                    let Some(slot) = Bus::new().slot_locked(slot_id as u32) else {
+                    let Some(slot) = Bus::new().slot_locked(slot_id as u32, worker_proc_number)
+                    else {
                         BackgroundWorker::wait_latch(Some(SLOT_WAIT_TIMEOUT));
                         continue;
                     };
@@ -168,8 +176,8 @@ pub extern "C" fn worker_main(_arg: pg_sys::Datum) {
 // runtime, while postgres functions can work only in single thread.
 
 /// Process packets from the slots and create tasks for them.
-async fn create_tasks(ctx: &mut WorkerContext, errors: &mut [Option<SmolStr>]) {
-    for (id, locked_slot) in Bus::new().into_iter().enumerate() {
+async fn create_tasks(ctx: &mut WorkerContext, errors: &mut [Option<SmolStr>], holder: i32) {
+    for (id, locked_slot) in Bus::new().into_iter(holder).enumerate() {
         let Some(slot) = locked_slot else {
             continue;
         };
@@ -226,12 +234,13 @@ async fn wait_results(
     errors: &mut [Option<SmolStr>],
     signals: &mut [bool],
     do_retry: &mut bool,
+    holder: i32,
 ) {
     for (id, task) in &mut ctx.tasks {
         let result = task.await.expect("Failed to await task");
         match result {
             Ok(TaskResult::Parsing((stmt, tables))) => {
-                let mut stream = wait_stream(*id).await;
+                let mut stream = wait_stream(*id, holder).await;
                 if tables.is_empty() {
                     // We don't need any table metadata for this query.
                     // So, write a fake metadata packet to the slot and proceed it
@@ -260,7 +269,7 @@ async fn wait_results(
                 ctx.statements[*id as usize] = Some(stmt);
             }
             Ok(TaskResult::Compilation(plan)) => {
-                let mut stream = wait_stream(*id).await;
+                let mut stream = wait_stream(*id, holder).await;
                 match request_params(&mut stream) {
                     Ok(()) => signals[*id as usize] = true,
                     Err(err) => {
@@ -282,9 +291,9 @@ async fn wait_results(
 }
 
 #[inline(always)]
-async fn wait_stream(slot_id: u32) -> SlotStream {
+async fn wait_stream(slot_id: u32, holder: i32) -> SlotStream {
     loop {
-        let Some(slot) = Bus::new().slot_locked(slot_id) else {
+        let Some(slot) = Bus::new().slot_locked(slot_id, holder) else {
             tokio::time::sleep(SLOT_WAIT_TIMEOUT).await;
             continue;
         };
@@ -339,6 +348,7 @@ mod tests {
     use super::*;
     use crate::data_type::{write_scalar_value, EncodedType};
     use crate::ipc::tests::{make_slot, SLOT_SIZE};
+    use crate::ipc::{Slot, BUS_PTR};
     use crate::protocol::prepare_query;
 
     #[tokio::test]
@@ -502,5 +512,37 @@ mod tests {
             explain,
             "Projection: Int64(1) [Int64(1):Int64]\n  EmptyRelation []",
         );
+    }
+
+    #[tokio::test]
+    async fn test_loop() {
+        let holder = 42;
+        let capacity = 2;
+        let mut ctx = WorkerContext::with_capacity(capacity);
+        let mut errors: Vec<Option<SmolStr>> = vec![None; capacity];
+        let mut signals: Vec<bool> = vec![false; capacity];
+        let mut do_retry = false;
+        let bus_size = Slot::estimated_size() * capacity;
+        let mut buffer = vec![0; bus_size];
+        unsafe { BUS_PTR.set(buffer.as_mut_ptr() as _).unwrap() };
+        init_slots(holder).expect("Failed to initialize slots");
+        // Check processing of the parse message.
+        let sql = "SELECT * FROM foo";
+        {
+            let slot = Bus::new().slot_locked(0, holder).unwrap();
+            let mut stream = SlotStream::from(slot);
+            prepare_query(&mut stream, sql).unwrap();
+        }
+        create_tasks(&mut ctx, &mut errors, holder).await;
+        wait_results(&mut ctx, &mut errors, &mut signals, &mut do_retry, holder).await;
+        let error = errors[0].take();
+        assert!(error.is_none(), "Error: {:?}", error);
+        let stmt = ctx.statements[0].take().unwrap();
+        let expected_stmt = DFParser::parse_sql(sql)
+            .expect("Failed to parse SQL")
+            .into_iter()
+            .next()
+            .expect("Failed to get statement");
+        assert_eq!(stmt, expected_stmt);
     }
 }
