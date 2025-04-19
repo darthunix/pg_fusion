@@ -4,8 +4,8 @@ use pgrx::pg_sys::{
     error, fetch_search_path_array, get_namespace_oid, get_relname_relid, palloc0,
     CustomExecMethods, CustomScan, CustomScanMethods, CustomScanState, EState, ExplainPropertyText,
     ExplainState, InvalidOid, List, ListCell, MyLatch, MyProcNumber, Node, NodeTag, Oid,
-    ParamListInfo, RegisterCustomScanMethods, ResetLatch, TupleTableSlot, WaitLatch,
-    PG_WAIT_EXTENSION, WL_LATCH_SET, WL_POSTMASTER_DEATH, WL_TIMEOUT,
+    ParamExternData, ParamListInfo, RegisterCustomScanMethods, ResetLatch, TupleTableSlot,
+    WaitLatch, PG_WAIT_EXTENSION, WL_LATCH_SET, WL_POSTMASTER_DEATH, WL_TIMEOUT,
 };
 use pgrx::{check_for_interrupts, pg_guard};
 use rmp::decode::{read_array_len, read_bin_len};
@@ -124,13 +124,18 @@ unsafe extern "C" fn create_df_scan_state(cscan: *mut CustomScan) -> *mut Node {
             }
         }
     }
+    let mut params: &[ParamExternData] = &[];
     let param_list = (*list_nth(list, 1)).ptr_value as ParamListInfo;
-    let num_params = unsafe { (*param_list).numParams } as usize;
-    let params = unsafe { (*param_list).params.as_slice(num_params) };
+    if !param_list.is_null() {
+        let num_params = unsafe { (*param_list).numParams } as usize;
+        params = unsafe { (*param_list).params.as_slice(num_params) };
+    }
     let stream = wait_stream();
     if let Err(err) = send_params(my_slot(), stream, params) {
         error!("Failed to send the parameter list: {}", err);
     }
+    // TODO: request plan fields from the worker to build custom_scan_tlist
+    // with repack_output().
     let css = CustomScanState {
         methods: exec_methods(),
         ..Default::default()
