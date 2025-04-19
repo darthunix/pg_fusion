@@ -236,29 +236,29 @@ async fn wait_results(
     do_retry: &mut bool,
     holder: i32,
 ) {
-    for (id, task) in &mut ctx.tasks {
+    while let Some((id, task)) = ctx.tasks.pop() {
         let result = task.await.expect("Failed to await task");
         match result {
             Ok(TaskResult::Parsing((stmt, tables))) => {
-                let mut stream = wait_stream(*id, holder).await;
+                let mut stream = wait_stream(id, holder).await;
                 if tables.is_empty() {
                     // We don't need any table metadata for this query.
                     // So, write a fake metadata packet to the slot and proceed it
                     // in the next iteration.
                     *do_retry = true;
                     match prepare_empty_metadata(&mut stream) {
-                        Ok(()) => signals[*id as usize] = true,
+                        Ok(()) => signals[id as usize] = true,
                         Err(err) => {
-                            errors[*id as usize] =
+                            errors[id as usize] =
                                 Some(format_smolstr!("Failed to prepare metadata: {:?}", err));
                             continue;
                         }
                     }
                 } else {
                     match prepare_table_refs(&mut stream, tables.as_slice()) {
-                        Ok(()) => signals[*id as usize] = true,
+                        Ok(()) => signals[id as usize] = true,
                         Err(err) => {
-                            errors[*id as usize] = Some(format_smolstr!(
+                            errors[id as usize] = Some(format_smolstr!(
                                 "Failed to prepare table references: {:?}",
                                 err
                             ));
@@ -266,25 +266,25 @@ async fn wait_results(
                         }
                     }
                 }
-                ctx.statements[*id as usize] = Some(stmt);
+                ctx.statements[id as usize] = Some(stmt);
             }
             Ok(TaskResult::Compilation(plan)) => {
-                let mut stream = wait_stream(*id, holder).await;
+                let mut stream = wait_stream(id, holder).await;
                 match request_params(&mut stream) {
-                    Ok(()) => signals[*id as usize] = true,
+                    Ok(()) => signals[id as usize] = true,
                     Err(err) => {
-                        errors[*id as usize] =
+                        errors[id as usize] =
                             Some(format_smolstr!("Failed to request params: {:?}", err));
                         continue;
                     }
                 }
-                ctx.logical_plans[*id as usize] = Some(plan);
+                ctx.logical_plans[id as usize] = Some(plan);
             }
             Ok(TaskResult::Bind(plan)) => {
-                ctx.logical_plans[*id as usize] = Some(plan);
+                ctx.logical_plans[id as usize] = Some(plan);
             }
             Err(err) => {
-                errors[*id as usize] = Some(format_smolstr!("Failed to execute task: {:?}", err))
+                errors[id as usize] = Some(format_smolstr!("Failed to execute task: {:?}", err))
             }
         }
     }
@@ -343,6 +343,7 @@ async fn bind(
 #[cfg(test)]
 mod tests {
     use datafusion::scalar::ScalarValue;
+    use rmp::decode::{read_array_len, read_bin_len};
     use rmp::encode::{write_array_len, write_bool, write_str, write_u32, write_u8};
 
     use super::*;
@@ -351,30 +352,9 @@ mod tests {
     use crate::ipc::{Slot, BUS_PTR};
     use crate::protocol::prepare_query;
 
-    #[tokio::test]
-    async fn test_parse() {
-        let mut buffer: [u8; SLOT_SIZE] = [0; SLOT_SIZE];
-        let mut stream: SlotStream = make_slot(&mut buffer).into();
-        let sql = "SELECT * FROM foo";
-        prepare_query(&mut stream, sql).unwrap();
-        stream.reset();
-        let header = consume_header(&mut stream).unwrap();
-        let result = parse(header, stream).await.expect("Failed to parse query");
-        let TaskResult::Parsing((stmt, tables)) = result else {
-            panic!("Expected parsing result");
-        };
-        let expected_stmt = DFParser::parse_sql(sql)
-            .expect("Failed to parse SQL")
-            .into_iter()
-            .next()
-            .expect("Failed to get statement");
-        assert_eq!(stmt, expected_stmt);
-        assert_eq!(tables.len(), 1);
-        let expected_table = TableReference::bare("foo");
-        assert_eq!(tables[0], expected_table);
-    }
+    // MOCKS
 
-    fn mock_foo_meta(stream: &mut SlotStream) {
+    fn encode_foo_meta(stream: &mut SlotStream) {
         stream.reset();
         write_header(stream, &Header::default()).unwrap();
         let pos_init = stream.position();
@@ -417,7 +397,7 @@ mod tests {
         stream.rewind(length as usize).unwrap();
     }
 
-    fn mock_a_param(stream: &mut SlotStream) {
+    fn encode_a_param(stream: &mut SlotStream) {
         stream.reset();
         write_header(stream, &Header::default()).unwrap();
         let pos_init = stream.position();
@@ -439,13 +419,56 @@ mod tests {
         stream.rewind(length as usize).unwrap();
     }
 
+    fn decode_foo_references(stream: &mut SlotStream) {
+        stream.reset();
+        let header = consume_header(stream).unwrap();
+        assert_eq!(header.packet, Packet::Metadata);
+        assert_eq!(header.direction, Direction::ToBackend);
+        assert_eq!(header.flag, Flag::Last);
+
+        let table_num = read_array_len(stream).unwrap();
+        assert_eq!(table_num, 1);
+        let elem_num = read_array_len(stream).unwrap();
+        assert_eq!(elem_num, 1);
+        let foo_len = read_bin_len(stream).unwrap();
+        assert_eq!(foo_len as usize, b"foo\0".len());
+        let foo = stream.look_ahead(foo_len as usize).unwrap();
+        assert_eq!(foo, b"foo\0");
+        stream.rewind(foo_len as usize).unwrap();
+    }
+
+    // TESTS
+
+    #[tokio::test]
+    async fn test_parse() {
+        let mut buffer: [u8; SLOT_SIZE] = [0; SLOT_SIZE];
+        let mut stream: SlotStream = make_slot(&mut buffer).into();
+        let sql = "SELECT * FROM foo";
+        prepare_query(&mut stream, sql).unwrap();
+        stream.reset();
+        let header = consume_header(&mut stream).unwrap();
+        let result = parse(header, stream).await.expect("Failed to parse query");
+        let TaskResult::Parsing((stmt, tables)) = result else {
+            panic!("Expected parsing result");
+        };
+        let expected_stmt = DFParser::parse_sql(sql)
+            .expect("Failed to parse SQL")
+            .into_iter()
+            .next()
+            .expect("Failed to get statement");
+        assert_eq!(stmt, expected_stmt);
+        assert_eq!(tables.len(), 1);
+        let expected_table = TableReference::bare("foo");
+        assert_eq!(tables[0], expected_table);
+    }
+
     #[tokio::test]
     async fn test_compile_and_bind() {
         let mut buffer: [u8; SLOT_SIZE] = [0; SLOT_SIZE];
 
         // Test compilation of a query.
         let mut stream: SlotStream = make_slot(&mut buffer).into();
-        mock_foo_meta(&mut stream);
+        encode_foo_meta(&mut stream);
         stream.reset();
         let header = consume_header(&mut stream).unwrap();
         let sql = "SELECT * FROM foo WHERE a = $1";
@@ -470,7 +493,7 @@ mod tests {
 
         // Now we need to bind the parameters.
         let mut stream: SlotStream = make_slot(&mut buffer).into();
-        mock_a_param(&mut stream);
+        encode_a_param(&mut stream);
         stream.reset();
         let header = consume_header(&mut stream).unwrap();
         let result = bind(header, stream, plan)
@@ -527,7 +550,7 @@ mod tests {
         unsafe { BUS_PTR.set(buffer.as_mut_ptr() as _).unwrap() };
         init_slots(holder).expect("Failed to initialize slots");
         // Check processing of the parse message.
-        let sql = "SELECT * FROM foo";
+        let sql = "SELECT * FROM foo WHERE a = $1";
         {
             let slot = Bus::new().slot_locked(0, holder).unwrap();
             let mut stream = SlotStream::from(slot);
@@ -537,12 +560,58 @@ mod tests {
         wait_results(&mut ctx, &mut errors, &mut signals, &mut do_retry, holder).await;
         let error = errors[0].take();
         assert!(error.is_none(), "Error: {:?}", error);
-        let stmt = ctx.statements[0].take().unwrap();
+        let stmt = ctx.statements.first().unwrap().as_ref().unwrap();
         let expected_stmt = DFParser::parse_sql(sql)
             .expect("Failed to parse SQL")
             .into_iter()
             .next()
             .expect("Failed to get statement");
-        assert_eq!(stmt, expected_stmt);
+        assert_eq!(stmt, &expected_stmt);
+        // Check request for table metadata and mock response.
+        {
+            let slot = Bus::new().slot_locked(0, holder).unwrap();
+            let mut stream = SlotStream::from(slot);
+            decode_foo_references(&mut stream);
+        }
+        // Check compilation of the statement.
+        {
+            let slot = Bus::new().slot_locked(0, holder).unwrap();
+            let mut stream = SlotStream::from(slot);
+            encode_foo_meta(&mut stream);
+        }
+        create_tasks(&mut ctx, &mut errors, holder).await;
+        wait_results(&mut ctx, &mut errors, &mut signals, &mut do_retry, holder).await;
+        let error = errors[0].take();
+        assert!(error.is_none(), "Error: {:?}", error);
+        let plan = ctx.logical_plans.first().unwrap().as_ref().unwrap();
+        let explain = format_smolstr!("{}", plan.display_indent_schema());
+        assert_eq!(
+            explain,
+            r#"Projection: * [a:Int32;N, b:Utf8]
+  Filter: foo.a = $1 [a:Int32;N, b:Utf8]
+    TableScan: foo [a:Int32;N, b:Utf8]"#,
+        );
+        // Check request for parameters and mock response.
+        {
+            let slot = Bus::new().slot_locked(0, holder).unwrap();
+            let mut stream = SlotStream::from(slot);
+            let header = consume_header(&mut stream).unwrap();
+            assert_eq!(header.packet, Packet::Bind);
+            assert_eq!(header.direction, Direction::ToBackend);
+            encode_a_param(&mut stream);
+        }
+        // Check binding of the parameters.
+        create_tasks(&mut ctx, &mut errors, holder).await;
+        wait_results(&mut ctx, &mut errors, &mut signals, &mut do_retry, holder).await;
+        let error = errors[0].take();
+        assert!(error.is_none(), "Error: {:?}", error);
+        let plan = ctx.logical_plans.first().unwrap().as_ref().unwrap();
+        let explain = format_smolstr!("{}", plan.display_indent_schema());
+        assert_eq!(
+            explain,
+            r#"Projection: * [a:Int32;N, b:Utf8]
+  Filter: foo.a = Int32(1) [a:Int32;N, b:Utf8]
+    TableScan: foo [a:Int32;N, b:Utf8]"#,
+        );
     }
 }
