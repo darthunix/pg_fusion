@@ -1,12 +1,12 @@
 use crate::error::FusionError;
 use crate::fsm::executor::StateMachine;
-use crate::fsm::ExecutorOutput;
+use crate::fsm::Action;
 use crate::ipc::{
     init_shmem, max_backends, set_worker_id, Bus, SlotNumber, SlotStream, INVALID_PROC_NUMBER,
 };
 use crate::protocol::{
-    consume_header, prepare_empty_metadata, prepare_table_refs, read_params, read_query,
-    request_params, send_error, signal, write_header, Direction, Flag, Header, Packet,
+    consume_header, prepare_empty_metadata, prepare_explain, prepare_table_refs, read_params,
+    read_query, request_params, send_error, signal, write_header, Direction, Flag, Header, Packet,
 };
 use crate::sql::Catalog;
 use anyhow::Result;
@@ -44,6 +44,7 @@ enum TaskResult {
     Parsing((Statement, Vec<TableReference>)),
     Compilation(LogicalPlan),
     Bind(LogicalPlan),
+    Explain(SmolStr),
 }
 
 struct WorkerContext {
@@ -203,24 +204,31 @@ async fn create_tasks(ctx: &mut WorkerContext, errors: &mut [Option<SmolStr>], h
             }
         };
         let handle = match output {
-            Some(ExecutorOutput::Parse) => tokio::spawn(parse(header, stream)),
-            Some(ExecutorOutput::Flush) => {
+            Some(Action::Parse) => tokio::spawn(parse(header, stream)),
+            Some(Action::Flush) => {
                 ctx.flush(slot_id);
                 continue;
             }
-            Some(ExecutorOutput::Compile) => {
+            Some(Action::Compile) => {
                 let Some(stmt) = std::mem::take(&mut ctx.statements[id]) else {
                     errors[id] = Some(format_smolstr!("No statement found for slot: {id}"));
                     continue;
                 };
                 tokio::spawn(compile(header, stream, stmt))
             }
-            Some(ExecutorOutput::Bind) => {
+            Some(Action::Bind) => {
                 let Some(plan) = std::mem::take(&mut ctx.logical_plans[id]) else {
                     errors[id] = Some(format_smolstr!("No logical plan found for slot: {id}"));
                     continue;
                 };
                 tokio::spawn(bind(header, stream, plan))
+            }
+            Some(Action::Explain) => {
+                let Some(plan) = std::mem::take(&mut ctx.logical_plans[id]) else {
+                    errors[id] = Some(format_smolstr!("No logical plan found for slot: {id}"));
+                    continue;
+                };
+                tokio::spawn(explain(plan))
             }
             None => unreachable!("Empty output in the worker state machine"),
         };
@@ -283,6 +291,17 @@ async fn wait_results(
             Ok(TaskResult::Bind(plan)) => {
                 ctx.logical_plans[id as usize] = Some(plan);
             }
+            Ok(TaskResult::Explain(explain)) => {
+                let mut stream = wait_stream(id, holder).await;
+                match prepare_explain(&mut stream, &explain) {
+                    Ok(()) => signals[id as usize] = true,
+                    Err(err) => {
+                        errors[id as usize] =
+                            Some(format_smolstr!("Failed to prepare explain: {:?}", err));
+                        continue;
+                    }
+                }
+            }
             Err(err) => {
                 errors[id as usize] = Some(format_smolstr!("Failed to execute task: {:?}", err))
             }
@@ -338,6 +357,11 @@ async fn bind(
     let params = read_params(&mut stream)?;
     let plan = base_plan.with_param_values(params)?;
     Ok(TaskResult::Bind(plan))
+}
+
+async fn explain(plan: LogicalPlan) -> Result<TaskResult> {
+    let explain = format_smolstr!("{}", plan.display_indent_schema());
+    Ok(TaskResult::Explain(explain))
 }
 
 #[cfg(test)]
@@ -613,5 +637,33 @@ mod tests {
   Filter: foo.a = Int32(1) [a:Int32;N, b:Utf8]
     TableScan: foo [a:Int32;N, b:Utf8]"#,
         );
+        // Check explain.
+        {
+            let slot = Bus::new().slot_locked(0, holder).unwrap();
+            let mut stream = SlotStream::from(slot);
+            let header = Header {
+                direction: Direction::ToWorker,
+                packet: Packet::Explain,
+                length: 0,
+                flag: Flag::Last,
+            };
+            write_header(&mut stream, &header).unwrap();
+        }
+        create_tasks(&mut ctx, &mut errors, holder).await;
+        wait_results(&mut ctx, &mut errors, &mut signals, &mut do_retry, holder).await;
+        let error = errors[0].take();
+        assert!(error.is_none(), "Error: {:?}", error);
+        {
+            let slot = Bus::new().slot_locked(0, holder).unwrap();
+            let mut stream = SlotStream::from(slot);
+            let header = consume_header(&mut stream).unwrap();
+            assert_eq!(header.packet, Packet::Explain);
+            assert_eq!(header.direction, Direction::ToBackend);
+            let len = read_bin_len(&mut stream).unwrap();
+            assert_eq!(len as usize, explain.len() + 1);
+            let expected = format_smolstr!("{}\0", explain);
+            let explain = stream.look_ahead(len as usize).unwrap();
+            assert_eq!(explain, expected.as_bytes());
+        }
     }
 }

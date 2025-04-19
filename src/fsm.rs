@@ -1,11 +1,12 @@
 use rust_fsm::*;
 
 #[derive(Debug)]
-pub enum ExecutorOutput {
+pub enum Action {
     Bind,
     Parse,
     Compile,
     Flush,
+    Explain,
 }
 
 pub enum ExecutorState {
@@ -15,7 +16,7 @@ pub enum ExecutorState {
 }
 
 state_machine! {
-    #[state_machine(input(crate::protocol::Packet), state(crate::fsm::ExecutorState), output(crate::fsm::ExecutorOutput))]
+    #[state_machine(input(crate::protocol::Packet), state(crate::fsm::ExecutorState), output(crate::fsm::Action))]
     pub executor(Initialized)
 
     Initialized => {
@@ -28,5 +29,6 @@ state_machine! {
     LogicalPlan => {
         Failure => Initialized[Flush],
         Bind => LogicalPlan[Bind],
+        Explain => Initialized[Explain],
     }
 }

@@ -2,10 +2,10 @@ use anyhow::Result as AnyResult;
 use libc::c_long;
 use pgrx::pg_sys::{
     error, fetch_search_path_array, get_namespace_oid, get_relname_relid, palloc0,
-    CustomExecMethods, CustomScan, CustomScanMethods, CustomScanState, EState, ExplainState,
-    InvalidOid, List, ListCell, MyLatch, MyProcNumber, Node, NodeTag, Oid, ParamListInfo,
-    RegisterCustomScanMethods, ResetLatch, TupleTableSlot, WaitLatch, PG_WAIT_EXTENSION,
-    WL_LATCH_SET, WL_POSTMASTER_DEATH, WL_TIMEOUT,
+    CustomExecMethods, CustomScan, CustomScanMethods, CustomScanState, EState, ExplainPropertyText,
+    ExplainState, InvalidOid, List, ListCell, MyLatch, MyProcNumber, Node, NodeTag, Oid,
+    ParamListInfo, RegisterCustomScanMethods, ResetLatch, TupleTableSlot, WaitLatch,
+    PG_WAIT_EXTENSION, WL_LATCH_SET, WL_POSTMASTER_DEATH, WL_TIMEOUT,
 };
 use pgrx::{check_for_interrupts, pg_guard};
 use rmp::decode::{read_array_len, read_bin_len};
@@ -16,8 +16,8 @@ use std::time::Duration;
 use crate::error::FusionError;
 use crate::ipc::{my_slot, Bus, SlotStream};
 use crate::protocol::{
-    consume_header, read_error, send_metadata, send_params, send_query, Direction, NeedSchema,
-    Packet,
+    consume_header, read_error, request_explain, send_metadata, send_params, send_query, Direction,
+    NeedSchema, Packet,
 };
 
 const BACKEND_WAIT_TIMEOUT: Duration = Duration::from_millis(100);
@@ -60,27 +60,23 @@ pub(crate) fn exec_methods() -> *const CustomExecMethods {
     EXEC_METHODS.with(|m| &*m as *const CustomExecMethods)
 }
 
-#[repr(C)]
-struct ScanState {
-    css: CustomScanState,
+#[pg_guard]
+#[inline(always)]
+fn wait_stream() -> SlotStream {
+    let my_proc_number = unsafe { MyProcNumber };
+    loop {
+        let Some(slot) = Bus::new().slot_locked(my_slot(), my_proc_number) else {
+            wait_latch(Some(BACKEND_WAIT_TIMEOUT));
+            continue;
+        };
+        return SlotStream::from(slot);
+    }
 }
 
 #[pg_guard]
 #[no_mangle]
 unsafe extern "C" fn create_df_scan_state(cscan: *mut CustomScan) -> *mut Node {
     let my_proc_number = unsafe { MyProcNumber };
-    let wait_stream = || -> SlotStream {
-        let stream;
-        loop {
-            let Some(slot) = Bus::new().slot_locked(my_slot(), my_proc_number) else {
-                wait_latch(Some(BACKEND_WAIT_TIMEOUT));
-                continue;
-            };
-            stream = Some(SlotStream::from(slot));
-            break;
-        }
-        stream.expect("Failed to acquire a slot stream")
-    };
     let list = (*cscan).custom_private;
     let pattern = (*list_nth(list, 0)).ptr_value as *mut c_char;
     let stream = wait_stream();
@@ -120,8 +116,11 @@ unsafe extern "C" fn create_df_scan_state(cscan: *mut CustomScan) -> *mut Node {
                 }
                 break;
             }
-            Packet::Bind | Packet::Parse => {
-                error!("Unexpected packet in backend: {:?}", header.packet)
+            Packet::Bind | Packet::Parse | Packet::Explain => {
+                error!(
+                    "Unexpected packet for create custom plan: {:?}",
+                    header.packet
+                )
             }
         }
     }
@@ -136,36 +135,85 @@ unsafe extern "C" fn create_df_scan_state(cscan: *mut CustomScan) -> *mut Node {
         methods: exec_methods(),
         ..Default::default()
     };
-    let state = ScanState { css };
-    let mut node = PgNode::empty(std::mem::size_of::<ScanState>());
+    let mut node = PgNode::empty(std::mem::size_of::<CustomScanState>());
     node.set_tag(NodeTag::T_CustomScanState);
     node.set_data(unsafe {
         std::slice::from_raw_parts(
-            &state as *const _ as *const u8,
-            std::mem::size_of::<ScanState>(),
+            &css as *const _ as *const u8,
+            std::mem::size_of::<CustomScanState>(),
         )
     });
     node.mut_node()
 }
 
+#[pg_guard]
+#[no_mangle]
 unsafe extern "C" fn begin_df_scan(node: *mut CustomScanState, estate: *mut EState, eflags: i32) {
     todo!()
 }
 
+#[pg_guard]
+#[no_mangle]
 unsafe extern "C" fn exec_df_scan(node: *mut CustomScanState) -> *mut TupleTableSlot {
     todo!()
 }
 
+#[pg_guard]
+#[no_mangle]
 unsafe extern "C" fn end_df_scan(node: *mut CustomScanState) {
     todo!()
 }
 
+#[pg_guard]
+#[no_mangle]
 unsafe extern "C" fn explain_df_scan(
-    node: *mut CustomScanState,
-    ancestors: *mut List,
+    _node: *mut CustomScanState,
+    _ancestors: *mut List,
     es: *mut ExplainState,
 ) {
-    todo!()
+    let my_proc_number = unsafe { MyProcNumber };
+    let stream = wait_stream();
+    if let Err(err) = request_explain(my_slot(), stream) {
+        error!("Failed to request explain: {}", err);
+    }
+    loop {
+        wait_latch(Some(BACKEND_WAIT_TIMEOUT));
+        let Some(slot) = Bus::new().slot_locked(my_slot(), my_proc_number) else {
+            continue;
+        };
+        let mut stream = SlotStream::from(slot);
+        let header = consume_header(&mut stream).expect("Failed to consume header");
+        if header.direction != Direction::ToBackend {
+            continue;
+        }
+        match header.packet {
+            Packet::None => {
+                // No data, just continue waiting.
+                continue;
+            }
+            Packet::Failure => {
+                let msg = read_error(&mut stream).expect("Failed to read the error message");
+                error!("Failed to compile the query: {}", msg);
+            }
+            Packet::Metadata | Packet::Bind | Packet::Parse => {
+                error!("Unexpected packet for explain: {:?}", header.packet)
+            }
+            Packet::Explain => {
+                let len = read_bin_len(&mut stream)
+                    .expect("Failed to read the length in explain message");
+                let explain = stream
+                    .look_ahead(len as usize)
+                    .expect("Failed to read the explain message");
+                unsafe {
+                    ExplainPropertyText(
+                        "DataFusion Plan\0".as_ptr() as _,
+                        explain.as_ptr() as _,
+                        es,
+                    );
+                }
+            }
+        }
+    }
 }
 
 // We expect that the header is already consumed and the packet type is `Packet::Metadata`.

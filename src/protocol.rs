@@ -56,6 +56,7 @@ pub enum Packet {
     Failure = 2,
     Metadata = 3,
     Parse = 4,
+    Explain = 5,
 }
 
 impl TryFrom<u8> for Packet {
@@ -69,6 +70,7 @@ impl TryFrom<u8> for Packet {
             2 => Ok(Packet::Failure),
             3 => Ok(Packet::Metadata),
             4 => Ok(Packet::Parse),
+            5 => Ok(Packet::Explain),
             _ => Err(FusionError::Deserialize("packet".to_string(), value.into())),
         }
     }
@@ -474,6 +476,42 @@ pub(crate) fn consume_metadata(
     Ok(tables)
 }
 
+// EXPLAIN
+
+pub(crate) fn prepare_explain(stream: &mut SlotStream, explain: &str) -> Result<()> {
+    stream.reset();
+    let header = Header::default();
+    write_header(stream, &header)?;
+    let pos_init = stream.position();
+    write_c_str(stream, explain)?;
+    let pos_final = stream.position();
+    let length = u16::try_from(pos_final - pos_init)?;
+    let header = Header {
+        direction: Direction::ToBackend,
+        packet: Packet::Explain,
+        length,
+        flag: Flag::Last,
+    };
+    stream.reset();
+    write_header(stream, &header)?;
+    stream.rewind(length as usize)?;
+    Ok(())
+}
+
+pub(crate) fn request_explain(slot_id: SlotNumber, mut stream: SlotStream) -> Result<()> {
+    let header = Header {
+        direction: Direction::ToWorker,
+        packet: Packet::Explain,
+        length: 0,
+        flag: Flag::Last,
+    };
+    write_header(&mut stream, &header)?;
+    // Unlock the slot after writing the explain.
+    let _guard = Slot::from(stream);
+    signal(slot_id, Direction::ToWorker);
+    Ok(())
+}
+
 #[cfg(any(test, feature = "pg_test"))]
 #[pg_schema]
 mod tests {
@@ -731,5 +769,25 @@ mod tests {
         assert_eq!(t2.schema().field(0).name(), "a");
         assert_eq!(t2.schema().field(0).data_type(), &DataType::Int32);
         assert!(t2.schema().field(0).is_nullable());
+    }
+
+    #[pg_test]
+    fn test_explain() {
+        let mut slot_buf: [u8; SLOT_SIZE] = [1; SLOT_SIZE];
+        let mut stream: SlotStream = make_slot(&mut slot_buf).into();
+        let orig_explain = r#"Projection: * [a:Int32;N, b:Utf8]
+  Filter: foo.a = $1 [a:Int32;N, b:Utf8]
+    TableScan: foo [a:Int32;N, b:Utf8]"#;
+        prepare_explain(&mut stream, orig_explain).unwrap();
+        stream.reset();
+        let header = consume_header(&mut stream).unwrap();
+        assert_eq!(header.direction, Direction::ToBackend);
+        assert_eq!(header.packet, Packet::Explain);
+        assert_eq!(header.flag, Flag::Last);
+        let explain_len = read_bin_len(&mut stream).unwrap();
+        assert_eq!(explain_len as usize, orig_explain.len() + 1);
+        let explain = stream.look_ahead(explain_len as usize).unwrap();
+        let expected = format!("{}\0", orig_explain);
+        assert_eq!(explain, expected.as_bytes());
     }
 }
