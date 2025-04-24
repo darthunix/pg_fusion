@@ -7,7 +7,7 @@ use crate::ipc::{worker_id, Bus, Slot, SlotNumber, SlotStream, DATA_SIZE};
 use crate::sql::Table;
 use ahash::AHashMap;
 use anyhow::Result;
-use datafusion::arrow::datatypes::{Field, Schema};
+use datafusion::arrow::datatypes::{Field, Fields, Schema};
 use datafusion::logical_expr::TableSource;
 use datafusion::scalar::ScalarValue;
 use datafusion_sql::TableReference;
@@ -57,6 +57,7 @@ pub enum Packet {
     Metadata = 3,
     Parse = 4,
     Explain = 5,
+    Columns = 6,
 }
 
 impl TryFrom<u8> for Packet {
@@ -71,6 +72,7 @@ impl TryFrom<u8> for Packet {
             3 => Ok(Packet::Metadata),
             4 => Ok(Packet::Parse),
             5 => Ok(Packet::Explain),
+            6 => Ok(Packet::Columns),
             _ => Err(FusionError::Deserialize("packet".to_string(), value.into())),
         }
     }
@@ -509,6 +511,34 @@ pub(crate) fn request_explain(slot_id: SlotNumber, mut stream: SlotStream) -> Re
     // Unlock the slot after writing the explain.
     let _guard = Slot::from(stream);
     signal(slot_id, Direction::ToWorker);
+    Ok(())
+}
+
+// COLUMNS
+
+pub(crate) fn prepare_columns(stream: &mut SlotStream, columns: &Fields) -> Result<()> {
+    stream.reset();
+    write_header(stream, &Header::default())?;
+    let pos_init = stream.position();
+    write_array_len(stream, u32::try_from(columns.len())?)?;
+    for column in columns {
+        write_u8(stream, EncodedType::try_from(column.data_type())? as u8)?;
+        let len = u32::try_from(column.name().len() + 1)?;
+        write_bin_len(stream, len)?;
+        stream.write_bytes(column.name().as_bytes())?;
+        write_pfix(stream, 0)?;
+    }
+    let pos_final = stream.position();
+    let length = u16::try_from(pos_final - pos_init)?;
+    let header = Header {
+        direction: Direction::ToBackend,
+        packet: Packet::Columns,
+        length,
+        flag: Flag::Last,
+    };
+    stream.reset();
+    write_header(stream, &header)?;
+    stream.rewind(length as usize)?;
     Ok(())
 }
 

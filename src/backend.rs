@@ -13,8 +13,9 @@ use smallvec::SmallVec;
 use std::ffi::c_char;
 use std::time::Duration;
 
+use crate::data_type::unpack_target_entry;
 use crate::error::FusionError;
-use crate::ipc::{my_slot, Bus, SlotStream};
+use crate::ipc::{my_slot, worker_id, Bus, SlotStream, INVALID_PROC_NUMBER};
 use crate::protocol::{
     consume_header, read_error, request_explain, send_metadata, send_params, send_query, Direction,
     NeedSchema, Packet,
@@ -88,6 +89,9 @@ unsafe extern "C" fn create_df_scan_state(cscan: *mut CustomScan) -> *mut Node {
     }
     let mut skip_wait = true;
     loop {
+        if worker_id() == INVALID_PROC_NUMBER {
+            error!("Worker ID is invalid");
+        }
         if !skip_wait {
             wait_latch(Some(BACKEND_WAIT_TIMEOUT));
             skip_wait = false;
@@ -96,7 +100,11 @@ unsafe extern "C" fn create_df_scan_state(cscan: *mut CustomScan) -> *mut Node {
             continue;
         };
         let mut stream = SlotStream::from(slot);
-        let header = consume_header(&mut stream).expect("Failed to consume header");
+        let header = match consume_header(&mut stream) {
+            Ok(header) => header,
+            // TODO: before panic we should send a Failure message to the worker.
+            Err(err) => error!("Failed to consume header: {}", err),
+        };
         if header.direction != Direction::ToBackend {
             continue;
         }
@@ -105,37 +113,44 @@ unsafe extern "C" fn create_df_scan_state(cscan: *mut CustomScan) -> *mut Node {
                 // No data, just continue waiting.
                 continue;
             }
-            Packet::Failure => {
-                let msg = read_error(&mut stream).expect("Failed to read the error message");
-                error!("Failed to compile the query: {}", msg);
-            }
+            Packet::Failure => match read_error(&mut stream) {
+                Ok(msg) => error!("Failed to compile the query: {}", msg),
+                Err(err) => error!("Double error: {}", err),
+            },
             Packet::Metadata => {
-                let oids = table_oids(&mut stream).expect("Failed to read table OIDs");
+                let oids = match table_oids(&mut stream) {
+                    Ok(oids) => oids,
+                    Err(err) => error!("Failed to read the table OIDs: {}", err),
+                };
                 if let Err(err) = send_metadata(my_slot(), stream, &oids) {
                     error!("Failed to send the table metadata: {}", err);
                 }
+            }
+            Packet::Bind => {
+                let mut params: &[ParamExternData] = &[];
+                let param_list = (*list_nth(list, 1)).ptr_value as ParamListInfo;
+                if !param_list.is_null() {
+                    let num_params = unsafe { (*param_list).numParams } as usize;
+                    params = unsafe { (*param_list).params.as_slice(num_params) };
+                }
+                if let Err(err) = send_params(my_slot(), stream, params) {
+                    error!("Failed to send the parameter list: {}", err);
+                }
+            }
+            Packet::Columns => {
+                if let Err(err) = unpack_target_entry(&mut stream, (*cscan).custom_scan_tlist) {
+                    error!("Failed to unpack target entry: {}", err);
+                }
                 break;
             }
-            Packet::Bind | Packet::Parse | Packet::Explain => {
+            Packet::Parse | Packet::Explain => {
                 error!(
-                    "Unexpected packet for create custom plan: {:?}",
+                    "Unexpected packet while creating a custom plan: {:?}",
                     header.packet
                 )
             }
         }
     }
-    let mut params: &[ParamExternData] = &[];
-    let param_list = (*list_nth(list, 1)).ptr_value as ParamListInfo;
-    if !param_list.is_null() {
-        let num_params = unsafe { (*param_list).numParams } as usize;
-        params = unsafe { (*param_list).params.as_slice(num_params) };
-    }
-    let stream = wait_stream();
-    if let Err(err) = send_params(my_slot(), stream, params) {
-        error!("Failed to send the parameter list: {}", err);
-    }
-    // TODO: request plan fields from the worker to build custom_scan_tlist
-    // with repack_output().
     let css = CustomScanState {
         methods: exec_methods(),
         ..Default::default()
@@ -200,7 +215,7 @@ unsafe extern "C" fn explain_df_scan(
                 let msg = read_error(&mut stream).expect("Failed to read the error message");
                 error!("Failed to compile the query: {}", msg);
             }
-            Packet::Metadata | Packet::Bind | Packet::Parse => {
+            Packet::Columns | Packet::Metadata | Packet::Bind | Packet::Parse => {
                 error!("Unexpected packet for explain: {:?}", header.packet)
             }
             Packet::Explain => {

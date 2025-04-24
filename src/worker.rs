@@ -5,8 +5,9 @@ use crate::ipc::{
     init_shmem, max_backends, set_worker_id, Bus, SlotNumber, SlotStream, INVALID_PROC_NUMBER,
 };
 use crate::protocol::{
-    consume_header, prepare_empty_metadata, prepare_explain, prepare_table_refs, read_params,
-    read_query, request_params, send_error, signal, write_header, Direction, Flag, Header, Packet,
+    consume_header, prepare_columns, prepare_empty_metadata, prepare_explain, prepare_table_refs,
+    read_params, read_query, request_params, send_error, signal, write_header, Direction, Flag,
+    Header, Packet,
 };
 use crate::sql::Catalog;
 use anyhow::Result;
@@ -74,10 +75,7 @@ impl WorkerContext {
     }
 
     fn flush(&mut self, slot_id: SlotNumber) {
-        let machine = &mut self.states[slot_id as usize];
-        machine
-            .consume(&Packet::Failure)
-            .expect("Failed to consume failure event during flush");
+        self.states[slot_id as usize] = StateMachine::new();
         self.statements[slot_id as usize] = None;
         for (id, task) in &mut self.tasks {
             if *id == slot_id {
@@ -131,6 +129,7 @@ pub extern "C" fn worker_main(_arg: pg_sys::Datum) {
 
     log!("DataFusion worker is running");
     while do_retry || BackgroundWorker::wait_latch(Some(WORKER_WAIT_TIMEOUT)) {
+        log!("DataFusion worker is processing slots");
         rt.block_on(async {
             do_retry = false;
             create_tasks(&mut ctx, &mut errors, worker_proc_number).await;
@@ -143,6 +142,7 @@ pub extern "C" fn worker_main(_arg: pg_sys::Datum) {
             )
             .await;
         });
+        log!("DataFusion worker is processing errors");
         // Process errors returned by the tasks.
         for (slot_id, msg) in errors.iter_mut().enumerate() {
             if let Some(msg) = msg {
@@ -160,6 +160,7 @@ pub extern "C" fn worker_main(_arg: pg_sys::Datum) {
             }
             *msg = None;
         }
+        log!("DataFusion worker is processing signals");
         // Signal backends about new messages.
         for (id, do_signal) in signals.iter_mut().enumerate() {
             let slot_id = id as u32;
@@ -170,6 +171,7 @@ pub extern "C" fn worker_main(_arg: pg_sys::Datum) {
         }
     }
     set_worker_id(INVALID_PROC_NUMBER);
+    log!("DataFusion worker is stopping");
 }
 
 // ASYNC WORLD
@@ -194,7 +196,10 @@ async fn create_tasks(ctx: &mut WorkerContext, errors: &mut [Option<SmolStr>], h
             continue;
         }
         let machine = &mut ctx.states[id];
-        let slot_id = u32::try_from(id).expect("Failed to convert slot id to u32");
+        let Ok(slot_id) = u32::try_from(id) else {
+            errors[id] = Some(format_smolstr!("Failed to convert id to u32: {id}"));
+            continue;
+        };
         let output = match machine.consume(&header.packet) {
             Ok(output) => output,
             Err(err) => {
@@ -230,7 +235,10 @@ async fn create_tasks(ctx: &mut WorkerContext, errors: &mut [Option<SmolStr>], h
                 };
                 tokio::spawn(explain(plan))
             }
-            None => unreachable!("Empty output in the worker state machine"),
+            None => {
+                errors[id] = Some(format_smolstr!("No action found for slot: {id}"));
+                continue;
+            }
         };
         ctx.tasks.push((slot_id, handle));
     }
@@ -245,7 +253,13 @@ async fn wait_results(
     holder: i32,
 ) {
     while let Some((id, task)) = ctx.tasks.pop() {
-        let result = task.await.expect("Failed to await task");
+        let result = match task.await {
+            Ok(result) => result,
+            Err(err) => {
+                errors[id as usize] = Some(format_smolstr!("Failed to join task: {:?}", err));
+                continue;
+            }
+        };
         match result {
             Ok(TaskResult::Parsing((stmt, tables))) => {
                 let mut stream = wait_stream(id, holder).await;
@@ -289,6 +303,15 @@ async fn wait_results(
                 ctx.logical_plans[id as usize] = Some(plan);
             }
             Ok(TaskResult::Bind(plan)) => {
+                let mut stream = wait_stream(id, holder).await;
+                match prepare_columns(&mut stream, plan.schema().fields()) {
+                    Ok(()) => signals[id as usize] = true,
+                    Err(err) => {
+                        errors[id as usize] =
+                            Some(format_smolstr!("Failed to prepare columns: {:?}", err));
+                        continue;
+                    }
+                }
                 ctx.logical_plans[id as usize] = Some(plan);
             }
             Ok(TaskResult::Explain(explain)) => {
@@ -367,7 +390,7 @@ async fn explain(plan: LogicalPlan) -> Result<TaskResult> {
 #[cfg(test)]
 mod tests {
     use datafusion::scalar::ScalarValue;
-    use rmp::decode::{read_array_len, read_bin_len};
+    use rmp::decode::{read_array_len, read_bin_len, read_u8};
     use rmp::encode::{write_array_len, write_bool, write_str, write_u32, write_u8};
 
     use super::*;
@@ -459,6 +482,31 @@ mod tests {
         let foo = stream.look_ahead(foo_len as usize).unwrap();
         assert_eq!(foo, b"foo\0");
         stream.rewind(foo_len as usize).unwrap();
+    }
+
+    fn decode_columns(stream: &mut SlotStream) {
+        stream.reset();
+        let header = consume_header(stream).unwrap();
+        assert_eq!(header.packet, Packet::Columns);
+        assert_eq!(header.direction, Direction::ToBackend);
+        assert_eq!(header.flag, Flag::Last);
+
+        let column_num = read_array_len(stream).unwrap();
+        assert_eq!(column_num, 2);
+        let a_etype = read_u8(stream).unwrap();
+        assert_eq!(a_etype, EncodedType::Int32 as u8);
+        let a_len = read_bin_len(stream).unwrap();
+        assert_eq!(a_len as usize, b"a\0".len());
+        let a = stream.look_ahead(a_len as usize).unwrap();
+        assert_eq!(a, b"a\0");
+        stream.rewind(a_len as usize).unwrap();
+        let b_etype = read_u8(stream).unwrap();
+        assert_eq!(b_etype, EncodedType::Utf8 as u8);
+        let b_len = read_bin_len(stream).unwrap();
+        assert_eq!(b_len as usize, b"b\0".len());
+        let b = stream.look_ahead(b_len as usize).unwrap();
+        assert_eq!(b, b"b\0");
+        stream.rewind(b_len as usize).unwrap();
     }
 
     // TESTS
@@ -637,6 +685,12 @@ mod tests {
   Filter: foo.a = Int32(1) [a:Int32;N, b:Utf8]
     TableScan: foo [a:Int32;N, b:Utf8]"#,
         );
+        // Check columns in response.
+        {
+            let slot = Bus::new().slot_locked(0, holder).unwrap();
+            let mut stream = SlotStream::from(slot);
+            decode_columns(&mut stream);
+        }
         // Check explain.
         {
             let slot = Bus::new().slot_locked(0, holder).unwrap();

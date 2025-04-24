@@ -13,7 +13,8 @@ use pgrx::pg_sys::{
     TargetEntry, GETSTRUCT,
 };
 use rmp::decode::{
-    read_bool, read_f32, read_f64, read_i16, read_i32, read_i64, read_str_len, RmpRead,
+    read_array_len, read_bin_len, read_bool, read_f32, read_f64, read_i16, read_i32, read_i64,
+    read_str_len, read_u8, RmpRead,
 };
 use rmp::encode::{
     write_bool, write_f32, write_f64, write_i16, write_i32, write_i64, write_pfix, write_str,
@@ -169,6 +170,27 @@ impl TryFrom<pg_sys::Oid> for EncodedType {
                 "encoded type".to_string(),
                 value.as_u32().into(),
             )),
+        }
+    }
+}
+
+impl TryFrom<&DataType> for EncodedType {
+    type Error = FusionError;
+
+    fn try_from(value: &DataType) -> Result<Self, Self::Error> {
+        match value {
+            DataType::Boolean => Ok(EncodedType::Boolean),
+            DataType::Utf8 => Ok(EncodedType::Utf8),
+            DataType::Int16 => Ok(EncodedType::Int16),
+            DataType::Int32 => Ok(EncodedType::Int32),
+            DataType::Int64 => Ok(EncodedType::Int64),
+            DataType::Float32 => Ok(EncodedType::Float32),
+            DataType::Float64 => Ok(EncodedType::Float64),
+            DataType::Date32 => Ok(EncodedType::Date32),
+            DataType::Time64(_) => Ok(EncodedType::Time64),
+            DataType::Timestamp(_, _) => Ok(EncodedType::Timestamp),
+            DataType::Interval(_) => Ok(EncodedType::Interval),
+            _ => Err(FusionError::UnsupportedType(format!("{:?}", value))),
         }
     }
 }
@@ -414,6 +436,41 @@ pub(crate) fn repack_output(columns: &[Field]) -> *mut List {
         }
     }
     list
+}
+
+// The header of the stream must already be consumed.
+pub(crate) fn unpack_target_entry(stream: &mut SlotStream, list: *mut List) -> Result<()> {
+    let column_len = read_array_len(stream)?;
+    assert!(column_len < i16::MAX as u32);
+    for position in 0..column_len {
+        let pos = position as i16 + 1;
+        let etype = read_u8(stream)?;
+        let oid = type_to_oid(&EncodedType::try_from(etype)?.to_arrow());
+        let tuple =
+            unsafe { pg_sys::SearchSysCache1(TYPEOID as i32, pg_sys::ObjectIdGetDatum(oid)) };
+        if tuple.is_null() {
+            bail!(FusionError::UnsupportedType(format!("{:?}", oid)));
+        }
+        let name_len = read_bin_len(stream)? as usize;
+        let name = stream.look_ahead(name_len)?;
+        unsafe {
+            let typtup = GETSTRUCT(tuple) as pg_sys::Form_pg_type;
+            let expr = makeVar(
+                pg_sys::INDEX_VAR,
+                pos,
+                oid,
+                (*typtup).typtypmod,
+                (*typtup).typcollation,
+                0,
+            );
+            let col_name = palloc0(name_len) as *mut u8;
+            std::ptr::copy_nonoverlapping(name.as_ptr(), col_name, name_len);
+            let entry = makeTargetEntry(expr as *mut Expr, pos, col_name as *mut i8, false);
+            pg_sys::ReleaseSysCache(tuple);
+            list_append_unique_ptr(list, entry as *mut c_void);
+        }
+    }
+    Ok(())
 }
 
 #[cfg(any(test, feature = "pg_test"))]
