@@ -15,7 +15,7 @@ use std::time::Duration;
 
 use crate::data_type::unpack_target_entry;
 use crate::error::FusionError;
-use crate::ipc::{my_slot, worker_id, Bus, SlotStream, INVALID_PROC_NUMBER};
+use crate::ipc::{max_backends, my_slot, worker_id, Bus, SlotStream, INVALID_PROC_NUMBER};
 use crate::protocol::{
     consume_header, read_error, request_explain, send_metadata, send_params, send_query, Direction,
     NeedSchema, Packet,
@@ -66,7 +66,8 @@ pub(crate) fn exec_methods() -> *const CustomExecMethods {
 fn wait_stream() -> SlotStream {
     let my_proc_number = unsafe { MyProcNumber };
     loop {
-        let Some(slot) = Bus::new().slot_locked(my_slot(), my_proc_number) else {
+        let Some(slot) = Bus::new(max_backends() as usize).slot_locked(my_slot(), my_proc_number)
+        else {
             wait_latch(Some(BACKEND_WAIT_TIMEOUT));
             continue;
         };
@@ -96,7 +97,8 @@ unsafe extern "C" fn create_df_scan_state(cscan: *mut CustomScan) -> *mut Node {
             wait_latch(Some(BACKEND_WAIT_TIMEOUT));
             skip_wait = false;
         }
-        let Some(slot) = Bus::new().slot_locked(my_slot(), my_proc_number) else {
+        let Some(slot) = Bus::new(max_backends() as usize).slot_locked(my_slot(), my_proc_number)
+        else {
             continue;
         };
         let mut stream = SlotStream::from(slot);
@@ -198,7 +200,8 @@ unsafe extern "C" fn explain_df_scan(
     }
     loop {
         wait_latch(Some(BACKEND_WAIT_TIMEOUT));
-        let Some(slot) = Bus::new().slot_locked(my_slot(), my_proc_number) else {
+        let Some(slot) = Bus::new(max_backends() as usize).slot_locked(my_slot(), my_proc_number)
+        else {
             continue;
         };
         let mut stream = SlotStream::from(slot);
