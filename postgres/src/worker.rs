@@ -87,7 +87,10 @@ impl WorkerContext {
 }
 
 fn init_slots(holder: i32) -> Result<()> {
-    for locked_slot in Bus::new().into_iter(holder).flatten() {
+    for locked_slot in Bus::new(max_backends() as usize)
+        .into_iter(holder)
+        .flatten()
+    {
         let mut stream = SlotStream::from(locked_slot);
         stream.reset();
         let header = Header {
@@ -148,7 +151,8 @@ pub extern "C" fn worker_main(_arg: pg_sys::Datum) {
             if let Some(msg) = msg {
                 let stream;
                 loop {
-                    let Some(slot) = Bus::new().slot_locked(slot_id as u32, worker_proc_number)
+                    let Some(slot) =
+                        Bus::new(capacity).slot_locked(slot_id as u32, worker_proc_number)
                     else {
                         BackgroundWorker::wait_latch(Some(SLOT_WAIT_TIMEOUT));
                         continue;
@@ -180,7 +184,8 @@ pub extern "C" fn worker_main(_arg: pg_sys::Datum) {
 
 /// Process packets from the slots and create tasks for them.
 async fn create_tasks(ctx: &mut WorkerContext, errors: &mut [Option<SmolStr>], holder: i32) {
-    for (id, locked_slot) in Bus::new().into_iter(holder).enumerate() {
+    let num_slots = ctx.states.len();
+    for (id, locked_slot) in Bus::new(num_slots).into_iter(holder).enumerate() {
         let Some(slot) = locked_slot else {
             continue;
         };
@@ -252,6 +257,7 @@ async fn wait_results(
     do_retry: &mut bool,
     holder: i32,
 ) {
+    let num_slots = ctx.states.len();
     while let Some((id, task)) = ctx.tasks.pop() {
         let result = match task.await {
             Ok(result) => result,
@@ -262,7 +268,7 @@ async fn wait_results(
         };
         match result {
             Ok(TaskResult::Parsing((stmt, tables))) => {
-                let mut stream = wait_stream(id, holder).await;
+                let mut stream = wait_stream(id, holder, num_slots).await;
                 if tables.is_empty() {
                     // We don't need any table metadata for this query.
                     // So, write a fake metadata packet to the slot and proceed it
@@ -291,7 +297,7 @@ async fn wait_results(
                 ctx.statements[id as usize] = Some(stmt);
             }
             Ok(TaskResult::Compilation(plan)) => {
-                let mut stream = wait_stream(id, holder).await;
+                let mut stream = wait_stream(id, holder, num_slots).await;
                 match request_params(&mut stream) {
                     Ok(()) => signals[id as usize] = true,
                     Err(err) => {
@@ -303,7 +309,7 @@ async fn wait_results(
                 ctx.logical_plans[id as usize] = Some(plan);
             }
             Ok(TaskResult::Bind(plan)) => {
-                let mut stream = wait_stream(id, holder).await;
+                let mut stream = wait_stream(id, holder, num_slots).await;
                 match prepare_columns(&mut stream, plan.schema().fields()) {
                     Ok(()) => signals[id as usize] = true,
                     Err(err) => {
@@ -315,7 +321,7 @@ async fn wait_results(
                 ctx.logical_plans[id as usize] = Some(plan);
             }
             Ok(TaskResult::Explain(explain)) => {
-                let mut stream = wait_stream(id, holder).await;
+                let mut stream = wait_stream(id, holder, num_slots).await;
                 match prepare_explain(&mut stream, &explain) {
                     Ok(()) => signals[id as usize] = true,
                     Err(err) => {
@@ -333,9 +339,9 @@ async fn wait_results(
 }
 
 #[inline(always)]
-async fn wait_stream(slot_id: u32, holder: i32) -> SlotStream {
+async fn wait_stream(slot_id: u32, holder: i32, num_slots: usize) -> SlotStream {
     loop {
-        let Some(slot) = Bus::new().slot_locked(slot_id, holder) else {
+        let Some(slot) = Bus::new(num_slots).slot_locked(slot_id, holder) else {
             tokio::time::sleep(SLOT_WAIT_TIMEOUT).await;
             continue;
         };
@@ -610,7 +616,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_loop() {
+    async fn test_loop_with_table() {
         let holder = 42;
         let capacity = 2;
         let mut ctx = WorkerContext::with_capacity(capacity);
@@ -624,7 +630,7 @@ mod tests {
         // Check processing of the parse message.
         let sql = "SELECT * FROM foo WHERE a = $1";
         {
-            let slot = Bus::new().slot_locked(0, holder).unwrap();
+            let slot = Bus::new(capacity).slot_locked(0, holder).unwrap();
             let mut stream = SlotStream::from(slot);
             prepare_query(&mut stream, sql).unwrap();
         }
@@ -641,13 +647,13 @@ mod tests {
         assert_eq!(stmt, &expected_stmt);
         // Check request for table metadata and mock response.
         {
-            let slot = Bus::new().slot_locked(0, holder).unwrap();
+            let slot = Bus::new(capacity).slot_locked(0, holder).unwrap();
             let mut stream = SlotStream::from(slot);
             decode_foo_references(&mut stream);
         }
         // Check compilation of the statement.
         {
-            let slot = Bus::new().slot_locked(0, holder).unwrap();
+            let slot = Bus::new(capacity).slot_locked(0, holder).unwrap();
             let mut stream = SlotStream::from(slot);
             encode_foo_meta(&mut stream);
         }
@@ -665,7 +671,7 @@ mod tests {
         );
         // Check request for parameters and mock response.
         {
-            let slot = Bus::new().slot_locked(0, holder).unwrap();
+            let slot = Bus::new(capacity).slot_locked(0, holder).unwrap();
             let mut stream = SlotStream::from(slot);
             let header = consume_header(&mut stream).unwrap();
             assert_eq!(header.packet, Packet::Bind);
@@ -687,13 +693,13 @@ mod tests {
         );
         // Check columns in response.
         {
-            let slot = Bus::new().slot_locked(0, holder).unwrap();
+            let slot = Bus::new(capacity).slot_locked(0, holder).unwrap();
             let mut stream = SlotStream::from(slot);
             decode_columns(&mut stream);
         }
         // Check explain.
         {
-            let slot = Bus::new().slot_locked(0, holder).unwrap();
+            let slot = Bus::new(capacity).slot_locked(0, holder).unwrap();
             let mut stream = SlotStream::from(slot);
             let header = Header {
                 direction: Direction::ToWorker,
@@ -708,7 +714,7 @@ mod tests {
         let error = errors[0].take();
         assert!(error.is_none(), "Error: {:?}", error);
         {
-            let slot = Bus::new().slot_locked(0, holder).unwrap();
+            let slot = Bus::new(capacity).slot_locked(0, holder).unwrap();
             let mut stream = SlotStream::from(slot);
             let header = consume_header(&mut stream).unwrap();
             assert_eq!(header.packet, Packet::Explain);
@@ -719,5 +725,37 @@ mod tests {
             let explain = stream.look_ahead(len as usize).unwrap();
             assert_eq!(explain, expected.as_bytes());
         }
+    }
+
+    #[tokio::test]
+    async fn test_loop_explain_empty_table() {
+        let holder = 42;
+        let capacity = 1;
+        let mut ctx = WorkerContext::with_capacity(capacity);
+        let mut errors: Vec<Option<SmolStr>> = vec![None; capacity];
+        let mut signals: Vec<bool> = vec![false; capacity];
+        let mut do_retry = false;
+        let bus_size = Slot::estimated_size() * capacity;
+        let mut buffer = vec![0; bus_size];
+        unsafe { BUS_PTR.set(buffer.as_mut_ptr() as _).unwrap() };
+        init_slots(holder).expect("Failed to initialize slots");
+        // Check processing of the parse message.
+        let sql = "EXPLAIN SELECT 1";
+        {
+            let slot = Bus::new(capacity).slot_locked(0, holder).unwrap();
+            let mut stream = SlotStream::from(slot);
+            prepare_query(&mut stream, sql).unwrap();
+        }
+        create_tasks(&mut ctx, &mut errors, holder).await;
+        wait_results(&mut ctx, &mut errors, &mut signals, &mut do_retry, holder).await;
+        let error = errors[0].take();
+        assert!(error.is_none(), "Error: {:?}", error);
+        let stmt = ctx.statements.first().unwrap().as_ref().unwrap();
+        let expected_stmt = DFParser::parse_sql(sql)
+            .expect("Failed to parse SQL")
+            .into_iter()
+            .next()
+            .expect("Failed to get statement");
+        assert_eq!(stmt, &expected_stmt);
     }
 }
