@@ -385,29 +385,29 @@ unsafe impl Send for SlotStream {}
 
 pub(crate) struct Bus {
     slots: *mut Slot,
+    num_slots: usize,
 }
 
 impl Bus {
-    pub(crate) fn estimated_size() -> usize {
-        Slot::estimated_size() * max_backends() as usize
-    }
-
-    pub(crate) fn init(ptr: *mut u8, size: usize) -> Self {
-        assert!(size >= Self::estimated_size());
-        for i in 0..max_backends() as usize {
+    pub(crate) fn init(ptr: *mut u8, num_slots: usize) -> Self {
+        assert!(num_slots > 0);
+        for i in 0..num_slots as usize {
             Slot::init(
                 unsafe { ptr.add(i * Slot::estimated_size()) },
                 Slot::estimated_size(),
             );
         }
         let slots = ptr as *mut Slot;
-        Self { slots }
+        Self { slots, num_slots }
     }
 
     pub(crate) fn from_bytes(ptr: *mut u8, size: usize) -> Self {
+        assert!(size % Slot::estimated_size() == 0);
+        assert!(size > 0);
+        let num_slots = size / Slot::estimated_size();
         let buffer = unsafe { from_raw_parts_mut(ptr, size) };
         let slots = buffer.as_mut_ptr() as *mut Slot;
-        Self { slots }
+        Self { slots, num_slots }
     }
 
     pub(crate) fn slot(&mut self, id: SlotNumber) -> Slot {
@@ -428,9 +428,9 @@ impl Bus {
         }
     }
 
-    pub(crate) fn new() -> Self {
+    pub(crate) fn new(capacity: usize) -> Self {
         let ptr = unsafe { *BUS_PTR.get().unwrap() };
-        Self::from_bytes(ptr as *mut u8, Self::estimated_size())
+        Self::from_bytes(ptr as *mut u8, Slot::estimated_size() * capacity)
     }
 
     pub(crate) fn into_iter(self, holder: i32) -> BusIter {
@@ -480,7 +480,7 @@ pub(crate) fn set_worker_id(id: ProcNumber) {
 #[pg_guard]
 #[no_mangle]
 pub unsafe extern "C" fn backend_cleanup(_code: i32, _args: Datum) {
-    let mut bus = Bus::new();
+    let mut bus = Bus::new(max_backends() as usize);
     if let Some(handler) = CURRENT_SLOT.take() {
         let slot = bus.slot(handler.id());
         if slot.owner() == slot.holder() {
@@ -500,9 +500,10 @@ pub unsafe extern "C" fn init_shmem() {
     let list_ptr = unsafe { *SLOT_FREE_LIST_PTR.get().unwrap() };
     SlotFreeList::init(list_ptr as *mut u8, SlotFreeList::estimated_size());
 
-    BUS_PTR.set(ShmemAlloc(Bus::estimated_size())).unwrap();
+    let size = Slot::estimated_size() * max_backends() as usize;
+    BUS_PTR.set(ShmemAlloc(size)).unwrap();
     let bus_ptr = unsafe { *BUS_PTR.get().unwrap() };
-    Bus::init(bus_ptr as *mut u8, Bus::estimated_size());
+    Bus::init(bus_ptr as *mut u8, size);
 
     WORKER_PID_PTR
         .set(ShmemAlloc(size_of::<AtomicI32>()))
@@ -624,9 +625,8 @@ pub(crate) mod tests {
         let mut buffer: [u8; SLOT_SIZE * 10] = [1; SLOT_SIZE * 10];
         let ptr = addr_of_mut!(buffer) as *mut u8;
         let len = buffer.len();
-        Bus::init(ptr, len);
+        Bus::init(ptr, 10);
         let slot_size = Slot::estimated_size();
-        assert_eq!(Bus::estimated_size(), slot_size * 10);
         for i in 0..max_backends() as usize {
             unsafe {
                 let slot_ptr = buffer.as_ptr().add(i * slot_size);

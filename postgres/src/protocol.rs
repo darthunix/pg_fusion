@@ -3,7 +3,7 @@ use std::sync::Arc;
 
 use crate::data_type::{datum_to_scalar, read_scalar_value, write_scalar_value, EncodedType};
 use crate::error::FusionError;
-use crate::ipc::{worker_id, Bus, Slot, SlotNumber, SlotStream, DATA_SIZE};
+use crate::ipc::{max_backends, worker_id, Bus, Slot, SlotNumber, SlotStream, DATA_SIZE};
 use crate::sql::Table;
 use ahash::AHashMap;
 use anyhow::Result;
@@ -124,7 +124,7 @@ pub(crate) fn signal(slot_id: SlotNumber, direction: Direction) {
             unsafe { ProcSendSignal(worker_id()) };
         }
         Direction::ToBackend => {
-            let id = Bus::new().slot(slot_id).owner();
+            let id = Bus::new(max_backends() as usize).slot(slot_id).owner();
             unsafe { ProcSendSignal(id) };
         }
     }
