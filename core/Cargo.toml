@@ -5,6 +5,7 @@ edition = "2021"
 
 [lib]
 crate-type = ["lib"]
+doctest = false
 
 [dependencies]
 ahash = "0.8"
