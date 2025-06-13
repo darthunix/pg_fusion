@@ -2,6 +2,7 @@ use crate::protocol::{write_header, ByteStream, Direction, Flag, Header, Packet}
 use anyhow::Result;
 use rmp::decode::read_str_len;
 use rmp::encode::write_str;
+use std::io::Write;
 
 pub fn read_error(stream: &mut impl ByteStream) -> Result<String> {
     let len = read_str_len(stream)?;
@@ -10,8 +11,7 @@ pub fn read_error(stream: &mut impl ByteStream) -> Result<String> {
     Ok(message)
 }
 
-pub fn prepare_error(stream: &mut impl ByteStream, message: &str) -> Result<()> {
-    stream.reset()?;
+pub fn prepare_error(stream: &mut impl Write, message: &str) -> Result<()> {
     let length = 1 + 1 + u32::try_from(message.len())?;
     let header = Header {
         direction: Direction::ToBackend,

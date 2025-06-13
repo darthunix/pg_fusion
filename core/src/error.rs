@@ -17,4 +17,10 @@ pub enum FusionError {
     InvalidName(SmolStr, SmolStr),
     #[error("Failed to {0}: {1}")]
     FailedTo(SmolStr, SmolStr),
+    #[error("Invalid header: {0}")]
+    InvalidHeader(anyhow::Error),
+    #[error("Invalid transition in FSM: {0}")]
+    InvalidTransition(anyhow::Error),
+    #[error(transparent)]
+    Other(#[from] anyhow::Error),
 }

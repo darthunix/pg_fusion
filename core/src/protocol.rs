@@ -112,8 +112,7 @@ impl Header {
     }
 }
 
-pub fn consume_header(stream: &mut impl ByteStream) -> Result<Header> {
-    assert_eq!(stream.position(), 0);
+pub fn consume_header(stream: &mut impl Read) -> Result<Header> {
     let direction = Direction::try_from(read_pfix(stream)?)?;
     let packet = Packet::try_from(read_pfix(stream)?)?;
     let flag = Flag::try_from(read_pfix(stream)?)?;
@@ -126,7 +125,7 @@ pub fn consume_header(stream: &mut impl ByteStream) -> Result<Header> {
     })
 }
 
-pub fn write_header(stream: &mut impl ByteStream, header: &Header) -> Result<()> {
+pub fn write_header(stream: &mut impl Write, header: &Header) -> Result<()> {
     write_pfix(stream, header.direction.to_owned() as u8)?;
     write_pfix(stream, header.packet.to_owned() as u8)?;
     write_pfix(stream, header.flag.to_owned() as u8)?;
