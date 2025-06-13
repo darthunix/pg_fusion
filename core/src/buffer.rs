@@ -1,5 +1,6 @@
 use crate::error::FusionError;
 use anyhow::{bail, Result};
+use std::io::{Error as IoError, ErrorKind, Read, Result as IoResult, Write};
 use std::sync::atomic::{AtomicU32, Ordering};
 
 pub struct LockFreeBuffer<'bytes> {
@@ -7,6 +8,26 @@ pub struct LockFreeBuffer<'bytes> {
     tail: &'bytes AtomicU32,
     data: &'bytes mut [u8],
     cap: u32,
+}
+
+impl<'bytes> Write for LockFreeBuffer<'bytes> {
+    fn write(&mut self, buf: &[u8]) -> IoResult<usize> {
+        match self.push(buf) {
+            Ok(_) => Ok(buf.len()),
+            Err(_) => Err(IoError::new(ErrorKind::Other, "Failed to write to buffer")),
+        }
+    }
+
+    fn flush(&mut self) -> IoResult<()> {
+        Ok(())
+    }
+}
+
+impl<'bytes> Read for LockFreeBuffer<'bytes> {
+    fn read(&mut self, buf: &mut [u8]) -> IoResult<usize> {
+        let bytes_read = self.pop(buf);
+        Ok(bytes_read)
+    }
 }
 
 impl<'bytes> LockFreeBuffer<'bytes> {
@@ -43,15 +64,21 @@ impl<'bytes> LockFreeBuffer<'bytes> {
     /// Reads bytes from the buffer into `out` and moves the head.
     /// Returns the number of bytes that were read.
     pub fn pop(&mut self, out: &mut [u8]) -> usize {
-        let (to_read, h) = self.read(out);
+        let (to_read, h) = self.read_bytes(out);
         self.head.store(h, Ordering::Release);
         to_read
+    }
+
+    /// Flushes the read position of the buffer.
+    pub fn flush_read(&mut self) {
+        self.head
+            .store(self.tail.load(Ordering::Relaxed), Ordering::Release);
     }
 
     /// Reads bytes from the buffer into `out` without moving the head.
     /// Returns the number of bytes that can be read.
     pub fn peek(&self, out: &mut [u8]) -> usize {
-        let (to_read, _) = self.read(out);
+        let (to_read, _) = self.read_bytes(out);
         to_read
     }
 
@@ -77,7 +104,7 @@ impl<'bytes> LockFreeBuffer<'bytes> {
     /// If there are no bytes to read, returns 0.
     /// If there are not enough bytes to read, returns n where n is the number of bytes that
     /// were read.
-    fn read(&self, out: &mut [u8]) -> (usize, u32) {
+    fn read_bytes(&self, out: &mut [u8]) -> (usize, u32) {
         let tail = self.tail.load(Ordering::Acquire);
         let head = self.head.load(Ordering::Relaxed);
 
