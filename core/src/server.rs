@@ -213,8 +213,14 @@ mod tests {
     }
     unsafe impl Sync for ConnMemory {}
 
+    fn flush(conn: &mut Connection) {
+        conn.storage.flush();
+        conn.recv_socket.buffer.flush_read();
+        conn.send_buffer.flush_read();
+    }
+
     #[tokio::test]
-    async fn test_parse_with_tables() -> Result<()> {
+    async fn test_parse() -> Result<()> {
         static BYTES: ConnMemory = ConnMemory::new();
         let state = Arc::new(SharedState::new(unsafe { &*BYTES.flag.get() }));
         let recv_buffer = LockFreeBuffer::new(unsafe { &mut *BYTES.rx.get() });
@@ -222,6 +228,7 @@ mod tests {
         let socket = Socket::new(0, Arc::clone(&state), recv_buffer);
         let mut conn = Connection::new(socket, send_buffer);
         tokio::spawn(async move {
+            // Test parsing a query with tables.
             assert_eq!(conn.storage.state.state(), &ExecutorState::Initialized);
             let sql = "select a from t";
             prepare_query(&mut conn.recv_socket.buffer, sql).expect("Failed to prepare SQL");
@@ -232,20 +239,9 @@ mod tests {
             };
             assert_eq!(conn.storage.statement, Some(stmt));
             assert_eq!(conn.storage.state.state(), &ExecutorState::Statement);
-        })
-        .await?;
-        Ok(())
-    }
 
-    #[tokio::test]
-    async fn test_parse_no_tables() -> Result<()> {
-        static BYTES: ConnMemory = ConnMemory::new();
-        let state = Arc::new(SharedState::new(unsafe { &*BYTES.flag.get() }));
-        let recv_buffer = LockFreeBuffer::new(unsafe { &mut *BYTES.rx.get() });
-        let send_buffer = LockFreeBuffer::new(unsafe { &mut *BYTES.tx.get() });
-        let socket = Socket::new(0, Arc::clone(&state), recv_buffer);
-        let mut conn = Connection::new(socket, send_buffer);
-        tokio::spawn(async move {
+            // Test parsing a query without tables.
+            flush(&mut conn);
             assert_eq!(conn.storage.state.state(), &ExecutorState::Initialized);
             let sql = "select 1";
             prepare_query(&mut conn.recv_socket.buffer, sql).expect("Failed to prepare SQL");
