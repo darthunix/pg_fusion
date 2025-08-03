@@ -14,7 +14,7 @@ use std::str::from_utf8;
 pub fn read_query(stream: &mut impl Tape) -> Result<SmolStr> {
     let len = read_str_len(stream)?;
     let mut buf = vec![0; len as usize];
-    let read_len = stream.peek(&mut buf);
+    let read_len = stream.read(&mut buf)?;
     debug_assert_eq!(read_len, len as usize);
     let query = SmolStr::from(from_utf8(&buf)?);
     Ok(query)
