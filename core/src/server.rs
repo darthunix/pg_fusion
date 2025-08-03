@@ -192,7 +192,12 @@ mod tests {
     use crate::buffer::LockFreeBuffer;
     use crate::fsm::ExecutorState;
     use crate::ipc::SharedState;
+    use crate::protocol::metadata::process_metadata_with_response;
+    use crate::protocol::metadata::tests::{
+        mock_schema_table_lookup, mock_table_lookup, mock_table_serialize,
+    };
     use crate::protocol::parse::prepare_query;
+    use crate::protocol::Tape;
     use std::cell::UnsafeCell;
     use std::sync::atomic::AtomicBool;
     use std::sync::Arc;
@@ -254,6 +259,43 @@ mod tests {
                 unreachable!();
             };
             assert_eq!(conn.storage.logical_plan, Some(plan));
+            assert_eq!(conn.storage.state.state(), &ExecutorState::LogicalPlan);
+        })
+        .await?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_from_parse_to_compile() -> Result<()> {
+        static BYTES: ConnMemory = ConnMemory::new();
+        let state = Arc::new(SharedState::new(unsafe { &*BYTES.flag.get() }));
+        let recv_buffer = LockFreeBuffer::new(unsafe { &mut *BYTES.rx.get() });
+        let send_buffer = LockFreeBuffer::new(unsafe { &mut *BYTES.tx.get() });
+        let socket = Socket::new(0, Arc::clone(&state), recv_buffer);
+        let mut conn = Connection::new(socket, send_buffer);
+        tokio::spawn(async move {
+            assert_eq!(conn.storage.state.state(), &ExecutorState::Initialized);
+            let sql = "select a from public.t1";
+            prepare_query(&mut conn.recv_socket.buffer, sql).expect("Failed to prepare SQL");
+            conn.process_message()
+                .expect("Failed to process parse message");
+            assert_eq!(conn.recv_socket.buffer.len(), 0);
+
+            assert_eq!(conn.storage.state.state(), &ExecutorState::Statement);
+            let header =
+                consume_header(&mut conn.send_buffer).expect("Failed to consume metadata header");
+            assert_eq!(header.direction, Direction::ToBackend);
+            assert_eq!(header.packet, Packet::Metadata);
+            process_metadata_with_response(
+                &mut conn.send_buffer,
+                &mut conn.recv_socket.buffer,
+                mock_schema_table_lookup,
+                mock_table_lookup,
+                mock_table_serialize,
+            )
+            .expect("Failed to process metadata");
+            conn.process_message()
+                .expect("Failed to process metadata message");
             assert_eq!(conn.storage.state.state(), &ExecutorState::LogicalPlan);
         })
         .await?;

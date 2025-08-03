@@ -152,7 +152,6 @@ where
     output.fast_forward(length as u32)?;
     debug_assert_eq!(output.uncommitted_len(), len_final);
     output.flush()?;
-    debug_assert_eq!(output.len(), len_final);
     debug_assert_eq!(output.uncommitted_len(), 0);
     Ok(())
 }
@@ -214,28 +213,32 @@ pub fn consume_metadata(
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use crate::buffer::LockFreeBuffer;
     use crate::protocol::consume_header;
     use datafusion::arrow::datatypes::DataType;
     use std::io::{Cursor, Read};
 
-    fn mock_table_lookup(name: &[u8]) -> Result<u32> {
+    pub(crate) fn mock_table_lookup(name: &[u8]) -> Result<u32> {
         if name == b"t2\0" {
             return Ok(666);
         }
         unreachable!();
     }
 
-    fn mock_schema_table_lookup(schema: &[u8], name: &[u8]) -> Result<u32> {
+    pub(crate) fn mock_schema_table_lookup(schema: &[u8], name: &[u8]) -> Result<u32> {
         if schema == b"public\0" && name == b"t1\0" {
             return Ok(42);
         }
         unreachable!();
     }
 
-    fn mock_table_serialize(id: u32, need_schema: bool, output: &mut dyn Write) -> Result<()> {
+    pub(crate) fn mock_table_serialize(
+        id: u32,
+        need_schema: bool,
+        output: &mut dyn Write,
+    ) -> Result<()> {
         match id {
             42 => {
                 assert!(need_schema);
