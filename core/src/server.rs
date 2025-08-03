@@ -192,6 +192,7 @@ mod tests {
     use crate::buffer::LockFreeBuffer;
     use crate::fsm::ExecutorState;
     use crate::ipc::SharedState;
+    use crate::protocol::bind::prepare_params;
     use crate::protocol::metadata::process_metadata_with_response;
     use crate::protocol::metadata::tests::{
         mock_schema_table_lookup, mock_table_lookup, mock_table_serialize,
@@ -266,7 +267,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_from_parse_to_compile() -> Result<()> {
+    async fn test_from_parse_to_bind() -> Result<()> {
         static BYTES: ConnMemory = ConnMemory::new();
         let state = Arc::new(SharedState::new(unsafe { &*BYTES.flag.get() }));
         let recv_buffer = LockFreeBuffer::new(unsafe { &mut *BYTES.rx.get() });
@@ -275,13 +276,13 @@ mod tests {
         let mut conn = Connection::new(socket, send_buffer);
         tokio::spawn(async move {
             assert_eq!(conn.storage.state.state(), &ExecutorState::Initialized);
-            let sql = "select a from public.t1";
+            let sql = "select a from public.t1 where b = $1";
             prepare_query(&mut conn.recv_socket.buffer, sql).expect("Failed to prepare SQL");
             conn.process_message()
                 .expect("Failed to process parse message");
             assert_eq!(conn.recv_socket.buffer.len(), 0);
-
             assert_eq!(conn.storage.state.state(), &ExecutorState::Statement);
+
             let header =
                 consume_header(&mut conn.send_buffer).expect("Failed to consume metadata header");
             assert_eq!(header.direction, Direction::ToBackend);
@@ -296,6 +297,20 @@ mod tests {
             .expect("Failed to process metadata");
             conn.process_message()
                 .expect("Failed to process metadata message");
+            assert_eq!(conn.recv_socket.buffer.len(), 0);
+            assert_eq!(conn.storage.state.state(), &ExecutorState::LogicalPlan);
+
+            let header =
+                consume_header(&mut conn.send_buffer).expect("Failed to consume bind header");
+            assert_eq!(header.direction, Direction::ToBackend);
+            assert_eq!(header.packet, Packet::Bind);
+            prepare_params(&mut conn.recv_socket.buffer, || {
+                (1, vec![Ok(ScalarValue::Int32(Some(1)))].into_iter())
+            })
+            .expect("Failed to prepare params");
+            conn.process_message()
+                .expect("Failed to process bind message");
+            assert_eq!(conn.recv_socket.buffer.len(), 0);
             assert_eq!(conn.storage.state.state(), &ExecutorState::LogicalPlan);
         })
         .await?;
