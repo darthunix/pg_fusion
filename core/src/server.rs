@@ -193,6 +193,7 @@ mod tests {
     use crate::fsm::ExecutorState;
     use crate::ipc::SharedState;
     use crate::protocol::bind::prepare_params;
+    use crate::protocol::columns::consume_columns;
     use crate::protocol::metadata::process_metadata_with_response;
     use crate::protocol::metadata::tests::{
         mock_schema_table_lookup, mock_table_lookup, mock_table_serialize,
@@ -200,6 +201,7 @@ mod tests {
     use crate::protocol::parse::prepare_query;
     use crate::protocol::Tape;
     use std::cell::UnsafeCell;
+    use std::os::raw::c_void;
     use std::sync::atomic::AtomicBool;
     use std::sync::Arc;
 
@@ -267,7 +269,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_from_parse_to_bind() -> Result<()> {
+    async fn test_from_parse_to_columns() -> Result<()> {
         static BYTES: ConnMemory = ConnMemory::new();
         let state = Arc::new(SharedState::new(unsafe { &*BYTES.flag.get() }));
         let recv_buffer = LockFreeBuffer::new(unsafe { &mut *BYTES.rx.get() });
@@ -312,6 +314,23 @@ mod tests {
                 .expect("Failed to process bind message");
             assert_eq!(conn.recv_socket.buffer.len(), 0);
             assert_eq!(conn.storage.state.state(), &ExecutorState::LogicalPlan);
+
+            let header =
+                consume_header(&mut conn.send_buffer).expect("Failed to consume bind header");
+            assert_eq!(header.direction, Direction::ToBackend);
+            assert_eq!(header.packet, Packet::Columns);
+            type Payload = (i16, u8, Vec<u8>);
+            let mut columns: Vec<Payload> = Vec::new();
+            let columns_ptr = &mut columns as *mut Vec<Payload> as *mut c_void;
+            let repack = |pos: i16, etype: u8, name: &[u8], ptr: *mut c_void| -> Result<()> {
+                let columns: &mut Vec<Payload> = unsafe { &mut *(ptr as *mut Vec<Payload>) };
+                columns.push((pos, etype, name.to_vec()));
+                Ok(())
+            };
+            consume_columns(&mut conn.send_buffer, columns_ptr, repack)
+                .expect("Failed to consume columns");
+            assert_eq!(columns.len(), 1);
+            assert_eq!(columns[0], (0, 4, b"a\0".into()));
         })
         .await?;
         Ok(())
