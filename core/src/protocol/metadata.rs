@@ -14,7 +14,7 @@ use std::io::{Read, Write};
 use std::str::from_utf8;
 use std::sync::Arc;
 
-const NAMEDATALEN: usize = 64;
+pub(crate) const NAMEDATALEN: usize = 64;
 
 /// Writes a table reference as null-terminated strings to
 /// the stream. It would be used by the Rust wrappers to the
