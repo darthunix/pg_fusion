@@ -1,5 +1,18 @@
 use crate::protocol::{write_c_str, write_header, Direction, Flag, Header, Packet, Tape};
 use anyhow::Result;
+use std::io::Write;
+
+pub fn request_explain(stream: &mut impl Write) -> Result<()> {
+    let header = Header {
+        direction: Direction::ToWorker,
+        packet: Packet::Explain,
+        length: 0,
+        flag: Flag::Last,
+    };
+    write_header(stream, &header)?;
+    stream.flush()?;
+    Ok(())
+}
 
 pub fn prepare_explain(stream: &mut impl Tape, explain: &str) -> Result<()> {
     let header = Header::default();
@@ -31,6 +44,21 @@ mod tests {
     use crate::buffer::LockFreeBuffer;
     use crate::protocol::consume_header;
     use std::io::Read;
+
+    #[test]
+    fn test_request_explain() {
+        let mut bytes = vec![0u8; 8 + 32];
+        let mut buffer = LockFreeBuffer::new(&mut bytes);
+        request_explain(&mut buffer).expect("Failed to request explain");
+        let expected_header = Header {
+            direction: Direction::ToWorker,
+            packet: Packet::Explain,
+            length: 0,
+            flag: Flag::Last,
+        };
+        let header = consume_header(&mut buffer).expect("Failed to consume header");
+        assert_eq!(header, expected_header);
+    }
 
     #[test]
     fn test_prepare_explain() {

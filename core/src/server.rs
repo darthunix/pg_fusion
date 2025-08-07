@@ -194,27 +194,33 @@ mod tests {
     use crate::ipc::SharedState;
     use crate::protocol::bind::prepare_params;
     use crate::protocol::columns::consume_columns;
+    use crate::protocol::explain::request_explain;
     use crate::protocol::metadata::process_metadata_with_response;
     use crate::protocol::metadata::tests::{
         mock_schema_table_lookup, mock_table_lookup, mock_table_serialize,
     };
     use crate::protocol::parse::prepare_query;
     use crate::protocol::Tape;
+    use rmp::decode::read_bin_len;
     use std::cell::UnsafeCell;
+    use std::ffi::CStr;
+    use std::io::Read;
     use std::os::raw::c_void;
     use std::sync::atomic::AtomicBool;
     use std::sync::Arc;
 
+    const PAYLOAD_SIZE: usize = 248;
+
     struct ConnMemory {
-        rx: UnsafeCell<[u8; 8 + 120]>,
-        tx: UnsafeCell<[u8; 8 + 120]>,
+        rx: UnsafeCell<[u8; 8 + PAYLOAD_SIZE]>,
+        tx: UnsafeCell<[u8; 8 + PAYLOAD_SIZE]>,
         flag: UnsafeCell<[AtomicBool; 1]>,
     }
     impl ConnMemory {
         const fn new() -> Self {
             Self {
-                rx: UnsafeCell::new([0; 8 + 120]),
-                tx: UnsafeCell::new([0; 8 + 120]),
+                rx: UnsafeCell::new([0; 8 + PAYLOAD_SIZE]),
+                tx: UnsafeCell::new([0; 8 + PAYLOAD_SIZE]),
                 flag: UnsafeCell::new([AtomicBool::new(false); 1]),
             }
         }
@@ -331,6 +337,31 @@ mod tests {
                 .expect("Failed to consume columns");
             assert_eq!(columns.len(), 1);
             assert_eq!(columns[0], (0, 4, b"a\0".into()));
+
+            request_explain(&mut conn.recv_socket.buffer).expect("Failed to request explain");
+            conn.process_message()
+                .expect("Failed to process explain message");
+            assert_eq!(conn.recv_socket.buffer.len(), 0);
+            assert_eq!(conn.storage.state.state(), &ExecutorState::Initialized);
+            let header =
+                consume_header(&mut conn.send_buffer).expect("Failed to consume explain header");
+            assert_eq!(header.direction, Direction::ToBackend);
+            assert_eq!(header.packet, Packet::Explain);
+            let len =
+                read_bin_len(&mut conn.send_buffer).expect("Failed to get explain length") as usize;
+            let mut buffer = vec![0u8; len];
+            conn.send_buffer
+                .read_exact(&mut buffer)
+                .expect("Failed to read explain to buffer");
+            assert!(!buffer.is_empty());
+            let explain = CStr::from_bytes_with_nul(&buffer)
+                .expect("Failed to convert explain bytes to C string")
+                .to_str()
+                .expect("Failed to cast C string to str");
+            let expected_explain = "Projection: public.t1.a [a:Int64;N]\n  \
+                Filter: public.t1.b = Int32(1) [a:Int64;N, b:Utf8]\n    \
+                TableScan: public.t1 [a:Int64;N, b:Utf8]";
+            assert_eq!(explain, expected_explain);
         })
         .await?;
         Ok(())
