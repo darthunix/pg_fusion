@@ -269,8 +269,7 @@ pub(crate) mod tests {
         unsafe {
             let base = std::alloc::alloc(layout.layout);
             assert!(!base.is_null());
-            let mem = std::slice::from_raw_parts_mut(base, layout.layout.size());
-            let mut buffer = LockFreeBuffer::new(mem);
+            let mut buffer = LockFreeBuffer::from_layout(base, layout);
 
         let expected_tables = vec![
             TableReference::partial("public", "table1"),
@@ -301,8 +300,7 @@ pub(crate) mod tests {
         unsafe {
             let base = std::alloc::alloc(layout.layout);
             assert!(!base.is_null());
-            let mem = std::slice::from_raw_parts_mut(base, layout.layout.size());
-            let mut buffer = LockFreeBuffer::new(mem);
+            let mut buffer = LockFreeBuffer::from_layout(base, layout);
 
         prepare_empty_metadata(&mut buffer).unwrap();
         assert_eq!(buffer.uncommitted_len(), 0);
@@ -372,8 +370,7 @@ pub(crate) mod tests {
         unsafe {
             let in_base = std::alloc::alloc(in_layout.layout);
             assert!(!in_base.is_null());
-            let in_mem = std::slice::from_raw_parts_mut(in_base, in_layout.layout.size());
-            let mut input = LockFreeBuffer::new(in_mem);
+            let mut input = LockFreeBuffer::from_layout(in_base, in_layout);
         let expected_tables = vec![
             TableReference::partial("public", "t1"),
             TableReference::bare("t2"),
@@ -389,8 +386,7 @@ pub(crate) mod tests {
 
             let out_base = std::alloc::alloc(out_layout.layout);
             assert!(!out_base.is_null());
-            let out_mem = std::slice::from_raw_parts_mut(out_base, out_layout.layout.size());
-            let mut output = LockFreeBuffer::new(out_mem);
+            let mut output = LockFreeBuffer::from_layout(out_base, out_layout);
         let _ = consume_header(&mut input).expect("Failed to consume metadata request header");
         process_metadata_with_response(
             &mut input,

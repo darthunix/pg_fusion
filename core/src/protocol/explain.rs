@@ -54,8 +54,7 @@ mod tests {
             let base = alloc(layout.layout);
             assert!(!base.is_null());
             std::ptr::write_bytes(base, 0, layout.layout.size());
-            let mem = std::slice::from_raw_parts_mut(base, layout.layout.size());
-            let mut buffer = LockFreeBuffer::new(mem);
+            let mut buffer = LockFreeBuffer::from_layout(base, layout);
             request_explain(&mut buffer).expect("Failed to request explain");
             let expected_header = Header {
                 direction: Direction::ToWorker,
@@ -76,8 +75,7 @@ mod tests {
             let base = alloc(layout.layout);
             assert!(!base.is_null());
             std::ptr::write_bytes(base, 0, layout.layout.size());
-            let mem = std::slice::from_raw_parts_mut(base, layout.layout.size());
-            let mut buffer = LockFreeBuffer::new(mem);
+            let mut buffer = LockFreeBuffer::from_layout(base, layout);
             assert!(buffer.is_empty());
             assert_eq!(buffer.uncommitted_len(), 0);
 

@@ -51,8 +51,7 @@ mod tests {
             let base = alloc(layout.layout);
             assert!(!base.is_null());
             std::ptr::write_bytes(base, 0, layout.layout.size());
-            let mem = std::slice::from_raw_parts_mut(base, layout.layout.size());
-            let mut buffer = LockFreeBuffer::new(mem);
+            let mut buffer = LockFreeBuffer::from_layout(base, layout);
             assert!(buffer.is_empty());
             assert_eq!(buffer.uncommitted_len(), 0);
 
@@ -82,8 +81,7 @@ mod tests {
             let base = alloc(layout.layout);
             assert!(!base.is_null());
             std::ptr::write_bytes(base, 0, layout.layout.size());
-            let mem = std::slice::from_raw_parts_mut(base, layout.layout.size());
-            let mut buffer = LockFreeBuffer::new(mem);
+            let mut buffer = LockFreeBuffer::from_layout(base, layout);
 
             prepare_query(&mut buffer, "select 1").unwrap();
             let _ = consume_header(&mut buffer).unwrap();

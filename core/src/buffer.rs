@@ -80,6 +80,30 @@ impl<'bytes> LockFreeBuffer<'bytes> {
         }
     }
 
+    /// Construct a buffer view from a region laid out by `crate::layout::lockfree_buffer_layout`.
+    ///
+    /// # Safety
+    /// - `base` must point to a memory region of at least `layout.layout.size()` bytes,
+    ///   aligned to `layout.layout.align()`.
+    /// - The memory must remain valid and uniquely borrowed for the lifetime `'bytes`.
+    pub unsafe fn from_layout(
+        base: *mut u8,
+        layout: crate::layout::BufferLayout,
+    ) -> Self {
+        let (head_ptr, tail_ptr, data_ptr) =
+            crate::layout::lockfree_buffer_ptrs(base, layout);
+        let data_len = layout.data_len;
+        let data = std::slice::from_raw_parts_mut(data_ptr, data_len);
+
+        Self {
+            head: &*head_ptr,
+            tail: &*tail_ptr,
+            data,
+            uncommitted_tail: AtomicU32::new((&*tail_ptr).load(Ordering::Relaxed)),
+            cap: data_len as u32,
+        }
+    }
+
     #[inline(always)]
     fn wrap(&self, idx: u32) -> u32 {
         idx % self.cap

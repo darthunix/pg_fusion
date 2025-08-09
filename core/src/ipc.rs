@@ -117,8 +117,7 @@ mod tests {
             let base = std::alloc::alloc(layout.layout);
             assert!(!base.is_null());
             std::ptr::write_bytes(base, 0, layout.layout.size());
-            let mem = std::slice::from_raw_parts_mut(base, layout.layout.size());
-            let buffer = LockFreeBuffer::new(mem);
+            let buffer = LockFreeBuffer::from_layout(base, layout);
             let socket = Socket::new(0, Arc::clone(&state), buffer);
 
             // As the flag is already set, .await should complete immediately.
