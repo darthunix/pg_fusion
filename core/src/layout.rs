@@ -1,6 +1,6 @@
 use crate::stack::TreiberStack;
 use std::alloc::{Layout, LayoutError};
-use std::sync::atomic::AtomicU32;
+use std::sync::atomic::{AtomicBool, AtomicU32};
 
 /// Memory layout helpers for placing the Treiber stack in a single
 /// contiguous shared memory region.
@@ -90,4 +90,45 @@ pub unsafe fn lockfree_buffer_ptrs(
     let tail = base.add(layout.tail_offset) as *mut AtomicU32;
     let data = base.add(layout.data_offset) as *mut u8;
     (head, tail, data)
+}
+
+/// Layout for a Socket: one `AtomicBool` signal flag and an embedded lock-free buffer region.
+#[derive(Clone, Copy, Debug)]
+pub struct SocketLayout {
+    pub layout: Layout,
+    pub flag_offset: usize,
+    pub buffer_offset: usize,
+    pub buffer_layout: BufferLayout,
+}
+
+/// Compute the layout for a single socket with a buffer of `capacity` bytes.
+pub fn socket_layout(capacity: usize) -> Result<SocketLayout, LayoutError> {
+    let flag = Layout::new::<AtomicBool>();
+    let buf = lockfree_buffer_layout(capacity)?;
+    let (combined, buffer_offset) = flag.extend(buf.layout)?;
+    Ok(SocketLayout {
+        layout: combined.pad_to_align(),
+        flag_offset: 0,
+        buffer_offset,
+        buffer_layout: buf,
+    })
+}
+
+/// Given the base pointer and computed `SocketLayout`, return pointers to:
+/// - the `AtomicBool` flag
+/// - the start of the buffer region
+///
+/// The caller can form a `&mut [u8]` of length `layout.buffer_layout.layout.size()`
+/// starting at `buffer_base` and pass it to `LockFreeBuffer::new`.
+///
+/// # Safety
+/// - `base` must be non-null and properly aligned for `layout.layout`.
+/// - Memory must be at least `layout.layout.size()` bytes long.
+pub unsafe fn socket_ptrs(
+    base: *mut u8,
+    layout: SocketLayout,
+) -> (*mut AtomicBool, *mut u8) {
+    let flag_ptr = base.add(layout.flag_offset) as *mut AtomicBool;
+    let buffer_base = base.add(layout.buffer_offset);
+    (flag_ptr, buffer_base)
 }
