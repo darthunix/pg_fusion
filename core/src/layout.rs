@@ -46,3 +46,48 @@ pub unsafe fn treiber_stack_ptrs(
     // and initializing the `next` array (or calling `TreiberStack::new`).
     (header_ptr, next_ptr)
 }
+
+/// Memory layout for the lock-free byte buffer (ring) used by `LockFreeBuffer`.
+/// Region contains two `AtomicU32` (head, tail) followed by a byte array of size `capacity`.
+#[derive(Clone, Copy, Debug)]
+pub struct BufferLayout {
+    pub layout: Layout,
+    pub head_offset: usize,
+    pub tail_offset: usize,
+    pub data_offset: usize,
+    pub data_len: usize,
+}
+
+/// Compute the memory layout for a lock-free ring buffer of `capacity` bytes.
+pub fn lockfree_buffer_layout(capacity: usize) -> Result<BufferLayout, LayoutError> {
+    // LockFreeBuffer uses u32 indices; keep capacity within u32 range.
+    assert!(capacity <= (u32::MAX as usize), "capacity exceeds u32 range");
+
+    let head = Layout::new::<AtomicU32>();
+    let tail = Layout::new::<AtomicU32>();
+    let (ht, tail_offset) = head.extend(tail)?;
+    let data = Layout::array::<u8>(capacity)?;
+    let (combined, data_offset) = ht.extend(data)?;
+    Ok(BufferLayout {
+        layout: combined.pad_to_align(),
+        head_offset: 0,
+        tail_offset,
+        data_offset,
+        data_len: capacity,
+    })
+}
+
+/// Given a base pointer and `BufferLayout`, return typed pointers to head, tail and data.
+///
+/// # Safety
+/// - `base` must point to a region of at least `layout.layout.size()` bytes
+///   with alignment `layout.layout.align()`.
+pub unsafe fn lockfree_buffer_ptrs(
+    base: *mut u8,
+    layout: BufferLayout,
+) -> (*mut AtomicU32, *mut AtomicU32, *mut u8) {
+    let head = base.add(layout.head_offset) as *mut AtomicU32;
+    let tail = base.add(layout.tail_offset) as *mut AtomicU32;
+    let data = base.add(layout.data_offset) as *mut u8;
+    (head, tail, data)
+}
