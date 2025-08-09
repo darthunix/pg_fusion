@@ -92,43 +92,47 @@ pub unsafe fn lockfree_buffer_ptrs(
     (head, tail, data)
 }
 
-/// Layout for a Socket: one `AtomicBool` signal flag and an embedded lock-free buffer region.
+/// Layout for SharedState flags array kept in shared memory.
+#[derive(Clone, Copy, Debug)]
+pub struct SharedStateLayout {
+    pub layout: Layout,
+}
+
+/// Compute the layout for a SharedState with `num_flags` sockets.
+pub fn shared_state_layout(num_flags: usize) -> Result<SharedStateLayout, LayoutError> {
+    let flags = Layout::array::<AtomicBool>(num_flags)?;
+    Ok(SharedStateLayout { layout: flags.pad_to_align() })
+}
+
+/// Return a pointer to the first flag for a SharedState region.
+/// The caller can create `&[AtomicBool]` of length `num_flags` from it.
+/// # Safety: `base` must be valid for at least `layout.layout.size()` bytes.
+pub unsafe fn shared_state_flags_ptr(base: *mut u8, _layout: SharedStateLayout) -> *mut AtomicBool {
+    base as *mut AtomicBool
+}
+
+/// Layout for a Socket memory region: contains only the embedded lock-free buffer region.
 #[derive(Clone, Copy, Debug)]
 pub struct SocketLayout {
     pub layout: Layout,
-    pub flag_offset: usize,
     pub buffer_offset: usize,
     pub buffer_layout: BufferLayout,
 }
 
-/// Compute the layout for a single socket with a buffer of `capacity` bytes.
+/// Compute the layout for a single socket's memory region with a buffer of `capacity` bytes.
+/// This function requires a `SharedStateLayout` to make the relationship explicit,
+/// but the socket region itself does not include flags.
 pub fn socket_layout(capacity: usize) -> Result<SocketLayout, LayoutError> {
-    let flag = Layout::new::<AtomicBool>();
     let buf = lockfree_buffer_layout(capacity)?;
-    let (combined, buffer_offset) = flag.extend(buf.layout)?;
     Ok(SocketLayout {
-        layout: combined.pad_to_align(),
-        flag_offset: 0,
-        buffer_offset,
+        layout: buf.layout,
+        buffer_offset: 0,
         buffer_layout: buf,
     })
 }
 
-/// Given the base pointer and computed `SocketLayout`, return pointers to:
-/// - the `AtomicBool` flag
-/// - the start of the buffer region
-///
-/// The caller can form a `&mut [u8]` of length `layout.buffer_layout.layout.size()`
-/// starting at `buffer_base` and pass it to `LockFreeBuffer::new`.
-///
-/// # Safety
-/// - `base` must be non-null and properly aligned for `layout.layout`.
-/// - Memory must be at least `layout.layout.size()` bytes long.
-pub unsafe fn socket_ptrs(
-    base: *mut u8,
-    layout: SocketLayout,
-) -> (*mut AtomicBool, *mut u8) {
-    let flag_ptr = base.add(layout.flag_offset) as *mut AtomicBool;
-    let buffer_base = base.add(layout.buffer_offset);
-    (flag_ptr, buffer_base)
+/// Given the base pointer and computed `SocketLayout`, return the start of the buffer region.
+/// # Safety: `base` must be non-null and properly aligned; memory must be at least `layout.layout.size()` bytes long.
+pub unsafe fn socket_ptrs(base: *mut u8, layout: SocketLayout) -> *mut u8 {
+    base.add(layout.buffer_offset)
 }

@@ -53,6 +53,24 @@ impl<'bytes> Socket<'bytes> {
     pub fn signal(&self) {
         self.state.flags[self.id].store(true, Ordering::Release);
     }
+
+    /// Construct a socket from a memory region described by `SocketLayout`
+    /// and an existing `SharedState` (which owns the flags array).
+    ///
+    /// # Safety
+    /// - `base` must be a valid pointer to a region of at least `layout.layout.size()` bytes
+    ///   with alignment `layout.layout.align()`.
+    /// - The memory must live at least as long as `'bytes` and not be aliased mutably elsewhere.
+    pub unsafe fn from_layout_with_state(
+        id: usize,
+        state: Arc<SharedState<'bytes>>,
+        base: *mut u8,
+        layout: crate::layout::SocketLayout,
+    ) -> Self {
+        let buffer_base = crate::layout::socket_ptrs(base, layout);
+        let buffer = LockFreeBuffer::from_layout(buffer_base, layout.buffer_layout);
+        Socket::new(id, state, buffer)
+    }
 }
 
 impl Future for Socket<'_> {
