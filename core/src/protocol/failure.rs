@@ -33,12 +33,19 @@ mod tests {
     use super::*;
     use crate::buffer::LockFreeBuffer;
     use crate::protocol::consume_header;
+    use crate::layout::lockfree_buffer_layout;
+    use std::alloc::{alloc, dealloc};
     use std::io::Read;
 
     #[test]
     fn test_prepare_error() {
-        let mut bytes = vec![0u8; 8 + 32];
-        let mut buffer = LockFreeBuffer::new(&mut bytes);
+        let layout = lockfree_buffer_layout(32).unwrap();
+        unsafe {
+            let base = alloc(layout.layout);
+            assert!(!base.is_null());
+            std::ptr::write_bytes(base, 0, layout.layout.size());
+            let mem = std::slice::from_raw_parts_mut(base, layout.layout.size());
+            let mut buffer = LockFreeBuffer::new(mem);
         assert!(buffer.is_empty());
         assert_eq!(buffer.uncommitted_len(), 0);
 
@@ -57,16 +64,25 @@ mod tests {
         let len = buffer.read(&mut data).unwrap();
         assert_eq!(len, MESSAGE.len());
         assert_eq!(&data, MESSAGE);
+            dealloc(base, layout.layout);
+        }
     }
 
     #[test]
     fn test_read_error() {
-        let mut bytes = vec![0u8; 8 + 32];
-        let mut buffer = LockFreeBuffer::new(&mut bytes);
+        let layout = lockfree_buffer_layout(32).unwrap();
+        unsafe {
+            let base = alloc(layout.layout);
+            assert!(!base.is_null());
+            std::ptr::write_bytes(base, 0, layout.layout.size());
+            let mem = std::slice::from_raw_parts_mut(base, layout.layout.size());
+            let mut buffer = LockFreeBuffer::new(mem);
 
-        prepare_error(&mut buffer, "error message").unwrap();
-        let _ = consume_header(&mut buffer).unwrap();
-        let msg = read_error(&mut buffer).unwrap();
-        assert_eq!(msg, "error message");
+            prepare_error(&mut buffer, "error message").unwrap();
+            let _ = consume_header(&mut buffer).unwrap();
+            let msg = read_error(&mut buffer).unwrap();
+            assert_eq!(msg, "error message");
+            dealloc(base, layout.layout);
+        }
     }
 }

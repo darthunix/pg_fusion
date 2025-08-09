@@ -265,8 +265,12 @@ pub(crate) mod tests {
 
     #[test]
     fn test_prepare_table_refs() {
-        let mut bytes = vec![0u8; 8 + 37];
-        let mut buffer = LockFreeBuffer::new(&mut bytes);
+        let layout = crate::layout::lockfree_buffer_layout(37).unwrap();
+        unsafe {
+            let base = std::alloc::alloc(layout.layout);
+            assert!(!base.is_null());
+            let mem = std::slice::from_raw_parts_mut(base, layout.layout.size());
+            let mut buffer = LockFreeBuffer::new(mem);
 
         let expected_tables = vec![
             TableReference::partial("public", "table1"),
@@ -287,12 +291,18 @@ pub(crate) mod tests {
         let len = buffer.read(&mut data).unwrap();
         assert_eq!(len, MESSAGE.len());
         assert_eq!(&data, MESSAGE);
+            std::alloc::dealloc(base, layout.layout);
+        }
     }
 
     #[test]
     fn test_prepare_empty_metadata() {
-        let mut bytes = vec![0u8; 8 + 8];
-        let mut buffer = LockFreeBuffer::new(&mut bytes);
+        let layout = crate::layout::lockfree_buffer_layout(8).unwrap();
+        unsafe {
+            let base = std::alloc::alloc(layout.layout);
+            assert!(!base.is_null());
+            let mem = std::slice::from_raw_parts_mut(base, layout.layout.size());
+            let mut buffer = LockFreeBuffer::new(mem);
 
         prepare_empty_metadata(&mut buffer).unwrap();
         assert_eq!(buffer.uncommitted_len(), 0);
@@ -304,6 +314,8 @@ pub(crate) mod tests {
             flag: Flag::Last,
         };
         assert_eq!(header, expected_header);
+            std::alloc::dealloc(base, layout.layout);
+        }
     }
 
     #[test]
@@ -355,8 +367,13 @@ pub(crate) mod tests {
 
     #[test]
     fn test_process_metadata_with_response() {
-        let mut input_bytes = vec![0u8; 8 + 37];
-        let mut input = LockFreeBuffer::new(&mut input_bytes);
+        let in_layout = crate::layout::lockfree_buffer_layout(37).unwrap();
+        let out_layout = crate::layout::lockfree_buffer_layout(120).unwrap();
+        unsafe {
+            let in_base = std::alloc::alloc(in_layout.layout);
+            assert!(!in_base.is_null());
+            let in_mem = std::slice::from_raw_parts_mut(in_base, in_layout.layout.size());
+            let mut input = LockFreeBuffer::new(in_mem);
         let expected_tables = vec![
             TableReference::partial("public", "t1"),
             TableReference::bare("t2"),
@@ -370,8 +387,10 @@ pub(crate) mod tests {
         mock_table_serialize(42, true, &mut expected_msg).expect("Failed to mock t1");
         mock_table_serialize(666, false, &mut expected_msg).expect("Failed to mock t2");
 
-        let mut output_bytes = vec![0u8; 8 + 120];
-        let mut output = LockFreeBuffer::new(&mut output_bytes);
+            let out_base = std::alloc::alloc(out_layout.layout);
+            assert!(!out_base.is_null());
+            let out_mem = std::slice::from_raw_parts_mut(out_base, out_layout.layout.size());
+            let mut output = LockFreeBuffer::new(out_mem);
         let _ = consume_header(&mut input).expect("Failed to consume metadata request header");
         process_metadata_with_response(
             &mut input,
@@ -394,5 +413,8 @@ pub(crate) mod tests {
         let len = output.read(&mut msg).expect("Failed to read result");
         assert_eq!(len, expected_msg.len());
         assert_eq!(msg, expected_msg);
+            std::alloc::dealloc(in_base, in_layout.layout);
+            std::alloc::dealloc(out_base, out_layout.layout);
+        }
     }
 }

@@ -86,6 +86,7 @@ impl Future for Socket<'_> {
 mod tests {
     use super::*;
     use crate::buffer::LockFreeBuffer;
+    use crate::layout::lockfree_buffer_layout;
     use std::cell::UnsafeCell;
     use std::time::Duration;
     use tokio::task;
@@ -110,12 +111,20 @@ mod tests {
         let flags = [AtomicBool::new(true)];
         let state = Arc::new(SharedState::new(&flags));
 
-        let mut bytes = vec![0u8; 8 + 13];
-        let buffer = LockFreeBuffer::new(&mut bytes);
-        let socket = Socket::new(0, Arc::clone(&state), buffer);
+        // Allocate buffer via BufferLayout on the heap
+        let layout = lockfree_buffer_layout(13).unwrap();
+        unsafe {
+            let base = std::alloc::alloc(layout.layout);
+            assert!(!base.is_null());
+            std::ptr::write_bytes(base, 0, layout.layout.size());
+            let mem = std::slice::from_raw_parts_mut(base, layout.layout.size());
+            let buffer = LockFreeBuffer::new(mem);
+            let socket = Socket::new(0, Arc::clone(&state), buffer);
 
-        // As the flag is already set, .await should complete immediately.
-        timeout(Duration::from_secs(1), socket).await??;
+            // As the flag is already set, .await should complete immediately.
+            timeout(Duration::from_secs(1), socket).await??;
+            std::alloc::dealloc(base, layout.layout);
+        }
         Ok(())
     }
 

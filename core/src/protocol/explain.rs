@@ -43,44 +43,60 @@ mod tests {
     use super::*;
     use crate::buffer::LockFreeBuffer;
     use crate::protocol::consume_header;
+    use crate::layout::lockfree_buffer_layout;
+    use std::alloc::{alloc, dealloc};
     use std::io::Read;
 
     #[test]
     fn test_request_explain() {
-        let mut bytes = vec![0u8; 8 + 32];
-        let mut buffer = LockFreeBuffer::new(&mut bytes);
-        request_explain(&mut buffer).expect("Failed to request explain");
-        let expected_header = Header {
-            direction: Direction::ToWorker,
-            packet: Packet::Explain,
-            length: 0,
-            flag: Flag::Last,
-        };
-        let header = consume_header(&mut buffer).expect("Failed to consume header");
-        assert_eq!(header, expected_header);
+        let layout = lockfree_buffer_layout(32).unwrap();
+        unsafe {
+            let base = alloc(layout.layout);
+            assert!(!base.is_null());
+            std::ptr::write_bytes(base, 0, layout.layout.size());
+            let mem = std::slice::from_raw_parts_mut(base, layout.layout.size());
+            let mut buffer = LockFreeBuffer::new(mem);
+            request_explain(&mut buffer).expect("Failed to request explain");
+            let expected_header = Header {
+                direction: Direction::ToWorker,
+                packet: Packet::Explain,
+                length: 0,
+                flag: Flag::Last,
+            };
+            let header = consume_header(&mut buffer).expect("Failed to consume header");
+            assert_eq!(header, expected_header);
+            dealloc(base, layout.layout);
+        }
     }
 
     #[test]
     fn test_prepare_explain() {
-        let mut bytes = vec![0u8; 8 + 32];
-        let mut buffer = LockFreeBuffer::new(&mut bytes);
-        assert!(buffer.is_empty());
-        assert_eq!(buffer.uncommitted_len(), 0);
+        let layout = lockfree_buffer_layout(32).unwrap();
+        unsafe {
+            let base = alloc(layout.layout);
+            assert!(!base.is_null());
+            std::ptr::write_bytes(base, 0, layout.layout.size());
+            let mem = std::slice::from_raw_parts_mut(base, layout.layout.size());
+            let mut buffer = LockFreeBuffer::new(mem);
+            assert!(buffer.is_empty());
+            assert_eq!(buffer.uncommitted_len(), 0);
 
-        prepare_explain(&mut buffer, "query plan").unwrap();
-        assert_eq!(buffer.uncommitted_len(), 0);
-        const PLAN: &[u8] = b"\xc4\x0bquery plan\0";
-        let header = consume_header(&mut buffer).unwrap();
-        let expected_header = Header {
-            direction: Direction::ToBackend,
-            packet: Packet::Explain,
-            length: PLAN.len() as u16,
-            flag: Flag::Last,
-        };
-        assert_eq!(header, expected_header);
-        let mut data = [0u8; PLAN.len()];
-        let len = buffer.read(&mut data).unwrap();
-        assert_eq!(len, PLAN.len());
-        assert_eq!(&data, PLAN);
+            prepare_explain(&mut buffer, "query plan").unwrap();
+            assert_eq!(buffer.uncommitted_len(), 0);
+            const PLAN: &[u8] = b"\xc4\x0bquery plan\0";
+            let header = consume_header(&mut buffer).unwrap();
+            let expected_header = Header {
+                direction: Direction::ToBackend,
+                packet: Packet::Explain,
+                length: PLAN.len() as u16,
+                flag: Flag::Last,
+            };
+            assert_eq!(header, expected_header);
+            let mut data = [0u8; PLAN.len()];
+            let len = buffer.read(&mut data).unwrap();
+            assert_eq!(len, PLAN.len());
+            assert_eq!(&data, PLAN);
+            dealloc(base, layout.layout);
+        }
     }
 }

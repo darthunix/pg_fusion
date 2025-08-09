@@ -66,13 +66,20 @@ mod tests {
     use super::*;
     use crate::buffer::LockFreeBuffer;
     use crate::protocol::consume_header;
+    use crate::layout::lockfree_buffer_layout;
+    use std::alloc::{alloc, dealloc};
     use datafusion::arrow::datatypes::{DataType, Field, SchemaBuilder};
     use std::io::{Cursor, Read};
 
     #[test]
     fn test_prepare_columns() {
-        let mut bytes = vec![0u8; 8 + 32];
-        let mut buffer = LockFreeBuffer::new(&mut bytes);
+        let layout = lockfree_buffer_layout(32).unwrap();
+        unsafe {
+            let base = alloc(layout.layout);
+            assert!(!base.is_null());
+            std::ptr::write_bytes(base, 0, layout.layout.size());
+            let mem = std::slice::from_raw_parts_mut(base, layout.layout.size());
+            let mut buffer = LockFreeBuffer::new(mem);
         assert!(buffer.is_empty());
         assert_eq!(buffer.uncommitted_len(), 0);
 
@@ -95,6 +102,8 @@ mod tests {
         let len = buffer.read(&mut data).unwrap();
         assert_eq!(len, 13);
         assert_eq!(&data, b"\x92\xcc\0\xc4\x02a\0\xcc\x03\xc4\x02b\0");
+            dealloc(base, layout.layout);
+        }
     }
 
     #[test]

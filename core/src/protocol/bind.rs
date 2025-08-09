@@ -69,13 +69,20 @@ mod tests {
     use crate::buffer::LockFreeBuffer;
     use crate::data_type::write_scalar_value;
     use crate::protocol::{consume_header, Direction, Flag, Header, Packet, Tape};
+    use crate::layout::lockfree_buffer_layout;
     use datafusion::scalar::ScalarValue;
+    use std::alloc::{alloc, dealloc};
     use std::io::Write;
 
     #[test]
     fn test_read_params() {
-        let mut bytes = vec![0u8; 8 + 16];
-        let mut buffer = LockFreeBuffer::new(&mut bytes);
+        let layout = lockfree_buffer_layout(16).unwrap();
+        unsafe {
+            let base = alloc(layout.layout);
+            assert!(!base.is_null());
+            std::ptr::write_bytes(base, 0, layout.layout.size());
+            let mem = std::slice::from_raw_parts_mut(base, layout.layout.size());
+            let mut buffer = LockFreeBuffer::new(mem);
         assert!(buffer.is_empty());
         assert_eq!(buffer.uncommitted_len(), 0);
 
@@ -100,12 +107,19 @@ mod tests {
 
         let params = read_params(&mut buffer);
         assert_eq!(params.unwrap(), expected);
+            dealloc(base, layout.layout);
+        }
     }
 
     #[test]
     fn test_request_params() {
-        let mut bytes = vec![0u8; 8 + 16];
-        let mut buffer = LockFreeBuffer::new(&mut bytes);
+        let layout = lockfree_buffer_layout(16).unwrap();
+        unsafe {
+            let base = alloc(layout.layout);
+            assert!(!base.is_null());
+            std::ptr::write_bytes(base, 0, layout.layout.size());
+            let mem = std::slice::from_raw_parts_mut(base, layout.layout.size());
+            let mut buffer = LockFreeBuffer::new(mem);
         assert!(buffer.is_empty());
         assert_eq!(buffer.uncommitted_len(), 0);
 
@@ -120,12 +134,19 @@ mod tests {
         let header = consume_header(&mut buffer).unwrap();
         assert_eq!(header, expected_header);
         assert!(buffer.is_empty());
+            dealloc(base, layout.layout);
+        }
     }
 
     #[test]
     fn test_prepare_params() {
-        let mut bytes = vec![0u8; 8 + 120];
-        let mut buffer = LockFreeBuffer::new(&mut bytes);
+        let layout = lockfree_buffer_layout(120).unwrap();
+        unsafe {
+            let base = alloc(layout.layout);
+            assert!(!base.is_null());
+            std::ptr::write_bytes(base, 0, layout.layout.size());
+            let mem = std::slice::from_raw_parts_mut(base, layout.layout.size());
+            let mut buffer = LockFreeBuffer::new(mem);
 
         prepare_params(&mut buffer, || {
             (1, vec![Ok(ScalarValue::Int32(Some(1)))].into_iter())
@@ -137,5 +158,7 @@ mod tests {
         let params = read_params(&mut buffer).expect("Failed to read parameters");
         assert_eq!(params.len(), 1);
         assert_eq!(params[0], ScalarValue::Int32(Some(1)));
+            dealloc(base, layout.layout);
+        }
     }
 }
