@@ -4,6 +4,7 @@ use pgrx::prelude::*;
 use pgrx::{GucContext, GucFlags, GucRegistry, GucSetting};
 use worker::init_datafusion_worker;
 
+mod backend;
 mod worker;
 
 pgrx::pg_module_magic!();
