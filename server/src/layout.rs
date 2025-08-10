@@ -185,3 +185,23 @@ pub unsafe fn connection_ptrs(
     let client_ptr = base.add(layout.client_offset) as *mut AtomicI32;
     (recv_base, send_base, client_ptr)
 }
+
+/// Layout for a single shared server PID cell.
+#[derive(Clone, Copy, Debug)]
+pub struct ServerPidLayout {
+    pub layout: Layout,
+}
+
+/// Compute the layout for a shared server PID cell stored as `AtomicI32`.
+pub fn server_pid_layout() -> Result<ServerPidLayout, LayoutError> {
+    Ok(ServerPidLayout {
+        layout: Layout::new::<AtomicI32>(),
+    })
+}
+
+/// Return a pointer to the shared server PID atomic cell.
+/// # Safety
+/// - `base` must be valid for at least `layout.layout.size()` bytes with proper alignment.
+pub unsafe fn server_pid_ptr(base: *mut u8, _layout: ServerPidLayout) -> *mut AtomicI32 {
+    base as *mut AtomicI32
+}

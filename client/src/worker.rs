@@ -71,6 +71,15 @@ pub unsafe extern "C" fn init_shmem() {
         let stack = unsafe { TreiberStack::new(next_ptr, num) };
         unsafe { ptr::write(hdr_ptr, stack) };
     }
+
+    // Allocate shared server PID cell
+    {
+        let layout = server::layout::server_pid_layout().expect("server pid layout");
+        let base = pgrx::pg_sys::ShmemAlloc(layout.layout.size());
+        SERVER_PID_PTR.set(base).ok();
+        // zero-init, value will be set in worker_main
+        std::ptr::write_bytes(base as *mut u8, 0, layout.layout.size());
+    }
 }
 
 #[pg_guard]
@@ -88,6 +97,15 @@ pub extern "C" fn worker_main(_arg: pg_sys::Datum) {
     };
     let state = Arc::new(server::ipc::SharedState::new(flags_slice));
 
+    // Set server PID in shared memory (OS pid)
+    unsafe {
+        let base = *SERVER_PID_PTR.get().expect("SERVER_PID_PTR not set") as *mut u8;
+        let layout = server::layout::server_pid_layout().expect("server pid layout");
+        let pid_ptr = server::layout::server_pid_ptr(base, layout);
+        let pid = libc::getpid();
+        (*pid_ptr).store(pid as i32, Ordering::Relaxed);
+    }
+
     // Build runtime
     let rt = Builder::new_multi_thread()
         .worker_threads(TOKIO_THREAD_NUMBER)
@@ -102,6 +120,11 @@ pub extern "C" fn worker_main(_arg: pg_sys::Datum) {
 
         let base = unsafe { *CONNS_PTR.get().expect("CONNS_PTR not set") as *mut u8 };
         let layout = server::layout::connection_layout(RECV_CAP, SEND_CAP).expect("conn layout");
+        let srv_pid_ptr = unsafe {
+            let base = *SERVER_PID_PTR.get().expect("SERVER_PID_PTR not set") as *mut u8;
+            let l = server::layout::server_pid_layout().expect("server pid layout");
+            server::layout::server_pid_ptr(base, l)
+        };
         for id in 0..num {
             let conn_base = unsafe { base.add(id * layout.layout.size()) };
             let (recv_base, send_base, client_ptr) = unsafe {
@@ -118,7 +141,7 @@ pub extern "C" fn worker_main(_arg: pg_sys::Datum) {
             let send_buffer =
                 unsafe { server::buffer::LockFreeBuffer::from_layout(send_base, layout.send_buffer_layout) };
             let pid = unsafe { (*client_ptr).load(Ordering::Relaxed) };
-            let mut conn = server::server::Connection::new(socket, send_buffer)
+            let mut conn = server::server::Connection::new(socket, send_buffer, unsafe { &*srv_pid_ptr })
                 .with_client(AtomicI32::new(pid));
 
             tokio::spawn(async move {
@@ -150,3 +173,4 @@ pub extern "C" fn worker_main(_arg: pg_sys::Datum) {
 static mut FLAGS_PTR: OnceCell<*mut c_void> = OnceCell::new();
 static mut CONNS_PTR: OnceCell<*mut c_void> = OnceCell::new();
 static mut STACK_PTR: OnceCell<*mut c_void> = OnceCell::new();
+static mut SERVER_PID_PTR: OnceCell<*mut c_void> = OnceCell::new();
