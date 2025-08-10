@@ -149,14 +149,12 @@ impl<'bytes> Connection<'bytes> {
         Ok(())
     }
 
-    fn handle_error(&mut self, error: FusionError) {
+    pub fn handle_error(&mut self, error: FusionError) {
         self.recv_socket.buffer.flush_read();
         let error_message = format_smolstr!("{error}");
         if let Err(e) = prepare_error(&mut self.send_buffer, &error_message) {
-            // TODO: we should rather keep enough space in the send buffer to handle errors.
-            eprintln!("Failed to prepare error response: {e}");
+            tracing::error!(target = "pg_fusion::server", error = %e, "Failed to prepare error response");
         }
-        // TODO: notify client about the error.
     }
 }
 
