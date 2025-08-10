@@ -21,7 +21,7 @@ use datafusion_sql::TableReference;
 use smol_str::{format_smolstr, SmolStr};
 
 #[derive(Default)]
-struct Storage {
+pub struct Storage {
     state: StateMachine,
     statement: Option<Statement>,
     logical_plan: Option<LogicalPlan>,
@@ -34,7 +34,6 @@ impl Storage {
 }
 
 pub struct Connection<'bytes> {
-    storage: Storage,
     recv_socket: Socket<'bytes>,
     send_buffer: LockFreeBuffer<'bytes>,
 }
@@ -42,7 +41,6 @@ pub struct Connection<'bytes> {
 impl<'bytes> Connection<'bytes> {
     pub fn new(recv_socket: Socket<'bytes>, send_buffer: LockFreeBuffer<'bytes>) -> Self {
         Self {
-            storage: Storage::default(),
             recv_socket,
             send_buffer,
         }
@@ -53,7 +51,7 @@ impl<'bytes> Connection<'bytes> {
         Ok(())
     }
 
-    pub fn process_message(&mut self) -> Result<()> {
+    pub fn process_message(&mut self, storage: &mut Storage) -> Result<()> {
         let header = consume_header(&mut self.recv_socket.buffer)?;
         if header.direction == Direction::ToBackend {
             return Ok(());
@@ -61,10 +59,10 @@ impl<'bytes> Connection<'bytes> {
         let mut packet = header.packet.clone();
         let mut skip_metadata = false;
         loop {
-            let action = self.storage.state.consume(&packet)?;
+            let action = storage.state.consume(&packet)?;
             let result = match action {
                 Some(Action::Bind) => {
-                    let Some(plan) = std::mem::take(&mut self.storage.logical_plan) else {
+                    let Some(plan) = std::mem::take(&mut storage.logical_plan) else {
                         bail!(FusionError::NotFound(
                             "Logical plan".into(),
                             "while processing bind message".into(),
@@ -74,7 +72,7 @@ impl<'bytes> Connection<'bytes> {
                     bind(plan, params)
                 }
                 Some(Action::Compile) => {
-                    let Some(stmt) = std::mem::take(&mut self.storage.statement) else {
+                    let Some(stmt) = std::mem::take(&mut storage.statement) else {
                         bail!(FusionError::NotFound(
                             "Statement".into(),
                             "while processing compile message".into(),
@@ -88,7 +86,7 @@ impl<'bytes> Connection<'bytes> {
                     compile(stmt, &catalog)
                 }
                 Some(Action::Explain) => {
-                    let Some(plan) = std::mem::take(&mut self.storage.logical_plan) else {
+                    let Some(plan) = std::mem::take(&mut storage.logical_plan) else {
                         bail!(FusionError::NotFound(
                             "Logical plan".into(),
                             "while processing explain message".into(),
@@ -97,7 +95,7 @@ impl<'bytes> Connection<'bytes> {
                     explain(&plan)
                 }
                 Some(Action::Flush) => {
-                    self.storage.flush();
+                    storage.flush();
                     return Ok(());
                 }
                 Some(Action::Parse) => {
@@ -114,17 +112,17 @@ impl<'bytes> Connection<'bytes> {
             match result {
                 TaskResult::Bind(plan) => {
                     prepare_columns(&mut self.send_buffer, plan.schema().fields())?;
-                    self.storage.logical_plan = Some(plan);
+                    storage.logical_plan = Some(plan);
                 }
                 TaskResult::Compilation(plan) => {
-                    self.storage.logical_plan = Some(plan);
+                    storage.logical_plan = Some(plan);
                     request_params(&mut self.send_buffer)?;
                 }
                 TaskResult::Explain(explain) => {
                     prepare_explain(&mut self.send_buffer, explain.as_str())?;
                 }
                 TaskResult::Parsing((stmt, tables)) => {
-                    self.storage.statement = Some(stmt);
+                    storage.statement = Some(stmt);
                     if tables.is_empty() {
                         // We don't need any table metadata for this query.
                         // Let's move connection to the next state.
@@ -227,8 +225,8 @@ mod tests {
     }
     unsafe impl Sync for ConnMemory {}
 
-    fn flush(conn: &mut Connection) {
-        conn.storage.flush();
+    fn flush(conn: &mut Connection, storage: &mut Storage) {
+        storage.flush();
         conn.recv_socket.buffer.flush_read();
         conn.send_buffer.flush_read();
     }
@@ -241,25 +239,27 @@ mod tests {
         let send_buffer = LockFreeBuffer::new(unsafe { &mut *BYTES.tx.get() });
         let socket = Socket::new(0, Arc::clone(&state), recv_buffer);
         let mut conn = Connection::new(socket, send_buffer);
+        let storage = Storage::default();
         tokio::spawn(async move {
+            let mut storage = storage;
             // Test parsing a query with tables.
-            assert_eq!(conn.storage.state.state(), &ExecutorState::Initialized);
+            assert_eq!(storage.state.state(), &ExecutorState::Initialized);
             let sql = "select a from t";
             prepare_query(&mut conn.recv_socket.buffer, sql).expect("Failed to prepare SQL");
-            conn.process_message()
+            conn.process_message(&mut storage)
                 .expect("Failed to process parse message");
             let Ok(TaskResult::Parsing((stmt, _))) = parse(sql.into()) else {
                 unreachable!();
             };
-            assert_eq!(conn.storage.statement, Some(stmt));
-            assert_eq!(conn.storage.state.state(), &ExecutorState::Statement);
+            assert_eq!(storage.statement, Some(stmt));
+            assert_eq!(storage.state.state(), &ExecutorState::Statement);
 
             // Test parsing a query without tables.
-            flush(&mut conn);
-            assert_eq!(conn.storage.state.state(), &ExecutorState::Initialized);
+            flush(&mut conn, &mut storage);
+            assert_eq!(storage.state.state(), &ExecutorState::Initialized);
             let sql = "select 1";
             prepare_query(&mut conn.recv_socket.buffer, sql).expect("Failed to prepare SQL");
-            conn.process_message()
+            conn.process_message(&mut storage)
                 .expect("Failed to process parse message");
             let Ok(TaskResult::Parsing((stmt, _))) = parse(sql.into()) else {
                 unreachable!();
@@ -267,8 +267,8 @@ mod tests {
             let Ok(TaskResult::Compilation(plan)) = compile(stmt, &Catalog::default()) else {
                 unreachable!();
             };
-            assert_eq!(conn.storage.logical_plan, Some(plan));
-            assert_eq!(conn.storage.state.state(), &ExecutorState::LogicalPlan);
+            assert_eq!(storage.logical_plan, Some(plan));
+            assert_eq!(storage.state.state(), &ExecutorState::LogicalPlan);
         })
         .await?;
         Ok(())
@@ -282,14 +282,16 @@ mod tests {
         let send_buffer = LockFreeBuffer::new(unsafe { &mut *BYTES.tx.get() });
         let socket = Socket::new(0, Arc::clone(&state), recv_buffer);
         let mut conn = Connection::new(socket, send_buffer);
+        let storage = Storage::default();
         tokio::spawn(async move {
-            assert_eq!(conn.storage.state.state(), &ExecutorState::Initialized);
+            let mut storage = storage;
+            assert_eq!(storage.state.state(), &ExecutorState::Initialized);
             let sql = "select a from public.t1 where b = $1";
             prepare_query(&mut conn.recv_socket.buffer, sql).expect("Failed to prepare SQL");
-            conn.process_message()
+            conn.process_message(&mut storage)
                 .expect("Failed to process parse message");
             assert_eq!(conn.recv_socket.buffer.len(), 0);
-            assert_eq!(conn.storage.state.state(), &ExecutorState::Statement);
+            assert_eq!(storage.state.state(), &ExecutorState::Statement);
 
             let header =
                 consume_header(&mut conn.send_buffer).expect("Failed to consume metadata header");
@@ -303,10 +305,10 @@ mod tests {
                 mock_table_serialize,
             )
             .expect("Failed to process metadata");
-            conn.process_message()
+            conn.process_message(&mut storage)
                 .expect("Failed to process metadata message");
             assert_eq!(conn.recv_socket.buffer.len(), 0);
-            assert_eq!(conn.storage.state.state(), &ExecutorState::LogicalPlan);
+            assert_eq!(storage.state.state(), &ExecutorState::LogicalPlan);
 
             let header =
                 consume_header(&mut conn.send_buffer).expect("Failed to consume bind header");
@@ -316,10 +318,10 @@ mod tests {
                 (1, vec![Ok(ScalarValue::Int32(Some(1)))].into_iter())
             })
             .expect("Failed to prepare params");
-            conn.process_message()
+            conn.process_message(&mut storage)
                 .expect("Failed to process bind message");
             assert_eq!(conn.recv_socket.buffer.len(), 0);
-            assert_eq!(conn.storage.state.state(), &ExecutorState::LogicalPlan);
+            assert_eq!(storage.state.state(), &ExecutorState::LogicalPlan);
 
             let header =
                 consume_header(&mut conn.send_buffer).expect("Failed to consume bind header");
@@ -339,10 +341,10 @@ mod tests {
             assert_eq!(columns[0], (0, 4, b"a\0".into()));
 
             request_explain(&mut conn.recv_socket.buffer).expect("Failed to request explain");
-            conn.process_message()
+            conn.process_message(&mut storage)
                 .expect("Failed to process explain message");
             assert_eq!(conn.recv_socket.buffer.len(), 0);
-            assert_eq!(conn.storage.state.state(), &ExecutorState::Initialized);
+            assert_eq!(storage.state.state(), &ExecutorState::Initialized);
             let header =
                 consume_header(&mut conn.send_buffer).expect("Failed to consume explain header");
             assert_eq!(header.direction, Direction::ToBackend);
