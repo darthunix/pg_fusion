@@ -9,6 +9,9 @@ use pgrx::bgworkers::{BackgroundWorker, BackgroundWorkerBuilder, SignalWakeFlags
 use pgrx::pg_sys::MyProcNumber;
 use pgrx::prelude::*;
 use smol_str::{format_smolstr, SmolStr};
+use std::slice;
+use std::sync::Arc;
+use std::future;
 use std::cell::OnceCell;
 use std::ptr;
 use std::sync::atomic::{AtomicI32, Ordering};
@@ -20,6 +23,8 @@ use tokio::task::JoinHandle;
 const TOKIO_THREAD_NUMBER: usize = 1;
 const WORKER_WAIT_TIMEOUT: Duration = Duration::from_millis(100);
 const SLOT_WAIT_TIMEOUT: Duration = Duration::from_millis(1);
+const RECV_CAP: usize = 8192;
+const SEND_CAP: usize = 8192;
 
 #[pg_guard]
 pub(crate) fn init_datafusion_worker() {
@@ -84,7 +89,73 @@ pub unsafe extern "C" fn init_shmem() {
 #[no_mangle]
 pub extern "C" fn worker_main(_arg: pg_sys::Datum) {
     BackgroundWorker::attach_signal_handlers(SignalWakeFlags::SIGHUP | SignalWakeFlags::SIGTERM);
-    unimplemented!();
+    let num = crate::max_backends() as usize;
+
+    // Build SharedState from shared flags
+    let flags_slice = unsafe {
+        let flags_base = *FLAGS_PTR.get().expect("FLAGS_PTR not set");
+        let layout = server::layout::shared_state_layout(num).expect("flags layout");
+        let flags_ptr = server::layout::shared_state_flags_ptr(flags_base as *mut u8, layout);
+        slice::from_raw_parts(flags_ptr, num)
+    };
+    let state = Arc::new(server::ipc::SharedState::new(flags_slice));
+
+    // Build runtime
+    let rt = Builder::new_multi_thread()
+        .worker_threads(TOKIO_THREAD_NUMBER)
+        .enable_all()
+        .build()
+        .unwrap();
+
+    // Build connections from shared memory and run tasks
+    rt.block_on(async move {
+        // Spawn shared signal listener (wakes sockets on SIGUSR1)
+        tokio::spawn(server::ipc::signal_listener(Arc::clone(&state)));
+
+        let base = unsafe { *CONNS_PTR.get().expect("CONNS_PTR not set") as *mut u8 };
+        let layout = server::layout::connection_layout(RECV_CAP, SEND_CAP).expect("conn layout");
+        for id in 0..num {
+            let conn_base = unsafe { base.add(id * layout.layout.size()) };
+            let (recv_base, send_base, client_ptr) = unsafe {
+                server::layout::connection_ptrs(conn_base, layout)
+            };
+            let socket = unsafe {
+                server::ipc::Socket::from_layout_with_state(
+                    id,
+                    Arc::clone(&state),
+                    recv_base,
+                    layout.recv_socket_layout,
+                )
+            };
+            let send_buffer =
+                unsafe { server::buffer::LockFreeBuffer::from_layout(send_base, layout.send_buffer_layout) };
+            let pid = unsafe { (*client_ptr).load(Ordering::Relaxed) };
+            let mut conn = server::server::Connection::new(socket, send_buffer)
+                .with_client(AtomicI32::new(pid));
+
+            tokio::spawn(async move {
+                let mut storage = server::server::Storage::default();
+                loop {
+                    let res = conn
+                        .poll()
+                        .await
+                        .and_then(|_| conn.process_message(&mut storage));
+                    if let Err(err) = res {
+                        let ferr = match err.downcast::<server::error::FusionError>() {
+                            Ok(f) => f,
+                            Err(e) => server::error::FusionError::Other(e),
+                        };
+                        conn.handle_error(ferr);
+                    }
+                    // Notify client process; ignore errors (e.g., invalid pid)
+                    let _ = conn.signal_client();
+                }
+            });
+        }
+
+        // Keep worker alive indefinitely
+        future::pending::<()>().await;
+    });
 }
 
 // Shared pointers to newly allocated regions
