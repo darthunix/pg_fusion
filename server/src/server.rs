@@ -38,16 +38,22 @@ pub struct Connection<'bytes> {
     recv_socket: Socket<'bytes>,
     send_buffer: LockFreeBuffer<'bytes>,
     client_pid: AtomicI32,
+    server_pid: &'bytes AtomicI32,
 }
 
 impl<'bytes> Connection<'bytes> {
-    pub fn new(recv_socket: Socket<'bytes>, send_buffer: LockFreeBuffer<'bytes>) -> Self {
+    pub fn new(
+        recv_socket: Socket<'bytes>,
+        send_buffer: LockFreeBuffer<'bytes>,
+        server_pid: &'bytes AtomicI32,
+    ) -> Self {
         Self {
             recv_socket,
             send_buffer,
             // The upper bound in /proc/sys/kernel/pid_max is 4_194_304.
             // So i32::MAX is always an invalid PID.
             client_pid: AtomicI32::new(i32::MAX),
+            server_pid,
         }
     }
 
@@ -90,6 +96,11 @@ impl<'bytes> Connection<'bytes> {
                 "unsupported platform".into()
             ));
         }
+    }
+
+    /// Read the server PID from shared memory.
+    pub fn server_pid(&self) -> i32 {
+        self.server_pid.load(Ordering::Relaxed)
     }
 
     pub fn process_message(&mut self, storage: &mut Storage) -> Result<()> {
@@ -296,7 +307,8 @@ mod tests {
         };
         let send_buffer =
             unsafe { LockFreeBuffer::from_layout(send_base, layout.send_buffer_layout) };
-        let mut conn = Connection::new(socket, send_buffer);
+        static SERVER_PID: AtomicI32 = AtomicI32::new(0);
+        let mut conn = Connection::new(socket, send_buffer, &SERVER_PID);
         let storage = Storage::default();
         tokio::spawn(async move {
             let mut storage = storage;
@@ -352,7 +364,8 @@ mod tests {
         };
         let send_buffer =
             unsafe { LockFreeBuffer::from_layout(send_base, layout.send_buffer_layout) };
-        let mut conn = Connection::new(socket, send_buffer);
+        static SERVER_PID: AtomicI32 = AtomicI32::new(0);
+        let mut conn = Connection::new(socket, send_buffer, &SERVER_PID);
         let storage = Storage::default();
         tokio::spawn(async move {
             let mut storage = storage;
