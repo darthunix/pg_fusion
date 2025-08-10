@@ -1,28 +1,16 @@
-use anyhow::Result;
-use datafusion::execution::SessionStateBuilder;
-use datafusion::logical_expr::LogicalPlan;
-use datafusion_sql::parser::{DFParser, Statement};
-use datafusion_sql::planner::SqlToRel;
-use datafusion_sql::TableReference;
 use libc::c_void;
 use pgrx::bgworkers::{BackgroundWorker, BackgroundWorkerBuilder, SignalWakeFlags};
-use pgrx::pg_sys::MyProcNumber;
 use pgrx::prelude::*;
-use smol_str::{format_smolstr, SmolStr};
 use std::slice;
 use std::sync::Arc;
 use std::future;
 use std::cell::OnceCell;
 use std::ptr;
 use std::sync::atomic::{AtomicI32, Ordering};
-use std::time::Duration;
 use tokio::runtime::Builder;
-use tokio::task::JoinHandle;
 
 // FIXME: This should be configurable.
 const TOKIO_THREAD_NUMBER: usize = 1;
-const WORKER_WAIT_TIMEOUT: Duration = Duration::from_millis(100);
-const SLOT_WAIT_TIMEOUT: Duration = Duration::from_millis(1);
 const RECV_CAP: usize = 8192;
 const SEND_CAP: usize = 8192;
 
