@@ -4,7 +4,7 @@ use std::io::Write;
 
 pub fn request_explain(stream: &mut impl Write) -> Result<()> {
     let header = Header {
-        direction: Direction::ToWorker,
+        direction: Direction::ToServer,
         packet: Packet::Explain,
         length: 0,
         flag: Flag::Last,
@@ -23,7 +23,7 @@ pub fn prepare_explain(stream: &mut impl Tape, explain: &str) -> Result<()> {
     let len_final = stream.uncommitted_len();
     let length = u16::try_from(len_final - len_init)?;
     let header = Header {
-        direction: Direction::ToBackend,
+        direction: Direction::ToClient,
         packet: Packet::Explain,
         length,
         flag: Flag::Last,
@@ -42,8 +42,8 @@ pub fn prepare_explain(stream: &mut impl Tape, explain: &str) -> Result<()> {
 mod tests {
     use super::*;
     use crate::buffer::LockFreeBuffer;
-    use crate::protocol::consume_header;
     use crate::layout::lockfree_buffer_layout;
+    use crate::protocol::consume_header;
     use std::alloc::{alloc, dealloc};
     use std::io::Read;
 
@@ -57,7 +57,7 @@ mod tests {
             let mut buffer = LockFreeBuffer::from_layout(base, layout);
             request_explain(&mut buffer).expect("Failed to request explain");
             let expected_header = Header {
-                direction: Direction::ToWorker,
+                direction: Direction::ToServer,
                 packet: Packet::Explain,
                 length: 0,
                 flag: Flag::Last,
@@ -84,7 +84,7 @@ mod tests {
             const PLAN: &[u8] = b"\xc4\x0bquery plan\0";
             let header = consume_header(&mut buffer).unwrap();
             let expected_header = Header {
-                direction: Direction::ToBackend,
+                direction: Direction::ToClient,
                 packet: Packet::Explain,
                 length: PLAN.len() as u16,
                 flag: Flag::Last,

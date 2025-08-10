@@ -24,7 +24,7 @@ pub fn prepare_columns(stream: &mut impl Tape, columns: &Fields) -> Result<()> {
     let len_final = stream.uncommitted_len();
     let length = u16::try_from(len_final - len_init)?;
     let header = Header {
-        direction: Direction::ToBackend,
+        direction: Direction::ToClient,
         packet: Packet::Columns,
         length,
         flag: Flag::Last,
@@ -65,10 +65,10 @@ where
 mod tests {
     use super::*;
     use crate::buffer::LockFreeBuffer;
-    use crate::protocol::consume_header;
     use crate::layout::lockfree_buffer_layout;
-    use std::alloc::{alloc, dealloc};
+    use crate::protocol::consume_header;
     use datafusion::arrow::datatypes::{DataType, Field, SchemaBuilder};
+    use std::alloc::{alloc, dealloc};
     use std::io::{Cursor, Read};
 
     #[test]
@@ -79,28 +79,28 @@ mod tests {
             assert!(!base.is_null());
             std::ptr::write_bytes(base, 0, layout.layout.size());
             let mut buffer = LockFreeBuffer::from_layout(base, layout);
-        assert!(buffer.is_empty());
-        assert_eq!(buffer.uncommitted_len(), 0);
+            assert!(buffer.is_empty());
+            assert_eq!(buffer.uncommitted_len(), 0);
 
-        let mut builder = SchemaBuilder::new();
-        builder.push(Field::new("a", DataType::Boolean, false));
-        builder.push(Field::new("b", DataType::Int32, true));
-        let columns = builder.finish().fields;
+            let mut builder = SchemaBuilder::new();
+            builder.push(Field::new("a", DataType::Boolean, false));
+            builder.push(Field::new("b", DataType::Int32, true));
+            let columns = builder.finish().fields;
 
-        prepare_columns(&mut buffer, &columns).unwrap();
-        assert_eq!(buffer.uncommitted_len(), 0);
-        let header = consume_header(&mut buffer).unwrap();
-        let expected_header = Header {
-            direction: Direction::ToBackend,
-            packet: Packet::Columns,
-            length: 13,
-            flag: Flag::Last,
-        };
-        assert_eq!(header, expected_header);
-        let mut data = [0u8; 13];
-        let len = buffer.read(&mut data).unwrap();
-        assert_eq!(len, 13);
-        assert_eq!(&data, b"\x92\xcc\0\xc4\x02a\0\xcc\x03\xc4\x02b\0");
+            prepare_columns(&mut buffer, &columns).unwrap();
+            assert_eq!(buffer.uncommitted_len(), 0);
+            let header = consume_header(&mut buffer).unwrap();
+            let expected_header = Header {
+                direction: Direction::ToClient,
+                packet: Packet::Columns,
+                length: 13,
+                flag: Flag::Last,
+            };
+            assert_eq!(header, expected_header);
+            let mut data = [0u8; 13];
+            let len = buffer.read(&mut data).unwrap();
+            assert_eq!(len, 13);
+            assert_eq!(&data, b"\x92\xcc\0\xc4\x02a\0\xcc\x03\xc4\x02b\0");
             dealloc(base, layout.layout);
         }
     }

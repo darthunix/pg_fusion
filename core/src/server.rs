@@ -94,7 +94,7 @@ impl<'bytes> Connection<'bytes> {
 
     pub fn process_message(&mut self, storage: &mut Storage) -> Result<()> {
         let header = consume_header(&mut self.recv_socket.buffer)?;
-        if header.direction == Direction::ToBackend {
+        if header.direction == Direction::ToClient {
             return Ok(());
         }
         let mut packet = header.packet.clone();
@@ -366,7 +366,7 @@ mod tests {
 
             let header =
                 consume_header(&mut conn.send_buffer).expect("Failed to consume metadata header");
-            assert_eq!(header.direction, Direction::ToBackend);
+            assert_eq!(header.direction, Direction::ToClient);
             assert_eq!(header.packet, Packet::Metadata);
             process_metadata_with_response(
                 &mut conn.send_buffer,
@@ -383,7 +383,7 @@ mod tests {
 
             let header =
                 consume_header(&mut conn.send_buffer).expect("Failed to consume bind header");
-            assert_eq!(header.direction, Direction::ToBackend);
+            assert_eq!(header.direction, Direction::ToClient);
             assert_eq!(header.packet, Packet::Bind);
             prepare_params(&mut conn.recv_socket.buffer, || {
                 (1, vec![Ok(ScalarValue::Int32(Some(1)))].into_iter())
@@ -396,7 +396,7 @@ mod tests {
 
             let header =
                 consume_header(&mut conn.send_buffer).expect("Failed to consume bind header");
-            assert_eq!(header.direction, Direction::ToBackend);
+            assert_eq!(header.direction, Direction::ToClient);
             assert_eq!(header.packet, Packet::Columns);
             type Payload = (i16, u8, Vec<u8>);
             let mut columns: Vec<Payload> = Vec::new();
@@ -418,7 +418,7 @@ mod tests {
             assert_eq!(storage.state.state(), &ExecutorState::Initialized);
             let header =
                 consume_header(&mut conn.send_buffer).expect("Failed to consume explain header");
-            assert_eq!(header.direction, Direction::ToBackend);
+            assert_eq!(header.direction, Direction::ToClient);
             assert_eq!(header.packet, Packet::Explain);
             let len =
                 read_bin_len(&mut conn.send_buffer).expect("Failed to get explain length") as usize;

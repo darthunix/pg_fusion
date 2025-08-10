@@ -50,7 +50,7 @@ pub fn prepare_table_refs(stream: &mut impl Tape, tables: &[TableReference]) -> 
     let len_final = stream.uncommitted_len();
     let length = u16::try_from(len_final - len_init)?;
     let header = Header {
-        direction: Direction::ToBackend,
+        direction: Direction::ToClient,
         packet: Packet::Metadata,
         length,
         flag: Flag::Last,
@@ -67,7 +67,7 @@ pub fn prepare_table_refs(stream: &mut impl Tape, tables: &[TableReference]) -> 
 
 pub fn prepare_empty_metadata(stream: &mut impl Write) -> Result<()> {
     let header = Header {
-        direction: Direction::ToWorker,
+        direction: Direction::ToServer,
         packet: Packet::Metadata,
         // The length of a zero element array in msgpack.
         length: size_of::<u8>() as u16,
@@ -142,7 +142,7 @@ where
     let len_final = output.uncommitted_len();
     let length = u16::try_from(len_final - len_init)?;
     let header = Header {
-        direction: Direction::ToWorker,
+        direction: Direction::ToServer,
         packet: Packet::Metadata,
         length,
         flag: Flag::Last,
@@ -271,25 +271,25 @@ pub(crate) mod tests {
             assert!(!base.is_null());
             let mut buffer = LockFreeBuffer::from_layout(base, layout);
 
-        let expected_tables = vec![
-            TableReference::partial("public", "table1"),
-            TableReference::bare("table2"),
-        ];
-        prepare_table_refs(&mut buffer, expected_tables.as_slice()).unwrap();
-        assert_eq!(buffer.uncommitted_len(), 0);
-        let header = consume_header(&mut buffer).unwrap();
-        const MESSAGE: &[u8] = b"\x92\x92\xc4\x07public\0\xc4\x07table1\0\x91\xc4\x07table2\0";
-        let expected_header = Header {
-            direction: Direction::ToBackend,
-            packet: Packet::Metadata,
-            length: MESSAGE.len() as u16,
-            flag: Flag::Last,
-        };
-        assert_eq!(header, expected_header);
-        let mut data = [0u8; MESSAGE.len()];
-        let len = buffer.read(&mut data).unwrap();
-        assert_eq!(len, MESSAGE.len());
-        assert_eq!(&data, MESSAGE);
+            let expected_tables = vec![
+                TableReference::partial("public", "table1"),
+                TableReference::bare("table2"),
+            ];
+            prepare_table_refs(&mut buffer, expected_tables.as_slice()).unwrap();
+            assert_eq!(buffer.uncommitted_len(), 0);
+            let header = consume_header(&mut buffer).unwrap();
+            const MESSAGE: &[u8] = b"\x92\x92\xc4\x07public\0\xc4\x07table1\0\x91\xc4\x07table2\0";
+            let expected_header = Header {
+                direction: Direction::ToClient,
+                packet: Packet::Metadata,
+                length: MESSAGE.len() as u16,
+                flag: Flag::Last,
+            };
+            assert_eq!(header, expected_header);
+            let mut data = [0u8; MESSAGE.len()];
+            let len = buffer.read(&mut data).unwrap();
+            assert_eq!(len, MESSAGE.len());
+            assert_eq!(&data, MESSAGE);
             std::alloc::dealloc(base, layout.layout);
         }
     }
@@ -302,16 +302,16 @@ pub(crate) mod tests {
             assert!(!base.is_null());
             let mut buffer = LockFreeBuffer::from_layout(base, layout);
 
-        prepare_empty_metadata(&mut buffer).unwrap();
-        assert_eq!(buffer.uncommitted_len(), 0);
-        let header = consume_header(&mut buffer).unwrap();
-        let expected_header = Header {
-            direction: Direction::ToWorker,
-            packet: Packet::Metadata,
-            length: 1,
-            flag: Flag::Last,
-        };
-        assert_eq!(header, expected_header);
+            prepare_empty_metadata(&mut buffer).unwrap();
+            assert_eq!(buffer.uncommitted_len(), 0);
+            let header = consume_header(&mut buffer).unwrap();
+            let expected_header = Header {
+                direction: Direction::ToServer,
+                packet: Packet::Metadata,
+                length: 1,
+                flag: Flag::Last,
+            };
+            assert_eq!(header, expected_header);
             std::alloc::dealloc(base, layout.layout);
         }
     }
@@ -371,44 +371,44 @@ pub(crate) mod tests {
             let in_base = std::alloc::alloc(in_layout.layout);
             assert!(!in_base.is_null());
             let mut input = LockFreeBuffer::from_layout(in_base, in_layout);
-        let expected_tables = vec![
-            TableReference::partial("public", "t1"),
-            TableReference::bare("t2"),
-        ];
-        prepare_table_refs(&mut input, expected_tables.as_slice()).unwrap();
+            let expected_tables = vec![
+                TableReference::partial("public", "t1"),
+                TableReference::bare("t2"),
+            ];
+            prepare_table_refs(&mut input, expected_tables.as_slice()).unwrap();
 
-        let mut expected_msg: Vec<u8> = Vec::new();
-        expected_msg
-            .write_all(b"\x92")
-            .expect("Failed to write amount of tables");
-        mock_table_serialize(42, true, &mut expected_msg).expect("Failed to mock t1");
-        mock_table_serialize(666, false, &mut expected_msg).expect("Failed to mock t2");
+            let mut expected_msg: Vec<u8> = Vec::new();
+            expected_msg
+                .write_all(b"\x92")
+                .expect("Failed to write amount of tables");
+            mock_table_serialize(42, true, &mut expected_msg).expect("Failed to mock t1");
+            mock_table_serialize(666, false, &mut expected_msg).expect("Failed to mock t2");
 
             let out_base = std::alloc::alloc(out_layout.layout);
             assert!(!out_base.is_null());
             let mut output = LockFreeBuffer::from_layout(out_base, out_layout);
-        let _ = consume_header(&mut input).expect("Failed to consume metadata request header");
-        process_metadata_with_response(
-            &mut input,
-            &mut output,
-            mock_schema_table_lookup,
-            mock_table_lookup,
-            mock_table_serialize,
-        )
-        .expect("Failed to process metadata");
-        let header =
-            consume_header(&mut output).expect("Failed to consume metadata response header");
-        let expected_header = Header {
-            direction: Direction::ToWorker,
-            packet: Packet::Metadata,
-            length: expected_msg.len() as u16,
-            flag: Flag::Last,
-        };
-        assert_eq!(header, expected_header);
-        let mut msg = vec![0u8; expected_msg.len()];
-        let len = output.read(&mut msg).expect("Failed to read result");
-        assert_eq!(len, expected_msg.len());
-        assert_eq!(msg, expected_msg);
+            let _ = consume_header(&mut input).expect("Failed to consume metadata request header");
+            process_metadata_with_response(
+                &mut input,
+                &mut output,
+                mock_schema_table_lookup,
+                mock_table_lookup,
+                mock_table_serialize,
+            )
+            .expect("Failed to process metadata");
+            let header =
+                consume_header(&mut output).expect("Failed to consume metadata response header");
+            let expected_header = Header {
+                direction: Direction::ToServer,
+                packet: Packet::Metadata,
+                length: expected_msg.len() as u16,
+                flag: Flag::Last,
+            };
+            assert_eq!(header, expected_header);
+            let mut msg = vec![0u8; expected_msg.len()];
+            let len = output.read(&mut msg).expect("Failed to read result");
+            assert_eq!(len, expected_msg.len());
+            assert_eq!(msg, expected_msg);
             std::alloc::dealloc(in_base, in_layout.layout);
             std::alloc::dealloc(out_base, out_layout.layout);
         }

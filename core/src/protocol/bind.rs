@@ -18,7 +18,7 @@ pub fn read_params(stream: &mut impl Tape) -> Result<Vec<ScalarValue>> {
 
 pub fn request_params(stream: &mut impl Write) -> Result<()> {
     let header = Header {
-        direction: Direction::ToBackend,
+        direction: Direction::ToClient,
         packet: Packet::Bind,
         length: 0,
         flag: Flag::Last,
@@ -49,7 +49,7 @@ where
     let len_final = stream.uncommitted_len();
     let length = u16::try_from(len_final - len_init)?;
     let header = Header {
-        direction: Direction::ToWorker,
+        direction: Direction::ToServer,
         packet: Packet::Bind,
         length,
         flag: Flag::Last,
@@ -68,8 +68,8 @@ mod tests {
     use super::*;
     use crate::buffer::LockFreeBuffer;
     use crate::data_type::write_scalar_value;
-    use crate::protocol::{consume_header, Direction, Flag, Header, Packet, Tape};
     use crate::layout::lockfree_buffer_layout;
+    use crate::protocol::{consume_header, Direction, Flag, Header, Packet, Tape};
     use datafusion::scalar::ScalarValue;
     use std::alloc::{alloc, dealloc};
     use std::io::Write;
@@ -82,30 +82,30 @@ mod tests {
             assert!(!base.is_null());
             std::ptr::write_bytes(base, 0, layout.layout.size());
             let mut buffer = LockFreeBuffer::from_layout(base, layout);
-        assert!(buffer.is_empty());
-        assert_eq!(buffer.uncommitted_len(), 0);
+            assert!(buffer.is_empty());
+            assert_eq!(buffer.uncommitted_len(), 0);
 
-        let expected = vec![
-            ScalarValue::Int32(Some(42)),
-            ScalarValue::Utf8(Some("test".to_string())),
-            ScalarValue::Boolean(None),
-        ];
+            let expected = vec![
+                ScalarValue::Int32(Some(42)),
+                ScalarValue::Utf8(Some("test".to_string())),
+                ScalarValue::Boolean(None),
+            ];
 
-        // Array length 3
-        buffer.write_all(b"\x93").unwrap();
-        assert_eq!(buffer.uncommitted_len(), 1);
-        // Push three scalar values
-        write_scalar_value(&mut buffer, &expected[0]).unwrap();
-        assert_eq!(buffer.uncommitted_len(), 7);
-        write_scalar_value(&mut buffer, &expected[1]).unwrap();
-        assert_eq!(buffer.uncommitted_len(), 13);
-        write_scalar_value(&mut buffer, &expected[2]).unwrap();
-        assert_eq!(buffer.uncommitted_len(), 15);
-        buffer.flush().unwrap();
-        assert_eq!(buffer.len(), 15);
+            // Array length 3
+            buffer.write_all(b"\x93").unwrap();
+            assert_eq!(buffer.uncommitted_len(), 1);
+            // Push three scalar values
+            write_scalar_value(&mut buffer, &expected[0]).unwrap();
+            assert_eq!(buffer.uncommitted_len(), 7);
+            write_scalar_value(&mut buffer, &expected[1]).unwrap();
+            assert_eq!(buffer.uncommitted_len(), 13);
+            write_scalar_value(&mut buffer, &expected[2]).unwrap();
+            assert_eq!(buffer.uncommitted_len(), 15);
+            buffer.flush().unwrap();
+            assert_eq!(buffer.len(), 15);
 
-        let params = read_params(&mut buffer);
-        assert_eq!(params.unwrap(), expected);
+            let params = read_params(&mut buffer);
+            assert_eq!(params.unwrap(), expected);
             dealloc(base, layout.layout);
         }
     }
@@ -118,20 +118,20 @@ mod tests {
             assert!(!base.is_null());
             std::ptr::write_bytes(base, 0, layout.layout.size());
             let mut buffer = LockFreeBuffer::from_layout(base, layout);
-        assert!(buffer.is_empty());
-        assert_eq!(buffer.uncommitted_len(), 0);
+            assert!(buffer.is_empty());
+            assert_eq!(buffer.uncommitted_len(), 0);
 
-        request_params(&mut buffer).unwrap();
-        assert_eq!(buffer.len(), Header::estimate_size());
-        let expected_header = Header {
-            direction: Direction::ToBackend,
-            packet: Packet::Bind,
-            length: 0,
-            flag: Flag::Last,
-        };
-        let header = consume_header(&mut buffer).unwrap();
-        assert_eq!(header, expected_header);
-        assert!(buffer.is_empty());
+            request_params(&mut buffer).unwrap();
+            assert_eq!(buffer.len(), Header::estimate_size());
+            let expected_header = Header {
+                direction: Direction::ToClient,
+                packet: Packet::Bind,
+                length: 0,
+                flag: Flag::Last,
+            };
+            let header = consume_header(&mut buffer).unwrap();
+            assert_eq!(header, expected_header);
+            assert!(buffer.is_empty());
             dealloc(base, layout.layout);
         }
     }
@@ -145,16 +145,16 @@ mod tests {
             std::ptr::write_bytes(base, 0, layout.layout.size());
             let mut buffer = LockFreeBuffer::from_layout(base, layout);
 
-        prepare_params(&mut buffer, || {
-            (1, vec![Ok(ScalarValue::Int32(Some(1)))].into_iter())
-        })
-        .expect("Failed to prepare params");
-        let header = consume_header(&mut buffer).expect("Failed to consume header");
-        assert_eq!(header.direction, Direction::ToWorker);
-        assert_eq!(header.packet, Packet::Bind);
-        let params = read_params(&mut buffer).expect("Failed to read parameters");
-        assert_eq!(params.len(), 1);
-        assert_eq!(params[0], ScalarValue::Int32(Some(1)));
+            prepare_params(&mut buffer, || {
+                (1, vec![Ok(ScalarValue::Int32(Some(1)))].into_iter())
+            })
+            .expect("Failed to prepare params");
+            let header = consume_header(&mut buffer).expect("Failed to consume header");
+            assert_eq!(header.direction, Direction::ToServer);
+            assert_eq!(header.packet, Packet::Bind);
+            let params = read_params(&mut buffer).expect("Failed to read parameters");
+            assert_eq!(params.len(), 1);
+            assert_eq!(params[0], ScalarValue::Int32(Some(1)));
             dealloc(base, layout.layout);
         }
     }

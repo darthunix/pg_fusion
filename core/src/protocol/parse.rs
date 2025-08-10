@@ -24,7 +24,7 @@ pub fn prepare_query(stream: &mut impl Write, query: &str) -> Result<()> {
     let data_len = u32::try_from(query.len())?;
     let length = str_prefix_len(data_len) + data_len;
     let header = Header {
-        direction: Direction::ToWorker,
+        direction: Direction::ToServer,
         packet: Packet::Parse,
         length: length as u16,
         flag: Flag::Last,
@@ -39,8 +39,8 @@ pub fn prepare_query(stream: &mut impl Write, query: &str) -> Result<()> {
 mod tests {
     use super::*;
     use crate::buffer::LockFreeBuffer;
-    use crate::protocol::consume_header;
     use crate::layout::lockfree_buffer_layout;
+    use crate::protocol::consume_header;
     use std::alloc::{alloc, dealloc};
     use std::io::Read;
 
@@ -60,7 +60,7 @@ mod tests {
             const MESSAGE: &[u8] = b"\xa8select 1";
             let header = consume_header(&mut buffer).unwrap();
             let expected_header = Header {
-                direction: Direction::ToWorker,
+                direction: Direction::ToServer,
                 packet: Packet::Parse,
                 length: MESSAGE.len() as u16,
                 flag: Flag::Last,

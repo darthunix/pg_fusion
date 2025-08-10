@@ -29,8 +29,8 @@ pub trait Tape: Read + Write {
 #[derive(Clone, Debug, Default, PartialEq)]
 pub enum Direction {
     #[default]
-    ToWorker = 0,
-    ToBackend = 1,
+    ToServer = 0,
+    ToClient = 1,
 }
 
 impl TryFrom<u8> for Direction {
@@ -39,8 +39,8 @@ impl TryFrom<u8> for Direction {
     fn try_from(value: u8) -> Result<Self, Self::Error> {
         assert!(value < 128);
         match value {
-            0 => Ok(Direction::ToWorker),
-            1 => Ok(Direction::ToBackend),
+            0 => Ok(Direction::ToServer),
+            1 => Ok(Direction::ToClient),
             _ => Err(FusionError::Deserialize("direction".into(), value.into())),
         }
     }
