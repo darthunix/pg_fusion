@@ -19,7 +19,7 @@ use datafusion_sql::parser::{DFParser, Statement};
 use datafusion_sql::planner::SqlToRel;
 use datafusion_sql::TableReference;
 use smol_str::{format_smolstr, SmolStr};
-use std::sync::atomic::AtomicI32;
+use std::sync::atomic::{AtomicI32, Ordering};
 
 #[derive(Default)]
 pub struct Storage {
@@ -59,6 +59,37 @@ impl<'bytes> Connection<'bytes> {
     pub async fn poll(&mut self) -> Result<()> {
         (&mut self.recv_socket).await?;
         Ok(())
+    }
+
+    /// Send SIGUSR1 to the client process ID stored in this connection.
+    /// On non-Unix platforms, returns an error.
+    pub fn signal_client(&self) -> Result<()> {
+        #[cfg(unix)]
+        {
+            let pid = self.client_pid.load(Ordering::Relaxed);
+            if pid <= 0 || pid == i32::MAX {
+                bail!(FusionError::FailedTo(
+                    "send SIGUSR1".into(),
+                    format_smolstr!("invalid pid: {pid}")
+                ));
+            }
+            let rc = unsafe { libc::kill(pid as libc::pid_t, libc::SIGUSR1) };
+            if rc == -1 {
+                let err = std::io::Error::last_os_error();
+                bail!(FusionError::FailedTo(
+                    "send SIGUSR1".into(),
+                    format_smolstr!("{err}")
+                ));
+            }
+            Ok(())
+        }
+        #[cfg(not(unix))]
+        {
+            bail!(FusionError::FailedTo(
+                "send SIGUSR1".into(),
+                "unsupported platform".into()
+            ));
+        }
     }
 
     pub fn process_message(&mut self, storage: &mut Storage) -> Result<()> {
