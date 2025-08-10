@@ -1,6 +1,6 @@
 use crate::stack::TreiberStack;
 use std::alloc::{Layout, LayoutError};
-use std::sync::atomic::{AtomicBool, AtomicU32};
+use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU32};
 
 /// Memory layout helpers for placing the Treiber stack in a single
 /// contiguous shared memory region.
@@ -135,4 +135,53 @@ pub fn socket_layout(capacity: usize) -> Result<SocketLayout, LayoutError> {
 /// # Safety: `base` must be non-null and properly aligned; memory must be at least `layout.layout.size()` bytes long.
 pub unsafe fn socket_ptrs(base: *mut u8, layout: SocketLayout) -> *mut u8 {
     base.add(layout.buffer_offset)
+}
+
+/// Layout for a `Connection` memory region: contains
+/// - receive `Socket`'s embedded buffer region
+/// - send `LockFreeBuffer` region
+/// - client PID stored as `AtomicI32`
+#[derive(Clone, Copy, Debug)]
+pub struct ConnectionLayout {
+    pub layout: Layout,
+    pub recv_offset: usize,
+    pub recv_socket_layout: SocketLayout,
+    pub send_offset: usize,
+    pub send_buffer_layout: BufferLayout,
+    pub client_offset: usize,
+}
+
+/// Compute a layout for a connection with given receive/send buffer capacities.
+pub fn connection_layout(
+    recv_capacity: usize,
+    send_capacity: usize,
+) -> Result<ConnectionLayout, LayoutError> {
+    let recv = socket_layout(recv_capacity)?;
+    let send = lockfree_buffer_layout(send_capacity)?;
+    let pid = Layout::new::<AtomicI32>();
+
+    let (rs, send_offset) = recv.layout.extend(send.layout)?;
+    let (combined, client_offset) = rs.extend(pid)?;
+
+    Ok(ConnectionLayout {
+        layout: combined.pad_to_align(),
+        recv_offset: 0,
+        recv_socket_layout: recv,
+        send_offset,
+        send_buffer_layout: send,
+        client_offset,
+    })
+}
+
+/// Return pointers to the receive buffer base, send buffer base, and client PID atomic.
+/// # Safety
+/// - `base` must be valid for at least `layout.layout.size()` bytes with proper alignment.
+pub unsafe fn connection_ptrs(
+    base: *mut u8,
+    layout: ConnectionLayout,
+) -> (*mut u8, *mut u8, *mut AtomicI32) {
+    let recv_base = base.add(layout.recv_offset);
+    let send_base = base.add(layout.send_offset);
+    let client_ptr = base.add(layout.client_offset) as *mut AtomicI32;
+    (recv_base, send_base, client_ptr)
 }

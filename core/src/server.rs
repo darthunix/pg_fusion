@@ -209,27 +209,32 @@ mod tests {
     };
     use crate::protocol::parse::prepare_query;
     use crate::protocol::Tape;
+    use core::mem::size_of;
     use rmp::decode::read_bin_len;
     use std::cell::UnsafeCell;
     use std::ffi::CStr;
     use std::io::Read;
     use std::os::raw::c_void;
-    use std::sync::atomic::AtomicBool;
+    use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU32};
     use std::sync::Arc;
 
     const PAYLOAD_SIZE: usize = 248;
 
+    // Use explicit connection layout: two lock-free buffers and a client PID.
+    // Each lock-free buffer occupies 2 * AtomicU32 (head, tail) + PAYLOAD_SIZE bytes of data.
+    const BUF_META: usize = size_of::<AtomicU32>() * 2;
+    const PID_SIZE: usize = size_of::<AtomicI32>();
+    const CONN_BYTES: usize = (BUF_META + PAYLOAD_SIZE) * 2 + PID_SIZE;
+
     struct ConnMemory {
-        rx: UnsafeCell<[u8; 8 + PAYLOAD_SIZE]>,
-        tx: UnsafeCell<[u8; 8 + PAYLOAD_SIZE]>,
-        flag: UnsafeCell<[AtomicBool; 1]>,
+        conn: UnsafeCell<[u8; CONN_BYTES]>,
+        flags: UnsafeCell<[AtomicBool; 1]>,
     }
     impl ConnMemory {
         const fn new() -> Self {
             Self {
-                rx: UnsafeCell::new([0; 8 + PAYLOAD_SIZE]),
-                tx: UnsafeCell::new([0; 8 + PAYLOAD_SIZE]),
-                flag: UnsafeCell::new([AtomicBool::new(false); 1]),
+                conn: UnsafeCell::new([0; CONN_BYTES]),
+                flags: UnsafeCell::new([AtomicBool::new(false); 1]),
             }
         }
     }
@@ -243,11 +248,25 @@ mod tests {
 
     #[tokio::test]
     async fn test_parse() -> Result<()> {
+        use crate::layout::{connection_layout, connection_ptrs};
         static BYTES: ConnMemory = ConnMemory::new();
-        let state = Arc::new(SharedState::new(unsafe { &*BYTES.flag.get() }));
-        let recv_buffer = LockFreeBuffer::new(unsafe { &mut *BYTES.rx.get() });
-        let send_buffer = LockFreeBuffer::new(unsafe { &mut *BYTES.tx.get() });
-        let socket = Socket::new(0, Arc::clone(&state), recv_buffer);
+        let state = Arc::new(SharedState::new(unsafe { &*BYTES.flags.get() }));
+
+        // Derive recv/send buffers from the connection layout.
+        let layout = connection_layout(PAYLOAD_SIZE, PAYLOAD_SIZE).expect("layout");
+        let base = unsafe { (&mut *BYTES.conn.get()).as_mut_ptr() as *mut u8 };
+        let (recv_base, send_base, _pid_ptr) = unsafe { connection_ptrs(base, layout) };
+
+        let socket = unsafe {
+            Socket::from_layout_with_state(
+                0,
+                Arc::clone(&state),
+                recv_base,
+                layout.recv_socket_layout,
+            )
+        };
+        let send_buffer =
+            unsafe { LockFreeBuffer::from_layout(send_base, layout.send_buffer_layout) };
         let mut conn = Connection::new(socket, send_buffer);
         let storage = Storage::default();
         tokio::spawn(async move {
@@ -286,11 +305,24 @@ mod tests {
 
     #[tokio::test]
     async fn test_from_parse_to_columns() -> Result<()> {
+        use crate::layout::{connection_layout, connection_ptrs};
         static BYTES: ConnMemory = ConnMemory::new();
-        let state = Arc::new(SharedState::new(unsafe { &*BYTES.flag.get() }));
-        let recv_buffer = LockFreeBuffer::new(unsafe { &mut *BYTES.rx.get() });
-        let send_buffer = LockFreeBuffer::new(unsafe { &mut *BYTES.tx.get() });
-        let socket = Socket::new(0, Arc::clone(&state), recv_buffer);
+        let state = Arc::new(SharedState::new(unsafe { &*BYTES.flags.get() }));
+
+        let layout = connection_layout(PAYLOAD_SIZE, PAYLOAD_SIZE).expect("layout");
+        let base = unsafe { (&mut *BYTES.conn.get()).as_mut_ptr() as *mut u8 };
+        let (recv_base, send_base, _pid_ptr) = unsafe { connection_ptrs(base, layout) };
+
+        let socket = unsafe {
+            Socket::from_layout_with_state(
+                0,
+                Arc::clone(&state),
+                recv_base,
+                layout.recv_socket_layout,
+            )
+        };
+        let send_buffer =
+            unsafe { LockFreeBuffer::from_layout(send_base, layout.send_buffer_layout) };
         let mut conn = Connection::new(socket, send_buffer);
         let storage = Storage::default();
         tokio::spawn(async move {
