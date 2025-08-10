@@ -19,6 +19,7 @@ use datafusion_sql::parser::{DFParser, Statement};
 use datafusion_sql::planner::SqlToRel;
 use datafusion_sql::TableReference;
 use smol_str::{format_smolstr, SmolStr};
+use std::sync::atomic::AtomicI32;
 
 #[derive(Default)]
 pub struct Storage {
@@ -36,6 +37,7 @@ impl Storage {
 pub struct Connection<'bytes> {
     recv_socket: Socket<'bytes>,
     send_buffer: LockFreeBuffer<'bytes>,
+    client_pid: AtomicI32,
 }
 
 impl<'bytes> Connection<'bytes> {
@@ -43,7 +45,15 @@ impl<'bytes> Connection<'bytes> {
         Self {
             recv_socket,
             send_buffer,
+            // The upper bound in /proc/sys/kernel/pid_max is 4_194_304.
+            // So i32::MAX is always an invalid PID.
+            client_pid: AtomicI32::new(i32::MAX),
         }
+    }
+
+    pub fn with_client(mut self, pid: AtomicI32) -> Self {
+        self.client_pid = pid;
+        self
     }
 
     pub async fn poll(&mut self) -> Result<()> {
