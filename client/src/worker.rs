@@ -8,6 +8,7 @@ use std::cell::OnceCell;
 use std::ptr;
 use std::sync::atomic::{AtomicI32, Ordering};
 use tokio::runtime::Builder;
+use server::stack::TreiberStack;
 
 // FIXME: This should be configurable.
 const TOKIO_THREAD_NUMBER: usize = 1;
@@ -60,7 +61,6 @@ pub unsafe extern "C" fn init_shmem() {
     // Allocate Treiber stack region.
     {
         use server::layout::{treiber_stack_layout, treiber_stack_ptrs};
-        use server::stack::TreiberStack;
         let layout = treiber_stack_layout(num).expect("treiber_stack_layout");
         let base = pgrx::pg_sys::ShmemAlloc(layout.layout.size());
         STACK_PTR.set(base).ok();
@@ -174,3 +174,14 @@ static mut FLAGS_PTR: OnceCell<*mut c_void> = OnceCell::new();
 static mut CONNS_PTR: OnceCell<*mut c_void> = OnceCell::new();
 static mut STACK_PTR: OnceCell<*mut c_void> = OnceCell::new();
 static mut SERVER_PID_PTR: OnceCell<*mut c_void> = OnceCell::new();
+
+// Accessor for Treiber stack stored in shared memory
+pub(crate) fn treiber_stack() -> &'static TreiberStack {
+    unsafe {
+        let base = *STACK_PTR.get().expect("STACK_PTR not set") as *mut u8;
+        let layout = server::layout::treiber_stack_layout(crate::max_backends() as usize)
+            .expect("treiber_stack_layout");
+        let (hdr_ptr, _next_ptr) = server::layout::treiber_stack_ptrs(base, layout);
+        &*hdr_ptr
+    }
+}
