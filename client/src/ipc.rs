@@ -1,11 +1,10 @@
 use crate::worker::treiber_stack;
 use anyhow::Result as AnyResult;
 use pgrx::warning;
-use std::cell::OnceCell;
-use std::sync::atomic::{AtomicBool, AtomicI32, Ordering};
-
 use server::buffer::LockFreeBuffer;
 use server::layout::{connection_ptrs, socket_ptrs, ConnectionLayout};
+use std::cell::OnceCell;
+use std::sync::atomic::{AtomicBool, AtomicI32, Ordering};
 
 /// RAII guard that acquires a free connection id from the global Treiber stack
 /// and returns it back on drop.
@@ -79,6 +78,26 @@ impl<'a> ConnectionShared<'a> {
     pub fn set_client_pid(&self, pid: i32) {
         self.client_pid.store(pid, Ordering::Relaxed)
     }
+
+    /// Send SIGUSR1 to the server process.
+    pub fn signal_server(&self) -> AnyResult<()> {
+        #[cfg(unix)]
+        {
+            let pid = self.server_pid.load(Ordering::Relaxed);
+            if pid <= 0 {
+                anyhow::bail!("invalid server pid: {}", pid);
+            }
+            let rc = unsafe { libc::kill(pid as libc::pid_t, libc::SIGUSR1) };
+            if rc == -1 {
+                return Err(std::io::Error::last_os_error().into());
+            }
+            Ok(())
+        }
+        #[cfg(not(unix))]
+        {
+            anyhow::bail!("sending signals is unsupported on this platform")
+        }
+    }
 }
 
 /// Resolve shared-memory regions for a given connection id: flag, recv and send buffers.
@@ -101,10 +120,18 @@ pub(crate) fn connection_shared(id: u32) -> AnyResult<ConnectionShared<'static>>
 
     // Resolve recv buffer via socket layout and create buffer views
     let recv_buf_base = unsafe { socket_ptrs(recv_base, layout.recv_socket_layout) };
-    let recv = unsafe { LockFreeBuffer::from_layout(recv_buf_base, layout.recv_socket_layout.buffer_layout) };
+    let recv = unsafe {
+        LockFreeBuffer::from_layout(recv_buf_base, layout.recv_socket_layout.buffer_layout)
+    };
     let send = unsafe { LockFreeBuffer::from_layout(send_base, layout.send_buffer_layout) };
     let client_pid_ref: &'static AtomicI32 = unsafe { &*client_ptr };
     let server_pid_ref: &'static AtomicI32 = crate::worker::server_pid_atomic();
 
-    Ok(ConnectionShared { flag: flag_ref, recv, send, client_pid: client_pid_ref, server_pid: server_pid_ref })
+    Ok(ConnectionShared {
+        flag: flag_ref,
+        recv,
+        send,
+        client_pid: client_pid_ref,
+        server_pid: server_pid_ref,
+    })
 }
