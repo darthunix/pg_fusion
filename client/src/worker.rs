@@ -6,14 +6,14 @@ use std::sync::Arc;
 use std::future;
 use std::cell::OnceCell;
 use std::ptr;
-use std::sync::atomic::{AtomicI32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI32, Ordering};
 use tokio::runtime::Builder;
 use server::stack::TreiberStack;
 
 // FIXME: This should be configurable.
 const TOKIO_THREAD_NUMBER: usize = 1;
-const RECV_CAP: usize = 8192;
-const SEND_CAP: usize = 8192;
+pub(crate) const RECV_CAP: usize = 8192;
+pub(crate) const SEND_CAP: usize = 8192;
 
 #[pg_guard]
 pub(crate) fn init_datafusion_worker() {
@@ -183,5 +183,32 @@ pub(crate) fn treiber_stack() -> &'static TreiberStack {
             .expect("treiber_stack_layout");
         let (hdr_ptr, _next_ptr) = server::layout::treiber_stack_ptrs(base, layout);
         &*hdr_ptr
+    }
+}
+
+pub(crate) fn shared_flags_slice() -> &'static [AtomicBool] {
+    let num = crate::max_backends() as usize;
+    unsafe {
+        let flags_base = *FLAGS_PTR.get().expect("FLAGS_PTR not set");
+        let layout = server::layout::shared_state_layout(num).expect("flags layout");
+        let flags_ptr = server::layout::shared_state_flags_ptr(flags_base as *mut u8, layout);
+        std::slice::from_raw_parts(flags_ptr, num)
+    }
+}
+
+pub(crate) fn connections_layout() -> server::layout::ConnectionLayout {
+    server::layout::connection_layout(RECV_CAP, SEND_CAP).expect("conn layout")
+}
+
+pub(crate) fn connections_base() -> *mut u8 {
+    unsafe { *CONNS_PTR.get().expect("CONNS_PTR not set") as *mut u8 }
+}
+
+pub(crate) fn server_pid_atomic() -> &'static AtomicI32 {
+    unsafe {
+        let base = *SERVER_PID_PTR.get().expect("SERVER_PID_PTR not set") as *mut u8;
+        let layout = server::layout::server_pid_layout().expect("server pid layout");
+        let pid_ptr = server::layout::server_pid_ptr(base, layout);
+        &*pid_ptr
     }
 }
