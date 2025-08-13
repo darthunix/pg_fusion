@@ -6,6 +6,7 @@ use worker::init_datafusion_worker;
 
 mod backend;
 mod ipc;
+mod planner_hook;
 mod worker;
 
 pgrx::pg_module_magic!();
@@ -20,6 +21,8 @@ pub extern "C" fn _PG_init() {
     init_gucs();
     mark_guc_prefix_reserved("pg_fusion");
     init_datafusion_worker();
+    backend::init_datafusion_methods();
+    planner_hook::init_datafusion_planner_hook();
 }
 
 fn init_seed() {
