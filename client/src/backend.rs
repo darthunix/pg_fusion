@@ -23,6 +23,7 @@ use server::buffer::LockFreeBuffer;
 use server::data_type::EncodedType;
 use server::protocol::bind::prepare_params as srv_prepare_params;
 use server::protocol::consume_header as srv_consume_header;
+use server::protocol::explain::request_explain as srv_request_explain;
 use server::protocol::failure::{
     read_error as srv_read_error, request_failure as srv_request_failure,
 };
@@ -285,7 +286,70 @@ unsafe extern "C" fn explain_df_scan(
     _ancestors: *mut List,
     es: *mut ExplainState,
 ) {
-    todo!()
+    // Acquire connection and shared buffers
+    let id = match connection_id() {
+        Ok(v) => v,
+        Err(e) => error!("Failed to acquire connection id: {}", e),
+    };
+    let mut shared = match connection_shared(id) {
+        Ok(s) => s,
+        Err(e) => error!("Failed to map shared connection: {}", e),
+    };
+    shared.set_client_pid(unsafe { libc::getpid() } as i32);
+
+    // Request explain and notify the server
+    if let Err(err) = srv_request_explain(&mut shared.recv) {
+        let _ = srv_request_failure(&mut shared.recv);
+        let _ = shared.signal_server();
+        error!("Failed to request explain: {}", err);
+    }
+    if let Err(err) = shared.signal_server() {
+        error!("Failed to signal server: {}", err);
+    }
+
+    // Wait for the explain response
+    loop {
+        wait_latch(None);
+        if shared.send.len() == 0 {
+            continue;
+        }
+        let header = match srv_consume_header(&mut shared.send) {
+            Ok(h) => h,
+            Err(err) => {
+                let _ = srv_request_failure(&mut shared.recv);
+                let _ = shared.signal_server();
+                error!("Failed to consume header: {}", err)
+            }
+        };
+        if header.direction != Direction::ToClient {
+            continue;
+        }
+        match header.packet {
+            Packet::None => continue,
+            Packet::Failure => match srv_read_error(&mut shared.send) {
+                Ok(msg) => error!("Failed to compile the query: {}", msg),
+                Err(err) => error!("Double error: {}", err),
+            },
+            Packet::Explain => {
+                let len = read_bin_len(&mut shared.send)
+                    .expect("Failed to read length in explain message");
+                let mut buf = SmallVec::<[u8; 256]>::new();
+                buf.resize(len as usize, 0);
+                let read = std::io::Read::read(&mut shared.send, buf.as_mut_slice())
+                    .expect("Failed to read explain payload");
+                debug_assert_eq!(read, len as usize);
+                unsafe {
+                    ExplainPropertyText(b"DataFusion Plan\0".as_ptr() as _, buf.as_ptr() as _, es);
+                }
+                break;
+            }
+            _ => {
+                let _ = srv_request_failure(&mut shared.recv);
+                let _ = shared.signal_server();
+                error!("Unexpected packet for explain: {:?}", header.packet)
+            }
+        }
+    }
 }
 
 fn wait_latch(timeout: Option<Duration>) {
