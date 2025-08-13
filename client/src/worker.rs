@@ -8,6 +8,7 @@ use std::cell::OnceCell;
 use std::ptr;
 use std::sync::atomic::{AtomicBool, AtomicI32, Ordering};
 use tokio::runtime::Builder;
+use tokio::signal::unix::{signal as unix_signal, SignalKind};
 use server::stack::TreiberStack;
 
 // FIXME: This should be configurable.
@@ -164,8 +165,25 @@ pub extern "C" fn worker_main(_arg: pg_sys::Datum) {
             });
         }
 
-        // Keep worker alive indefinitely
-        future::pending::<()>().await;
+        // Keep worker alive until a termination signal arrives
+        let mut sigterm = unix_signal(SignalKind::terminate()).expect("sigterm stream");
+        #[allow(unused_mut)]
+        let mut sigint = unix_signal(SignalKind::interrupt()).ok();
+        #[allow(unused_mut)]
+        let mut sigquit = unix_signal(SignalKind::quit()).ok();
+        #[allow(unused_mut)]
+        let mut sighup = unix_signal(SignalKind::hangup()).ok();
+
+        loop {
+            tokio::select! {
+                _ = sigterm.recv() => break,
+                // Some systems may deliver INT/QUIT; treat as shutdown as well.
+                _ = async { if let Some(s) = &mut sigint { s.recv().await; } } => break,
+                _ = async { if let Some(s) = &mut sigquit { s.recv().await; } } => break,
+                // SIGHUP typically for reload; ignore and continue waiting.
+                _ = async { if let Some(s) = &mut sighup { s.recv().await; } } => {},
+            }
+        }
     });
 }
 
