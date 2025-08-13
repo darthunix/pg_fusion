@@ -83,6 +83,10 @@ impl<'a> ConnectionShared<'a> {
     pub fn signal_server(&self) -> AnyResult<()> {
         #[cfg(unix)]
         {
+            // Mark this connection as ready in shared memory so the server's
+            // signal listener can wake the correct socket upon SIGUSR1.
+            self.flag.store(true, Ordering::Release);
+
             let pid = self.server_pid.load(Ordering::Relaxed);
             if pid <= 0 {
                 anyhow::bail!("invalid server pid: {}", pid);
