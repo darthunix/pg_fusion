@@ -308,9 +308,11 @@ fn table_oids(stream: &mut SlotStream) -> AnyResult<SmallVec<[(Oid, NeedSchema);
 }
 
 fn wait_latch(timeout: Option<Duration>) {
+    // In PostgreSQL, WaitLatch timeout -1 means wait forever, 0 means do not wait.
+    // For None we want to block until signaled, not to return immediately.
     let timeout: c_long = timeout
         .map(|t| t.as_millis().try_into().unwrap())
-        .unwrap_or(0);
+        .unwrap_or(-1);
     let events = WL_LATCH_SET | WL_TIMEOUT | WL_POSTMASTER_DEATH;
     let rc = unsafe {
         let rc = WaitLatch(MyLatch, events as i32, timeout, PG_WAIT_EXTENSION);
