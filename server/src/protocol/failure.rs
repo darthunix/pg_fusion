@@ -108,7 +108,12 @@ mod tests {
 
             request_failure(&mut buffer).unwrap();
             let header = consume_header(&mut buffer).unwrap();
-            let expected_header = Header { direction: Direction::ToServer, packet: Packet::Failure, length: 0, flag: Flag::Last };
+            let expected_header = Header {
+                direction: Direction::ToServer,
+                packet: Packet::Failure,
+                length: 0,
+                flag: Flag::Last,
+            };
             assert_eq!(header, expected_header);
             assert!(buffer.is_empty());
             dealloc(base, layout.layout);

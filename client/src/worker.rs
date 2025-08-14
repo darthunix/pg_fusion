@@ -1,15 +1,15 @@
 use libc::c_void;
 use pgrx::bgworkers::{BackgroundWorker, BackgroundWorkerBuilder, SignalWakeFlags};
 use pgrx::prelude::*;
-use std::slice;
-use std::sync::Arc;
-use std::future;
+use server::stack::TreiberStack;
 use std::cell::OnceCell;
+use std::future;
 use std::ptr;
+use std::slice;
 use std::sync::atomic::{AtomicBool, AtomicI32, Ordering};
+use std::sync::Arc;
 use tokio::runtime::Builder;
 use tokio::signal::unix::{signal as unix_signal, SignalKind};
-use server::stack::TreiberStack;
 
 // FIXME: This should be configurable.
 const TOKIO_THREAD_NUMBER: usize = 1;
@@ -128,9 +128,8 @@ pub extern "C" fn worker_main(_arg: pg_sys::Datum) {
         };
         for id in 0..num {
             let conn_base = unsafe { base.add(id * layout.layout.size()) };
-            let (recv_base, send_base, client_ptr) = unsafe {
-                server::layout::connection_ptrs(conn_base, layout)
-            };
+            let (recv_base, send_base, client_ptr) =
+                unsafe { server::layout::connection_ptrs(conn_base, layout) };
             let socket = unsafe {
                 server::ipc::Socket::from_layout_with_state(
                     id,
@@ -139,11 +138,16 @@ pub extern "C" fn worker_main(_arg: pg_sys::Datum) {
                     layout.recv_socket_layout,
                 )
             };
-            let send_buffer =
-                unsafe { server::buffer::LockFreeBuffer::from_layout(send_base, layout.send_buffer_layout) };
+            let send_buffer = unsafe {
+                server::buffer::LockFreeBuffer::from_layout(send_base, layout.send_buffer_layout)
+            };
             let pid = unsafe { (*client_ptr).load(Ordering::Relaxed) };
-            let mut conn = server::server::Connection::new(socket, send_buffer, unsafe { &*srv_pid_ptr })
-                .with_client(AtomicI32::new(pid));
+            let mut conn = server::server::Connection::new(
+                socket,
+                send_buffer,
+                unsafe { &*srv_pid_ptr },
+                unsafe { &*client_ptr },
+            );
 
             tokio::spawn(async move {
                 let mut storage = server::server::Storage::default();

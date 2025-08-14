@@ -61,7 +61,10 @@ pub struct BufferLayout {
 /// Compute the memory layout for a lock-free ring buffer of `capacity` bytes.
 pub fn lockfree_buffer_layout(capacity: usize) -> Result<BufferLayout, LayoutError> {
     // LockFreeBuffer uses u32 indices; keep capacity within u32 range.
-    assert!(capacity <= (u32::MAX as usize), "capacity exceeds u32 range");
+    assert!(
+        capacity <= (u32::MAX as usize),
+        "capacity exceeds u32 range"
+    );
 
     let head = Layout::new::<AtomicU32>();
     let tail = Layout::new::<AtomicU32>();
@@ -101,7 +104,9 @@ pub struct SharedStateLayout {
 /// Compute the layout for a SharedState with `num_flags` sockets.
 pub fn shared_state_layout(num_flags: usize) -> Result<SharedStateLayout, LayoutError> {
     let flags = Layout::array::<AtomicBool>(num_flags)?;
-    Ok(SharedStateLayout { layout: flags.pad_to_align() })
+    Ok(SharedStateLayout {
+        layout: flags.pad_to_align(),
+    })
 }
 
 /// Return a pointer to the first flag for a SharedState region.

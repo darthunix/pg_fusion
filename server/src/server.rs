@@ -37,7 +37,7 @@ impl Storage {
 pub struct Connection<'bytes> {
     recv_socket: Socket<'bytes>,
     send_buffer: LockFreeBuffer<'bytes>,
-    client_pid: AtomicI32,
+    client_pid: &'bytes AtomicI32,
     server_pid: &'bytes AtomicI32,
 }
 
@@ -46,20 +46,14 @@ impl<'bytes> Connection<'bytes> {
         recv_socket: Socket<'bytes>,
         send_buffer: LockFreeBuffer<'bytes>,
         server_pid: &'bytes AtomicI32,
+        client_pid: &'bytes AtomicI32,
     ) -> Self {
         Self {
             recv_socket,
             send_buffer,
-            // The upper bound in /proc/sys/kernel/pid_max is 4_194_304.
-            // So i32::MAX is always an invalid PID.
-            client_pid: AtomicI32::new(i32::MAX),
+            client_pid,
             server_pid,
         }
-    }
-
-    pub fn with_client(mut self, pid: AtomicI32) -> Self {
-        self.client_pid = pid;
-        self
     }
 
     pub async fn poll(&mut self) -> Result<()> {
@@ -308,7 +302,8 @@ mod tests {
         let send_buffer =
             unsafe { LockFreeBuffer::from_layout(send_base, layout.send_buffer_layout) };
         static SERVER_PID: AtomicI32 = AtomicI32::new(0);
-        let mut conn = Connection::new(socket, send_buffer, &SERVER_PID);
+        static CLIENT_PID: AtomicI32 = AtomicI32::new(0);
+        let mut conn = Connection::new(socket, send_buffer, &SERVER_PID, &CLIENT_PID);
         let storage = Storage::default();
         tokio::spawn(async move {
             let mut storage = storage;
@@ -365,7 +360,8 @@ mod tests {
         let send_buffer =
             unsafe { LockFreeBuffer::from_layout(send_base, layout.send_buffer_layout) };
         static SERVER_PID: AtomicI32 = AtomicI32::new(0);
-        let mut conn = Connection::new(socket, send_buffer, &SERVER_PID);
+        static CLIENT_PID: AtomicI32 = AtomicI32::new(0);
+        let mut conn = Connection::new(socket, send_buffer, &SERVER_PID, &CLIENT_PID);
         let storage = Storage::default();
         tokio::spawn(async move {
             let mut storage = storage;
