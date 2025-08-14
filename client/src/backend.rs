@@ -166,6 +166,13 @@ unsafe extern "C" fn create_df_scan_state(cscan: *mut CustomScan) -> *mut Node {
     // Ensure server can signal us
     shared.set_client_pid(unsafe { libc::getpid() } as i32);
 
+    // Fast-fail when worker is not running (PID not published yet)
+    if shared.server_pid() <= 0 {
+        error!(
+            "DataFusion worker is not running (server PID is 0). Make sure shared_preload_libraries = 'pg_fusion' and restart the cluster."
+        );
+    }
+
     // Read the query from CustomScan private list and send it to server
     let list = unsafe { (*cscan).custom_private };
     let pattern = unsafe { (*list_nth(list, 0)).ptr_value as *const c_char };
@@ -264,19 +271,21 @@ unsafe extern "C" fn create_df_scan_state(cscan: *mut CustomScan) -> *mut Node {
 #[pg_guard]
 #[no_mangle]
 unsafe extern "C" fn begin_df_scan(node: *mut CustomScanState, estate: *mut EState, eflags: i32) {
-    todo!()
+    // No-op for now. We only rely on the planning/explain paths currently.
 }
 
 #[pg_guard]
 #[no_mangle]
 unsafe extern "C" fn exec_df_scan(node: *mut CustomScanState) -> *mut TupleTableSlot {
-    todo!()
+    // Execution is not implemented yet. Returning null ensures executor won't use it
+    // in contexts where execution is not expected (e.g., EXPLAIN).
+    std::ptr::null_mut()
 }
 
 #[pg_guard]
 #[no_mangle]
 unsafe extern "C" fn end_df_scan(node: *mut CustomScanState) {
-    todo!()
+    // No-op for now.
 }
 
 #[pg_guard]
@@ -296,6 +305,13 @@ unsafe extern "C" fn explain_df_scan(
         Err(e) => error!("Failed to map shared connection: {}", e),
     };
     shared.set_client_pid(unsafe { libc::getpid() } as i32);
+
+    // Fast-fail when worker is not running (PID not published yet)
+    if shared.server_pid() <= 0 {
+        error!(
+            "DataFusion worker is not running (server PID is 0). Make sure shared_preload_libraries = 'pg_fusion' and restart the cluster."
+        );
+    }
 
     // Request explain and notify the server
     if let Err(err) = srv_request_explain(&mut shared.recv) {

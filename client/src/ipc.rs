@@ -84,13 +84,28 @@ impl<'a> ConnectionShared<'a> {
         #[cfg(unix)]
         {
             // Mark this connection as ready in shared memory so the server's
-            // signal listener can wake the correct socket upon SIGUSR1.
+            // runtime (when it starts or is already running) will see our flag
+            // on its next poll without requiring a signal.
             self.flag.store(true, Ordering::Release);
 
-            let pid = self.server_pid.load(Ordering::Relaxed);
+            // Best-effort: wait briefly for the worker to publish PID.
+            let mut pid = self.server_pid.load(Ordering::Relaxed);
             if pid <= 0 {
-                anyhow::bail!("invalid server pid: {}", pid);
+                use std::time::Duration;
+                for _ in 0..200 {
+                    std::thread::sleep(Duration::from_millis(10));
+                    pid = self.server_pid.load(Ordering::Relaxed);
+                    if pid > 0 {
+                        break;
+                    }
+                }
             }
+            if pid <= 0 {
+                // Worker not ready yet; we've set the flag so it will be noticed
+                // on the first poll after startup. Do not fail the operation.
+                return Ok(());
+            }
+
             let rc = unsafe { libc::kill(pid as libc::pid_t, libc::SIGUSR1) };
             if rc == -1 {
                 return Err(std::io::Error::last_os_error().into());
