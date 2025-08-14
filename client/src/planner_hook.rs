@@ -1,9 +1,9 @@
+use pgrx::pg_sys::palloc0;
+use pgrx::pg_sys::CmdType::CMD_SELECT;
 use pgrx::pg_sys::{
     list_make2_impl, planner_hook, planner_hook_type, standard_planner, CustomScan, ListCell,
     NodeTag, ParamListInfo, Plan, PlannedStmt, Query,
 };
-use pgrx::pg_sys::CmdType::CMD_SELECT;
-use pgrx::pg_sys::palloc0;
 use pgrx::prelude::*;
 use std::ffi::{c_char, c_int, c_void, CStr};
 use std::mem::size_of;

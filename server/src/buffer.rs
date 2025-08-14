@@ -86,12 +86,8 @@ impl<'bytes> LockFreeBuffer<'bytes> {
     /// - `base` must point to a memory region of at least `layout.layout.size()` bytes,
     ///   aligned to `layout.layout.align()`.
     /// - The memory must remain valid and uniquely borrowed for the lifetime `'bytes`.
-    pub unsafe fn from_layout(
-        base: *mut u8,
-        layout: crate::layout::BufferLayout,
-    ) -> Self {
-        let (head_ptr, tail_ptr, data_ptr) =
-            crate::layout::lockfree_buffer_ptrs(base, layout);
+    pub unsafe fn from_layout(base: *mut u8, layout: crate::layout::BufferLayout) -> Self {
+        let (head_ptr, tail_ptr, data_ptr) = crate::layout::lockfree_buffer_ptrs(base, layout);
         let data_len = layout.data_len;
         let data = std::slice::from_raw_parts_mut(data_ptr, data_len);
 
