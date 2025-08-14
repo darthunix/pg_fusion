@@ -1,24 +1,16 @@
-use crate::worker::treiber_stack;
+use crate::ipc::{connection_id, connection_shared};
 use anyhow::Result as AnyResult;
 use libc::c_long;
 use pgrx::pg_sys::{
-    error, fetch_search_path_array, get_namespace_oid, get_relname_relid, palloc0,
+    self, error, fetch_search_path_array, get_namespace_oid, get_relname_relid, palloc0,
     CustomExecMethods, CustomScan, CustomScanMethods, CustomScanState, EState, ExplainPropertyText,
-    ExplainState, InvalidOid, List, ListCell, MyLatch, MyProcNumber, Node, NodeTag, Oid,
-    ParamExternData, ParamListInfo, RegisterCustomScanMethods, ResetLatch, TupleTableSlot,
-    WaitLatch, PG_WAIT_EXTENSION, WL_LATCH_SET, WL_POSTMASTER_DEATH, WL_TIMEOUT,
+    ExplainState, InvalidOid, List, ListCell, MyLatch, Node, NodeTag, Oid,
+    RegisterCustomScanMethods, ResetLatch, TupleTableSlot, WaitLatch, PG_WAIT_EXTENSION,
+    WL_LATCH_SET, WL_POSTMASTER_DEATH, WL_TIMEOUT,
 };
-use pgrx::{check_for_interrupts, pg_guard, warning};
-use rmp::decode::{read_array_len, read_bin_len};
+use pgrx::{check_for_interrupts, pg_guard};
+use rmp::decode::read_bin_len;
 use rmp::encode::{write_array_len, write_bool, write_str, write_u32, write_u8};
-use smallvec::SmallVec;
-use std::cell::OnceCell;
-use std::ffi::c_char;
-use std::ffi::CStr;
-use std::time::Duration;
-
-use crate::ipc::{connection_id, connection_shared};
-use pgrx::pg_sys;
 use server::buffer::LockFreeBuffer;
 use server::data_type::EncodedType;
 use server::protocol::bind::prepare_params as srv_prepare_params;
@@ -31,6 +23,10 @@ use server::protocol::metadata::process_metadata_with_response as srv_process_me
 use server::protocol::parse::prepare_query as srv_prepare_query;
 use server::protocol::Tape;
 use server::protocol::{Direction, Packet};
+use smallvec::SmallVec;
+use std::ffi::c_char;
+use std::ffi::CStr;
+use std::time::Duration;
 
 fn handle_metadata(send: &mut LockFreeBuffer, recv: &mut LockFreeBuffer) -> AnyResult<()> {
     let schema_table_lookup = |schema: &[u8], table: &[u8]| -> AnyResult<u32> {
@@ -253,19 +249,19 @@ unsafe extern "C" fn create_df_scan_state(cscan: *mut CustomScan) -> *mut Node {
         }
     }
 
-    let css = CustomScanState {
+    // Allocate a proper CustomScanState object; Postgres expects the pointer
+    // to point directly to a CustomScanState (no extra Node header prefix).
+    let state_ptr = palloc0(std::mem::size_of::<CustomScanState>()) as *mut CustomScanState;
+    let mut state = CustomScanState {
         methods: exec_methods(),
+        slotOps: &pg_sys::TTSOpsVirtual,
         ..Default::default()
     };
-    let mut node = PgNode::empty(std::mem::size_of::<CustomScanState>());
-    node.set_tag(NodeTag::T_CustomScanState);
-    node.set_data(unsafe {
-        std::slice::from_raw_parts(
-            &css as *const _ as *const u8,
-            std::mem::size_of::<CustomScanState>(),
-        )
-    });
-    node.mut_node()
+    // Set the NodeTag for this PlanState
+    state.ss.ps.type_ = NodeTag::T_CustomScanState;
+    // Write the initialized state into the allocated memory
+    std::ptr::write(state_ptr, state);
+    state_ptr as *mut Node
 }
 
 #[pg_guard]

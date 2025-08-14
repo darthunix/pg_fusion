@@ -153,19 +153,15 @@ unsafe extern "C" fn create_df_scan_state(cscan: *mut CustomScan) -> *mut Node {
             }
         }
     }
-    let css = CustomScanState {
+    // Allocate and initialize CustomScanState directly
+    let state_ptr = palloc0(std::mem::size_of::<CustomScanState>()) as *mut CustomScanState;
+    let mut state = CustomScanState {
         methods: exec_methods(),
         ..Default::default()
     };
-    let mut node = PgNode::empty(std::mem::size_of::<CustomScanState>());
-    node.set_tag(NodeTag::T_CustomScanState);
-    node.set_data(unsafe {
-        std::slice::from_raw_parts(
-            &css as *const _ as *const u8,
-            std::mem::size_of::<CustomScanState>(),
-        )
-    });
-    node.mut_node()
+    state.ss.ps.type_ = NodeTag::T_CustomScanState;
+    std::ptr::write(state_ptr, state);
+    state_ptr as *mut Node
 }
 
 #[pg_guard]
