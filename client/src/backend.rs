@@ -389,47 +389,6 @@ fn wait_latch(timeout: Option<Duration>) {
     }
 }
 
-pub(crate) struct PgNode {
-    size: usize,
-    node: *mut Node,
-}
-
-impl PgNode {
-    pub(crate) fn empty(data_size: usize) -> Self {
-        let size = std::mem::size_of::<Node>() + data_size;
-        let buf_ptr = unsafe { palloc0(size) };
-        PgNode {
-            size,
-            node: buf_ptr as *mut Node,
-        }
-    }
-
-    pub(crate) fn set_tag(&mut self, tag: NodeTag) {
-        unsafe {
-            (*self.node).type_ = tag;
-        }
-    }
-
-    pub(crate) fn set_data(&mut self, data: &[u8]) {
-        assert!(data.len() <= self.size - std::mem::size_of::<Node>());
-        unsafe {
-            let buf = std::slice::from_raw_parts_mut(self.node as *mut u8, self.size);
-            buf[std::mem::size_of::<Node>()..].copy_from_slice(data);
-        }
-    }
-
-    pub(crate) fn data(&self) -> &[u8] {
-        unsafe {
-            let buf = std::slice::from_raw_parts(self.node as *const u8, self.size);
-            &buf[std::mem::size_of::<Node>()..]
-        }
-    }
-
-    pub(crate) fn mut_node(&self) -> *mut Node {
-        self.node
-    }
-}
-
 fn list_nth(list: *mut List, n: i32) -> *mut ListCell {
     assert_ne!(list, std::ptr::null_mut());
     unsafe {
