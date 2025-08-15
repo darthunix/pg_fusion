@@ -1,8 +1,8 @@
 use libc::c_void;
 use pgrx::bgworkers::{BackgroundWorker, BackgroundWorkerBuilder, SignalWakeFlags};
 use pgrx::prelude::*;
-use server::server::{Connection, Storage};
-use server::stack::TreiberStack;
+use executor::server::{Connection, Storage};
+use executor::stack::TreiberStack;
 use std::cell::OnceCell;
 use std::fs;
 use std::path::Path;
@@ -36,7 +36,7 @@ pub unsafe extern "C" fn init_shmem() {
 
     // Allocate flags region: one `AtomicBool` per backend connection.
     {
-        use server::layout::shared_state_layout;
+        use executor::layout::shared_state_layout;
         let shared = shared_state_layout(num).expect("shared_state_layout");
         let ptr = pgrx::pg_sys::ShmemAlloc(shared.layout.size());
         FLAGS_PTR.set(ptr).ok();
@@ -51,7 +51,7 @@ pub unsafe extern "C" fn init_shmem() {
 
     // Allocate connection regions: one `ConnectionLayout` per backend connection.
     {
-        use server::layout::connection_layout;
+        use executor::layout::connection_layout;
         const RECV_CAP: usize = 8192;
         const SEND_CAP: usize = 8192;
         let layout = connection_layout(RECV_CAP, SEND_CAP).expect("connection_layout");
@@ -63,7 +63,7 @@ pub unsafe extern "C" fn init_shmem() {
         std::ptr::write_bytes(base_u8, 0, total);
         for i in 0..num {
             let conn_base = base_u8.add(i * layout.layout.size());
-            let (_, _, client_ptr) = server::layout::connection_ptrs(conn_base, layout);
+            let (_, _, client_ptr) = executor::layout::connection_ptrs(conn_base, layout);
             (*client_ptr).store(i32::MAX, Ordering::Relaxed);
         }
         info!(
@@ -74,7 +74,7 @@ pub unsafe extern "C" fn init_shmem() {
 
     // Allocate Treiber stack region.
     {
-        use server::layout::{treiber_stack_layout, treiber_stack_ptrs};
+        use executor::layout::{treiber_stack_layout, treiber_stack_ptrs};
         let layout = treiber_stack_layout(num).expect("treiber_stack_layout");
         let base = pgrx::pg_sys::ShmemAlloc(layout.layout.size());
         STACK_PTR.set(base).ok();
@@ -93,7 +93,7 @@ pub unsafe extern "C" fn init_shmem() {
 
     // Allocate shared server PID cell
     {
-        let layout = server::layout::server_pid_layout().expect("server pid layout");
+        let layout = executor::layout::server_pid_layout().expect("server pid layout");
         let base = pgrx::pg_sys::ShmemAlloc(layout.layout.size());
         SERVER_PID_PTR.set(base).ok();
         // zero-init, value will be set in worker_main
@@ -129,11 +129,11 @@ pub extern "C" fn worker_main(_arg: pg_sys::Datum) {
     // Build SharedState from shared flags
     let flags_slice = unsafe {
         let flags_base = *FLAGS_PTR.get().expect("FLAGS_PTR not set");
-        let layout = server::layout::shared_state_layout(num).expect("flags layout");
-        let flags_ptr = server::layout::shared_state_flags_ptr(flags_base as *mut u8, layout);
+        let layout = executor::layout::shared_state_layout(num).expect("flags layout");
+        let flags_ptr = executor::layout::shared_state_flags_ptr(flags_base as *mut u8, layout);
         slice::from_raw_parts(flags_ptr, num)
     };
-    let state = Arc::new(server::ipc::SharedState::new(flags_slice));
+    let state = Arc::new(executor::ipc::SharedState::new(flags_slice));
     info!(
         "worker_main: SharedState ready (flags={})",
         flags_slice.len()
@@ -142,8 +142,8 @@ pub extern "C" fn worker_main(_arg: pg_sys::Datum) {
     // Set server PID in shared memory (OS pid)
     unsafe {
         let base = *SERVER_PID_PTR.get().expect("SERVER_PID_PTR not set") as *mut u8;
-        let layout = server::layout::server_pid_layout().expect("server pid layout");
-        let pid_ptr = server::layout::server_pid_ptr(base, layout);
+        let layout = executor::layout::server_pid_layout().expect("server pid layout");
+        let pid_ptr = executor::layout::server_pid_ptr(base, layout);
         let pid = libc::getpid();
         (*pid_ptr).store(pid as i32, Ordering::Relaxed);
         info!("worker_main: published server pid={}", pid);
@@ -163,21 +163,21 @@ pub extern "C" fn worker_main(_arg: pg_sys::Datum) {
     // Build connections from shared memory and run tasks
     rt.block_on(async move {
         // Spawn shared signal listener (wakes sockets on SIGUSR1)
-        tokio::spawn(server::ipc::signal_listener(Arc::clone(&state)));
+        tokio::spawn(executor::ipc::signal_listener(Arc::clone(&state)));
 
         let base = unsafe { *CONNS_PTR.get().expect("CONNS_PTR not set") as *mut u8 };
-        let layout = server::layout::connection_layout(RECV_CAP, SEND_CAP).expect("conn layout");
+        let layout = executor::layout::connection_layout(RECV_CAP, SEND_CAP).expect("conn layout");
         let srv_pid_ptr = unsafe {
             let base = *SERVER_PID_PTR.get().expect("SERVER_PID_PTR not set") as *mut u8;
-            let l = server::layout::server_pid_layout().expect("server pid layout");
-            server::layout::server_pid_ptr(base, l)
+            let l = executor::layout::server_pid_layout().expect("server pid layout");
+            executor::layout::server_pid_ptr(base, l)
         };
         for id in 0..num {
             let conn_base = unsafe { base.add(id * layout.layout.size()) };
             let (recv_base, send_base, client_ptr) =
-                unsafe { server::layout::connection_ptrs(conn_base, layout) };
+                unsafe { executor::layout::connection_ptrs(conn_base, layout) };
             let socket = unsafe {
-                server::ipc::Socket::from_layout_with_state(
+                executor::ipc::Socket::from_layout_with_state(
                     id,
                     Arc::clone(&state),
                     recv_base,
@@ -185,7 +185,7 @@ pub extern "C" fn worker_main(_arg: pg_sys::Datum) {
                 )
             };
             let send_buffer = unsafe {
-                server::buffer::LockFreeBuffer::from_layout(send_base, layout.send_buffer_layout)
+                executor::buffer::LockFreeBuffer::from_layout(send_base, layout.send_buffer_layout)
             };
             let mut conn = Connection::new(socket, send_buffer, unsafe { &*srv_pid_ptr }, unsafe {
                 &*client_ptr
@@ -205,9 +205,9 @@ pub extern "C" fn worker_main(_arg: pg_sys::Datum) {
                     match res {
                         Ok(()) => tracing::trace!(connection_id = id, "message processed"),
                         Err(err) => {
-                            let ferr = match err.downcast::<server::error::FusionError>() {
+                            let ferr = match err.downcast::<executor::error::FusionError>() {
                                 Ok(f) => f,
-                                Err(e) => server::error::FusionError::Other(e),
+                                Err(e) => executor::error::FusionError::Other(e),
                             };
                             tracing::error!(connection_id = id, error = %ferr, "processing error");
                             storage.flush();
@@ -264,7 +264,7 @@ fn init_tracing_file_logger() {
 
     let filter = tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| {
         // Default: verbose for our crates; info elsewhere
-        tracing_subscriber::EnvFilter::new("info,pg_fusion=trace,server=trace")
+        tracing_subscriber::EnvFilter::new("info,pg_fusion=trace,executor=trace")
     });
 
     let subscriber = tracing_subscriber::fmt()
@@ -291,9 +291,9 @@ static mut SERVER_PID_PTR: OnceCell<*mut c_void> = OnceCell::new();
 pub(crate) fn treiber_stack() -> &'static TreiberStack {
     unsafe {
         let base = *STACK_PTR.get().expect("STACK_PTR not set") as *mut u8;
-        let layout = server::layout::treiber_stack_layout(crate::max_backends() as usize)
+        let layout = executor::layout::treiber_stack_layout(crate::max_backends() as usize)
             .expect("treiber_stack_layout");
-        let (hdr_ptr, _next_ptr) = server::layout::treiber_stack_ptrs(base, layout);
+        let (hdr_ptr, _next_ptr) = executor::layout::treiber_stack_ptrs(base, layout);
         &*hdr_ptr
     }
 }
@@ -302,14 +302,14 @@ pub(crate) fn shared_flags_slice() -> &'static [AtomicBool] {
     let num = crate::max_backends() as usize;
     unsafe {
         let flags_base = *FLAGS_PTR.get().expect("FLAGS_PTR not set");
-        let layout = server::layout::shared_state_layout(num).expect("flags layout");
-        let flags_ptr = server::layout::shared_state_flags_ptr(flags_base as *mut u8, layout);
+        let layout = executor::layout::shared_state_layout(num).expect("flags layout");
+        let flags_ptr = executor::layout::shared_state_flags_ptr(flags_base as *mut u8, layout);
         std::slice::from_raw_parts(flags_ptr, num)
     }
 }
 
-pub(crate) fn connections_layout() -> server::layout::ConnectionLayout {
-    server::layout::connection_layout(RECV_CAP, SEND_CAP).expect("conn layout")
+pub(crate) fn connections_layout() -> executor::layout::ConnectionLayout {
+    executor::layout::connection_layout(RECV_CAP, SEND_CAP).expect("conn layout")
 }
 
 pub(crate) fn connections_base() -> *mut u8 {
@@ -319,8 +319,8 @@ pub(crate) fn connections_base() -> *mut u8 {
 pub(crate) fn server_pid_atomic() -> &'static AtomicI32 {
     unsafe {
         let base = *SERVER_PID_PTR.get().expect("SERVER_PID_PTR not set") as *mut u8;
-        let layout = server::layout::server_pid_layout().expect("server pid layout");
-        let pid_ptr = server::layout::server_pid_ptr(base, layout);
+        let layout = executor::layout::server_pid_layout().expect("server pid layout");
+        let pid_ptr = executor::layout::server_pid_ptr(base, layout);
         &*pid_ptr
     }
 }

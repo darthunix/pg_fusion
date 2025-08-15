@@ -20,7 +20,7 @@ ahash = "0.8"
 anyhow = "1.0"
 datafusion = "44.0"
 datafusion-sql = "44.0"
-server = { path = "../server", version = "25.0" }
+executor = { path = "../executor", version = "25.0" }
 fasthash = "0.4"
 libc = "0.2"
 once_cell = "1.21"
@@ -32,7 +32,11 @@ smol_str = "0.3"
 thiserror = "2.0"
 tokio = { version = "1.42", features = ["full"] }
 tracing = "0.1"
-tracing-subscriber = { version = "0.3", features = ["fmt", "env-filter", "time"] }
+tracing-subscriber = { version = "0.3", features = [
+  "fmt",
+  "env-filter",
+  "time",
+] }
 tracing-appender = "0.2"
 
 [dev-dependencies]

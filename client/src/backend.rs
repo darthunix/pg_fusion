@@ -11,18 +11,18 @@ use pgrx::pg_sys::{
 use pgrx::{check_for_interrupts, pg_guard};
 use rmp::decode::read_bin_len;
 use rmp::encode::{write_array_len, write_bool, write_str, write_u32, write_u8};
-use server::buffer::LockFreeBuffer;
-use server::data_type::EncodedType;
-use server::protocol::bind::prepare_params as srv_prepare_params;
-use server::protocol::consume_header as srv_consume_header;
-use server::protocol::explain::request_explain as srv_request_explain;
-use server::protocol::failure::{
+use executor::buffer::LockFreeBuffer;
+use executor::data_type::EncodedType;
+use executor::protocol::bind::prepare_params as srv_prepare_params;
+use executor::protocol::consume_header as srv_consume_header;
+use executor::protocol::explain::request_explain as srv_request_explain;
+use executor::protocol::failure::{
     read_error as srv_read_error, request_failure as srv_request_failure,
 };
-use server::protocol::metadata::process_metadata_with_response as srv_process_metadata;
-use server::protocol::parse::prepare_query as srv_prepare_query;
-use server::protocol::Tape;
-use server::protocol::{Direction, Packet};
+use executor::protocol::metadata::process_metadata_with_response as srv_process_metadata;
+use executor::protocol::parse::prepare_query as srv_prepare_query;
+use executor::protocol::Tape;
+use executor::protocol::{Direction, Packet};
 use smallvec::SmallVec;
 use std::ffi::c_char;
 use std::ffi::CStr;
