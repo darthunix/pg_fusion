@@ -70,21 +70,21 @@ unsafe extern "C" fn pg_fusion_shmem_request_hook() {
     // as required by PostgreSQL (must be within shmem_request_hook).
     let num = max_backends() as usize;
 
-    let flags_sz = server::layout::shared_state_layout(num)
+    let flags_sz = executor::layout::shared_state_layout(num)
         .expect("shared_state_layout")
         .layout
         .size();
 
-    let conn_layout = server::layout::connection_layout(worker::RECV_CAP, worker::SEND_CAP)
+    let conn_layout = executor::layout::connection_layout(worker::RECV_CAP, worker::SEND_CAP)
         .expect("connection_layout");
     let conns_sz = conn_layout.layout.size() * num;
 
-    let stack_sz = server::layout::treiber_stack_layout(num)
+    let stack_sz = executor::layout::treiber_stack_layout(num)
         .expect("treiber_stack_layout")
         .layout
         .size();
 
-    let pid_sz = server::layout::server_pid_layout()
+    let pid_sz = executor::layout::server_pid_layout()
         .expect("server_pid_layout")
         .layout
         .size();

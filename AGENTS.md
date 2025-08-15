@@ -7,8 +7,8 @@
 - doc/adr/: Architectural Decision Records and template.
 
 ## Build, Test, and Development Commands
-- Build engine: `cargo build -p server`
-- Unit tests (engine): `cargo test -p server`
+- Build engine: `cargo build -p executor`
+- Unit tests (engine): `cargo test -p executor`
 - Format & lint: `cargo fmt --all -- --check` and `cargo clippy --all-targets --features "pg17, pg_test" --no-default-features`
 - pgrx setup (once): `cargo install cargo-pgrx && cargo pgrx init --pg17 $(which pg_config)`
 - Run extension locally: `cargo pgrx run` (see README for `shared_preload_libraries`)
