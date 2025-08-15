@@ -1,18 +1,18 @@
 use libc::c_void;
 use pgrx::bgworkers::{BackgroundWorker, BackgroundWorkerBuilder, SignalWakeFlags};
 use pgrx::prelude::*;
+use server::server::{Connection, Storage};
 use server::stack::TreiberStack;
 use std::cell::OnceCell;
+use std::fs;
+use std::path::Path;
 use std::ptr;
 use std::slice;
 use std::sync::atomic::{AtomicBool, AtomicI32, Ordering};
 use std::sync::Arc;
+use std::sync::OnceLock;
 use tokio::runtime::Builder;
 use tokio::signal::unix::{signal as unix_signal, SignalKind};
-use std::path::Path;
-use std::fs;
-use std::sync::OnceLock;
-use server::server::{Connection, Storage};
 
 // FIXME: This should be configurable.
 const TOKIO_THREAD_NUMBER: usize = 1;
@@ -42,7 +42,11 @@ pub unsafe extern "C" fn init_shmem() {
         FLAGS_PTR.set(ptr).ok();
         // Zero-initialize flags
         std::ptr::write_bytes(ptr as *mut u8, 0, shared.layout.size());
-        info!("init_shmem: allocated flags region: bytes={} count={}", shared.layout.size(), num);
+        info!(
+            "init_shmem: allocated flags region: bytes={} count={}",
+            shared.layout.size(),
+            num
+        );
     }
 
     // Allocate connection regions: one `ConnectionLayout` per backend connection.
@@ -82,7 +86,8 @@ pub unsafe extern "C" fn init_shmem() {
         unsafe { ptr::write(hdr_ptr, stack) };
         info!(
             "init_shmem: allocated treiber stack: bytes={} nodes={}",
-            layout.layout.size(), num
+            layout.layout.size(),
+            num
         );
     }
 
@@ -93,7 +98,10 @@ pub unsafe extern "C" fn init_shmem() {
         SERVER_PID_PTR.set(base).ok();
         // zero-init, value will be set in worker_main
         std::ptr::write_bytes(base as *mut u8, 0, layout.layout.size());
-        info!("init_shmem: allocated server pid cell: bytes={}", layout.layout.size());
+        info!(
+            "init_shmem: allocated server pid cell: bytes={}",
+            layout.layout.size()
+        );
     }
 }
 
@@ -106,7 +114,6 @@ fn signal_client(conn: &Connection, id: usize) {
     }
 }
 
-
 #[pg_guard]
 #[no_mangle]
 pub extern "C" fn worker_main(_arg: pg_sys::Datum) {
@@ -114,7 +121,10 @@ pub extern "C" fn worker_main(_arg: pg_sys::Datum) {
     let num = crate::max_backends() as usize;
     init_tracing_file_logger();
     let pid = unsafe { libc::getpid() };
-    info!("worker_main: starting DataFusion worker pid={} max_backends={}", pid, num);
+    info!(
+        "worker_main: starting DataFusion worker pid={} max_backends={}",
+        pid, num
+    );
 
     // Build SharedState from shared flags
     let flags_slice = unsafe {
@@ -124,7 +134,10 @@ pub extern "C" fn worker_main(_arg: pg_sys::Datum) {
         slice::from_raw_parts(flags_ptr, num)
     };
     let state = Arc::new(server::ipc::SharedState::new(flags_slice));
-    info!("worker_main: SharedState ready (flags={})", flags_slice.len());
+    info!(
+        "worker_main: SharedState ready (flags={})",
+        flags_slice.len()
+    );
 
     // Set server PID in shared memory (OS pid)
     unsafe {
@@ -142,7 +155,10 @@ pub extern "C" fn worker_main(_arg: pg_sys::Datum) {
         .enable_all()
         .build()
         .unwrap();
-    info!("worker_main: tokio runtime built, threads={}", TOKIO_THREAD_NUMBER);
+    info!(
+        "worker_main: tokio runtime built, threads={}",
+        TOKIO_THREAD_NUMBER
+    );
 
     // Build connections from shared memory and run tasks
     rt.block_on(async move {
@@ -171,12 +187,9 @@ pub extern "C" fn worker_main(_arg: pg_sys::Datum) {
             let send_buffer = unsafe {
                 server::buffer::LockFreeBuffer::from_layout(send_base, layout.send_buffer_layout)
             };
-            let mut conn = Connection::new(
-                socket,
-                send_buffer,
-                unsafe { &*srv_pid_ptr },
-                unsafe { &*client_ptr },
-            );
+            let mut conn = Connection::new(socket, send_buffer, unsafe { &*srv_pid_ptr }, unsafe {
+                &*client_ptr
+            });
 
             tokio::spawn(async move {
                 tracing::trace!(connection_id = id, "connection task started");
@@ -232,14 +245,18 @@ fn init_tracing_file_logger() {
     if GUARD.get().is_some() {
         return;
     }
-    let path = std::env::var("PG_FUSION_LOG").unwrap_or_else(|_| "/tmp/pg_fusion_worker.log".to_string());
+    let path =
+        std::env::var("PG_FUSION_LOG").unwrap_or_else(|_| "/tmp/pg_fusion_worker.log".to_string());
     let p = Path::new(&path);
     if let Some(parent) = p.parent() {
         let _ = fs::create_dir_all(parent);
     }
     let (dir, file) = match (p.parent(), p.file_name()) {
         (Some(d), Some(f)) => (d.to_path_buf(), f.to_string_lossy().to_string()),
-        _ => (Path::new("/tmp").to_path_buf(), "pg_fusion_worker.log".to_string()),
+        _ => (
+            Path::new("/tmp").to_path_buf(),
+            "pg_fusion_worker.log".to_string(),
+        ),
     };
 
     let file_appender = tracing_appender::rolling::never(dir, file);

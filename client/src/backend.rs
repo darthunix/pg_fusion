@@ -235,7 +235,10 @@ unsafe extern "C" fn create_df_scan_state(cscan: *mut CustomScan) -> *mut Node {
                 }
             }
             Packet::Columns => {
-                // Columns are ready; planning phase done
+                // Columns are ready; planning phase done. Drain payload to keep buffer aligned.
+                let mut scratch = SmallVec::<[u8; 256]>::new();
+                scratch.resize(header.length as usize, 0);
+                let _ = std::io::Read::read(&mut shared.send, scratch.as_mut_slice());
                 break;
             }
             Packet::Parse | Packet::Explain => {
