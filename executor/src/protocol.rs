@@ -159,17 +159,3 @@ fn str_prefix_len(len: u32) -> u32 {
         5
     }
 }
-
-#[inline]
-fn bin_prefix_len(len: u32) -> u32 {
-    if len < 256 {
-        // bin8 (0xC4) + 1-byte length
-        2
-    } else if len <= u16::MAX as u32 {
-        // bin16 (0xC5) + 2-byte length
-        3
-    } else {
-        // bin32 (0xC6) + 4-byte length
-        5
-    }
-}

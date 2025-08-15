@@ -9,6 +9,7 @@ use crate::protocol::explain::prepare_explain;
 use crate::protocol::failure::prepare_error;
 use crate::protocol::metadata::prepare_table_refs;
 use crate::protocol::parse::read_query;
+use crate::protocol::Tape;
 use crate::protocol::{consume_header, Direction, Packet};
 use crate::sql::Catalog;
 use anyhow::{bail, Result};
@@ -19,9 +20,8 @@ use datafusion_sql::parser::{DFParser, Statement};
 use datafusion_sql::planner::SqlToRel;
 use datafusion_sql::TableReference;
 use smol_str::{format_smolstr, SmolStr};
-use tracing::{debug, trace};
-use crate::protocol::Tape;
 use std::sync::atomic::{AtomicI32, Ordering};
+use tracing::{debug, trace};
 
 #[derive(Default)]
 pub struct Storage {
@@ -61,7 +61,10 @@ impl<'bytes> Connection<'bytes> {
     pub async fn poll(&mut self) -> Result<()> {
         trace!("poll: waiting for socket signal");
         (&mut self.recv_socket).await?;
-        trace!("poll: socket signaled (data available: {} bytes)", self.recv_socket.buffer.len());
+        trace!(
+            "poll: socket signaled (data available: {} bytes)",
+            self.recv_socket.buffer.len()
+        );
         Ok(())
     }
 
@@ -147,7 +150,11 @@ impl<'bytes> Connection<'bytes> {
                     } else {
                         Catalog::from_stream(&mut self.recv_socket.buffer)?
                     };
-                    trace!(skip_metadata, "process_message: Action::Compile (catalog {}loaded)", if skip_metadata {"not "} else {""});
+                    trace!(
+                        skip_metadata,
+                        "process_message: Action::Compile (catalog {}loaded)",
+                        if skip_metadata { "not " } else { "" }
+                    );
                     compile(stmt, &catalog)
                 }
                 Some(Action::Explain) => {
@@ -180,7 +187,10 @@ impl<'bytes> Connection<'bytes> {
             match result {
                 TaskResult::Bind(plan) => {
                     prepare_columns(&mut self.send_buffer, plan.schema().fields())?;
-                    trace!(columns = plan.schema().fields().len(), "process_message: prepared columns for Bind");
+                    trace!(
+                        columns = plan.schema().fields().len(),
+                        "process_message: prepared columns for Bind"
+                    );
                     storage.logical_plan = Some(plan);
                 }
                 TaskResult::Compilation(plan) => {
@@ -190,7 +200,10 @@ impl<'bytes> Connection<'bytes> {
                 }
                 TaskResult::Explain(explain) => {
                     prepare_explain(&mut self.send_buffer, explain.as_str())?;
-                    trace!(explain_len = explain.len(), "process_message: prepared Explain");
+                    trace!(
+                        explain_len = explain.len(),
+                        "process_message: prepared Explain"
+                    );
                 }
                 TaskResult::Parsing((stmt, tables)) => {
                     storage.statement = Some(stmt);
@@ -202,14 +215,21 @@ impl<'bytes> Connection<'bytes> {
                         trace!("process_message: no tables, skipping metadata, forcing Packet::Metadata");
                         continue;
                     } else {
-                        trace!(tables = tables.len(), "process_message: preparing table refs");
+                        trace!(
+                            tables = tables.len(),
+                            "process_message: preparing table refs"
+                        );
                         prepare_table_refs(&mut self.send_buffer, tables.as_slice())?
                     }
                 }
             }
             break;
         }
-        debug!(send_unread = self.send_buffer.len(), client_pid = self.client_pid.load(Ordering::Relaxed), "process_message: response buffered, ready to signal client");
+        debug!(
+            send_unread = self.send_buffer.len(),
+            client_pid = self.client_pid.load(Ordering::Relaxed),
+            "process_message: response buffered, ready to signal client"
+        );
         Ok(())
     }
 

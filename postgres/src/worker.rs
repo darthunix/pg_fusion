@@ -1,8 +1,8 @@
+use executor::server::{Connection, Storage};
+use executor::stack::TreiberStack;
 use libc::c_void;
 use pgrx::bgworkers::{BackgroundWorker, BackgroundWorkerBuilder, SignalWakeFlags};
 use pgrx::prelude::*;
-use executor::server::{Connection, Storage};
-use executor::stack::TreiberStack;
 use std::cell::OnceCell;
 use std::fs;
 use std::path::Path;

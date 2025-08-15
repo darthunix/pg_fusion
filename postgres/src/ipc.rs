@@ -1,8 +1,8 @@
 use crate::worker::treiber_stack;
 use anyhow::Result as AnyResult;
-use pgrx::warning;
 use executor::buffer::LockFreeBuffer;
 use executor::layout::{connection_ptrs, socket_ptrs, ConnectionLayout};
+use pgrx::warning;
 use std::cell::OnceCell;
 use std::sync::atomic::{AtomicBool, AtomicI32, Ordering};
 

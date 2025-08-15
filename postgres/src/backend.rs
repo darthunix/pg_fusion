@@ -476,7 +476,10 @@ fn oid_to_encoded_type(oid: pg_sys::Oid) -> Option<EncodedType> {
         o if o == pg_sys::TEXTOID
             || o == pg_sys::VARCHAROID
             || o == pg_sys::BPCHAROID
-            || o == pg_sys::NAMEOID => Some(EncodedType::Utf8),
+            || o == pg_sys::NAMEOID =>
+        {
+            Some(EncodedType::Utf8)
+        }
         // Integers
         o if o == pg_sys::INT2OID => Some(EncodedType::Int16),
         o if o == pg_sys::INT4OID => Some(EncodedType::Int32),
