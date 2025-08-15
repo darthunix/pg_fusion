@@ -1,0 +1,18 @@
+[package]
+name = "protocol"
+version = "25.0.0"
+edition = "2021"
+
+[lib]
+crate-type = ["lib"]
+doctest = false
+
+[dependencies]
+anyhow = "1.0"
+ahash = "0.8"
+datafusion = "44.0"
+datafusion-sql = "44.0"
+rmp = "0.8"
+smallvec = "1.14"
+common = { path = "../common", version = "25.0" }
+smol_str = "0.3"

@@ -1,9 +1,9 @@
+use crate::Tape;
 use anyhow::{bail, Result};
 use common::FusionError;
 use datafusion::arrow::datatypes::{DataType, IntervalUnit, TimeUnit};
 use datafusion::common::arrow::array::types::IntervalMonthDayNano;
 use datafusion::common::ScalarValue;
-use protocol::Tape;
 use rmp::decode::{
     read_bool, read_f32, read_f64, read_i16, read_i32, read_i64, read_str_len, RmpRead,
 };
@@ -98,7 +98,7 @@ pub fn write_scalar_value(stream: &mut impl Write, value: &ScalarValue) -> Resul
     let write_null = |mut stream: &mut dyn Write| -> Result<()> {
         // Though it is not a valid msgpack, we use it to represent null values
         // as we don't want to waste bytes for additional marker.
-        stream.write_u8(Marker::Null.to_u8())?;
+        stream.write_u8(rmp::Marker::Null.to_u8())?;
         Ok(())
     };
     match value {
@@ -204,7 +204,7 @@ pub fn read_scalar_value(stream: &mut impl Tape) -> Result<ScalarValue> {
     let marker = peak_u8(stream)?;
     let value = match EncodedType::try_from(etype)? {
         EncodedType::Boolean => {
-            if marker == u8::from(Marker::Null) {
+            if marker == u8::from(rmp::Marker::Null) {
                 let _ = read_u8(stream)?;
                 ScalarValue::Boolean(None)
             } else {
@@ -212,7 +212,7 @@ pub fn read_scalar_value(stream: &mut impl Tape) -> Result<ScalarValue> {
             }
         }
         EncodedType::Utf8 => {
-            if marker == u8::from(Marker::Null) {
+            if marker == u8::from(rmp::Marker::Null) {
                 let _ = read_u8(stream)?;
                 ScalarValue::Utf8(None)
             } else {
@@ -224,7 +224,7 @@ pub fn read_scalar_value(stream: &mut impl Tape) -> Result<ScalarValue> {
             }
         }
         EncodedType::Int16 => {
-            if marker == u8::from(Marker::Null) {
+            if marker == u8::from(rmp::Marker::Null) {
                 let _ = stream.read_u8()?;
                 ScalarValue::Int16(None)
             } else {
@@ -232,7 +232,7 @@ pub fn read_scalar_value(stream: &mut impl Tape) -> Result<ScalarValue> {
             }
         }
         EncodedType::Int32 => {
-            if marker == u8::from(Marker::Null) {
+            if marker == u8::from(rmp::Marker::Null) {
                 let _ = stream.read_u8()?;
                 ScalarValue::Int32(None)
             } else {
@@ -240,7 +240,7 @@ pub fn read_scalar_value(stream: &mut impl Tape) -> Result<ScalarValue> {
             }
         }
         EncodedType::Int64 => {
-            if marker == u8::from(Marker::Null) {
+            if marker == u8::from(rmp::Marker::Null) {
                 let _ = stream.read_u8()?;
                 ScalarValue::Int64(None)
             } else {
@@ -248,7 +248,7 @@ pub fn read_scalar_value(stream: &mut impl Tape) -> Result<ScalarValue> {
             }
         }
         EncodedType::Float32 => {
-            if marker == u8::from(Marker::Null) {
+            if marker == u8::from(rmp::Marker::Null) {
                 let _ = stream.read_u8()?;
                 ScalarValue::Float32(None)
             } else {
@@ -256,7 +256,7 @@ pub fn read_scalar_value(stream: &mut impl Tape) -> Result<ScalarValue> {
             }
         }
         EncodedType::Float64 => {
-            if marker == u8::from(Marker::Null) {
+            if marker == u8::from(rmp::Marker::Null) {
                 let _ = stream.read_u8()?;
                 ScalarValue::Float64(None)
             } else {
@@ -264,7 +264,7 @@ pub fn read_scalar_value(stream: &mut impl Tape) -> Result<ScalarValue> {
             }
         }
         EncodedType::Date32 => {
-            if marker == u8::from(Marker::Null) {
+            if marker == u8::from(rmp::Marker::Null) {
                 let _ = stream.read_u8()?;
                 ScalarValue::Date32(None)
             } else {
@@ -272,7 +272,7 @@ pub fn read_scalar_value(stream: &mut impl Tape) -> Result<ScalarValue> {
             }
         }
         EncodedType::Interval => {
-            if marker == u8::from(Marker::Null) {
+            if marker == u8::from(rmp::Marker::Null) {
                 let _ = stream.read_u8()?;
                 ScalarValue::IntervalMonthDayNano(None)
             } else {
@@ -287,7 +287,7 @@ pub fn read_scalar_value(stream: &mut impl Tape) -> Result<ScalarValue> {
             }
         }
         EncodedType::Time64 => {
-            if marker == u8::from(Marker::Null) {
+            if marker == u8::from(rmp::Marker::Null) {
                 let _ = stream.read_u8()?;
                 ScalarValue::Time64Microsecond(None)
             } else {
@@ -295,7 +295,7 @@ pub fn read_scalar_value(stream: &mut impl Tape) -> Result<ScalarValue> {
             }
         }
         EncodedType::Timestamp => {
-            if marker == u8::from(Marker::Null) {
+            if marker == u8::from(rmp::Marker::Null) {
                 let _ = stream.read_u8()?;
                 ScalarValue::TimestampMicrosecond(None, None)
             } else {

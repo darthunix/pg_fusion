@@ -1,24 +1,24 @@
 use crate::buffer::LockFreeBuffer;
-use crate::error::FusionError;
 use crate::fsm::executor::StateMachine;
 use crate::fsm::Action;
 use crate::ipc::Socket;
-use crate::protocol::bind::{read_params, request_params};
-use crate::protocol::columns::prepare_columns;
-use crate::protocol::explain::prepare_explain;
-use crate::protocol::failure::prepare_error;
-use crate::protocol::metadata::prepare_table_refs;
-use crate::protocol::parse::read_query;
-use crate::protocol::Tape;
-use crate::protocol::{consume_header, Direction, Packet};
 use crate::sql::Catalog;
 use anyhow::{bail, Result};
+use common::FusionError;
 use datafusion::execution::SessionStateBuilder;
 use datafusion::logical_expr::LogicalPlan;
 use datafusion::scalar::ScalarValue;
 use datafusion_sql::parser::{DFParser, Statement};
 use datafusion_sql::planner::SqlToRel;
 use datafusion_sql::TableReference;
+use protocol::bind::{read_params, request_params};
+use protocol::columns::prepare_columns;
+use protocol::explain::prepare_explain;
+use protocol::failure::prepare_error;
+use protocol::metadata::prepare_table_refs;
+use protocol::parse::read_query;
+use protocol::Tape;
+use protocol::{consume_header, Direction, Packet};
 use smol_str::{format_smolstr, SmolStr};
 use std::sync::atomic::{AtomicI32, Ordering};
 use tracing::{debug, trace};
@@ -175,7 +175,7 @@ impl<'bytes> Connection<'bytes> {
                 Some(Action::Parse) => {
                     let query = read_query(&mut self.recv_socket.buffer)?;
                     trace!(query = %query, "process_message: Action::Parse");
-                    parse(query)
+                    parse(query.into())
                 }
                 None => {
                     bail!(FusionError::NotFound(
@@ -283,16 +283,12 @@ mod tests {
     use crate::buffer::LockFreeBuffer;
     use crate::fsm::ExecutorState;
     use crate::ipc::SharedState;
-    use crate::protocol::bind::prepare_params;
-    use crate::protocol::columns::consume_columns;
-    use crate::protocol::explain::request_explain;
-    use crate::protocol::metadata::process_metadata_with_response;
-    use crate::protocol::metadata::tests::{
-        mock_schema_table_lookup, mock_table_lookup, mock_table_serialize,
-    };
-    use crate::protocol::parse::prepare_query;
-    use crate::protocol::Tape;
     use core::mem::size_of;
+    use protocol::bind::prepare_params;
+    use protocol::columns::consume_columns;
+    use protocol::explain::request_explain;
+    use protocol::metadata::process_metadata_with_response;
+    use protocol::parse::prepare_query;
     use rmp::decode::read_bin_len;
     use std::cell::UnsafeCell;
     use std::ffi::CStr;
@@ -327,6 +323,52 @@ mod tests {
         storage.flush();
         conn.recv_socket.buffer.flush_read();
         conn.send_buffer.flush_read();
+    }
+
+    // Local mocks for metadata processing used by tests
+    fn mock_table_lookup(name: &[u8]) -> anyhow::Result<u32> {
+        if name == b"t2\0" {
+            return Ok(666);
+        }
+        unreachable!();
+    }
+
+    fn mock_schema_table_lookup(schema: &[u8], name: &[u8]) -> anyhow::Result<u32> {
+        if schema == b"public\0" && name == b"t1\0" {
+            return Ok(42);
+        }
+        unreachable!();
+    }
+
+    fn mock_table_serialize(
+        id: u32,
+        need_schema: bool,
+        output: &mut dyn std::io::Write,
+    ) -> anyhow::Result<()> {
+        match id {
+            42 => {
+                assert!(need_schema);
+                output
+                    .write_all(b"\x93\xce\x00\x00\x00\x2a\xa6public\xa2t1")
+                    .expect("write t1");
+                // Two columns: a:Int64;N, b:Utf8 (not null)
+                output
+                    .write_all(b"\x92\x93\xcc\x04\xc3\xa1a\x93\xcc\x01\xc2\xa1b")
+                    .expect("write t1 columns");
+            }
+            666 => {
+                assert!(!need_schema);
+                output
+                    .write_all(b"\x92\xce\x00\x00\x02\x9a\xa2t2")
+                    .expect("write t2");
+                // One column (example): c:Utf8 nullable
+                output
+                    .write_all(b"\x91\x93\xcc\x01\xc3\xa1c")
+                    .expect("write t2 columns");
+            }
+            _ => unreachable!(),
+        }
+        Ok(())
     }
 
     #[tokio::test]

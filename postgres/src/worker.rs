@@ -205,9 +205,9 @@ pub extern "C" fn worker_main(_arg: pg_sys::Datum) {
                     match res {
                         Ok(()) => tracing::trace!(connection_id = id, "message processed"),
                         Err(err) => {
-                            let ferr = match err.downcast::<executor::error::FusionError>() {
+                            let ferr = match err.downcast::<common::FusionError>() {
                                 Ok(f) => f,
-                                Err(e) => executor::error::FusionError::Other(e),
+                                Err(e) => common::FusionError::Other(e),
                             };
                             tracing::error!(connection_id = id, error = %ferr, "processing error");
                             storage.flush();

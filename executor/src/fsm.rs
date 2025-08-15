@@ -17,7 +17,7 @@ pub enum ExecutorState {
 }
 
 state_machine! {
-    #[state_machine(input(crate::protocol::Packet), state(crate::fsm::ExecutorState), output(crate::fsm::Action))]
+    #[state_machine(input(protocol::Packet), state(crate::fsm::ExecutorState), output(crate::fsm::Action))]
     pub executor(Initialized)
 
     Initialized => {

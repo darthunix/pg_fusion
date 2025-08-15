@@ -1,6 +1,6 @@
-use crate::error::FusionError;
-use crate::protocol::Tape;
 use anyhow::{bail, Result};
+use common::FusionError;
+use protocol::Tape;
 use std::io::{Error as IoError, ErrorKind, Read, Result as IoResult, Write};
 use std::sync::atomic::{AtomicU32, Ordering};
 

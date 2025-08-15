@@ -1,20 +1,8 @@
 use crate::ipc::{connection_id, connection_shared};
 use anyhow::Result as AnyResult;
+use common::FusionError;
 use datafusion::arrow::datatypes::DataType;
 use executor::buffer::LockFreeBuffer;
-use executor::data_type::EncodedType;
-use executor::error::FusionError;
-use executor::protocol::bind::prepare_params as srv_prepare_params;
-use executor::protocol::columns::consume_columns;
-use executor::protocol::consume_header as srv_consume_header;
-use executor::protocol::explain::request_explain as srv_request_explain;
-use executor::protocol::failure::{
-    read_error as srv_read_error, request_failure as srv_request_failure,
-};
-use executor::protocol::metadata::process_metadata_with_response as srv_process_metadata;
-use executor::protocol::parse::prepare_query as srv_prepare_query;
-use executor::protocol::Tape;
-use executor::protocol::{Direction, Packet};
 use libc::c_long;
 use pgrx::pg_sys::SysCacheIdentifier::TYPEOID;
 use pgrx::pg_sys::{
@@ -26,6 +14,16 @@ use pgrx::pg_sys::{
     WL_TIMEOUT,
 };
 use pgrx::{check_for_interrupts, pg_guard};
+use protocol::bind::prepare_params as srv_prepare_params;
+use protocol::columns::consume_columns;
+use protocol::consume_header as srv_consume_header;
+use protocol::data_type::EncodedType;
+use protocol::explain::request_explain as srv_request_explain;
+use protocol::failure::{read_error as srv_read_error, request_failure as srv_request_failure};
+use protocol::metadata::process_metadata_with_response as srv_process_metadata;
+use protocol::parse::prepare_query as srv_prepare_query;
+use protocol::Tape;
+use protocol::{Direction, Packet};
 use rmp::decode::read_bin_len;
 use rmp::encode::{write_array_len, write_bool, write_str, write_u32, write_u8};
 use smallvec::SmallVec;

@@ -1,5 +1,7 @@
-use crate::error::FusionError;
+pub mod data_type;
+
 use anyhow::Result;
+use common::FusionError;
 use rmp::decode::{read_pfix, read_u16};
 use rmp::encode::{write_bin_len, write_pfix, write_u16, RmpWrite};
 use std::io::{Read, Write};

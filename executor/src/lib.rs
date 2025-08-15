@@ -1,10 +1,9 @@
 pub mod buffer;
 pub mod data_type;
-pub mod error;
 pub mod fsm;
 pub mod ipc;
 pub mod layout;
-pub mod protocol;
+// Protocol moved to a separate crate `protocol`.
 pub mod server;
 pub mod sql;
 pub mod stack;
