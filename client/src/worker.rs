@@ -3,13 +3,16 @@ use pgrx::bgworkers::{BackgroundWorker, BackgroundWorkerBuilder, SignalWakeFlags
 use pgrx::prelude::*;
 use server::stack::TreiberStack;
 use std::cell::OnceCell;
-use std::future;
 use std::ptr;
 use std::slice;
 use std::sync::atomic::{AtomicBool, AtomicI32, Ordering};
 use std::sync::Arc;
 use tokio::runtime::Builder;
 use tokio::signal::unix::{signal as unix_signal, SignalKind};
+use std::path::Path;
+use std::fs;
+use std::sync::OnceLock;
+use server::server::{Connection, Storage};
 
 // FIXME: This should be configurable.
 const TOKIO_THREAD_NUMBER: usize = 1;
@@ -18,6 +21,7 @@ pub(crate) const SEND_CAP: usize = 8192;
 
 #[pg_guard]
 pub(crate) fn init_datafusion_worker() {
+    info!("Registering DataFusion background worker");
     BackgroundWorkerBuilder::new("datafusion")
         .set_function("worker_main")
         .set_library("pg_fusion")
@@ -38,6 +42,7 @@ pub unsafe extern "C" fn init_shmem() {
         FLAGS_PTR.set(ptr).ok();
         // Zero-initialize flags
         std::ptr::write_bytes(ptr as *mut u8, 0, shared.layout.size());
+        info!("init_shmem: allocated flags region: bytes={} count={}", shared.layout.size(), num);
     }
 
     // Allocate connection regions: one `ConnectionLayout` per backend connection.
@@ -57,6 +62,10 @@ pub unsafe extern "C" fn init_shmem() {
             let (_, _, client_ptr) = server::layout::connection_ptrs(conn_base, layout);
             (*client_ptr).store(i32::MAX, Ordering::Relaxed);
         }
+        info!(
+            "init_shmem: allocated connections region: bytes_per_conn={} total_bytes={} recv_cap={} send_cap={} count={}",
+            layout.layout.size(), total, RECV_CAP, SEND_CAP, num
+        );
     }
 
     // Allocate Treiber stack region.
@@ -71,6 +80,10 @@ pub unsafe extern "C" fn init_shmem() {
         let (hdr_ptr, next_ptr) = treiber_stack_ptrs(base_u8, layout);
         let stack = unsafe { TreiberStack::new(next_ptr, num) };
         unsafe { ptr::write(hdr_ptr, stack) };
+        info!(
+            "init_shmem: allocated treiber stack: bytes={} nodes={}",
+            layout.layout.size(), num
+        );
     }
 
     // Allocate shared server PID cell
@@ -80,14 +93,28 @@ pub unsafe extern "C" fn init_shmem() {
         SERVER_PID_PTR.set(base).ok();
         // zero-init, value will be set in worker_main
         std::ptr::write_bytes(base as *mut u8, 0, layout.layout.size());
+        info!("init_shmem: allocated server pid cell: bytes={}", layout.layout.size());
     }
 }
+
+fn signal_client(conn: &Connection, id: usize) {
+    // Notify client process; ignore errors (e.g., invalid pid)
+    if let Err(e) = conn.signal_client() {
+        tracing::trace!(connection_id = id, error = %e, "signal_client failed (ignored)");
+    } else {
+        tracing::trace!(connection_id = id, "client signaled");
+    }
+}
+
 
 #[pg_guard]
 #[no_mangle]
 pub extern "C" fn worker_main(_arg: pg_sys::Datum) {
     BackgroundWorker::attach_signal_handlers(SignalWakeFlags::SIGHUP | SignalWakeFlags::SIGTERM);
     let num = crate::max_backends() as usize;
+    init_tracing_file_logger();
+    let pid = unsafe { libc::getpid() };
+    info!("worker_main: starting DataFusion worker pid={} max_backends={}", pid, num);
 
     // Build SharedState from shared flags
     let flags_slice = unsafe {
@@ -97,6 +124,7 @@ pub extern "C" fn worker_main(_arg: pg_sys::Datum) {
         slice::from_raw_parts(flags_ptr, num)
     };
     let state = Arc::new(server::ipc::SharedState::new(flags_slice));
+    info!("worker_main: SharedState ready (flags={})", flags_slice.len());
 
     // Set server PID in shared memory (OS pid)
     unsafe {
@@ -105,6 +133,7 @@ pub extern "C" fn worker_main(_arg: pg_sys::Datum) {
         let pid_ptr = server::layout::server_pid_ptr(base, layout);
         let pid = libc::getpid();
         (*pid_ptr).store(pid as i32, Ordering::Relaxed);
+        info!("worker_main: published server pid={}", pid);
     }
 
     // Build runtime
@@ -113,6 +142,7 @@ pub extern "C" fn worker_main(_arg: pg_sys::Datum) {
         .enable_all()
         .build()
         .unwrap();
+    info!("worker_main: tokio runtime built, threads={}", TOKIO_THREAD_NUMBER);
 
     // Build connections from shared memory and run tasks
     rt.block_on(async move {
@@ -141,8 +171,7 @@ pub extern "C" fn worker_main(_arg: pg_sys::Datum) {
             let send_buffer = unsafe {
                 server::buffer::LockFreeBuffer::from_layout(send_base, layout.send_buffer_layout)
             };
-            let pid = unsafe { (*client_ptr).load(Ordering::Relaxed) };
-            let mut conn = server::server::Connection::new(
+            let mut conn = Connection::new(
                 socket,
                 send_buffer,
                 unsafe { &*srv_pid_ptr },
@@ -150,32 +179,38 @@ pub extern "C" fn worker_main(_arg: pg_sys::Datum) {
             );
 
             tokio::spawn(async move {
-                let mut storage = server::server::Storage::default();
+                tracing::trace!(connection_id = id, "connection task started");
+                let mut storage = Storage::default();
                 loop {
-                    let res = conn
-                        .poll()
-                        .await
-                        .and_then(|_| conn.process_message(&mut storage));
-                    if let Err(err) = res {
-                        let ferr = match err.downcast::<server::error::FusionError>() {
-                            Ok(f) => f,
-                            Err(e) => server::error::FusionError::Other(e),
-                        };
-                        conn.handle_error(ferr);
+                    let res = match conn.poll().await {
+                        Ok(_) => {
+                            tracing::trace!(connection_id = id, "processing message");
+                            conn.process_message(&mut storage)
+                        }
+                        Err(e) => Err(e),
+                    };
+                    match res {
+                        Ok(()) => tracing::trace!(connection_id = id, "message processed"),
+                        Err(err) => {
+                            let ferr = match err.downcast::<server::error::FusionError>() {
+                                Ok(f) => f,
+                                Err(e) => server::error::FusionError::Other(e),
+                            };
+                            tracing::error!(connection_id = id, error = %ferr, "processing error");
+                            storage.flush();
+                            conn.handle_error(ferr);
+                            signal_client(&conn, id);
+                        }
                     }
-                    // Notify client process; ignore errors (e.g., invalid pid)
-                    let _ = conn.signal_client();
+                    signal_client(&conn, id);
                 }
             });
         }
 
         // Keep worker alive until a termination signal arrives
-        let mut sigterm = unix_signal(SignalKind::terminate()).expect("sigterm stream");
-        #[allow(unused_mut)]
+        let mut sigterm = unix_signal(SignalKind::terminate()).expect("sigterm is not supported");
         let mut sigint = unix_signal(SignalKind::interrupt()).ok();
-        #[allow(unused_mut)]
         let mut sigquit = unix_signal(SignalKind::quit()).ok();
-        #[allow(unused_mut)]
         let mut sighup = unix_signal(SignalKind::hangup()).ok();
 
         loop {
@@ -189,6 +224,44 @@ pub extern "C" fn worker_main(_arg: pg_sys::Datum) {
             }
         }
     });
+}
+
+// Initialize a global tracing subscriber that writes to a file. Safe to call multiple times.
+fn init_tracing_file_logger() {
+    static GUARD: OnceLock<tracing_appender::non_blocking::WorkerGuard> = OnceLock::new();
+    if GUARD.get().is_some() {
+        return;
+    }
+    let path = std::env::var("PG_FUSION_LOG").unwrap_or_else(|_| "/tmp/pg_fusion_worker.log".to_string());
+    let p = Path::new(&path);
+    if let Some(parent) = p.parent() {
+        let _ = fs::create_dir_all(parent);
+    }
+    let (dir, file) = match (p.parent(), p.file_name()) {
+        (Some(d), Some(f)) => (d.to_path_buf(), f.to_string_lossy().to_string()),
+        _ => (Path::new("/tmp").to_path_buf(), "pg_fusion_worker.log".to_string()),
+    };
+
+    let file_appender = tracing_appender::rolling::never(dir, file);
+    let (nb, guard) = tracing_appender::non_blocking(file_appender);
+
+    let filter = tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| {
+        // Default: verbose for our crates; info elsewhere
+        tracing_subscriber::EnvFilter::new("info,pg_fusion=trace,server=trace")
+    });
+
+    let subscriber = tracing_subscriber::fmt()
+        .with_env_filter(filter)
+        .with_ansi(false)
+        .with_target(true)
+        .with_thread_ids(true)
+        .with_thread_names(true)
+        .with_writer(nb)
+        .finish();
+
+    // Ignore if already set; we only attempt once due to OnceLock check above.
+    let _ = tracing::subscriber::set_global_default(subscriber);
+    let _ = GUARD.set(guard);
 }
 
 // Shared pointers to newly allocated regions

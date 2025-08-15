@@ -19,6 +19,8 @@ use datafusion_sql::parser::{DFParser, Statement};
 use datafusion_sql::planner::SqlToRel;
 use datafusion_sql::TableReference;
 use smol_str::{format_smolstr, SmolStr};
+use tracing::{debug, trace};
+use crate::protocol::Tape;
 use std::sync::atomic::{AtomicI32, Ordering};
 
 #[derive(Default)]
@@ -29,7 +31,7 @@ pub struct Storage {
 }
 
 impl Storage {
-    fn flush(&mut self) {
+    pub fn flush(&mut self) {
         *self = Self::default();
     }
 }
@@ -57,7 +59,9 @@ impl<'bytes> Connection<'bytes> {
     }
 
     pub async fn poll(&mut self) -> Result<()> {
+        trace!("poll: waiting for socket signal");
         (&mut self.recv_socket).await?;
+        trace!("poll: socket signaled (data available: {} bytes)", self.recv_socket.buffer.len());
         Ok(())
     }
 
@@ -67,6 +71,7 @@ impl<'bytes> Connection<'bytes> {
         #[cfg(unix)]
         {
             let pid = self.client_pid.load(Ordering::Relaxed);
+            trace!(client_pid = pid, "signal_client: about to send SIGUSR1");
             if pid <= 0 || pid == i32::MAX {
                 bail!(FusionError::FailedTo(
                     "send SIGUSR1".into(),
@@ -81,6 +86,7 @@ impl<'bytes> Connection<'bytes> {
                     format_smolstr!("{err}")
                 ));
             }
+            trace!(client_pid = pid, "signal_client: SIGUSR1 sent");
             Ok(())
         }
         #[cfg(not(unix))]
@@ -99,13 +105,24 @@ impl<'bytes> Connection<'bytes> {
 
     pub fn process_message(&mut self, storage: &mut Storage) -> Result<()> {
         let header = consume_header(&mut self.recv_socket.buffer)?;
+        debug!(
+            direction = ?header.direction,
+            packet = ?header.packet,
+            flag = ?header.flag,
+            length = header.length,
+            recv_unread = self.recv_socket.buffer.len(),
+            send_unread = self.send_buffer.len(),
+            "process_message: header received"
+        );
         if header.direction == Direction::ToClient {
+            trace!("process_message: header direction ToClient, ignoring");
             return Ok(());
         }
         let mut packet = header.packet.clone();
         let mut skip_metadata = false;
         loop {
             let action = storage.state.consume(&packet)?;
+            trace!(current_packet = ?packet, action = ?action, "process_message: state consumed");
             let result = match action {
                 Some(Action::Bind) => {
                     let Some(plan) = std::mem::take(&mut storage.logical_plan) else {
@@ -115,6 +132,7 @@ impl<'bytes> Connection<'bytes> {
                         ));
                     };
                     let params = read_params(&mut self.recv_socket.buffer)?;
+                    trace!("process_message: Action::Bind with {} params", params.len());
                     bind(plan, params)
                 }
                 Some(Action::Compile) => {
@@ -129,6 +147,7 @@ impl<'bytes> Connection<'bytes> {
                     } else {
                         Catalog::from_stream(&mut self.recv_socket.buffer)?
                     };
+                    trace!(skip_metadata, "process_message: Action::Compile (catalog {}loaded)", if skip_metadata {"not "} else {""});
                     compile(stmt, &catalog)
                 }
                 Some(Action::Explain) => {
@@ -138,14 +157,17 @@ impl<'bytes> Connection<'bytes> {
                             "while processing explain message".into(),
                         ));
                     };
+                    trace!("process_message: Action::Explain");
                     explain(&plan)
                 }
                 Some(Action::Flush) => {
+                    trace!("process_message: Action::Flush (reset state)");
                     storage.flush();
                     return Ok(());
                 }
                 Some(Action::Parse) => {
                     let query = read_query(&mut self.recv_socket.buffer)?;
+                    trace!(query = %query, "process_message: Action::Parse");
                     parse(query)
                 }
                 None => {
@@ -158,14 +180,17 @@ impl<'bytes> Connection<'bytes> {
             match result {
                 TaskResult::Bind(plan) => {
                     prepare_columns(&mut self.send_buffer, plan.schema().fields())?;
+                    trace!(columns = plan.schema().fields().len(), "process_message: prepared columns for Bind");
                     storage.logical_plan = Some(plan);
                 }
                 TaskResult::Compilation(plan) => {
                     storage.logical_plan = Some(plan);
                     request_params(&mut self.send_buffer)?;
+                    trace!("process_message: requested params after Compilation");
                 }
                 TaskResult::Explain(explain) => {
                     prepare_explain(&mut self.send_buffer, explain.as_str())?;
+                    trace!(explain_len = explain.len(), "process_message: prepared Explain");
                 }
                 TaskResult::Parsing((stmt, tables)) => {
                     storage.statement = Some(stmt);
@@ -174,18 +199,22 @@ impl<'bytes> Connection<'bytes> {
                         // Let's move connection to the next state.
                         skip_metadata = true;
                         packet = Packet::Metadata;
+                        trace!("process_message: no tables, skipping metadata, forcing Packet::Metadata");
                         continue;
                     } else {
+                        trace!(tables = tables.len(), "process_message: preparing table refs");
                         prepare_table_refs(&mut self.send_buffer, tables.as_slice())?
                     }
                 }
             }
             break;
         }
+        debug!(send_unread = self.send_buffer.len(), client_pid = self.client_pid.load(Ordering::Relaxed), "process_message: response buffered, ready to signal client");
         Ok(())
     }
 
     pub fn handle_error(&mut self, error: FusionError) {
+        self.send_buffer.rollback();
         self.recv_socket.buffer.flush_read();
         let error_message = format_smolstr!("{error}");
         if let Err(e) = prepare_error(&mut self.send_buffer, &error_message) {

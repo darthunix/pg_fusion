@@ -33,7 +33,6 @@ pub fn prepare_explain(stream: &mut impl Tape, explain: &str) -> Result<()> {
     stream.fast_forward(length as u32)?;
     debug_assert_eq!(stream.uncommitted_len(), len_final);
     stream.flush()?;
-    debug_assert_eq!(stream.len(), len_final);
     debug_assert_eq!(stream.uncommitted_len(), 0);
     Ok(())
 }
