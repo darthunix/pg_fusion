@@ -1,7 +1,7 @@
 use crate::{str_prefix_len, write_header, Direction, Flag, Header, Packet};
 use anyhow::Result;
-use rmp::decode::{read_bin_len, read_str_len};
-use rmp::encode::{write_bin_len, write_pfix};
+use rmp::decode::read_str_len;
+use rmp::encode::write_bin_len;
 use std::io::{Read, Write};
 
 pub fn prepare_error(stream: &mut impl Write, message: &str) -> Result<()> {

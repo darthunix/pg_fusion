@@ -1,7 +1,7 @@
 use crate::{write_c_str, write_header, Direction, Flag, Header, Packet, Tape};
 use anyhow::Result;
 use rmp::decode::read_bin_len;
-use std::io::{Read, Write};
+use std::io::Read;
 
 pub fn read_query(stream: &mut impl Read) -> Result<String> {
     // Query is serialized as a C string (bin payload + trailing nul)

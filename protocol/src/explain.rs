@@ -1,7 +1,6 @@
 use crate::{write_c_str, write_header, Direction, Flag, Header, Packet, Tape};
 use anyhow::Result;
 use rmp::decode::read_bin_len;
-use rmp::encode::{write_bin_len, write_pfix};
 use std::io::{Read, Write};
 
 pub fn prepare_explain(stream: &mut impl Tape, explain: &str) -> Result<()> {

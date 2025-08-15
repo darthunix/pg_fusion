@@ -1,5 +1,4 @@
 pub mod buffer;
-pub mod data_type;
 pub mod fsm;
 pub mod ipc;
 pub mod layout;

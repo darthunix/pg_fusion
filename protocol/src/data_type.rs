@@ -11,7 +11,6 @@ use rmp::encode::{
     write_bool, write_f32, write_f64, write_i16, write_i32, write_i64, write_pfix, write_str,
     RmpWrite,
 };
-use rmp::Marker;
 use smol_str::format_smolstr;
 use std::io::Write;
 
