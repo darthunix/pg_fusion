@@ -1,33 +1,40 @@
 # Repository Guidelines
 
 ## Project Structure & Module Organization
-- `server/` (crate `executor`): Core query engine, IPC, and protocol; pure Rust with unit tests.
-- `client/`: PostgreSQL extension (pgrx) that exposes the engine to Postgres.
-- `postgres/`: Integration tests for the extension (run with pgrx); used in CI and locally.
-- `doc/adr/`: Architectural Decision Records and template.
+- `executor/`: Core execution engine (DataFusion integration, IPC, buffers, protocol). Library crate.
+- `postgres/`: pgrx extension glue (planner hook, background worker, IPC). Builds a `cdylib`.
+- `doc/adr/`: Architectural notes and decisions (if any).
+- `target/`: Build artifacts (ignored).
 
 ## Build, Test, and Development Commands
-- Build engine: `cargo build -p executor` — compiles the core library.
-- Unit tests (engine): `cargo test -p executor` — runs server crate tests.
-- Format & lint: `cargo fmt --all -- --check` and `cargo clippy --all-targets --features "pg17, pg_test" --no-default-features`.
-- pgrx setup (once): `cargo install cargo-pgrx && cargo pgrx init --pg17 $(which pg_config)`.
-- Run extension locally: `cargo pgrx run` (ensure `shared_preload_libraries = 'pg_fusion'`).
-- Integration tests (from `postgres/`): `cargo build --features "pg17, pg_test" --no-default-features && cargo pgrx test pg17 --no-default-features`.
+- Build workspace: `cargo build --workspace`
+- Build only executor: `cargo build -p executor`
+- Set up pgrx (once): `cargo pgrx init --pg17 $(which pg_config)`
+- Enable extension for dev cluster: `echo "shared_preload_libraries = 'pg_fusion'" >> ~/.pgrx/data-17/postgresql.conf`
+- Run dev Postgres with extension: `cargo pgrx run`
+- Test executor crate: `cargo test -p executor`
+- Test extension (PG): `cargo pgrx test` (supports PG 17 via `pg17` feature)
 
 ## Coding Style & Naming Conventions
-- Rust 2021; rustfmt defaults (4‑space indent). Run `cargo fmt` before committing.
-- Naming: `snake_case` for modules/functions, `CamelCase` for types, `SCREAMING_SNAKE_CASE` for consts.
-- Keep modules small by domain under `server/src/` (e.g., `protocol/`, `ipc/`). Prefer explicit types.
+- Language: Rust 2021; prefer safe Rust; isolate `unsafe` behind minimal, well-documented APIs.
+- Formatting: `rustfmt` defaults. Run `cargo fmt --all` before pushing.
+- Linting: `cargo clippy --workspace --all-targets -D warnings` for CI-quality checks.
+- Naming: modules/files `snake_case`; types/traits `PascalCase`; functions/vars `snake_case`.
+- Errors: use `thiserror` for error types and `anyhow` at boundaries.
+- Logging: use `tracing`; enable with `RUST_LOG=info` (e.g., `RUST_LOG=pg_fusion=debug cargo pgrx run`).
 
 ## Testing Guidelines
-- Unit tests live next to code behind `#[cfg(test)]`; name tests by the unit under test.
-- Extension tests use `pgrx-tests`; run with `cargo pgrx test pg17` from `postgres/`.
-- Optional coverage: `cargo install cargo-llvm-cov && cargo llvm-cov report` (run in `postgres/`).
+- Unit tests: colocate with modules using `#[cfg(test)]` in both crates; name test fns descriptively.
+- Extension tests: use `pgrx-tests` with `#[pg_test]`; run via `cargo pgrx test`.
+- Add focused tests for planner hooks, IPC paths, and executor protocol; avoid flaky timing-based tests.
 
 ## Commit & Pull Request Guidelines
-- Conventional Commits: `feat:`, `fix:`, `chore:`, with optional scope (e.g., `feat(protocol): ...`).
-- PRs: concise description, link issues, list test steps, call out perf/compat impacts. Ensure fmt/clippy/tests pass.
+- Commits: imperative mood, small, and scoped; prefix scope when helpful, e.g., `executor: ...`, `postgres: ...`.
+- PRs: include a clear summary, motivation, benchmarks or repro SQL if performance-related, and linked issues.
+- Checks: ensure `cargo fmt`, `cargo clippy`, and tests pass locally before requesting review.
 
 ## Security & Configuration Tips
-- macOS builds rely on `.cargo/config.toml` for dynamic Postgres symbols — keep it intact.
-- Default Postgres target is PG 17. Set `shared_preload_libraries = 'pg_fusion'` for local runs.
+- Supported PG: 17 (`pg17` feature). Re-init pgrx when upgrading Postgres.
+- Dev cluster path: `~/.pgrx/data-17`. Keep `shared_preload_libraries` configured for `pg_fusion`.
+- Avoid long-running or blocking work on Postgres backends; prefer background workers/IPC already provided.
+
