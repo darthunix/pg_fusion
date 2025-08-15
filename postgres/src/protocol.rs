@@ -481,7 +481,6 @@ pub(crate) fn consume_metadata(
 // EXPLAIN
 
 pub(crate) fn prepare_explain(stream: &mut SlotStream, explain: &str) -> Result<()> {
-    stream.reset();
     let header = Header::default();
     write_header(stream, &header)?;
     let pos_init = stream.position();
