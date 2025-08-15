@@ -1,19 +1,11 @@
 use crate::ipc::{connection_id, connection_shared};
 use anyhow::Result as AnyResult;
-use libc::c_long;
-use pgrx::pg_sys::{
-    self, error, fetch_search_path_array, get_namespace_oid, get_relname_relid, palloc0,
-    CustomExecMethods, CustomScan, CustomScanMethods, CustomScanState, EState, ExplainPropertyText,
-    ExplainState, InvalidOid, List, ListCell, MyLatch, Node, NodeTag, Oid,
-    RegisterCustomScanMethods, ResetLatch, TupleTableSlot, WaitLatch, PG_WAIT_EXTENSION,
-    WL_LATCH_SET, WL_POSTMASTER_DEATH, WL_TIMEOUT,
-};
-use pgrx::{check_for_interrupts, pg_guard};
-use rmp::decode::read_bin_len;
-use rmp::encode::{write_array_len, write_bool, write_str, write_u32, write_u8};
+use datafusion::arrow::datatypes::DataType;
 use executor::buffer::LockFreeBuffer;
 use executor::data_type::EncodedType;
+use executor::error::FusionError;
 use executor::protocol::bind::prepare_params as srv_prepare_params;
+use executor::protocol::columns::consume_columns;
 use executor::protocol::consume_header as srv_consume_header;
 use executor::protocol::explain::request_explain as srv_request_explain;
 use executor::protocol::failure::{
@@ -23,9 +15,24 @@ use executor::protocol::metadata::process_metadata_with_response as srv_process_
 use executor::protocol::parse::prepare_query as srv_prepare_query;
 use executor::protocol::Tape;
 use executor::protocol::{Direction, Packet};
+use libc::c_long;
+use pgrx::pg_sys::SysCacheIdentifier::TYPEOID;
+use pgrx::pg_sys::{
+    self, error, fetch_search_path_array, get_namespace_oid, get_relname_relid,
+    list_append_unique_ptr, makeTargetEntry, makeVar, palloc0, CustomExecMethods, CustomScan,
+    CustomScanMethods, CustomScanState, EState, ExplainPropertyText, ExplainState, Expr,
+    InvalidOid, List, ListCell, MyLatch, Node, NodeTag, Oid, RegisterCustomScanMethods, ResetLatch,
+    TupleTableSlot, WaitLatch, GETSTRUCT, PG_WAIT_EXTENSION, WL_LATCH_SET, WL_POSTMASTER_DEATH,
+    WL_TIMEOUT,
+};
+use pgrx::{check_for_interrupts, pg_guard};
+use rmp::decode::read_bin_len;
+use rmp::encode::{write_array_len, write_bool, write_str, write_u32, write_u8};
 use smallvec::SmallVec;
+use smol_str::format_smolstr;
 use std::ffi::c_char;
 use std::ffi::CStr;
+use std::os::raw::c_void;
 use std::time::Duration;
 
 fn handle_metadata(send: &mut LockFreeBuffer, recv: &mut LockFreeBuffer) -> AnyResult<()> {
@@ -90,7 +97,15 @@ fn handle_metadata(send: &mut LockFreeBuffer, recv: &mut LockFreeBuffer) -> AnyR
                 continue;
             }
             write_array_len(&mut ow, 3)?;
-            let etype = EncodedType::Utf8 as u8; // TODO: map OIDs properly
+            let etype = match oid_to_encoded_type(attr.atttypid) {
+                Some(t) => t as u8,
+                None => {
+                    // Fail fast on unsupported types so the client can fall back
+                    return Err(anyhow::anyhow!(FusionError::UnsupportedType(
+                        format_smolstr!("pg type oid {:?}", attr.atttypid)
+                    )));
+                }
+            };
             write_u8(&mut ow, etype)?;
             let is_nullable = !attr.attnotnull;
             write_bool(&mut ow, is_nullable)?;
@@ -235,10 +250,43 @@ unsafe extern "C" fn create_df_scan_state(cscan: *mut CustomScan) -> *mut Node {
                 }
             }
             Packet::Columns => {
-                // Columns are ready; planning phase done. Drain payload to keep buffer aligned.
-                let mut scratch = SmallVec::<[u8; 256]>::new();
-                scratch.resize(header.length as usize, 0);
-                let _ = std::io::Read::read(&mut shared.send, scratch.as_mut_slice());
+                let list_ptr = (*cscan).custom_scan_tlist as *mut c_void;
+                let repack =
+                    |pos: i16, etype: u8, name: &[u8], ptr: *mut c_void| -> anyhow::Result<()> {
+                        let pos = pos + 1;
+                        let oid = type_to_oid(&EncodedType::try_from(etype)?.to_arrow())?;
+                        unsafe {
+                            let list = ptr as *mut List;
+                            let tuple = pg_sys::SearchSysCache1(
+                                TYPEOID as i32,
+                                pg_sys::ObjectIdGetDatum(oid),
+                            );
+                            if tuple.is_null() {
+                                anyhow::bail!(FusionError::UnsupportedType(format_smolstr!(
+                                    "{:?}", oid
+                                )));
+                            }
+                            let typtup = GETSTRUCT(tuple) as pg_sys::Form_pg_type;
+                            let expr = makeVar(
+                                pg_sys::INDEX_VAR,
+                                pos,
+                                oid,
+                                (*typtup).typtypmod,
+                                (*typtup).typcollation,
+                                0,
+                            );
+                            let col_name = palloc0(name.len()) as *mut u8;
+                            std::ptr::copy_nonoverlapping(name.as_ptr(), col_name, name.len());
+                            let entry =
+                                makeTargetEntry(expr as *mut Expr, pos, col_name as *mut i8, false);
+                            pg_sys::ReleaseSysCache(tuple);
+                            list_append_unique_ptr(list, entry as *mut c_void);
+                        }
+                        Ok(())
+                    };
+                if let Err(e) = consume_columns(&mut shared.send, list_ptr, repack) {
+                    error!("Failed to consume columns: {e}");
+                }
                 break;
             }
             Packet::Parse | Packet::Explain => {
@@ -257,7 +305,6 @@ unsafe extern "C" fn create_df_scan_state(cscan: *mut CustomScan) -> *mut Node {
     let state_ptr = palloc0(std::mem::size_of::<CustomScanState>()) as *mut CustomScanState;
     let mut state = CustomScanState {
         methods: exec_methods(),
-        slotOps: &pg_sys::TTSOpsVirtual,
         ..Default::default()
     };
     // Set the NodeTag for this PlanState
@@ -397,5 +444,55 @@ fn list_nth(list: *mut List, n: i32) -> *mut ListCell {
     unsafe {
         assert!(n >= 0 && n < (*list).length);
         (*list).elements.offset(n as isize)
+    }
+}
+
+fn type_to_oid(dtype: &DataType) -> AnyResult<pg_sys::Oid> {
+    let oid = match dtype {
+        DataType::Boolean => pg_sys::BOOLOID,
+        DataType::Utf8 => pg_sys::TEXTOID,
+        DataType::Int16 => pg_sys::INT2OID,
+        DataType::Int32 => pg_sys::INT4OID,
+        DataType::Int64 => pg_sys::INT8OID,
+        DataType::Float32 => pg_sys::FLOAT4OID,
+        DataType::Float64 => pg_sys::FLOAT8OID,
+        DataType::Date32 => pg_sys::DATEOID,
+        DataType::Time64(_) => pg_sys::TIMEOID,
+        DataType::Timestamp(_, _) => pg_sys::TIMESTAMPOID,
+        DataType::Interval(_) => pg_sys::INTERVALOID,
+        _ => {
+            return Err(FusionError::UnsupportedType(format_smolstr!("{:?}", dtype)).into());
+        }
+    };
+    Ok(oid)
+}
+
+#[inline]
+fn oid_to_encoded_type(oid: pg_sys::Oid) -> Option<EncodedType> {
+    match oid {
+        // Booleans
+        o if o == pg_sys::BOOLOID => Some(EncodedType::Boolean),
+        // Text-like
+        o if o == pg_sys::TEXTOID
+            || o == pg_sys::VARCHAROID
+            || o == pg_sys::BPCHAROID
+            || o == pg_sys::NAMEOID => Some(EncodedType::Utf8),
+        // Integers
+        o if o == pg_sys::INT2OID => Some(EncodedType::Int16),
+        o if o == pg_sys::INT4OID => Some(EncodedType::Int32),
+        o if o == pg_sys::INT8OID => Some(EncodedType::Int64),
+        // Floats
+        o if o == pg_sys::FLOAT4OID => Some(EncodedType::Float32),
+        o if o == pg_sys::FLOAT8OID => Some(EncodedType::Float64),
+        // Date/Time
+        o if o == pg_sys::DATEOID => Some(EncodedType::Date32),
+        o if o == pg_sys::TIMEOID || o == pg_sys::TIMETZOID => Some(EncodedType::Time64),
+        o if o == pg_sys::TIMESTAMPOID || o == pg_sys::TIMESTAMPTZOID => {
+            Some(EncodedType::Timestamp)
+        }
+        // Interval
+        o if o == pg_sys::INTERVALOID => Some(EncodedType::Interval),
+        // Not (yet) supported
+        _ => None,
     }
 }
