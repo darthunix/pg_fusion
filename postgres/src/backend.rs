@@ -6,22 +6,18 @@ use executor::buffer::LockFreeBuffer;
 use libc::c_long;
 use pgrx::pg_sys::SysCacheIdentifier::TYPEOID;
 use pgrx::pg_sys::{
-    self, error, fetch_search_path_array, get_namespace_oid, get_relname_relid,
-    list_append_unique_ptr, makeTargetEntry, makeVar, palloc0, CustomExecMethods, CustomScan,
-    CustomScanMethods, CustomScanState, EState, ExplainPropertyText, ExplainState, Expr,
-    InvalidOid, List, ListCell, MyLatch, Node, NodeTag, Oid, RegisterCustomScanMethods, ResetLatch,
-    TupleTableSlot, WaitLatch, GETSTRUCT, PG_WAIT_EXTENSION, WL_LATCH_SET, WL_POSTMASTER_DEATH,
-    WL_TIMEOUT,
+    self, error, palloc0, CustomExecMethods, CustomScanMethods, CustomScanState, InvalidOid, List,
+    MyLatch, Node, Oid, WL_LATCH_SET, WL_POSTMASTER_DEATH, WL_TIMEOUT,
 };
 use pgrx::{check_for_interrupts, pg_guard};
-use protocol::bind::prepare_params as srv_prepare_params;
+use protocol::bind::prepare_params;
 use protocol::columns::consume_columns;
-use protocol::consume_header as srv_consume_header;
+use protocol::consume_header;
 use protocol::data_type::EncodedType;
-use protocol::explain::request_explain as srv_request_explain;
-use protocol::failure::{read_error as srv_read_error, request_failure as srv_request_failure};
-use protocol::metadata::process_metadata_with_response as srv_process_metadata;
-use protocol::parse::prepare_query as srv_prepare_query;
+use protocol::explain::request_explain;
+use protocol::failure::{read_error, request_failure};
+use protocol::metadata::process_metadata_with_response;
+use protocol::parse::prepare_query;
 use protocol::Tape;
 use protocol::{Direction, Packet};
 use rmp::decode::read_bin_len;
@@ -39,8 +35,8 @@ fn handle_metadata(send: &mut LockFreeBuffer, recv: &mut LockFreeBuffer) -> AnyR
             .map_err(|_| anyhow::anyhow!("invalid schema cstr"))?;
         let tbl =
             CStr::from_bytes_with_nul(table).map_err(|_| anyhow::anyhow!("invalid table cstr"))?;
-        let ns_oid = unsafe { get_namespace_oid(ns.as_ptr(), false) };
-        let rel_oid = unsafe { get_relname_relid(tbl.as_ptr(), ns_oid) };
+        let ns_oid = unsafe { pg_sys::get_namespace_oid(ns.as_ptr(), false) };
+        let rel_oid = unsafe { pg_sys::get_relname_relid(tbl.as_ptr(), ns_oid) };
         if rel_oid == InvalidOid {
             Err(anyhow::anyhow!("table not found"))
         } else {
@@ -51,12 +47,12 @@ fn handle_metadata(send: &mut LockFreeBuffer, recv: &mut LockFreeBuffer) -> AnyR
         let tbl =
             CStr::from_bytes_with_nul(table).map_err(|_| anyhow::anyhow!("invalid table cstr"))?;
         let mut search_path: [Oid; 16] = [InvalidOid; 16];
-        let path_len =
-            unsafe { fetch_search_path_array(search_path.as_mut_ptr(), search_path.len() as i32) }
-                as usize;
+        let path_len = unsafe {
+            pg_sys::fetch_search_path_array(search_path.as_mut_ptr(), search_path.len() as i32)
+        } as usize;
         let path = &search_path[..path_len];
         for ns_oid in path {
-            let rel_oid = unsafe { get_relname_relid(tbl.as_ptr(), *ns_oid) };
+            let rel_oid = unsafe { pg_sys::get_relname_relid(tbl.as_ptr(), *ns_oid) };
             if rel_oid != InvalidOid {
                 return Ok(rel_oid.as_u32());
             }
@@ -64,7 +60,6 @@ fn handle_metadata(send: &mut LockFreeBuffer, recv: &mut LockFreeBuffer) -> AnyR
         Err(anyhow::anyhow!("table not found in search_path"))
     };
     let table_serialize = |rel_oid: u32, need_schema: bool, out: &mut dyn std::io::Write| {
-        // Replicate postgres/protocol::serialize_table but writing to dyn Write
         let rel_oid = Oid::from(rel_oid);
         let rel = unsafe { pgrx::PgRelation::with_lock(rel_oid, pg_sys::AccessShareLock as i32) };
         struct Out<'a>(&'a mut dyn std::io::Write);
@@ -112,7 +107,7 @@ fn handle_metadata(send: &mut LockFreeBuffer, recv: &mut LockFreeBuffer) -> AnyR
         AnyResult::Ok(())
     };
 
-    srv_process_metadata(
+    process_metadata_with_response(
         send,
         recv,
         schema_table_lookup,
@@ -148,7 +143,7 @@ thread_local! {
 #[no_mangle]
 pub(crate) extern "C" fn init_datafusion_methods() {
     unsafe {
-        RegisterCustomScanMethods(scan_methods());
+        pg_sys::RegisterCustomScanMethods(scan_methods());
     }
 }
 
@@ -162,7 +157,7 @@ pub(crate) fn exec_methods() -> *const CustomExecMethods {
 
 #[pg_guard]
 #[no_mangle]
-unsafe extern "C" fn create_df_scan_state(cscan: *mut CustomScan) -> *mut Node {
+unsafe extern "C" fn create_df_scan_state(cscan: *mut pg_sys::CustomScan) -> *mut Node {
     // Acquire connection and shared buffers
     let id = match connection_id() {
         Ok(v) => v,
@@ -188,8 +183,8 @@ unsafe extern "C" fn create_df_scan_state(cscan: *mut CustomScan) -> *mut Node {
     let query = unsafe { CStr::from_ptr(pattern) }
         .to_str()
         .expect("Expected a zero-terminated string");
-    if let Err(err) = srv_prepare_query(&mut shared.recv, query) {
-        let _ = srv_request_failure(&mut shared.recv);
+    if let Err(err) = prepare_query(&mut shared.recv, query) {
+        let _ = request_failure(&mut shared.recv);
         let _ = shared.signal_server();
         error!("Failed to prepare SQL: {}", err);
     }
@@ -204,10 +199,10 @@ unsafe extern "C" fn create_df_scan_state(cscan: *mut CustomScan) -> *mut Node {
         if shared.send.len() == 0 {
             continue;
         }
-        let header = match srv_consume_header(&mut shared.send) {
+        let header = match consume_header(&mut shared.send) {
             Ok(h) => h,
             Err(err) => {
-                let _ = srv_request_failure(&mut shared.recv);
+                let _ = request_failure(&mut shared.recv);
                 let _ = shared.signal_server();
                 error!("Failed to consume header: {}", err)
             }
@@ -217,13 +212,13 @@ unsafe extern "C" fn create_df_scan_state(cscan: *mut CustomScan) -> *mut Node {
         }
         match header.packet {
             Packet::None => continue,
-            Packet::Failure => match srv_read_error(&mut shared.send) {
+            Packet::Failure => match read_error(&mut shared.send) {
                 Ok(msg) => error!("Failed to compile the query: {}", msg),
                 Err(err) => error!("Double error: {}", err),
             },
             Packet::Metadata => {
                 if let Err(err) = handle_metadata(&mut shared.send, &mut shared.recv) {
-                    let _ = srv_request_failure(&mut shared.recv);
+                    let _ = request_failure(&mut shared.recv);
                     let _ = shared.signal_server();
                     error!("Failed to process metadata: {}", err);
                 }
@@ -233,13 +228,13 @@ unsafe extern "C" fn create_df_scan_state(cscan: *mut CustomScan) -> *mut Node {
             }
             Packet::Bind => {
                 // For now, send empty params (queries without params)
-                if let Err(err) = srv_prepare_params(&mut shared.recv, || {
+                if let Err(err) = prepare_params(&mut shared.recv, || {
                     (
                         0usize,
                         std::iter::empty::<AnyResult<datafusion::scalar::ScalarValue>>(),
                     )
                 }) {
-                    let _ = srv_request_failure(&mut shared.recv);
+                    let _ = request_failure(&mut shared.recv);
                     let _ = shared.signal_server();
                     error!("Failed to prepare params: {}", err);
                 }
@@ -264,8 +259,8 @@ unsafe extern "C" fn create_df_scan_state(cscan: *mut CustomScan) -> *mut Node {
                                     "{:?}", oid
                                 )));
                             }
-                            let typtup = GETSTRUCT(tuple) as pg_sys::Form_pg_type;
-                            let expr = makeVar(
+                            let typtup = pg_sys::GETSTRUCT(tuple) as pg_sys::Form_pg_type;
+                            let expr = pg_sys::makeVar(
                                 pg_sys::INDEX_VAR,
                                 pos,
                                 oid,
@@ -275,10 +270,14 @@ unsafe extern "C" fn create_df_scan_state(cscan: *mut CustomScan) -> *mut Node {
                             );
                             let col_name = palloc0(name.len()) as *mut u8;
                             std::ptr::copy_nonoverlapping(name.as_ptr(), col_name, name.len());
-                            let entry =
-                                makeTargetEntry(expr as *mut Expr, pos, col_name as *mut i8, false);
+                            let entry = pg_sys::makeTargetEntry(
+                                expr as *mut pg_sys::Expr,
+                                pos,
+                                col_name as *mut i8,
+                                false,
+                            );
                             pg_sys::ReleaseSysCache(tuple);
-                            list_append_unique_ptr(list, entry as *mut c_void);
+                            pg_sys::list_append_unique_ptr(list, entry as *mut c_void);
                         }
                         Ok(())
                     };
@@ -288,7 +287,7 @@ unsafe extern "C" fn create_df_scan_state(cscan: *mut CustomScan) -> *mut Node {
                 break;
             }
             Packet::Parse | Packet::Explain => {
-                let _ = srv_request_failure(&mut shared.recv);
+                let _ = request_failure(&mut shared.recv);
                 let _ = shared.signal_server();
                 error!(
                     "Unexpected packet while creating a custom plan: {:?}",
@@ -306,7 +305,7 @@ unsafe extern "C" fn create_df_scan_state(cscan: *mut CustomScan) -> *mut Node {
         ..Default::default()
     };
     // Set the NodeTag for this PlanState
-    state.ss.ps.type_ = NodeTag::T_CustomScanState;
+    state.ss.ps.type_ = pg_sys::NodeTag::T_CustomScanState;
     // Write the initialized state into the allocated memory
     std::ptr::write(state_ptr, state);
     state_ptr as *mut Node
@@ -314,13 +313,17 @@ unsafe extern "C" fn create_df_scan_state(cscan: *mut CustomScan) -> *mut Node {
 
 #[pg_guard]
 #[no_mangle]
-unsafe extern "C" fn begin_df_scan(node: *mut CustomScanState, estate: *mut EState, eflags: i32) {
+unsafe extern "C" fn begin_df_scan(
+    node: *mut CustomScanState,
+    estate: *mut pg_sys::EState,
+    eflags: i32,
+) {
     // No-op for now. We only rely on the planning/explain paths currently.
 }
 
 #[pg_guard]
 #[no_mangle]
-unsafe extern "C" fn exec_df_scan(node: *mut CustomScanState) -> *mut TupleTableSlot {
+unsafe extern "C" fn exec_df_scan(node: *mut CustomScanState) -> *mut pg_sys::TupleTableSlot {
     // Execution is not implemented yet. Returning null ensures executor won't use it
     // in contexts where execution is not expected (e.g., EXPLAIN).
     std::ptr::null_mut()
@@ -337,7 +340,7 @@ unsafe extern "C" fn end_df_scan(node: *mut CustomScanState) {
 unsafe extern "C" fn explain_df_scan(
     _node: *mut CustomScanState,
     _ancestors: *mut List,
-    es: *mut ExplainState,
+    es: *mut pg_sys::ExplainState,
 ) {
     // Acquire connection and shared buffers
     let id = match connection_id() {
@@ -358,8 +361,8 @@ unsafe extern "C" fn explain_df_scan(
     }
 
     // Request explain and notify the server
-    if let Err(err) = srv_request_explain(&mut shared.recv) {
-        let _ = srv_request_failure(&mut shared.recv);
+    if let Err(err) = request_explain(&mut shared.recv) {
+        let _ = request_failure(&mut shared.recv);
         let _ = shared.signal_server();
         error!("Failed to request explain: {}", err);
     }
@@ -373,10 +376,10 @@ unsafe extern "C" fn explain_df_scan(
         if shared.send.len() == 0 {
             continue;
         }
-        let header = match srv_consume_header(&mut shared.send) {
+        let header = match consume_header(&mut shared.send) {
             Ok(h) => h,
             Err(err) => {
-                let _ = srv_request_failure(&mut shared.recv);
+                let _ = request_failure(&mut shared.recv);
                 let _ = shared.signal_server();
                 error!("Failed to consume header: {}", err)
             }
@@ -386,7 +389,7 @@ unsafe extern "C" fn explain_df_scan(
         }
         match header.packet {
             Packet::None => continue,
-            Packet::Failure => match srv_read_error(&mut shared.send) {
+            Packet::Failure => match read_error(&mut shared.send) {
                 Ok(msg) => error!("Failed to compile the query: {}", msg),
                 Err(err) => error!("Double error: {}", err),
             },
@@ -399,12 +402,16 @@ unsafe extern "C" fn explain_df_scan(
                     .expect("Failed to read explain payload");
                 debug_assert_eq!(read, len as usize);
                 unsafe {
-                    ExplainPropertyText(b"DataFusion Plan\0".as_ptr() as _, buf.as_ptr() as _, es);
+                    pg_sys::ExplainPropertyText(
+                        b"DataFusion Plan\0".as_ptr() as _,
+                        buf.as_ptr() as _,
+                        es,
+                    );
                 }
                 break;
             }
             _ => {
-                let _ = srv_request_failure(&mut shared.recv);
+                let _ = request_failure(&mut shared.recv);
                 let _ = shared.signal_server();
                 error!("Unexpected packet for explain: {:?}", header.packet)
             }
@@ -425,8 +432,13 @@ fn wait_latch(timeout: Option<Duration>) {
         WL_LATCH_SET | WL_POSTMASTER_DEATH
     };
     let rc = unsafe {
-        let rc = WaitLatch(MyLatch, events as i32, timeout_ms, PG_WAIT_EXTENSION);
-        ResetLatch(MyLatch);
+        let rc = pg_sys::WaitLatch(
+            MyLatch,
+            events as i32,
+            timeout_ms,
+            pg_sys::PG_WAIT_EXTENSION,
+        );
+        pg_sys::ResetLatch(MyLatch);
         rc
     };
     check_for_interrupts!();
@@ -437,7 +449,7 @@ fn wait_latch(timeout: Option<Duration>) {
     }
 }
 
-fn list_nth(list: *mut List, n: i32) -> *mut ListCell {
+fn list_nth(list: *mut List, n: i32) -> *mut pg_sys::ListCell {
     assert_ne!(list, std::ptr::null_mut());
     unsafe {
         assert!(n >= 0 && n < (*list).length);
