@@ -1,14 +1,13 @@
 use executor::server::{Connection, Storage};
 use executor::stack::TreiberStack;
-use libc::c_void;
 use pgrx::bgworkers::{BackgroundWorker, BackgroundWorkerBuilder, SignalWakeFlags};
 use pgrx::prelude::*;
-use std::cell::OnceCell;
+// Use thread-safe OnceLock for globals instead of OnceCell on a mutable static.
 use std::fs;
 use std::path::Path;
 use std::ptr;
 use std::slice;
-use std::sync::atomic::{AtomicBool, AtomicI32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI32, AtomicPtr, Ordering};
 use std::sync::Arc;
 use std::sync::OnceLock;
 use tokio::runtime::Builder;
@@ -39,7 +38,7 @@ pub unsafe extern "C" fn init_shmem() {
         use executor::layout::shared_state_layout;
         let shared = shared_state_layout(num).expect("shared_state_layout");
         let ptr = pgrx::pg_sys::ShmemAlloc(shared.layout.size());
-        FLAGS_PTR.set(ptr).ok();
+        FLAGS_PTR.store(ptr as *mut u8, Ordering::Release);
         // Zero-initialize flags
         std::ptr::write_bytes(ptr as *mut u8, 0, shared.layout.size());
         info!(
@@ -57,7 +56,7 @@ pub unsafe extern "C" fn init_shmem() {
         let layout = connection_layout(RECV_CAP, SEND_CAP).expect("connection_layout");
         let total = layout.layout.size() * num;
         let base = pgrx::pg_sys::ShmemAlloc(total);
-        CONNS_PTR.set(base).ok();
+        CONNS_PTR.store(base as *mut u8, Ordering::Release);
         // Zero-initialize and set client pid to i32::MAX
         let base_u8 = base as *mut u8;
         std::ptr::write_bytes(base_u8, 0, total);
@@ -77,7 +76,7 @@ pub unsafe extern "C" fn init_shmem() {
         use executor::layout::{treiber_stack_layout, treiber_stack_ptrs};
         let layout = treiber_stack_layout(num).expect("treiber_stack_layout");
         let base = pgrx::pg_sys::ShmemAlloc(layout.layout.size());
-        STACK_PTR.set(base).ok();
+        STACK_PTR.store(base as *mut u8, Ordering::Release);
         // Initialize memory and construct stack header in place
         let base_u8 = base as *mut u8;
         std::ptr::write_bytes(base_u8, 0, layout.layout.size());
@@ -95,7 +94,7 @@ pub unsafe extern "C" fn init_shmem() {
     {
         let layout = executor::layout::server_pid_layout().expect("server pid layout");
         let base = pgrx::pg_sys::ShmemAlloc(layout.layout.size());
-        SERVER_PID_PTR.set(base).ok();
+        SERVER_PID_PTR.store(base as *mut u8, Ordering::Release);
         // zero-init, value will be set in worker_main
         std::ptr::write_bytes(base as *mut u8, 0, layout.layout.size());
         info!(
@@ -128,9 +127,10 @@ pub extern "C" fn worker_main(_arg: pg_sys::Datum) {
 
     // Build SharedState from shared flags
     let flags_slice = unsafe {
-        let flags_base = *FLAGS_PTR.get().expect("FLAGS_PTR not set");
+        let flags_base = FLAGS_PTR.load(Ordering::Acquire);
+        assert!(!flags_base.is_null(), "FLAGS_PTR not set");
         let layout = executor::layout::shared_state_layout(num).expect("flags layout");
-        let flags_ptr = executor::layout::shared_state_flags_ptr(flags_base as *mut u8, layout);
+        let flags_ptr = executor::layout::shared_state_flags_ptr(flags_base, layout);
         slice::from_raw_parts(flags_ptr, num)
     };
     let state = Arc::new(executor::ipc::SharedState::new(flags_slice));
@@ -141,7 +141,8 @@ pub extern "C" fn worker_main(_arg: pg_sys::Datum) {
 
     // Set server PID in shared memory (OS pid)
     unsafe {
-        let base = *SERVER_PID_PTR.get().expect("SERVER_PID_PTR not set") as *mut u8;
+        let base = SERVER_PID_PTR.load(Ordering::Acquire);
+        assert!(!base.is_null(), "SERVER_PID_PTR not set");
         let layout = executor::layout::server_pid_layout().expect("server pid layout");
         let pid_ptr = executor::layout::server_pid_ptr(base, layout);
         let pid = libc::getpid();
@@ -165,10 +166,12 @@ pub extern "C" fn worker_main(_arg: pg_sys::Datum) {
         // Spawn shared signal listener (wakes sockets on SIGUSR1)
         tokio::spawn(executor::ipc::signal_listener(Arc::clone(&state)));
 
-        let base = unsafe { *CONNS_PTR.get().expect("CONNS_PTR not set") as *mut u8 };
+        let base = CONNS_PTR.load(Ordering::Acquire);
+        assert!(!base.is_null(), "CONNS_PTR not set");
         let layout = executor::layout::connection_layout(RECV_CAP, SEND_CAP).expect("conn layout");
         let srv_pid_ptr = unsafe {
-            let base = *SERVER_PID_PTR.get().expect("SERVER_PID_PTR not set") as *mut u8;
+            let base = SERVER_PID_PTR.load(Ordering::Acquire);
+            assert!(!base.is_null(), "SERVER_PID_PTR not set");
             let l = executor::layout::server_pid_layout().expect("server pid layout");
             executor::layout::server_pid_ptr(base, l)
         };
@@ -281,16 +284,17 @@ fn init_tracing_file_logger() {
     let _ = GUARD.set(guard);
 }
 
-// Shared pointers to newly allocated regions
-static mut FLAGS_PTR: OnceCell<*mut c_void> = OnceCell::new();
-static mut CONNS_PTR: OnceCell<*mut c_void> = OnceCell::new();
-static mut STACK_PTR: OnceCell<*mut c_void> = OnceCell::new();
-static mut SERVER_PID_PTR: OnceCell<*mut c_void> = OnceCell::new();
+// Shared pointers to newly allocated regions (atomic raw pointers)
+static FLAGS_PTR: AtomicPtr<u8> = AtomicPtr::new(core::ptr::null_mut());
+static CONNS_PTR: AtomicPtr<u8> = AtomicPtr::new(core::ptr::null_mut());
+static STACK_PTR: AtomicPtr<u8> = AtomicPtr::new(core::ptr::null_mut());
+static SERVER_PID_PTR: AtomicPtr<u8> = AtomicPtr::new(core::ptr::null_mut());
 
 // Accessor for Treiber stack stored in shared memory
 pub(crate) fn treiber_stack() -> &'static TreiberStack {
     unsafe {
-        let base = *STACK_PTR.get().expect("STACK_PTR not set") as *mut u8;
+        let base = STACK_PTR.load(Ordering::Acquire);
+        assert!(!base.is_null(), "STACK_PTR not set");
         let layout = executor::layout::treiber_stack_layout(crate::max_backends() as usize)
             .expect("treiber_stack_layout");
         let (hdr_ptr, _next_ptr) = executor::layout::treiber_stack_ptrs(base, layout);
@@ -301,9 +305,10 @@ pub(crate) fn treiber_stack() -> &'static TreiberStack {
 pub(crate) fn shared_flags_slice() -> &'static [AtomicBool] {
     let num = crate::max_backends() as usize;
     unsafe {
-        let flags_base = *FLAGS_PTR.get().expect("FLAGS_PTR not set");
+        let flags_base = FLAGS_PTR.load(Ordering::Acquire);
+        assert!(!flags_base.is_null(), "FLAGS_PTR not set");
         let layout = executor::layout::shared_state_layout(num).expect("flags layout");
-        let flags_ptr = executor::layout::shared_state_flags_ptr(flags_base as *mut u8, layout);
+        let flags_ptr = executor::layout::shared_state_flags_ptr(flags_base, layout);
         std::slice::from_raw_parts(flags_ptr, num)
     }
 }
@@ -312,13 +317,12 @@ pub(crate) fn connections_layout() -> executor::layout::ConnectionLayout {
     executor::layout::connection_layout(RECV_CAP, SEND_CAP).expect("conn layout")
 }
 
-pub(crate) fn connections_base() -> *mut u8 {
-    unsafe { *CONNS_PTR.get().expect("CONNS_PTR not set") as *mut u8 }
-}
+pub(crate) fn connections_base() -> *mut u8 { CONNS_PTR.load(Ordering::Acquire) }
 
 pub(crate) fn server_pid_atomic() -> &'static AtomicI32 {
     unsafe {
-        let base = *SERVER_PID_PTR.get().expect("SERVER_PID_PTR not set") as *mut u8;
+        let base = SERVER_PID_PTR.load(Ordering::Acquire);
+        assert!(!base.is_null(), "SERVER_PID_PTR not set");
         let layout = executor::layout::server_pid_layout().expect("server pid layout");
         let pid_ptr = executor::layout::server_pid_ptr(base, layout);
         &*pid_ptr

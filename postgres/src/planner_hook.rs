@@ -16,6 +16,7 @@ static mut PREV_PLANNER_HOOK: planner_hook_type = None;
 
 #[pg_guard]
 #[no_mangle]
+#[allow(static_mut_refs)]
 pub(crate) extern "C" fn init_datafusion_planner_hook() {
     unsafe {
         if planner_hook.is_some() {
@@ -34,11 +35,6 @@ extern "C" fn datafusion_planner_hook(
     boundparams: ParamListInfo,
 ) -> *mut PlannedStmt {
     if ENABLE_DATAFUSION.get() {
-        let pattern = unsafe { CStr::from_ptr(query_string) };
-        info!(
-            "DataFusion planner hook called for query: {:?}",
-            pattern.to_str().unwrap()
-        );
         return df_planner(query_string, boundparams);
     }
     unsafe {

@@ -37,18 +37,6 @@ thread_local! {
     static CONNECTION_HANDLE: OnceCell<ConnectionHandle> = OnceCell::new();
 }
 
-/// Ensure the per-backend ConnectionHandle is initialized exactly once.
-pub(crate) fn acuire_connection() -> AnyResult<()> {
-    CONNECTION_HANDLE.with(|cell| {
-        if cell.get().is_none() {
-            let handle = ConnectionHandle::acquire()?;
-            // Ignore error if already set by a race in the same thread (unlikely)
-            let _ = cell.set(handle);
-        }
-        Ok(())
-    })
-}
-
 /// Get the current backend's connection id, initializing lazily on first use.
 pub(crate) fn connection_id() -> AnyResult<u32> {
     CONNECTION_HANDLE.with(|cell| {
