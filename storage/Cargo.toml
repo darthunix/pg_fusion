@@ -1,0 +1,18 @@
+[package]
+name = "storage"
+version = "25.0.0"
+edition = "2021"
+
+[lib]
+crate-type = ["lib"]
+doctest = false
+
+[features]
+default = ["pg17"]
+pg17 = ["pgrx-pg-sys/pg17"]
+
+[dependencies]
+anyhow = "1.0"
+common = { path = "../common", version = "25.0" }
+pgrx-pg-sys = "0.12"
+smol_str = "0.3"
