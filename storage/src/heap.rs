@@ -74,64 +74,64 @@ impl<'bytes> HeapPage<'bytes> {
         }
     }
 
-    /// Returns tuple slices ordered by ascending `lp_off`.
-    /// Builds a compact index of `(off, len)` pairs and sorts it once.
-    ///
-    /// Allocation: a single `Vec<(u16,u16)>` sized up to `lp_count()`.
-    ///
-    /// `filter` works the same as in `tuples()` and is applied while building
-    /// the sorted index of line pointers.
+    /// Returns tuple slices ordered by ascending `lp_off`, filling the caller-provided
+    /// `(off,len)` buffer referenced by a mutable pointer and returning an iterator that
+    /// borrows the filled pairs slice. This allows reuse of the same allocation across
+    /// multiple pages.
     pub fn tuples_by_offset(
         &self,
         filter: Option<LpFilter>,
         ctx: *mut c_void,
-    ) -> SortedTupleSliceIter<'bytes> {
+        pairs: &'bytes mut Vec<(u16, u16)>,
+    ) -> SortedTupleSliceIterBorrowed<'bytes> {
         let cnt = self.lp_count();
-        let mut pairs: Vec<(u16, u16)> = Vec::with_capacity(cnt);
+        if pairs.capacity() < cnt {
+            pairs.reserve(cnt - pairs.capacity());
+        }
+        pairs.clear();
 
         let hdr = self.header();
         let upper = hdr.pd_upper as usize;
         let special = hdr.pd_special as usize;
         let special_limit = core::cmp::min(special, self.data.len());
 
-        unsafe {
-            let mut cur = self.data.as_ptr().add(size_of::<PageHeaderData>()) as *const ItemIdData;
-            let end = cur.add(cnt);
-            while cur < end {
-                let item = ptr::read(cur);
-                cur = cur.add(1);
-                if (item.lp_flags() as u32) != pg_sys::LP_NORMAL {
-                    continue;
-                }
-                let off = item.lp_off() as usize;
-                let len = item.lp_len() as usize;
-                if len == 0 {
-                    continue;
-                }
-                if off < upper {
-                    continue;
-                }
-                let end_off = match off.checked_add(len) {
-                    Some(v) => v,
-                    None => continue,
-                };
-                if end_off > special_limit {
-                    continue;
-                }
-                if let Some(f) = filter {
-                    if !f(&item, ctx) {
-                        continue;
-                    }
-                }
-                pairs.push((off as u16, len as u16));
+        let mut cur =
+            unsafe { self.data.as_ptr().add(size_of::<PageHeaderData>()) as *const ItemIdData };
+        let end = unsafe { cur.add(cnt) };
+        while cur < end {
+            let item = unsafe { ptr::read(cur) };
+            cur = unsafe { cur.add(1) };
+            if (item.lp_flags() as u32) != pg_sys::LP_NORMAL {
+                continue;
             }
+            let off = item.lp_off() as usize;
+            let len = item.lp_len() as usize;
+            if len == 0 {
+                continue;
+            }
+            if off < upper {
+                continue;
+            }
+            let end_off = match off.checked_add(len) {
+                Some(v) => v,
+                None => continue,
+            };
+            if end_off > special_limit {
+                continue;
+            }
+            if let Some(f) = filter {
+                if !f(&item, ctx) {
+                    continue;
+                }
+            }
+            pairs.push((off as u16, len as u16));
         }
 
         pairs.sort_unstable_by_key(|&(off, _)| off);
 
-        SortedTupleSliceIter {
+        SortedTupleSliceIterBorrowed {
             page: self.data,
-            pairs,
+            pairs: pairs.as_slice(),
             idx: 0,
         }
     }
@@ -221,6 +221,27 @@ pub struct SortedTupleSliceIter<'a> {
 }
 
 impl<'a> Iterator for SortedTupleSliceIter<'a> {
+    type Item = &'a [u8];
+
+    fn next(&mut self) -> Option<Self::Item> {
+        if self.idx >= self.pairs.len() {
+            return None;
+        }
+        let (off, len) = self.pairs[self.idx];
+        self.idx += 1;
+        let ptr = unsafe { self.page.as_ptr().add(off as usize) };
+        Some(unsafe { slice::from_raw_parts(ptr, len as usize) })
+    }
+}
+
+/// Iterator over tuple slices sorted by `lp_off` that borrows a pairs slice
+pub struct SortedTupleSliceIterBorrowed<'a> {
+    page: &'a [u8],
+    pairs: &'a [(u16, u16)],
+    idx: usize,
+}
+
+impl<'a> Iterator for SortedTupleSliceIterBorrowed<'a> {
     type Item = &'a [u8];
 
     fn next(&mut self) -> Option<Self::Item> {
