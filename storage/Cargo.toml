@@ -16,3 +16,14 @@ anyhow = "1.0"
 common = { path = "../common", version = "25.0" }
 pgrx-pg-sys = "0.12"
 smol_str = "0.3"
+
+[dev-dependencies]
+criterion = "0.5"
+
+[target.'cfg(feature = "pg_test")'.dev-dependencies]
+pgrx = "0.12"
+pgrx-tests = "0.12"
+
+[[bench]]
+name = "memcpy"
+harness = false
