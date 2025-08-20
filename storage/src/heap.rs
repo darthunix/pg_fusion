@@ -1,8 +1,8 @@
 use anyhow::{bail, Result};
 use common::FusionError;
 use core::cmp::min;
-use core::mem::size_of;
 use core::ffi::c_void;
+use core::mem::size_of;
 use core::ptr;
 use core::slice;
 use pg_sys::BLCKSZ;

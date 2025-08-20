@@ -1,3 +1,10 @@
 [workspace]
-members = ["executor", "postgres", "protocol", "common", "storage"]
+members = [
+  "executor",
+  "postgres",
+  "protocol",
+  "common",
+  "storage",
+  "storage/pg_test",
+]
 resolver = "2"
