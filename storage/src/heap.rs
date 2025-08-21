@@ -676,7 +676,9 @@ fn typed_null_for(atttypid: pg_sys::Oid) -> ScalarValue {
         x if x == TEXTOID || x == VARCHAROID || x == BPCHAROID => ScalarValue::Utf8(None),
         x if x == DATEOID => ScalarValue::Date32(None),
         x if x == TIMEOID => ScalarValue::Time64Microsecond(None),
-        x if x == TIMESTAMPOID || x == TIMESTAMPTZOID => ScalarValue::TimestampMicrosecond(None, None),
+        x if x == TIMESTAMPOID || x == TIMESTAMPTZOID => {
+            ScalarValue::TimestampMicrosecond(None, None)
+        }
         x if x == INTERVALOID => ScalarValue::IntervalMonthDayNano(None),
         _ => ScalarValue::Null,
     }

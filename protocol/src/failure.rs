@@ -1,10 +1,10 @@
 use crate::{str_prefix_len, write_header, Direction, Flag, Header, Packet};
 use anyhow::Result;
-use smol_str::SmolStr;
-use std::fmt;
-use std::error::Error;
 use rmp::decode::read_str_len;
 use rmp::encode::write_bin_len;
+use smol_str::SmolStr;
+use std::error::Error;
+use std::fmt;
 use std::io::{Read, Write};
 
 pub fn prepare_error(stream: &mut impl Write, message: &str) -> Result<()> {

@@ -24,4 +24,3 @@ fn bench_memcpy_blcksz(c: &mut Criterion) {
 
 criterion_group!(benches, bench_memcpy_blcksz);
 criterion_main!(benches);
-
