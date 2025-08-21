@@ -142,8 +142,8 @@ jobs:
           source <(cargo llvm-cov show-env --export-prefix)
           cargo llvm-cov clean
           cargo llvm-cov --workspace \
-            --exclude postgres \
-            --exclude storage/pg_test \
+            --exclude pg_fusion \
+            --exclude pg_test \
             --lcov --output-path core_lcov.info
 
       - name: Upload core coverage report to Codecov
