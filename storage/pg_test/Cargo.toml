@@ -16,12 +16,12 @@ pg17 = ["pgrx/pg17", "pgrx-tests/pg17"]
 pg_test = []
 
 [dependencies]
-pgrx = "=0.12.6"
+pgrx = "0.12"
 storage = { path = "..", version = "25.0" }
 datafusion-common = "44.0"
 
 [dev-dependencies]
-pgrx-tests = "=0.12.6"
+pgrx-tests = "0.12"
 
 [profile.dev]
 panic = "unwind"
