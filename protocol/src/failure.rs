@@ -1,5 +1,8 @@
 use crate::{str_prefix_len, write_header, Direction, Flag, Header, Packet};
 use anyhow::Result;
+use smol_str::SmolStr;
+use std::fmt;
+use std::error::Error;
 use rmp::decode::read_str_len;
 use rmp::encode::write_bin_len;
 use std::io::{Read, Write};
@@ -38,3 +41,15 @@ pub fn request_failure(stream: &mut impl Write) -> Result<()> {
     stream.flush()?;
     Ok(())
 }
+
+/// Error indicating an out-of-bounds access (e.g., attribute index beyond available columns).
+#[derive(Debug, Clone)]
+pub struct OutOfBound(pub SmolStr);
+
+impl fmt::Display for OutOfBound {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "Out of bound: {}", self.0)
+    }
+}
+
+impl Error for OutOfBound {}
