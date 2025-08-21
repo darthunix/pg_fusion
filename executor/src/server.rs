@@ -379,7 +379,7 @@ mod tests {
 
         // Derive recv/send buffers from the connection layout.
         let layout = connection_layout(PAYLOAD_SIZE, PAYLOAD_SIZE).expect("layout");
-        let base = unsafe { (&mut *BYTES.conn.get()).as_mut_ptr() as *mut u8 };
+        let base = unsafe { (*BYTES.conn.get()).as_mut_ptr() };
         let (recv_base, send_base, _pid_ptr) = unsafe { connection_ptrs(base, layout) };
 
         let socket = unsafe {
@@ -437,7 +437,7 @@ mod tests {
         let state = Arc::new(SharedState::new(unsafe { &*BYTES.flags.get() }));
 
         let layout = connection_layout(PAYLOAD_SIZE, PAYLOAD_SIZE).expect("layout");
-        let base = unsafe { (&mut *BYTES.conn.get()).as_mut_ptr() as *mut u8 };
+        let base = unsafe { (*BYTES.conn.get()).as_mut_ptr() };
         let (recv_base, send_base, _pid_ptr) = unsafe { connection_ptrs(base, layout) };
 
         let socket = unsafe {

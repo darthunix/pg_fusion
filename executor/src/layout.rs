@@ -91,7 +91,7 @@ pub unsafe fn lockfree_buffer_ptrs(
 ) -> (*mut AtomicU32, *mut AtomicU32, *mut u8) {
     let head = base.add(layout.head_offset) as *mut AtomicU32;
     let tail = base.add(layout.tail_offset) as *mut AtomicU32;
-    let data = base.add(layout.data_offset) as *mut u8;
+    let data = base.add(layout.data_offset);
     (head, tail, data)
 }
 

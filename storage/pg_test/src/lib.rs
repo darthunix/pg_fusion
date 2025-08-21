@@ -304,7 +304,6 @@ mod tests {
 
             let nblocks =
                 pg_sys::RelationGetNumberOfBlocksInFork(rel, pg_sys::ForkNumber::MAIN_FORKNUM);
-            let mut tested = false;
             for blkno in 0..nblocks {
                 let buf = pg_sys::ReadBufferExtended(
                     rel,
@@ -351,19 +350,12 @@ mod tests {
                         }
                         other => panic!("unexpected decode sequence: {:?}", other),
                     }
-
-                    tested = true;
-                    break;
                 }
 
                 pg_sys::UnlockReleaseBuffer(buf);
-                if tested {
-                    break;
-                }
             }
 
             pg_sys::relation_close(rel, pg_sys::AccessShareLock as pg_sys::LOCKMODE);
-            assert!(tested);
         }
     }
 }

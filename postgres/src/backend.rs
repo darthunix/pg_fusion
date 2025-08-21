@@ -63,7 +63,7 @@ fn handle_metadata(send: &mut LockFreeBuffer, recv: &mut LockFreeBuffer) -> AnyR
         let rel_oid = Oid::from(rel_oid);
         let rel = unsafe { pgrx::PgRelation::with_lock(rel_oid, pg_sys::AccessShareLock as i32) };
         struct Out<'a>(&'a mut dyn std::io::Write);
-        impl<'a> std::io::Write for Out<'a> {
+        impl std::io::Write for Out<'_> {
             fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
                 self.0.write(buf)
             }
@@ -119,11 +119,11 @@ fn handle_metadata(send: &mut LockFreeBuffer, recv: &mut LockFreeBuffer) -> AnyR
 
 thread_local! {
     static SCAN_METHODS: CustomScanMethods = CustomScanMethods {
-        CustomName: b"DataFusionScan\0".as_ptr() as *const c_char,
+        CustomName: c"DataFusionScan".as_ptr() as *const c_char,
         CreateCustomScanState: Some(create_df_scan_state),
     };
     static EXEC_METHODS: CustomExecMethods = CustomExecMethods {
-        CustomName: b"DataFusionScan\0".as_ptr() as *const c_char,
+        CustomName: c"DataFusionScan".as_ptr() as *const c_char,
         BeginCustomScan: Some(begin_df_scan),
         ExecCustomScan: Some(exec_df_scan),
         EndCustomScan: Some(end_df_scan),
@@ -148,11 +148,11 @@ pub(crate) extern "C" fn init_datafusion_methods() {
 }
 
 pub(crate) fn scan_methods() -> *const CustomScanMethods {
-    SCAN_METHODS.with(|m| &*m as *const CustomScanMethods)
+    SCAN_METHODS.with(|m| m as *const CustomScanMethods)
 }
 
 pub(crate) fn exec_methods() -> *const CustomExecMethods {
-    EXEC_METHODS.with(|m| &*m as *const CustomExecMethods)
+    EXEC_METHODS.with(|m| m as *const CustomExecMethods)
 }
 
 #[pg_guard]
@@ -314,16 +314,16 @@ unsafe extern "C" fn create_df_scan_state(cscan: *mut pg_sys::CustomScan) -> *mu
 #[pg_guard]
 #[no_mangle]
 unsafe extern "C" fn begin_df_scan(
-    node: *mut CustomScanState,
-    estate: *mut pg_sys::EState,
-    eflags: i32,
+    _node: *mut CustomScanState,
+    _estate: *mut pg_sys::EState,
+    _eflags: i32,
 ) {
     // No-op for now. We only rely on the planning/explain paths currently.
 }
 
 #[pg_guard]
 #[no_mangle]
-unsafe extern "C" fn exec_df_scan(node: *mut CustomScanState) -> *mut pg_sys::TupleTableSlot {
+unsafe extern "C" fn exec_df_scan(_node: *mut CustomScanState) -> *mut pg_sys::TupleTableSlot {
     // Execution is not implemented yet. Returning null ensures executor won't use it
     // in contexts where execution is not expected (e.g., EXPLAIN).
     std::ptr::null_mut()
@@ -331,7 +331,7 @@ unsafe extern "C" fn exec_df_scan(node: *mut CustomScanState) -> *mut pg_sys::Tu
 
 #[pg_guard]
 #[no_mangle]
-unsafe extern "C" fn end_df_scan(node: *mut CustomScanState) {
+unsafe extern "C" fn end_df_scan(_node: *mut CustomScanState) {
     // No-op for now.
 }
 
@@ -403,7 +403,7 @@ unsafe extern "C" fn explain_df_scan(
                 debug_assert_eq!(read, len as usize);
                 unsafe {
                     pg_sys::ExplainPropertyText(
-                        b"DataFusion Plan\0".as_ptr() as _,
+                        c"DataFusion Plan".as_ptr() as _,
                         buf.as_ptr() as _,
                         es,
                     );

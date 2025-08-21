@@ -12,7 +12,7 @@ pub struct LockFreeBuffer<'bytes> {
     cap: u32,
 }
 
-impl<'bytes> Write for LockFreeBuffer<'bytes> {
+impl Write for LockFreeBuffer<'_> {
     /// Write bytes to the buffer without moving the tail.
     /// Returns the number of bytes written.
     fn write(&mut self, buf: &[u8]) -> IoResult<usize> {
@@ -53,7 +53,7 @@ impl<'bytes> Write for LockFreeBuffer<'bytes> {
     }
 }
 
-impl<'bytes> Read for LockFreeBuffer<'bytes> {
+impl Read for LockFreeBuffer<'_> {
     fn read(&mut self, buf: &mut [u8]) -> IoResult<usize> {
         let bytes_read = self.pop(buf);
         Ok(bytes_read)
@@ -95,7 +95,7 @@ impl<'bytes> LockFreeBuffer<'bytes> {
             head: &*head_ptr,
             tail: &*tail_ptr,
             data,
-            uncommitted_tail: AtomicU32::new((&*tail_ptr).load(Ordering::Relaxed)),
+            uncommitted_tail: AtomicU32::new((*tail_ptr).load(Ordering::Relaxed)),
             cap: data_len as u32,
         }
     }

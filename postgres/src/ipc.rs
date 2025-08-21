@@ -34,7 +34,7 @@ impl Drop for ConnectionHandle {
 
 // Thread-local, one-per-backend handle that returns to the stack on thread exit.
 thread_local! {
-    static CONNECTION_HANDLE: OnceCell<ConnectionHandle> = OnceCell::new();
+    static CONNECTION_HANDLE: OnceCell<ConnectionHandle> = const { OnceCell::new() };
 }
 
 /// Get the current backend's connection id, initializing lazily on first use.
@@ -56,7 +56,7 @@ pub(crate) struct ConnectionShared<'a> {
     pub server_pid: &'a AtomicI32,
 }
 
-impl<'a> ConnectionShared<'a> {
+impl ConnectionShared<'_> {
     #[inline]
     pub fn server_pid(&self) -> i32 {
         self.server_pid.load(Ordering::Relaxed)
