@@ -65,7 +65,7 @@ jobs:
         continue-on-error: false
         with:
           path: ${{ env.SCCACHE_DIR }}
-          key: ${{env.SCCACHE_PREFIX}}-${{ runner.os }}-${{ hashFiles('Cargo.toml', '.github/workflows/ci.yml') }}
+          key: ${{env.SCCACHE_PREFIX}}-${{ runner.os }}-${{ hashFiles('Cargo.toml', '.github/workflows/ci.yaml') }}
 
       - name: Install PostgreSQL
         run: |
@@ -109,7 +109,7 @@ jobs:
           cargo llvm-cov clean
           cargo build --features "pg${{ env.PG_MAJOR }}, pg_test" --no-default-features
           cargo pgrx test pg${{ env.PG_MAJOR }} --no-default-features
-          cargo llvm-cov report --lcov > postgres_lcov.info
+          cargo llvm-cov report --lcov > ../postgres_lcov.info
 
       - name: Upload postgres coverage report to Codecov
         uses: codecov/codecov-action@v4
@@ -118,14 +118,33 @@ jobs:
           files: ./postgres_lcov.info
           token: ${{ secrets.CODECOV_TOKEN }}
 
-      - name: Run core tests
-        working-directory: core
+      - name: Run storage pg_test (extension) tests
+        working-directory: storage/pg_test
         run: |
           # Run tests with coverage tool
           source <(cargo llvm-cov show-env --export-prefix)
           cargo llvm-cov clean
-          cargo test
-          cargo llvm-cov report --lcov > core_lcov.info
+          cargo build --features "pg${{ env.PG_MAJOR }}, pg_test" --no-default-features
+          cargo pgrx test pg${{ env.PG_MAJOR }} --no-default-features
+          cargo llvm-cov report --lcov > ../../storage_pgtest_lcov.info
+
+      - name: Upload storage pg_test coverage to Codecov
+        uses: codecov/codecov-action@v4
+        with:
+          fail_ci_if_error: true
+          files: ./storage_pgtest_lcov.info
+          token: ${{ secrets.CODECOV_TOKEN }}
+
+      - name: Run library coverage (common, executor, protocol, storage)
+        working-directory: .
+        run: |
+          # Run all non-extension crates with coverage
+          source <(cargo llvm-cov show-env --export-prefix)
+          cargo llvm-cov clean
+          cargo llvm-cov --workspace \
+            --exclude postgres \
+            --exclude storage/pg_test \
+            --lcov --output-path core_lcov.info
 
       - name: Upload core coverage report to Codecov
         uses: codecov/codecov-action@v4

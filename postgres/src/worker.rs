@@ -317,7 +317,9 @@ pub(crate) fn connections_layout() -> executor::layout::ConnectionLayout {
     executor::layout::connection_layout(RECV_CAP, SEND_CAP).expect("conn layout")
 }
 
-pub(crate) fn connections_base() -> *mut u8 { CONNS_PTR.load(Ordering::Acquire) }
+pub(crate) fn connections_base() -> *mut u8 {
+    CONNS_PTR.load(Ordering::Acquire)
+}
 
 pub(crate) fn server_pid_atomic() -> &'static AtomicI32 {
     unsafe {
