@@ -16,6 +16,8 @@ anyhow = "1.0"
 common = { path = "../common", version = "25.0" }
 pgrx-pg-sys = "0.12"
 smol_str = "0.3"
+datafusion-common = "44.0"
+protocol = { path = "../protocol", version = "25.0" }
 
 [dev-dependencies]
 criterion = "0.5"
