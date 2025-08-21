@@ -601,7 +601,12 @@ fn decode_fixed_width(atttypid: pg_sys::Oid, bytes: &[u8]) -> Result<Option<Scal
             let mut a = [0u8; 4];
             a.copy_from_slice(bytes);
             let pg_days = i32::from_ne_bytes(a);
-            let unix_days = pg_days.saturating_add(UNIX_EPOCH_DAYS_FROM_PG);
+            // Preserve infinities as sentinels, otherwise convert from PG epoch (2000-01-01) to UNIX (1970-01-01)
+            let unix_days = if pg_days == i32::MIN || pg_days == i32::MAX {
+                pg_days
+            } else {
+                pg_days.saturating_add(UNIX_EPOCH_DAYS_FROM_PG)
+            };
             ScalarValue::Date32(Some(unix_days))
         }
         x if x == TIMEOID => {

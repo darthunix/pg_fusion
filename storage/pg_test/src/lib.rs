@@ -5,9 +5,9 @@ use pgrx::prelude::*;
 #[cfg(any(test, feature = "pg_test"))]
 #[pg_schema]
 mod tests {
-    use std::{os::raw::c_void, ptr};
-
+    use datafusion_common::ScalarValue;
     use pgrx::prelude::*;
+    use std::{os::raw::c_void, ptr};
     use storage::heap::{decode_tuple_project, HeapPage, PgAttrMeta};
 
     #[pg_test]
@@ -176,30 +176,18 @@ mod tests {
                     let vals: Vec<_> = iter.map(|r| r.unwrap()).collect();
 
                     if seen_rows == 0 {
-                        assert_eq!(vals[0], datafusion_common::ScalarValue::Boolean(Some(true)));
-                        assert_eq!(vals[1], datafusion_common::ScalarValue::Int32(Some(2)));
-                        assert_eq!(
-                            vals[2],
-                            datafusion_common::ScalarValue::Utf8(Some("hi".to_string()))
-                        );
-                        assert_eq!(
-                            vals[3],
-                            datafusion_common::ScalarValue::Date32(Some(10_958))
-                        );
-                        assert_eq!(
-                            vals[4],
-                            datafusion_common::ScalarValue::Time64Microsecond(Some(1_000_000))
-                        );
+                        assert_eq!(vals[0], ScalarValue::Boolean(Some(true)));
+                        assert_eq!(vals[1], ScalarValue::Int32(Some(2)));
+                        assert_eq!(vals[2], ScalarValue::Utf8(Some("hi".to_string())));
+                        assert_eq!(vals[3], ScalarValue::Date32(Some(10_958)));
+                        assert_eq!(vals[4], ScalarValue::Time64Microsecond(Some(1_000_000)));
                         assert_eq!(
                             vals[5],
-                            datafusion_common::ScalarValue::TimestampMicrosecond(
-                                Some(946_684_801_000_000),
-                                None
-                            )
+                            ScalarValue::TimestampMicrosecond(Some(946_684_801_000_000), None)
                         );
                         assert_eq!(
                             vals[6],
-                            datafusion_common::ScalarValue::IntervalMonthDayNano(Some(
+                            ScalarValue::IntervalMonthDayNano(Some(
                                 datafusion_common::arrow::array::types::IntervalMonthDayNano {
                                     months: 1,
                                     days: 2,
@@ -208,27 +196,18 @@ mod tests {
                             ))
                         );
                     } else if seen_rows == 1 {
-                        assert_eq!(vals[0], datafusion_common::ScalarValue::Boolean(None));
-                        assert_eq!(vals[1], datafusion_common::ScalarValue::Int32(Some(42)));
-                        assert_eq!(vals[2], datafusion_common::ScalarValue::Utf8(None));
-                        assert_eq!(
-                            vals[3],
-                            datafusion_common::ScalarValue::Date32(Some(10_957))
-                        );
-                        assert_eq!(
-                            vals[4],
-                            datafusion_common::ScalarValue::Time64Microsecond(Some(0))
-                        );
+                        assert_eq!(vals[0], ScalarValue::Boolean(None));
+                        assert_eq!(vals[1], ScalarValue::Int32(Some(42)));
+                        assert_eq!(vals[2], ScalarValue::Utf8(None));
+                        assert_eq!(vals[3], ScalarValue::Date32(Some(10_957)));
+                        assert_eq!(vals[4], ScalarValue::Time64Microsecond(Some(0)));
                         assert_eq!(
                             vals[5],
-                            datafusion_common::ScalarValue::TimestampMicrosecond(
-                                Some(946_684_800_000_000),
-                                None
-                            )
+                            ScalarValue::TimestampMicrosecond(Some(946_684_800_000_000), None)
                         );
                         assert_eq!(
                             vals[6],
-                            datafusion_common::ScalarValue::IntervalMonthDayNano(Some(
+                            ScalarValue::IntervalMonthDayNano(Some(
                                 datafusion_common::arrow::array::types::IntervalMonthDayNano {
                                     months: 0,
                                     days: 0,
@@ -345,8 +324,8 @@ mod tests {
                         decode_tuple_project(page_hdr, tup_bytes, &attrs, &proj_ok).unwrap();
                     match (it.next(), it.next(), it.next()) {
                         (Some(Ok(v1)), Some(Ok(v2)), None) => {
-                            assert_eq!(v1, datafusion_common::ScalarValue::Int32(Some(1)));
-                            assert_eq!(v2, datafusion_common::ScalarValue::Int32(Some(42)));
+                            assert_eq!(v1, ScalarValue::Int32(Some(1)));
+                            assert_eq!(v2, ScalarValue::Int32(Some(42)));
                         }
                         other => panic!("unexpected decode sequence: {:?}", other),
                     }
@@ -356,6 +335,115 @@ mod tests {
             }
 
             pg_sys::relation_close(rel, pg_sys::AccessShareLock as pg_sys::LOCKMODE);
+        }
+    }
+
+    #[pg_test]
+    fn heap_decode_date_extremes() {
+        Spi::run("DROP TABLE IF EXISTS public.heap_decode_date_t").unwrap();
+        Spi::run(
+            "CREATE TABLE public.heap_decode_date_t (
+                id int4,
+                dt date
+            )",
+        )
+        .unwrap();
+
+        // Insert a set of extreme and representative dates
+        Spi::run(
+            "INSERT INTO public.heap_decode_date_t VALUES
+                (1, DATE '1970-01-01'),
+                (2, DATE '2000-01-01'),
+                (3, DATE '4713-01-01 BC'),
+                (4, DATE '5874897-12-31'),
+                (5, '-infinity'::date),
+                (6, 'infinity'::date),
+                (7, NULL)
+            ",
+        )
+        .unwrap();
+
+        unsafe {
+            // Build expected map id -> expected days since 1970-01-01 (use SPI per id)
+            let mut expected: std::collections::HashMap<i32, i32> =
+                std::collections::HashMap::new();
+            for id in 1..=6 {
+                let q = format!(
+                    "SELECT CASE WHEN dt = '-infinity'::date THEN -2147483648 WHEN dt = 'infinity'::date THEN 2147483647 ELSE (dt - DATE '1970-01-01')::int END FROM public.heap_decode_date_t WHERE id = {}",
+                    id
+                );
+                let days: i32 = Spi::get_one(&q).unwrap().unwrap();
+                expected.insert(id, days);
+            }
+
+            // Prepare attribute metadata and projection [id, dt]
+            let attrs: Vec<PgAttrMeta> = vec![
+                PgAttrMeta {
+                    atttypid: pg_sys::INT4OID,
+                    attlen: 4,
+                    attalign: b'i',
+                },
+                PgAttrMeta {
+                    atttypid: pg_sys::DATEOID,
+                    attlen: 4,
+                    attalign: b'i',
+                },
+            ];
+            let proj: [usize; 2] = [0, 1];
+
+            let relid: pg_sys::Oid =
+                Spi::get_one("SELECT 'public.heap_decode_date_t'::regclass::oid")
+                    .unwrap()
+                    .unwrap();
+            let rel = pg_sys::relation_open(relid, pg_sys::AccessShareLock as pg_sys::LOCKMODE);
+
+            let nblocks =
+                pg_sys::RelationGetNumberOfBlocksInFork(rel, pg_sys::ForkNumber::MAIN_FORKNUM);
+            let mut verified = 0usize;
+            for blkno in 0..nblocks {
+                let buf = pg_sys::ReadBufferExtended(
+                    rel,
+                    pg_sys::ForkNumber::MAIN_FORKNUM,
+                    blkno,
+                    pg_sys::ReadBufferMode::RBM_NORMAL,
+                    ptr::null_mut(),
+                );
+                pg_sys::LockBuffer(buf, pg_sys::BUFFER_LOCK_SHARE as i32);
+
+                let page = pg_sys::BufferGetPage(buf);
+                let page_hdr = page as *const pg_sys::PageHeaderData;
+                let ptr = page as *const u8;
+                let slice = std::slice::from_raw_parts(ptr, pg_sys::BLCKSZ as usize);
+                let hp = HeapPage::from_slice(slice).unwrap();
+
+                for tup_bytes in hp.tuples(None, ptr::null_mut::<c_void>()) {
+                    let iter =
+                        storage::heap::decode_tuple_project(page_hdr, tup_bytes, &attrs, &proj)
+                            .unwrap();
+                    let vals: Vec<_> = iter.map(|r| r.unwrap()).collect();
+                    // Extract id and days
+                    if let (ScalarValue::Int32(Some(id)), date_val) = (&vals[0], &vals[1]) {
+                        match date_val {
+                            ScalarValue::Date32(Some(days)) => {
+                                if let Some(exp) = expected.get(id) {
+                                    assert_eq!(*days, *exp, "mismatch for id {}", id);
+                                }
+                            }
+                            ScalarValue::Date32(None) => {
+                                // id 7 is NULL
+                                assert_eq!(*id, 7);
+                            }
+                            other => panic!("unexpected date scalar: {:?}", other),
+                        }
+                        verified += 1;
+                    }
+                }
+
+                pg_sys::UnlockReleaseBuffer(buf);
+            }
+
+            pg_sys::relation_close(rel, pg_sys::AccessShareLock as pg_sys::LOCKMODE);
+            assert!(verified >= 7);
         }
     }
 }
