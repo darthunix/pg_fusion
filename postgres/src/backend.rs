@@ -216,6 +216,10 @@ unsafe extern "C-unwind" fn create_df_scan_state(cscan: *mut pg_sys::CustomScan)
                 Ok(msg) => error!("Failed to compile the query: {}", msg),
                 Err(err) => error!("Double error: {}", err),
             },
+            Packet::Heap => {
+                // Not expected during planning; ignore.
+                continue;
+            }
             Packet::Metadata => {
                 if let Err(err) = handle_metadata(&mut shared.send, &mut shared.recv) {
                     let _ = request_failure(&mut shared.recv);
@@ -395,6 +399,10 @@ unsafe extern "C-unwind" fn explain_df_scan(
                 Ok(msg) => error!("Failed to compile the query: {}", msg),
                 Err(err) => error!("Double error: {}", err),
             },
+            Packet::Heap => {
+                // Not expected for EXPLAIN; ignore.
+                continue;
+            }
             Packet::Explain => {
                 let len = read_bin_len(&mut shared.send)
                     .expect("Failed to read length in explain message");
