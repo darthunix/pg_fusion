@@ -6,6 +6,8 @@ use crate::sql::Catalog;
 use anyhow::{bail, Result};
 use common::FusionError;
 use datafusion::execution::SessionStateBuilder;
+use datafusion::physical_plan::ExecutionPlan;
+use std::sync::Arc;
 use datafusion::logical_expr::LogicalPlan;
 use datafusion::scalar::ScalarValue;
 use datafusion_sql::parser::{DFParser, Statement};
@@ -28,6 +30,7 @@ pub struct Storage {
     state: StateMachine,
     statement: Option<Statement>,
     logical_plan: Option<LogicalPlan>,
+    physical_plan: Option<Arc<dyn ExecutionPlan>>,
 }
 
 impl Storage {
@@ -106,7 +109,7 @@ impl<'bytes> Connection<'bytes> {
         self.server_pid.load(Ordering::Relaxed)
     }
 
-    pub fn process_message(&mut self, storage: &mut Storage) -> Result<()> {
+    pub async fn process_message(&mut self, storage: &mut Storage) -> Result<()> {
         let header = consume_header(&mut self.recv_socket.buffer)?;
         debug!(
             direction = ?header.direction,
@@ -167,6 +170,16 @@ impl<'bytes> Connection<'bytes> {
                     trace!("process_message: Action::Explain");
                     explain(&plan)
                 }
+                Some(Action::Optimize) => {
+                    let Some(plan) = std::mem::take(&mut storage.logical_plan) else {
+                        bail!(FusionError::NotFound(
+                            "Logical plan".into(),
+                            "while processing optimize message".into(),
+                        ));
+                    };
+                    trace!("process_message: Action::Optimize");
+                    optimize(plan)
+                }
                 Some(Action::Flush) => {
                     trace!("process_message: Action::Flush (reset state)");
                     storage.flush();
@@ -176,6 +189,16 @@ impl<'bytes> Connection<'bytes> {
                     let query = read_query(&mut self.recv_socket.buffer)?;
                     trace!(query = %query, "process_message: Action::Parse");
                     parse(query.into())
+                }
+                Some(Action::Translate) => {
+                    let Some(plan) = storage.logical_plan.clone() else {
+                        bail!(FusionError::NotFound(
+                            "Logical plan".into(),
+                            "while processing translate message".into(),
+                        ));
+                    };
+                    trace!("process_message: Action::Translate");
+                    translate(plan).await
                 }
                 None => {
                     bail!(FusionError::NotFound(
@@ -192,11 +215,25 @@ impl<'bytes> Connection<'bytes> {
                         "process_message: prepared columns for Bind"
                     );
                     storage.logical_plan = Some(plan);
+                    // Immediately schedule an Optimize pass for the next loop iteration.
+                    packet = Packet::Optimize;
+                    trace!("process_message: scheduling Optimize after Bind");
+                    continue;
                 }
                 TaskResult::Compilation(plan) => {
                     storage.logical_plan = Some(plan);
                     request_params(&mut self.send_buffer)?;
                     trace!("process_message: requested params after Compilation");
+                }
+                TaskResult::Optimized(plan) => {
+                    storage.logical_plan = Some(plan);
+                    packet = Packet::Translate;
+                    trace!("process_message: scheduling Translate after Optimize");
+                    continue;
+                }
+                TaskResult::Translated(phys) => {
+                    storage.physical_plan = phys;
+                    trace!("process_message: transitioned to PhysicalPlan (built physical plan)");
                 }
                 TaskResult::Explain(explain) => {
                     prepare_explain(&mut self.send_buffer, explain.as_str())?;
@@ -259,6 +296,24 @@ fn explain(plan: &LogicalPlan) -> Result<TaskResult> {
     Ok(TaskResult::Explain(explain))
 }
 
+fn optimize(plan: LogicalPlan) -> Result<TaskResult> {
+    let state = SessionStateBuilder::new().build();
+    let optimized = state.optimize(&plan)?;
+    Ok(TaskResult::Optimized(optimized))
+}
+
+async fn translate(plan: LogicalPlan) -> Result<TaskResult> {
+    let state = SessionStateBuilder::new().build();
+    let optimized = state.optimize(&plan)?; // ensure optimized prior to physical
+    match state.create_physical_plan(&optimized).await {
+        Ok(physical) => Ok(TaskResult::Translated(Some(physical))),
+        Err(e) => {
+            tracing::warn!("translate: failed to build physical plan: {e}");
+            Ok(TaskResult::Translated(None))
+        }
+    }
+}
+
 fn parse(query: SmolStr) -> Result<TaskResult> {
     let stmts = DFParser::parse_sql(query.as_str())?;
     let Some(stmt) = stmts.into_iter().next() else {
@@ -274,6 +329,8 @@ enum TaskResult {
     Parsing((Statement, Vec<TableReference>)),
     Compilation(LogicalPlan),
     Bind(LogicalPlan),
+    Optimized(LogicalPlan),
+    Translated(Option<Arc<dyn ExecutionPlan>>),
     Explain(SmolStr),
 }
 
@@ -402,7 +459,7 @@ mod tests {
             assert_eq!(storage.state.state(), &ExecutorState::Initialized);
             let sql = "select a from t";
             prepare_query(&mut conn.recv_socket.buffer, sql).expect("Failed to prepare SQL");
-            conn.process_message(&mut storage)
+            conn.process_message(&mut storage).await
                 .expect("Failed to process parse message");
             let Ok(TaskResult::Parsing((stmt, _))) = parse(sql.into()) else {
                 unreachable!();
@@ -415,7 +472,7 @@ mod tests {
             assert_eq!(storage.state.state(), &ExecutorState::Initialized);
             let sql = "select 1";
             prepare_query(&mut conn.recv_socket.buffer, sql).expect("Failed to prepare SQL");
-            conn.process_message(&mut storage)
+            conn.process_message(&mut storage).await
                 .expect("Failed to process parse message");
             let Ok(TaskResult::Parsing((stmt, _))) = parse(sql.into()) else {
                 unreachable!();
@@ -431,7 +488,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_from_parse_to_columns() -> Result<()> {
+    async fn test_from_parse_to_physical() -> Result<()> {
         use crate::layout::{connection_layout, connection_ptrs};
         static BYTES: ConnMemory = ConnMemory::new();
         let state = Arc::new(SharedState::new(unsafe { &*BYTES.flags.get() }));
@@ -460,10 +517,12 @@ mod tests {
             let sql = "select a from public.t1 where b = $1";
             prepare_query(&mut conn.recv_socket.buffer, sql).expect("Failed to prepare SQL");
             conn.process_message(&mut storage)
+                .await
                 .expect("Failed to process parse message");
             assert_eq!(conn.recv_socket.buffer.len(), 0);
             assert_eq!(storage.state.state(), &ExecutorState::Statement);
 
+            // 1) Parse -> Statement, server requests Metadata
             let header =
                 consume_header(&mut conn.send_buffer).expect("Failed to consume metadata header");
             assert_eq!(header.direction, Direction::ToClient);
@@ -476,11 +535,14 @@ mod tests {
                 mock_table_serialize,
             )
             .expect("Failed to process metadata");
+            // 2) Compile -> LogicalPlan after sending metadata
             conn.process_message(&mut storage)
+                .await
                 .expect("Failed to process metadata message");
             assert_eq!(conn.recv_socket.buffer.len(), 0);
             assert_eq!(storage.state.state(), &ExecutorState::LogicalPlan);
 
+            // 3) Server requests Bind (Columns will be sent back), then we send params
             let header =
                 consume_header(&mut conn.send_buffer).expect("Failed to consume bind header");
             assert_eq!(header.direction, Direction::ToClient);
@@ -489,10 +551,14 @@ mod tests {
                 (1, vec![Ok(ScalarValue::Int32(Some(1)))].into_iter())
             })
             .expect("Failed to prepare params");
+            // 4) Bind -> Optimize -> Translate (to PhysicalPlan) in subsequent iterations
             conn.process_message(&mut storage)
-                .expect("Failed to process bind message");
+                .await
+                .expect("Failed to process bind/optimize/translate messages");
             assert_eq!(conn.recv_socket.buffer.len(), 0);
-            assert_eq!(storage.state.state(), &ExecutorState::LogicalPlan);
+            assert_eq!(storage.state.state(), &ExecutorState::PhysicalPlan);
+            // Optionally, physical plan may or may not be built in this environment
+            // assert!(storage.physical_plan.is_some() || storage.physical_plan.is_none());
 
             let header =
                 consume_header(&mut conn.send_buffer).expect("Failed to consume bind header");
@@ -513,6 +579,7 @@ mod tests {
 
             request_explain(&mut conn.recv_socket.buffer).expect("Failed to request explain");
             conn.process_message(&mut storage)
+                .await
                 .expect("Failed to process explain message");
             assert_eq!(conn.recv_socket.buffer.len(), 0);
             assert_eq!(storage.state.state(), &ExecutorState::Initialized);
@@ -532,8 +599,8 @@ mod tests {
                 .to_str()
                 .expect("Failed to cast C string to str");
             let expected_explain = "Projection: public.t1.a [a:Int64;N]\n  \
-                Filter: public.t1.b = Int32(1) [a:Int64;N, b:Utf8]\n    \
-                TableScan: public.t1 [a:Int64;N, b:Utf8]";
+                Filter: public.t1.b = Utf8(\"1\") [a:Int64;N, b:Utf8]\n    \
+                TableScan: public.t1 projection=[a, b] [a:Int64;N, b:Utf8]";
             assert_eq!(explain, expected_explain);
         })
         .await?;

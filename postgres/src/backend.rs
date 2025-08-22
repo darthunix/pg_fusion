@@ -286,7 +286,7 @@ unsafe extern "C" fn create_df_scan_state(cscan: *mut pg_sys::CustomScan) -> *mu
                 }
                 break;
             }
-            Packet::Parse | Packet::Explain => {
+            Packet::Parse | Packet::Explain | Packet::Optimize | Packet::Translate => {
                 let _ = request_failure(&mut shared.recv);
                 let _ = shared.signal_server();
                 error!(

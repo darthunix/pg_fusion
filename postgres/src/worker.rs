@@ -201,7 +201,7 @@ pub extern "C" fn worker_main(_arg: pg_sys::Datum) {
                     let res = match conn.poll().await {
                         Ok(_) => {
                             tracing::trace!(connection_id = id, "processing message");
-                            conn.process_message(&mut storage)
+                            conn.process_message(&mut storage).await
                         }
                         Err(e) => Err(e),
                     };
