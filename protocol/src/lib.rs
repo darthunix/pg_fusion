@@ -59,6 +59,8 @@ pub enum Packet {
     Parse = 4,
     Explain = 5,
     Columns = 6,
+    Optimize = 7,
+    Translate = 8,
 }
 
 impl TryFrom<u8> for Packet {
@@ -74,6 +76,8 @@ impl TryFrom<u8> for Packet {
             4 => Ok(Packet::Parse),
             5 => Ok(Packet::Explain),
             6 => Ok(Packet::Columns),
+            7 => Ok(Packet::Optimize),
+            8 => Ok(Packet::Translate),
             _ => Err(FusionError::Deserialize("packet".into(), value.into())),
         }
     }
