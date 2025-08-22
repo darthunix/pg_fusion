@@ -210,3 +210,85 @@ pub fn server_pid_layout() -> Result<ServerPidLayout, LayoutError> {
 pub unsafe fn server_pid_ptr(base: *mut u8, _layout: ServerPidLayout) -> *mut AtomicI32 {
     base as *mut AtomicI32
 }
+
+/// Layout for per-slot buffers used to stage heap blocks (e.g., BLCKSZ bytes each).
+/// Each slot reserves `blocks_per_slot` contiguous byte arrays of length `block_len`.
+#[derive(Clone, Copy, Debug)]
+pub struct SlotBlocksLayout {
+    /// Total layout for the entire region holding all slots.
+    pub layout: Layout,
+    /// Number of slots in this region.
+    pub slot_count: usize,
+    /// Length of a single heap block buffer (typically BLCKSZ).
+    pub block_len: usize,
+    /// Number of block-sized buffers reserved per slot (e.g., 2 for double-buffering).
+    pub blocks_per_slot: usize,
+}
+
+/// Compute a memory layout for `slot_count` slots, each with `blocks_per_slot` buffers of
+/// `block_len` bytes. The memory region is a flat byte array of size
+/// `slot_count * blocks_per_slot * block_len`.
+pub fn slot_blocks_layout(
+    slot_count: usize,
+    block_len: usize,
+    blocks_per_slot: usize,
+) -> Result<SlotBlocksLayout, LayoutError> {
+    assert!(slot_count > 0, "slot_count must be > 0");
+    assert!(block_len > 0, "block_len must be > 0");
+    assert!(blocks_per_slot > 0, "blocks_per_slot must be > 0");
+    // Total bytes required for all slots and both buffers per slot.
+    let total = slot_count
+        .checked_mul(blocks_per_slot)
+        .and_then(|v| v.checked_mul(block_len))
+        .expect("slot buffers size overflow");
+    let region = Layout::array::<u8>(total)?;
+    Ok(SlotBlocksLayout {
+        layout: region.pad_to_align(),
+        slot_count,
+        block_len,
+        blocks_per_slot,
+    })
+}
+
+/// Return pointers to the first two buffers backing the given `slot` index (for double-buffering).
+///
+/// # Safety
+/// - `base` must be valid for at least `layout.layout.size()` bytes with proper alignment.
+/// - `slot` must be in `0..layout.slot_count`.
+pub unsafe fn slot_blocks_ptrs(
+    base: *mut u8,
+    layout: SlotBlocksLayout,
+    slot: usize,
+) -> (*mut u8, *mut u8) {
+    assert!(slot < layout.slot_count, "slot index out of range");
+    assert!(
+        layout.blocks_per_slot >= 2,
+        "need at least 2 blocks per slot to return a pair"
+    );
+    let stride = layout.blocks_per_slot * layout.block_len;
+    let slot_base = base.add(slot * stride);
+    let buf0 = slot_base;
+    let buf1 = slot_base.add(layout.block_len);
+    (buf0, buf1)
+}
+
+/// Return a pointer to a specific block buffer within a slot.
+/// `block_idx` must be in `0..layout.blocks_per_slot`.
+///
+/// # Safety
+/// - Same safety requirements as `slot_blocks_ptrs`.
+pub unsafe fn slot_block_ptr(
+    base: *mut u8,
+    layout: SlotBlocksLayout,
+    slot: usize,
+    block_idx: usize,
+) -> *mut u8 {
+    assert!(slot < layout.slot_count, "slot index out of range");
+    assert!(
+        block_idx < layout.blocks_per_slot,
+        "block index out of range"
+    );
+    let stride = layout.blocks_per_slot * layout.block_len;
+    let slot_base = base.add(slot * stride);
+    slot_base.add(block_idx * layout.block_len)
+}
