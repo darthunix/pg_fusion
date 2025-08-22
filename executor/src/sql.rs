@@ -1,9 +1,9 @@
 use ahash::AHashMap;
 use anyhow::Result;
 use datafusion::arrow::datatypes::{DataType, SchemaRef};
+use datafusion::config::ConfigOptions;
 use datafusion::datasource::empty::EmptyTable;
 use datafusion::datasource::DefaultTableSource;
-use datafusion::config::ConfigOptions;
 use datafusion::error::DataFusionError;
 use datafusion::error::Result as DataFusionResult;
 use datafusion::functions::all_default_functions;
