@@ -17,6 +17,9 @@ use tokio::signal::unix::{signal as unix_signal, SignalKind};
 const TOKIO_THREAD_NUMBER: usize = 1;
 pub(crate) const RECV_CAP: usize = 8192;
 pub(crate) const SEND_CAP: usize = 8192;
+// Heap block buffer configuration per connection
+const SLOTS_PER_CONN: usize = 2; // two logical slots per connection
+const BLOCKS_PER_SLOT: usize = 2; // double buffering inside each slot
 
 #[pg_guard]
 pub(crate) fn init_datafusion_worker() {
@@ -68,6 +71,24 @@ pub unsafe extern "C" fn init_shmem() {
         info!(
             "init_shmem: allocated connections region: bytes_per_conn={} total_bytes={} recv_cap={} send_cap={} count={}",
             layout.layout.size(), total, RECV_CAP, SEND_CAP, num
+        );
+    }
+
+    // Allocate per-connection heap block buffers (SlotBlocksLayout).
+    {
+        use executor::layout::slot_blocks_layout;
+        let blksz = unsafe { pgrx::pg_sys::BLCKSZ as usize };
+        let layout =
+            slot_blocks_layout(SLOTS_PER_CONN, blksz, BLOCKS_PER_SLOT).expect("slot_blocks_layout");
+        let total = layout.layout.size() * num;
+        let base = pgrx::pg_sys::ShmemAlloc(total);
+        SLOT_BLOCKS_PTR.store(base as *mut u8, Ordering::Release);
+        // zero-init the whole region
+        let base_u8 = base as *mut u8;
+        std::ptr::write_bytes(base_u8, 0, total);
+        info!(
+            "init_shmem: allocated slot blocks: bytes_per_conn={} total_bytes={} slots_per_conn={} blocks_per_slot={} blksz={} count={}",
+            layout.layout.size(), total, SLOTS_PER_CONN, BLOCKS_PER_SLOT, blksz, num
         );
     }
 
@@ -289,6 +310,7 @@ static FLAGS_PTR: AtomicPtr<u8> = AtomicPtr::new(core::ptr::null_mut());
 static CONNS_PTR: AtomicPtr<u8> = AtomicPtr::new(core::ptr::null_mut());
 static STACK_PTR: AtomicPtr<u8> = AtomicPtr::new(core::ptr::null_mut());
 static SERVER_PID_PTR: AtomicPtr<u8> = AtomicPtr::new(core::ptr::null_mut());
+static SLOT_BLOCKS_PTR: AtomicPtr<u8> = AtomicPtr::new(core::ptr::null_mut());
 
 // Accessor for Treiber stack stored in shared memory
 pub(crate) fn treiber_stack() -> &'static TreiberStack {
@@ -319,6 +341,26 @@ pub(crate) fn connections_layout() -> executor::layout::ConnectionLayout {
 
 pub(crate) fn connections_base() -> *mut u8 {
     CONNS_PTR.load(Ordering::Acquire)
+}
+
+pub(crate) fn slot_blocks_layout() -> executor::layout::SlotBlocksLayout {
+    let blksz = unsafe { pgrx::pg_sys::BLCKSZ as usize };
+    executor::layout::slot_blocks_layout(SLOTS_PER_CONN, blksz, BLOCKS_PER_SLOT)
+        .expect("slot_blocks_layout")
+}
+
+pub(crate) fn slot_blocks_base() -> *mut u8 {
+    SLOT_BLOCKS_PTR.load(Ordering::Acquire)
+}
+
+/// Return the base pointer for the slot blocks region of a specific connection id.
+pub(crate) fn slot_blocks_base_for(conn_id: usize) -> *mut u8 {
+    unsafe {
+        let base = SLOT_BLOCKS_PTR.load(Ordering::Acquire);
+        assert!(!base.is_null(), "SLOT_BLOCKS_PTR not set");
+        let layout = slot_blocks_layout();
+        base.add(conn_id * layout.layout.size())
+    }
 }
 
 pub(crate) fn server_pid_atomic() -> &'static AtomicI32 {
