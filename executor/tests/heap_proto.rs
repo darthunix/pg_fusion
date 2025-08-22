@@ -1,0 +1,91 @@
+use executor::buffer::LockFreeBuffer;
+use executor::layout::lockfree_buffer_layout;
+use protocol::heap::{
+    prepare_heap_block_bitmap, prepare_heap_block_eof, read_heap_block_bitmap, read_heap_block_eof,
+    read_heap_block_request, request_heap_block,
+};
+use protocol::{consume_header, Direction, Flag, Packet};
+
+#[test]
+fn test_request_and_read_block_request_lockfree() {
+    // Allocate aligned memory for LockFreeBuffer using layout helper
+    let layout = lockfree_buffer_layout(256).expect("layout");
+    let base = unsafe { std::alloc::alloc_zeroed(layout.layout) };
+    assert!(!base.is_null());
+    let mut buf = unsafe { LockFreeBuffer::from_layout(base, layout) };
+
+    let table_oid = 42u32;
+    let slot_id = 7u16;
+    request_heap_block(&mut buf, table_oid, slot_id).expect("request_heap_block");
+
+    let header = consume_header(&mut buf).expect("header");
+    assert_eq!(header.direction, Direction::ToClient);
+    assert_eq!(header.packet, Packet::Heap);
+    assert_eq!(header.flag, Flag::Last);
+    assert_eq!(
+        header.length as usize,
+        core::mem::size_of::<u32>() + core::mem::size_of::<u16>()
+    );
+
+    let (t, s) = read_heap_block_request(&mut buf).expect("read request");
+    assert_eq!(t, table_oid);
+    assert_eq!(s, slot_id);
+
+    unsafe { std::alloc::dealloc(base, layout.layout) };
+}
+
+#[test]
+fn test_prepare_and_read_block_bitmap_lockfree() {
+    let layout = lockfree_buffer_layout(512).expect("layout");
+    let base = unsafe { std::alloc::alloc_zeroed(layout.layout) };
+    assert!(!base.is_null());
+    let mut buf = unsafe { LockFreeBuffer::from_layout(base, layout) };
+
+    let slot_id = 3u16;
+    let table_oid = 777u32;
+    let blkno = 1234u32;
+    let num_offsets = 17u16; // 17 offsets -> bitmap length 3 bytes
+
+    // Construct a 3-byte bitmap (LSB-first within each byte)
+    let byte0: u8 = (1 << 0) | (1 << 2) | (1 << 7); // offsets 1,3,8
+    let byte1: u8 = (1 << 1) | (1 << 5); // offsets 10,14
+    let byte2: u8 = 1; // offset 17
+    let bitmap = [byte0, byte1, byte2];
+
+    prepare_heap_block_bitmap(&mut buf, slot_id, table_oid, blkno, num_offsets, &bitmap)
+        .expect("prepare_heap_block_bitmap");
+
+    let header = consume_header(&mut buf).expect("header");
+    assert_eq!(header.direction, Direction::ToServer);
+    assert_eq!(header.packet, Packet::Heap);
+    assert_eq!(header.flag, Flag::Last);
+
+    let resp = read_heap_block_bitmap(&mut buf).expect("bitmap");
+    assert_eq!(resp.slot_id, slot_id);
+    assert_eq!(resp.table_oid, table_oid);
+    assert_eq!(resp.blkno, blkno);
+    assert_eq!(resp.num_offsets, num_offsets);
+    assert_eq!(resp.bitmap, bitmap);
+
+    unsafe { std::alloc::dealloc(base, layout.layout) };
+}
+
+#[test]
+fn test_prepare_block_eof_lockfree() {
+    let layout = lockfree_buffer_layout(64).expect("layout");
+    let base = unsafe { std::alloc::alloc_zeroed(layout.layout) };
+    assert!(!base.is_null());
+    let mut buf = unsafe { LockFreeBuffer::from_layout(base, layout) };
+
+    let slot_id = 1u16;
+    prepare_heap_block_eof(&mut buf, slot_id).expect("eof");
+
+    let header = consume_header(&mut buf).expect("header");
+    assert_eq!(header.direction, Direction::ToServer);
+    assert_eq!(header.packet, Packet::Heap);
+    assert_eq!(header.length, core::mem::size_of::<u16>() as u16);
+    let echoed = read_heap_block_eof(&mut buf).expect("read eof");
+    assert_eq!(echoed, slot_id);
+
+    unsafe { std::alloc::dealloc(base, layout.layout) };
+}

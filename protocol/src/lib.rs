@@ -10,6 +10,7 @@ pub mod bind;
 pub mod columns;
 pub mod explain;
 pub mod failure;
+pub mod heap;
 pub mod metadata;
 pub mod parse;
 
@@ -61,6 +62,7 @@ pub enum Packet {
     Columns = 6,
     Optimize = 7,
     Translate = 8,
+    Heap = 9,
 }
 
 impl TryFrom<u8> for Packet {
@@ -78,6 +80,7 @@ impl TryFrom<u8> for Packet {
             6 => Ok(Packet::Columns),
             7 => Ok(Packet::Optimize),
             8 => Ok(Packet::Translate),
+            9 => Ok(Packet::Heap),
             _ => Err(FusionError::Deserialize("packet".into(), value.into())),
         }
     }
