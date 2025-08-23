@@ -1,8 +1,8 @@
 use executor::buffer::LockFreeBuffer;
 use executor::layout::lockfree_buffer_layout;
 use protocol::heap::{
-    prepare_heap_block_bitmap, prepare_heap_block_eof, read_heap_block_bitmap, read_heap_block_eof,
-    read_heap_block_request, request_heap_block,
+    heap_bitmap_positions, prepare_heap_block_bitmap, prepare_heap_block_eof,
+    read_heap_block_bitmap_meta, read_heap_block_eof, read_heap_block_request, request_heap_block,
 };
 use protocol::{consume_header, Direction, Flag, Packet};
 
@@ -60,12 +60,15 @@ fn test_prepare_and_read_block_bitmap_lockfree() {
     assert_eq!(header.packet, Packet::Heap);
     assert_eq!(header.flag, Flag::Last);
 
-    let resp = read_heap_block_bitmap(&mut buf).expect("bitmap");
-    assert_eq!(resp.slot_id, slot_id);
-    assert_eq!(resp.table_oid, table_oid);
-    assert_eq!(resp.blkno, blkno);
-    assert_eq!(resp.num_offsets, num_offsets);
-    assert_eq!(resp.bitmap, bitmap);
+    let meta = read_heap_block_bitmap_meta(&mut buf).expect("bitmap meta");
+    assert_eq!(meta.slot_id, slot_id);
+    assert_eq!(meta.table_oid, table_oid);
+    assert_eq!(meta.blkno, blkno);
+    assert_eq!(meta.num_offsets, num_offsets);
+    assert_eq!(meta.bitmap_len as usize, bitmap.len());
+    // Iterate set positions directly from the buffer (consuming bytes)
+    let positions: Vec<usize> = heap_bitmap_positions(&mut buf, meta.num_offsets, meta.bitmap_len).collect();
+    assert_eq!(positions, vec![1, 3, 8, 10, 14, 17]);
 
     unsafe { std::alloc::dealloc(base, layout.layout) };
 }
