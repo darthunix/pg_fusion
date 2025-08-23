@@ -52,7 +52,14 @@ fn test_prepare_and_read_block_bitmap_lockfree() {
     let byte2: u8 = 1; // offset 17
     let bitmap = [byte0, byte1, byte2];
 
-    prepare_heap_block_bitmap(&mut buf, slot_id, table_oid, blkno, num_offsets, &bitmap)
+    // Convert bitmap slice to positions iterator
+    let positions = (1usize..=num_offsets as usize).filter(|off| {
+        let idx = off - 1;
+        let b = bitmap[idx / 8];
+        let bit = 1u8 << (idx as u8 % 8);
+        (b & bit) != 0
+    });
+    prepare_heap_block_bitmap(&mut buf, slot_id, table_oid, blkno, num_offsets, positions)
         .expect("prepare_heap_block_bitmap");
 
     let header = consume_header(&mut buf).expect("header");
@@ -60,14 +67,18 @@ fn test_prepare_and_read_block_bitmap_lockfree() {
     assert_eq!(header.packet, Packet::Heap);
     assert_eq!(header.flag, Flag::Last);
 
-    let meta = read_heap_block_bitmap_meta(&mut buf).expect("bitmap meta");
+    let meta = read_heap_block_bitmap_meta(&mut buf, header.length).expect("bitmap meta");
     assert_eq!(meta.slot_id, slot_id);
     assert_eq!(meta.table_oid, table_oid);
     assert_eq!(meta.blkno, blkno);
     assert_eq!(meta.num_offsets, num_offsets);
     assert_eq!(meta.bitmap_len as usize, bitmap.len());
     // Iterate set positions directly from the buffer (consuming bytes)
-    let positions: Vec<usize> = heap_bitmap_positions(&mut buf, meta.num_offsets, meta.bitmap_len).collect();
+    let positions: Vec<usize> =
+        heap_bitmap_positions(&mut buf, meta.num_offsets, meta.bitmap_len).collect();
+    // trailing u16 (bitmap length) should remain in the buffer; read and verify
+    let trailing_len = rmp::decode::read_u16(&mut buf).expect("read trailing msgpack u16");
+    assert_eq!(trailing_len as usize, bitmap.len());
     assert_eq!(positions, vec![1, 3, 8, 10, 14, 17]);
 
     unsafe { std::alloc::dealloc(base, layout.layout) };
