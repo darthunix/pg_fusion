@@ -85,32 +85,107 @@ pub fn prepare_heap_block_bitmap(
     Ok(())
 }
 
-pub struct BlockBitmap {
+// Removed BlockBitmap to prefer zero-copy flow via HeapBitmapMeta
+
+/// Zero-copy friendly metadata for a heap page bitmap.
+/// The actual bitmap bytes remain unread in the stream, allowing callers that
+/// control the underlying buffer (e.g., a lock-free ring) to access them
+/// without allocation and advance the read head manually.
+pub struct HeapBitmapMeta {
     pub slot_id: u16,
     pub table_oid: u32,
     pub blkno: u32,
-    /// Number of meaningful offsets on the page (1..=num_offsets).
     pub num_offsets: u16,
-    pub bitmap: Vec<u8>,
+    pub bitmap_len: u16,
 }
 
-/// Read the heap page bitmap response on the executor.
-pub fn read_heap_block_bitmap(stream: &mut impl Read) -> Result<BlockBitmap> {
+// Removed read_heap_block_bitmap allocation-heavy function
+
+/// Read only metadata for the heap page bitmap, leaving the bitmap bytes unread.
+pub fn read_heap_block_bitmap_meta(stream: &mut impl Read) -> Result<HeapBitmapMeta> {
     let slot_id = read_u16(stream)?;
     let table_oid = read_u32(stream)?;
     let blkno = read_u32(stream)?;
     let num_offsets = read_u16(stream)?;
-    let bitmap_len = read_u16(stream)? as usize;
-    let mut bitmap = vec![0u8; bitmap_len];
-    let read = std::io::Read::read(stream, &mut bitmap)?;
-    debug_assert_eq!(read, bitmap_len);
-    Ok(BlockBitmap {
+    let bitmap_len = read_u16(stream)?;
+    Ok(HeapBitmapMeta {
         slot_id,
         table_oid,
         blkno,
         num_offsets,
-        bitmap,
+        bitmap_len,
     })
+}
+
+/// Iterator over set-bit positions (1-based offsets) in a heap visibility bitmap.
+///
+/// Consumes `bitmap_len` bytes from `reader`, interpreting each bit LSB-first as
+/// an offset position starting at 1. Yields positions `usize` in ascending order
+/// for bits that are set and within `1..=num_offsets`. Trailing pad bits (beyond
+/// `num_offsets`) are ignored but still consumed from the reader.
+pub struct HeapBitmapIter<'a, R: Read + ?Sized> {
+    reader: &'a mut R,
+    remaining_bytes: usize,
+    next_offset: usize,
+    total_offsets: usize,
+    current_byte: u8,
+    bit_index: u8,
+    have_byte: bool,
+}
+
+impl<'a, R: Read + ?Sized> Iterator for HeapBitmapIter<'a, R> {
+    type Item = usize;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        loop {
+            if !self.have_byte || self.bit_index >= 8 {
+                if self.remaining_bytes == 0 {
+                    return None;
+                }
+                let mut b = [0u8; 1];
+                let n = std::io::Read::read(self.reader, &mut b).ok()?;
+                if n == 0 {
+                    return None;
+                }
+                self.current_byte = b[0];
+                self.bit_index = 0;
+                self.have_byte = true;
+                self.remaining_bytes -= 1;
+            }
+
+            // Inspect the current bit, then advance.
+            let pos = self.next_offset;
+            let set = (self.current_byte & (1u8 << self.bit_index)) != 0;
+            self.bit_index += 1;
+            self.next_offset += 1;
+
+            if pos > self.total_offsets {
+                // Beyond meaningful offsets: ignore but continue consuming.
+                continue;
+            }
+            if set {
+                return Some(pos);
+            }
+            // Otherwise, loop for the next bit/byte.
+        }
+    }
+}
+
+/// Create an iterator over set positions in the heap bitmap.
+pub fn heap_bitmap_positions<'a, R: Read + ?Sized>(
+    reader: &'a mut R,
+    num_offsets: u16,
+    bitmap_len: u16,
+) -> HeapBitmapIter<'a, R> {
+    HeapBitmapIter {
+        reader,
+        remaining_bytes: bitmap_len as usize,
+        next_offset: 1,
+        total_offsets: num_offsets as usize,
+        current_byte: 0,
+        bit_index: 8,
+        have_byte: false,
+    }
 }
 
 /// Signal end-of-scan: no more heap pages available for the relation.
