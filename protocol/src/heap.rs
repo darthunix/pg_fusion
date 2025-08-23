@@ -46,9 +46,9 @@ pub fn read_heap_block_request(stream: &mut impl Read) -> Result<(u32, u16)> {
 ///        Offsets are 1-based (1..=num_offsets). The bitmap encodes
 ///        visibility for each offset; trailing pad bits in the last
 ///        byte (if any) must be ignored.
-/// - u16: bitmap length in bytes
 /// - [u8; bitmap_len]: visibility bitmap (1 bit per offset, LSB-first)
-pub fn prepare_heap_block_bitmap(
+/// - u16: bitmap length in bytes (echoed at the end)
+pub fn prepare_heap_block_bitmap<PosIter>(
     stream: &mut impl Tape,
     slot_id: u16,
     table_oid: u32,
@@ -56,8 +56,11 @@ pub fn prepare_heap_block_bitmap(
     // Number of meaningful ItemId slots on the page (1..=num_offsets).
     // This is the max offset number (aka `PageGetMaxOffsetNumber`).
     num_offsets: u16,
-    bitmap: &[u8],
-) -> Result<()> {
+    mut positions: PosIter,
+) -> Result<()>
+where
+    PosIter: Iterator<Item = usize>,
+{
     // Two-phase header write since bitmap is variable-sized
     write_header(stream, &Header::default())?;
     let len_init = stream.uncommitted_len();
@@ -65,10 +68,38 @@ pub fn prepare_heap_block_bitmap(
     write_u32(stream, table_oid)?;
     write_u32(stream, blkno)?;
     // Encode the count of offsets (not the index of the last bit).
-    // Consumer must read ceil(num_offsets/8) bytes from `bitmap`.
     write_u16(stream, num_offsets)?;
-    write_u16(stream, u16::try_from(bitmap.len())?)?;
-    stream.write_all(bitmap)?;
+    // Stream out the bitmap bytes generated from sorted positions without allocating.
+    let total = num_offsets as usize;
+    let mut next = positions.next();
+    let mut byte_acc: u8 = 0;
+    let mut bit_idx: u8 = 0;
+    let mut written: usize = 0;
+    for off in 1..=total {
+        if let Some(p) = next {
+            if p == off {
+                byte_acc |= 1u8 << bit_idx;
+                next = positions.next();
+            } else if p < off {
+                // Skip any positions less than current (should not happen if sorted)
+                // and fetch next
+                next = positions.next();
+            }
+        }
+        bit_idx += 1;
+        if bit_idx == 8 {
+            stream.write_all(&[byte_acc])?;
+            written += 1;
+            byte_acc = 0;
+            bit_idx = 0;
+        }
+    }
+    if bit_idx > 0 {
+        stream.write_all(&[byte_acc])?;
+        written += 1;
+    }
+    // Write bitmap length at the end (u16)
+    write_u16(stream, u16::try_from(written)?)?;
 
     let len_final = stream.uncommitted_len();
     let length = u16::try_from(len_final - len_init)?;
@@ -102,12 +133,19 @@ pub struct HeapBitmapMeta {
 // Removed read_heap_block_bitmap allocation-heavy function
 
 /// Read only metadata for the heap page bitmap, leaving the bitmap bytes unread.
-pub fn read_heap_block_bitmap_meta(stream: &mut impl Read) -> Result<HeapBitmapMeta> {
+pub fn read_heap_block_bitmap_meta(
+    stream: &mut impl Read,
+    payload_len: u16,
+) -> Result<HeapBitmapMeta> {
     let slot_id = read_u16(stream)?;
     let table_oid = read_u32(stream)?;
     let blkno = read_u32(stream)?;
     let num_offsets = read_u16(stream)?;
-    let bitmap_len = read_u16(stream)?;
+    // Payload layout with MessagePack integer encoding sizes:
+    // slot_id (u16 -> 3) + table_oid (u32 -> 5) + blkno (u32 -> 5)
+    // + num_offsets (u16 -> 3) + trailing bitmap_len (u16 -> 3)
+    let fixed = 3 + 5 + 5 + 3 + 3; // = 19 bytes
+    let bitmap_len = payload_len.saturating_sub(fixed);
     Ok(HeapBitmapMeta {
         slot_id,
         table_oid,
