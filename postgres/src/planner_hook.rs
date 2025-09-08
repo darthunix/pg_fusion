@@ -17,7 +17,7 @@ static mut PREV_PLANNER_HOOK: planner_hook_type = None;
 #[pg_guard]
 #[no_mangle]
 #[allow(static_mut_refs)]
-pub(crate) extern "C" fn init_datafusion_planner_hook() {
+pub(crate) extern "C-unwind" fn init_datafusion_planner_hook() {
     unsafe {
         if planner_hook.is_some() {
             PREV_PLANNER_HOOK = planner_hook;
@@ -28,7 +28,7 @@ pub(crate) extern "C" fn init_datafusion_planner_hook() {
 
 #[pg_guard]
 #[no_mangle]
-extern "C" fn datafusion_planner_hook(
+extern "C-unwind" fn datafusion_planner_hook(
     parse: *mut Query,
     query_string: *const c_char,
     cursoroptions: c_int,
@@ -47,7 +47,7 @@ extern "C" fn datafusion_planner_hook(
 }
 
 #[pg_guard]
-fn df_planner(pattern: *const c_char, params: ParamListInfo) -> *mut PlannedStmt {
+extern "C-unwind" fn df_planner(pattern: *const c_char, params: ParamListInfo) -> *mut PlannedStmt {
     let seed: u64 = unsafe { SEED.unwrap() };
     let bytes = unsafe { CStr::from_ptr(pattern).to_bytes() };
 
@@ -85,7 +85,7 @@ fn df_planner(pattern: *const c_char, params: ParamListInfo) -> *mut PlannedStmt
 }
 
 #[pg_guard]
-fn pack_args(pattern: *const c_char, params: ParamListInfo) -> *mut CustomScan {
+extern "C-unwind" fn pack_args(pattern: *const c_char, params: ParamListInfo) -> *mut CustomScan {
     let mut cscan = CustomScan::default();
     cscan.scan.plan.type_ = NodeTag::T_CustomScan;
     let lc_query = ListCell {

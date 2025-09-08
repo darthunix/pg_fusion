@@ -8,3 +8,11 @@ members = [
   "storage/pg_test",
 ]
 resolver = "2"
+
+[workspace.dependencies]
+pgrx-pg-sys = "0.16"
+pgrx = "0.16"
+pgrx-tests = "0.16"
+datafusion-common = "44.0"
+datafusion = "44.0"
+datafusion-sql = "44.0"

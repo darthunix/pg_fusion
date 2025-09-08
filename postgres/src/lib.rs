@@ -16,7 +16,7 @@ pub(crate) static mut SEED: Option<u64> = None;
 
 #[pg_guard]
 #[allow(non_snake_case)]
-pub extern "C" fn _PG_init() {
+pub unsafe extern "C-unwind" fn _PG_init() {
     init_seed();
     init_gucs();
     mark_guc_prefix_reserved("pg_fusion");
@@ -34,9 +34,9 @@ fn init_seed() {
 
 fn init_gucs() {
     GucRegistry::define_bool_guc(
-        "pg_fusion.enable",
-        "Enable DataFusion runtime",
-        "Enable DataFusion runtime",
+        c"pg_fusion.enable",
+        c"Enable DataFusion runtime",
+        c"Enable DataFusion runtime",
         &ENABLE_DATAFUSION,
         GucContext::Userset,
         GucFlags::default(),
@@ -60,7 +60,7 @@ fn register_shmem_request_hook() {
 
 #[pg_guard]
 #[no_mangle]
-unsafe extern "C" fn pg_fusion_shmem_request_hook() {
+unsafe extern "C-unwind" fn pg_fusion_shmem_request_hook() {
     // Chain to any previous hook first
     if let Some(prev) = PREV_SHMEM_REQUEST_HOOK {
         prev();
