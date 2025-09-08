@@ -17,12 +17,12 @@ pg_test = []
 
 [dependencies]
 anyhow = "1.0"
-pgrx = "0.12"
+pgrx = { workspace = true }
 storage = { path = "..", version = "25.0" }
-datafusion-common = "44.0"
+datafusion-common = { workspace = true }
 
 [dev-dependencies]
-pgrx-tests = "0.12"
+pgrx-tests = { workspace = true }
 
 [profile.dev]
 panic = "unwind"

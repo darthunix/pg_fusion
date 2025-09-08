@@ -40,7 +40,7 @@ fn handle_metadata(send: &mut LockFreeBuffer, recv: &mut LockFreeBuffer) -> AnyR
         if rel_oid == InvalidOid {
             Err(anyhow::anyhow!("table not found"))
         } else {
-            Ok(rel_oid.as_u32())
+            Ok(rel_oid.to_u32())
         }
     };
     let table_lookup = |table: &[u8]| -> AnyResult<u32> {
@@ -54,7 +54,7 @@ fn handle_metadata(send: &mut LockFreeBuffer, recv: &mut LockFreeBuffer) -> AnyR
         for ns_oid in path {
             let rel_oid = unsafe { pg_sys::get_relname_relid(tbl.as_ptr(), *ns_oid) };
             if rel_oid != InvalidOid {
-                return Ok(rel_oid.as_u32());
+                return Ok(rel_oid.to_u32());
             }
         }
         Err(anyhow::anyhow!("table not found in search_path"))
@@ -74,12 +74,12 @@ fn handle_metadata(send: &mut LockFreeBuffer, recv: &mut LockFreeBuffer) -> AnyR
         let mut ow = Out(out);
         if need_schema {
             write_array_len(&mut ow, 3)?;
-            write_u32(&mut ow, rel_oid.as_u32())?;
+            write_u32(&mut ow, rel_oid.to_u32())?;
             write_str(&mut ow, rel.namespace())?;
             write_str(&mut ow, rel.name())?;
         } else {
             write_array_len(&mut ow, 2)?;
-            write_u32(&mut ow, rel_oid.as_u32())?;
+            write_u32(&mut ow, rel_oid.to_u32())?;
             write_str(&mut ow, rel.name())?;
         }
         let tuple_desc = rel.tuple_desc();
@@ -141,7 +141,7 @@ thread_local! {
 
 #[pg_guard]
 #[no_mangle]
-pub(crate) extern "C" fn init_datafusion_methods() {
+pub(crate) extern "C-unwind" fn init_datafusion_methods() {
     unsafe {
         pg_sys::RegisterCustomScanMethods(scan_methods());
     }
@@ -157,7 +157,7 @@ pub(crate) fn exec_methods() -> *const CustomExecMethods {
 
 #[pg_guard]
 #[no_mangle]
-unsafe extern "C" fn create_df_scan_state(cscan: *mut pg_sys::CustomScan) -> *mut Node {
+unsafe extern "C-unwind" fn create_df_scan_state(cscan: *mut pg_sys::CustomScan) -> *mut Node {
     // Acquire connection and shared buffers
     let id = match connection_id() {
         Ok(v) => v,
@@ -313,7 +313,7 @@ unsafe extern "C" fn create_df_scan_state(cscan: *mut pg_sys::CustomScan) -> *mu
 
 #[pg_guard]
 #[no_mangle]
-unsafe extern "C" fn begin_df_scan(
+unsafe extern "C-unwind" fn begin_df_scan(
     _node: *mut CustomScanState,
     _estate: *mut pg_sys::EState,
     _eflags: i32,
@@ -323,7 +323,9 @@ unsafe extern "C" fn begin_df_scan(
 
 #[pg_guard]
 #[no_mangle]
-unsafe extern "C" fn exec_df_scan(_node: *mut CustomScanState) -> *mut pg_sys::TupleTableSlot {
+unsafe extern "C-unwind" fn exec_df_scan(
+    _node: *mut CustomScanState,
+) -> *mut pg_sys::TupleTableSlot {
     // Execution is not implemented yet. Returning null ensures executor won't use it
     // in contexts where execution is not expected (e.g., EXPLAIN).
     std::ptr::null_mut()
@@ -331,13 +333,13 @@ unsafe extern "C" fn exec_df_scan(_node: *mut CustomScanState) -> *mut pg_sys::T
 
 #[pg_guard]
 #[no_mangle]
-unsafe extern "C" fn end_df_scan(_node: *mut CustomScanState) {
+unsafe extern "C-unwind" fn end_df_scan(_node: *mut CustomScanState) {
     // No-op for now.
 }
 
 #[pg_guard]
 #[no_mangle]
-unsafe extern "C" fn explain_df_scan(
+unsafe extern "C-unwind" fn explain_df_scan(
     _node: *mut CustomScanState,
     _ancestors: *mut List,
     es: *mut pg_sys::ExplainState,

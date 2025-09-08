@@ -19,7 +19,7 @@ pub(crate) const RECV_CAP: usize = 8192;
 pub(crate) const SEND_CAP: usize = 8192;
 
 #[pg_guard]
-pub(crate) fn init_datafusion_worker() {
+pub(crate) unsafe extern "C-unwind" fn init_datafusion_worker() {
     info!("Registering DataFusion background worker");
     BackgroundWorkerBuilder::new("datafusion")
         .set_function("worker_main")
@@ -30,7 +30,7 @@ pub(crate) fn init_datafusion_worker() {
 
 #[pg_guard]
 #[no_mangle]
-pub unsafe extern "C" fn init_shmem() {
+pub unsafe extern "C-unwind" fn init_shmem() {
     let num = crate::max_backends() as usize;
 
     // Allocate flags region: one `AtomicBool` per backend connection.
@@ -115,7 +115,7 @@ fn signal_client(conn: &Connection, id: usize) {
 
 #[pg_guard]
 #[no_mangle]
-pub extern "C" fn worker_main(_arg: pg_sys::Datum) {
+pub extern "C-unwind" fn worker_main(_arg: pg_sys::Datum) {
     BackgroundWorker::attach_signal_handlers(SignalWakeFlags::SIGHUP | SignalWakeFlags::SIGTERM);
     let num = crate::max_backends() as usize;
     init_tracing_file_logger();
