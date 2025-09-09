@@ -1,8 +1,8 @@
+use crate::heap::HeapTableProvider;
 use ahash::AHashMap;
 use anyhow::Result;
 use datafusion::arrow::datatypes::{DataType, SchemaRef};
 use datafusion::config::ConfigOptions;
-use datafusion::datasource::empty::EmptyTable;
 use datafusion::datasource::DefaultTableSource;
 use datafusion::error::DataFusionError;
 use datafusion::error::Result as DataFusionResult;
@@ -169,7 +169,7 @@ fn consume_metadata_exec(
     for _ in 0..table_num {
         let name_part_num = read_array_len(stream)?;
         debug_assert!(name_part_num == 2 || name_part_num == 3);
-        let _oid = read_u32(stream)?;
+        let oid = read_u32(stream)?;
         let mut schema = None;
         if name_part_num == 3 {
             let ns_len = read_str_len(stream)?;
@@ -205,8 +205,8 @@ fn consume_metadata_exec(
             fields.push(field);
         }
         let schema = Arc::new(datafusion::arrow::datatypes::Schema::new(fields));
-        // Provide a DefaultTableSource wrapping an EmptyTable so physical planning can succeed.
-        let provider = Arc::new(EmptyTable::new(Arc::clone(&schema)));
+        // Wrap a HeapTableProvider so physical planning will use our HeapScanExec.
+        let provider = Arc::new(HeapTableProvider::new(oid, Arc::clone(&schema)));
         let source = Arc::new(DefaultTableSource::new(provider));
         tables.insert(table_ref, source as Arc<dyn TableSource>);
     }
