@@ -9,6 +9,7 @@ pub enum Action {
     Explain,
     Optimize,
     Translate,
+    ReadHeap,
 }
 
 #[derive(Debug, PartialEq)]
@@ -40,5 +41,6 @@ state_machine! {
     PhysicalPlan => {
         Failure => Initialized[Flush],
         Explain => Initialized[Explain],
+        Heap => PhysicalPlan[ReadHeap],
     }
 }

@@ -201,6 +201,10 @@ impl<'bytes> Connection<'bytes> {
                     trace!("process_message: Action::Translate");
                     translate(plan).await
                 }
+                Some(Action::ReadHeap) => {
+                    trace!("process_message: Action::ReadHeap (heap packet received, placeholder)");
+                    Ok(TaskResult::Noop)
+                }
                 None => {
                     bail!(FusionError::NotFound(
                         "find an action".into(),
@@ -242,6 +246,9 @@ impl<'bytes> Connection<'bytes> {
                         explain_len = explain.len(),
                         "process_message: prepared Explain"
                     );
+                }
+                TaskResult::Noop => {
+                    // Intentionally no-op (e.g., heap packet consumed elsewhere)
                 }
                 TaskResult::Parsing((stmt, tables)) => {
                     storage.statement = Some(stmt);
@@ -346,6 +353,7 @@ enum TaskResult {
     Optimized(LogicalPlan),
     Translated(Option<Arc<dyn ExecutionPlan>>),
     Explain(SmolStr),
+    Noop,
 }
 
 #[cfg(test)]
