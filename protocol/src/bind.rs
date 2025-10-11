@@ -1,5 +1,5 @@
 use crate::data_type::{read_scalar_value, write_scalar_value};
-use crate::{write_header, Direction, Flag, Header, Packet, Tape};
+use crate::{write_header, ControlPacket, Direction, Flag, Header, Tape};
 use anyhow::Result;
 use datafusion::scalar::ScalarValue;
 use rmp::decode::read_array_len;
@@ -19,7 +19,7 @@ pub fn read_params(stream: &mut impl Tape) -> Result<Vec<ScalarValue>> {
 pub fn request_params(stream: &mut impl Write) -> Result<()> {
     let header = Header {
         direction: Direction::ToClient,
-        packet: Packet::Bind,
+        tag: ControlPacket::Bind as u8,
         length: 0,
         flag: Flag::Last,
     };
@@ -50,7 +50,7 @@ where
     let length = u16::try_from(len_final - len_init)?;
     let header = Header {
         direction: Direction::ToServer,
-        packet: Packet::Bind,
+        tag: ControlPacket::Bind as u8,
         length,
         flag: Flag::Last,
     };

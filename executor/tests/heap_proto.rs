@@ -4,7 +4,7 @@ use protocol::heap::{
     heap_bitmap_positions, prepare_heap_block_bitmap, prepare_heap_block_eof,
     read_heap_block_bitmap_meta, read_heap_block_eof, read_heap_block_request, request_heap_block,
 };
-use protocol::{consume_header, Direction, Flag, Packet};
+use protocol::{consume_header, DataPacket, Direction, Flag};
 
 #[test]
 fn test_request_and_read_block_request_lockfree() {
@@ -20,7 +20,7 @@ fn test_request_and_read_block_request_lockfree() {
 
     let header = consume_header(&mut buf).expect("header");
     assert_eq!(header.direction, Direction::ToClient);
-    assert_eq!(header.packet, Packet::Heap);
+    assert_eq!(header.tag, DataPacket::Heap as u8);
     assert_eq!(header.flag, Flag::Last);
     assert_eq!(
         header.length as usize,
@@ -64,7 +64,7 @@ fn test_prepare_and_read_block_bitmap_lockfree() {
 
     let header = consume_header(&mut buf).expect("header");
     assert_eq!(header.direction, Direction::ToServer);
-    assert_eq!(header.packet, Packet::Heap);
+    assert_eq!(header.tag, DataPacket::Heap as u8);
     assert_eq!(header.flag, Flag::Last);
 
     let meta = read_heap_block_bitmap_meta(&mut buf, header.length).expect("bitmap meta");
@@ -96,7 +96,7 @@ fn test_prepare_block_eof_lockfree() {
 
     let header = consume_header(&mut buf).expect("header");
     assert_eq!(header.direction, Direction::ToServer);
-    assert_eq!(header.packet, Packet::Heap);
+    assert_eq!(header.tag, DataPacket::Heap as u8);
     assert_eq!(header.length, core::mem::size_of::<u16>() as u16);
     let echoed = read_heap_block_eof(&mut buf).expect("read eof");
     assert_eq!(echoed, slot_id);

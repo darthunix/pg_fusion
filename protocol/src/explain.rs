@@ -1,4 +1,4 @@
-use crate::{write_c_str, write_header, Direction, Flag, Header, Packet, Tape};
+use crate::{write_c_str, write_header, ControlPacket, Direction, Flag, Header, Tape};
 use anyhow::Result;
 use rmp::decode::read_bin_len;
 use std::io::{Read, Write};
@@ -14,7 +14,7 @@ pub fn prepare_explain(stream: &mut impl Tape, explain: &str) -> Result<()> {
     let length = u16::try_from(len_final - len_init)?;
     let header = Header {
         direction: Direction::ToClient,
-        packet: Packet::Explain,
+        tag: ControlPacket::Explain as u8,
         length,
         flag: Flag::Last,
     };
@@ -30,7 +30,7 @@ pub fn prepare_explain(stream: &mut impl Tape, explain: &str) -> Result<()> {
 pub fn request_explain(stream: &mut impl Write) -> Result<()> {
     let header = Header {
         direction: Direction::ToServer,
-        packet: Packet::Explain,
+        tag: ControlPacket::Explain as u8,
         length: 0,
         flag: Flag::Last,
     };

@@ -19,7 +19,7 @@ use protocol::failure::{read_error, request_failure};
 use protocol::metadata::process_metadata_with_response;
 use protocol::parse::prepare_query;
 use protocol::Tape;
-use protocol::{Direction, Packet};
+use protocol::{ControlPacket, DataPacket, Direction};
 use rmp::decode::read_bin_len;
 use rmp::encode::{write_array_len, write_bool, write_str, write_u32, write_u8};
 use smallvec::SmallVec;
@@ -210,17 +210,17 @@ unsafe extern "C-unwind" fn create_df_scan_state(cscan: *mut pg_sys::CustomScan)
         if header.direction != Direction::ToClient {
             continue;
         }
-        match header.packet {
-            Packet::None => continue,
-            Packet::Failure => match read_error(&mut shared.send) {
+        match ControlPacket::try_from(header.tag) {
+            Ok(ControlPacket::None) => continue,
+            Ok(ControlPacket::Failure) => match read_error(&mut shared.send) {
                 Ok(msg) => error!("Failed to compile the query: {}", msg),
                 Err(err) => error!("Double error: {}", err),
             },
-            Packet::Heap => {
+            Err(_) if DataPacket::try_from(header.tag).is_ok() => {
                 // Not expected during planning; ignore.
                 continue;
             }
-            Packet::Metadata => {
+            Ok(ControlPacket::Metadata) => {
                 if let Err(err) = handle_metadata(&mut shared.send, &mut shared.recv) {
                     let _ = request_failure(&mut shared.recv);
                     let _ = shared.signal_server();
@@ -230,7 +230,7 @@ unsafe extern "C-unwind" fn create_df_scan_state(cscan: *mut pg_sys::CustomScan)
                     error!("Failed to signal server: {}", err);
                 }
             }
-            Packet::Bind => {
+            Ok(ControlPacket::Bind) => {
                 // For now, send empty params (queries without params)
                 if let Err(err) = prepare_params(&mut shared.recv, || {
                     (
@@ -246,7 +246,7 @@ unsafe extern "C-unwind" fn create_df_scan_state(cscan: *mut pg_sys::CustomScan)
                     error!("Failed to signal server: {}", err);
                 }
             }
-            Packet::Columns => {
+            Ok(ControlPacket::Columns) => {
                 let list_ptr = (*cscan).custom_scan_tlist as *mut c_void;
                 let repack =
                     |pos: i16, etype: u8, name: &[u8], ptr: *mut c_void| -> anyhow::Result<()> {
@@ -290,14 +290,18 @@ unsafe extern "C-unwind" fn create_df_scan_state(cscan: *mut pg_sys::CustomScan)
                 }
                 break;
             }
-            Packet::Parse | Packet::Explain | Packet::Optimize | Packet::Translate => {
+            Ok(ControlPacket::Parse)
+            | Ok(ControlPacket::Explain)
+            | Ok(ControlPacket::Optimize)
+            | Ok(ControlPacket::Translate) => {
                 let _ = request_failure(&mut shared.recv);
                 let _ = shared.signal_server();
                 error!(
                     "Unexpected packet while creating a custom plan: {:?}",
-                    header.packet
+                    header.tag
                 )
             }
+            Err(_) => continue,
         }
     }
 
@@ -393,17 +397,17 @@ unsafe extern "C-unwind" fn explain_df_scan(
         if header.direction != Direction::ToClient {
             continue;
         }
-        match header.packet {
-            Packet::None => continue,
-            Packet::Failure => match read_error(&mut shared.send) {
+        match ControlPacket::try_from(header.tag) {
+            Ok(ControlPacket::None) => continue,
+            Ok(ControlPacket::Failure) => match read_error(&mut shared.send) {
                 Ok(msg) => error!("Failed to compile the query: {}", msg),
                 Err(err) => error!("Double error: {}", err),
             },
-            Packet::Heap => {
+            Err(_) if DataPacket::try_from(header.tag).is_ok() => {
                 // Not expected for EXPLAIN; ignore.
                 continue;
             }
-            Packet::Explain => {
+            Ok(ControlPacket::Explain) => {
                 let len = read_bin_len(&mut shared.send)
                     .expect("Failed to read length in explain message");
                 let mut buf = SmallVec::<[u8; 256]>::new();
@@ -423,7 +427,7 @@ unsafe extern "C-unwind" fn explain_df_scan(
             _ => {
                 let _ = request_failure(&mut shared.recv);
                 let _ = shared.signal_server();
-                error!("Unexpected packet for explain: {:?}", header.packet)
+                error!("Unexpected tag for explain: {:?}", header.tag)
             }
         }
     }

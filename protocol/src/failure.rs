@@ -1,4 +1,4 @@
-use crate::{str_prefix_len, write_header, Direction, Flag, Header, Packet};
+use crate::{str_prefix_len, write_header, ControlPacket, Direction, Flag, Header};
 use anyhow::Result;
 use rmp::decode::read_str_len;
 use rmp::encode::write_bin_len;
@@ -11,7 +11,7 @@ pub fn prepare_error(stream: &mut impl Write, message: &str) -> Result<()> {
     let len = u32::try_from(message.len())?;
     let header = Header {
         direction: Direction::ToClient,
-        packet: Packet::Failure,
+        tag: ControlPacket::Failure as u8,
         length: u16::try_from(1 + str_prefix_len(len) + len)?,
         flag: Flag::Last,
     };
@@ -33,7 +33,7 @@ pub fn read_error(stream: &mut impl Read) -> Result<String> {
 pub fn request_failure(stream: &mut impl Write) -> Result<()> {
     let header = Header {
         direction: Direction::ToServer,
-        packet: Packet::Failure,
+        tag: ControlPacket::Failure as u8,
         length: 0,
         flag: Flag::Last,
     };
