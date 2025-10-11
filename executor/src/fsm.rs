@@ -9,6 +9,9 @@ pub enum Action {
     Explain,
     Optimize,
     Translate,
+    OpenDataFlow,
+    StartDataFlow,
+    EndDataFlow,
 }
 
 #[derive(Debug, PartialEq)]
@@ -40,5 +43,8 @@ state_machine! {
     PhysicalPlan => {
         Failure => Initialized[Flush],
         Explain => Initialized[Explain],
+        BeginScan => PhysicalPlan[OpenDataFlow],
+        ExecScan => PhysicalPlan[StartDataFlow],
+        EndScan => PhysicalPlan[EndDataFlow],
     }
 }

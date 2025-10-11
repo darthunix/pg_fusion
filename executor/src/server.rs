@@ -201,6 +201,18 @@ impl<'bytes> Connection<'bytes> {
                     trace!("process_message: Action::Translate");
                     translate(plan).await
                 }
+                Some(Action::OpenDataFlow) => {
+                    trace!("process_message: Action::OpenDataFlow");
+                    open_data_flow(storage)
+                }
+                Some(Action::StartDataFlow) => {
+                    trace!("process_message: Action::StartDataFlow");
+                    start_data_flow(storage)
+                }
+                Some(Action::EndDataFlow) => {
+                    trace!("process_message: Action::EndDataFlow");
+                    end_data_flow(storage)
+                }
                 None => {
                     bail!(FusionError::NotFound(
                         "find an action".into(),
@@ -340,6 +352,33 @@ fn parse(query: SmolStr) -> Result<TaskResult> {
     let state = SessionStateBuilder::new().build();
     let tables = state.resolve_table_references(&stmt)?;
     Ok(TaskResult::Parsing((stmt, tables)))
+}
+
+fn open_data_flow(storage: &mut Storage) -> Result<TaskResult> {
+    if storage.physical_plan.is_none() {
+        bail!(FusionError::NotFound(
+            "Physical plan".into(),
+            "open data flow requires a physical plan".into(),
+        ));
+    }
+    // TODO: create data sockets/queues and prime ScanRegistry channels if needed
+    Ok(TaskResult::Noop)
+}
+
+fn start_data_flow(storage: &mut Storage) -> Result<TaskResult> {
+    if storage.physical_plan.is_none() {
+        bail!(FusionError::NotFound(
+            "Physical plan".into(),
+            "start data flow requires a physical plan".into(),
+        ));
+    }
+    // TODO: spawn DataFusion execution and start consuming data
+    Ok(TaskResult::Noop)
+}
+
+fn end_data_flow(_storage: &mut Storage) -> Result<TaskResult> {
+    // TODO: cancel/await execution and close data channels
+    Ok(TaskResult::Noop)
 }
 
 enum TaskResult {

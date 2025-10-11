@@ -13,6 +13,7 @@ pub mod failure;
 pub mod heap;
 pub mod metadata;
 pub mod parse;
+pub mod exec;
 
 pub const DATA_SIZE: usize = 8 * 1024;
 
@@ -62,6 +63,9 @@ pub enum ControlPacket {
     Columns = 6,
     Optimize = 7,
     Translate = 8,
+    BeginScan = 10,
+    ExecScan = 11,
+    EndScan = 12,
 }
 
 impl TryFrom<u8> for ControlPacket {
@@ -79,6 +83,9 @@ impl TryFrom<u8> for ControlPacket {
             6 => Ok(ControlPacket::Columns),
             7 => Ok(ControlPacket::Optimize),
             8 => Ok(ControlPacket::Translate),
+            10 => Ok(ControlPacket::BeginScan),
+            11 => Ok(ControlPacket::ExecScan),
+            12 => Ok(ControlPacket::EndScan),
             _ => Err(FusionError::Deserialize(
                 "control_packet".into(),
                 value.into(),

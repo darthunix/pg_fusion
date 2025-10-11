@@ -223,9 +223,20 @@ impl PgScanStream {
 impl Stream for PgScanStream {
     type Item = DFResult<RecordBatch>;
 
-    fn poll_next(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
-        // Skeleton: no decoding yet; end the stream immediately
-        Poll::Ready(None)
+    fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        let this = self.get_mut();
+        let Some(rx) = this.rx.as_mut() else {
+            return Poll::Ready(None);
+        };
+        match rx.poll_recv(cx) {
+            Poll::Ready(Some(_block)) => {
+                // TODO: decode HeapBlock into RecordBatch using storage::heap
+                let batch = RecordBatch::new_empty(Arc::clone(&this.schema));
+                Poll::Ready(Some(Ok(batch)))
+            }
+            Poll::Ready(None) => Poll::Ready(None),
+            Poll::Pending => Poll::Pending,
+        }
     }
 }
 
