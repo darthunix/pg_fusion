@@ -15,6 +15,7 @@ use protocol::columns::consume_columns;
 use protocol::consume_header;
 use protocol::data_type::EncodedType;
 use protocol::explain::request_explain;
+use protocol::exec::{request_begin_scan, request_end_scan, request_exec_scan};
 use protocol::failure::{read_error, request_failure};
 use protocol::metadata::process_metadata_with_response;
 use protocol::parse::prepare_query;
@@ -301,6 +302,12 @@ unsafe extern "C-unwind" fn create_df_scan_state(cscan: *mut pg_sys::CustomScan)
                     header.tag
                 )
             }
+            Ok(ControlPacket::BeginScan)
+            | Ok(ControlPacket::ExecScan)
+            | Ok(ControlPacket::EndScan) => {
+                // Ignore execution-time control messages during planning
+                continue;
+            }
             Err(_) => continue,
         }
     }
@@ -326,7 +333,23 @@ unsafe extern "C-unwind" fn begin_df_scan(
     _estate: *mut pg_sys::EState,
     _eflags: i32,
 ) {
-    // No-op for now. We only rely on the planning/explain paths currently.
+    // Notify executor to prepare data channel (Data socket) for upcoming scan
+    let id = match connection_id() {
+        Ok(v) => v,
+        Err(e) => error!("Failed to acquire connection id: {}", e),
+    };
+    let mut shared = match connection_shared(id) {
+        Ok(s) => s,
+        Err(e) => error!("Failed to map shared connection: {}", e),
+    };
+    if let Err(err) = request_begin_scan(&mut shared.recv) {
+        let _ = request_failure(&mut shared.recv);
+        let _ = shared.signal_server();
+        error!("Failed to request begin scan: {}", err);
+    }
+    if let Err(err) = shared.signal_server() {
+        error!("Failed to signal server: {}", err);
+    }
 }
 
 #[pg_guard]
@@ -334,15 +357,47 @@ unsafe extern "C-unwind" fn begin_df_scan(
 unsafe extern "C-unwind" fn exec_df_scan(
     _node: *mut CustomScanState,
 ) -> *mut pg_sys::TupleTableSlot {
-    // Execution is not implemented yet. Returning null ensures executor won't use it
-    // in contexts where execution is not expected (e.g., EXPLAIN).
+    // Notify executor that backend is switching to data flow (begin producing/consuming data)
+    let id = match connection_id() {
+        Ok(v) => v,
+        Err(e) => error!("Failed to acquire connection id: {}", e),
+    };
+    let mut shared = match connection_shared(id) {
+        Ok(s) => s,
+        Err(e) => error!("Failed to map shared connection: {}", e),
+    };
+    if let Err(err) = request_exec_scan(&mut shared.recv) {
+        let _ = request_failure(&mut shared.recv);
+        let _ = shared.signal_server();
+        error!("Failed to request exec scan: {}", err);
+    }
+    if let Err(err) = shared.signal_server() {
+        error!("Failed to signal server: {}", err);
+    }
+    // Execution not implemented yet; return NULL slot to indicate no tuples
     std::ptr::null_mut()
 }
 
 #[pg_guard]
 #[no_mangle]
 unsafe extern "C-unwind" fn end_df_scan(_node: *mut CustomScanState) {
-    // No-op for now.
+    // Notify executor to close data/control flow associated with the scan
+    let id = match connection_id() {
+        Ok(v) => v,
+        Err(e) => error!("Failed to acquire connection id: {}", e),
+    };
+    let mut shared = match connection_shared(id) {
+        Ok(s) => s,
+        Err(e) => error!("Failed to map shared connection: {}", e),
+    };
+    if let Err(err) = request_end_scan(&mut shared.recv) {
+        let _ = request_failure(&mut shared.recv);
+        let _ = shared.signal_server();
+        error!("Failed to request end scan: {}", err);
+    }
+    if let Err(err) = shared.signal_server() {
+        error!("Failed to signal server: {}", err);
+    }
 }
 
 #[pg_guard]
