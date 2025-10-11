@@ -49,10 +49,10 @@ impl TryFrom<u8> for Direction {
     }
 }
 
+// Control packets correspond to planning/metadata/coordination messages.
 #[repr(u8)]
-#[derive(Clone, Debug, Default, PartialEq)]
-pub enum Packet {
-    #[default]
+#[derive(Clone, Debug, PartialEq)]
+pub enum ControlPacket {
     None = 0,
     Bind = 1,
     Failure = 2,
@@ -62,28 +62,54 @@ pub enum Packet {
     Columns = 6,
     Optimize = 7,
     Translate = 8,
-    Heap = 9,
 }
 
-impl TryFrom<u8> for Packet {
+impl TryFrom<u8> for ControlPacket {
     type Error = FusionError;
 
     fn try_from(value: u8) -> Result<Self, Self::Error> {
         assert!(value < 128);
         match value {
-            0 => Ok(Packet::None),
-            1 => Ok(Packet::Bind),
-            2 => Ok(Packet::Failure),
-            3 => Ok(Packet::Metadata),
-            4 => Ok(Packet::Parse),
-            5 => Ok(Packet::Explain),
-            6 => Ok(Packet::Columns),
-            7 => Ok(Packet::Optimize),
-            8 => Ok(Packet::Translate),
-            9 => Ok(Packet::Heap),
-            _ => Err(FusionError::Deserialize("packet".into(), value.into())),
+            0 => Ok(ControlPacket::None),
+            1 => Ok(ControlPacket::Bind),
+            2 => Ok(ControlPacket::Failure),
+            3 => Ok(ControlPacket::Metadata),
+            4 => Ok(ControlPacket::Parse),
+            5 => Ok(ControlPacket::Explain),
+            6 => Ok(ControlPacket::Columns),
+            7 => Ok(ControlPacket::Optimize),
+            8 => Ok(ControlPacket::Translate),
+            _ => Err(FusionError::Deserialize(
+                "control_packet".into(),
+                value.into(),
+            )),
         }
     }
+}
+
+// Data packets correspond to execution-time data transfer.
+#[repr(u8)]
+#[derive(Clone, Debug, PartialEq)]
+pub enum DataPacket {
+    Heap = 9,
+}
+
+impl TryFrom<u8> for DataPacket {
+    type Error = FusionError;
+
+    fn try_from(value: u8) -> Result<Self, Self::Error> {
+        assert!(value < 128);
+        match value {
+            9 => Ok(DataPacket::Heap),
+            _ => Err(FusionError::Deserialize("data_packet".into(), value.into())),
+        }
+    }
+}
+
+/// Helper to check whether a tag is a data packet value.
+#[inline]
+pub fn is_data_tag(tag: u8) -> bool {
+    matches!(tag, x if x == DataPacket::Heap as u8)
 }
 
 #[repr(u8)]
@@ -110,7 +136,7 @@ impl TryFrom<u8> for Flag {
 #[derive(Default, Debug, PartialEq)]
 pub struct Header {
     pub direction: Direction,
-    pub packet: Packet,
+    pub tag: u8,
     pub flag: Flag,
     pub length: u16,
 }
@@ -128,12 +154,12 @@ impl Header {
 
 pub fn consume_header(stream: &mut impl Read) -> Result<Header> {
     let direction = Direction::try_from(read_pfix(stream)?)?;
-    let packet = Packet::try_from(read_pfix(stream)?)?;
+    let tag = read_pfix(stream)?;
     let flag = Flag::try_from(read_pfix(stream)?)?;
     let length = read_u16(stream)?;
     Ok(Header {
         direction,
-        packet,
+        tag,
         flag,
         length,
     })
@@ -141,7 +167,7 @@ pub fn consume_header(stream: &mut impl Read) -> Result<Header> {
 
 pub fn write_header(stream: &mut impl Write, header: &Header) -> Result<()> {
     write_pfix(stream, header.direction.to_owned() as u8)?;
-    write_pfix(stream, header.packet.to_owned() as u8)?;
+    write_pfix(stream, header.tag)?;
     write_pfix(stream, header.flag.to_owned() as u8)?;
     write_u16(stream, header.length.to_owned())?;
     Ok(())

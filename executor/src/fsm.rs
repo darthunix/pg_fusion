@@ -9,7 +9,6 @@ pub enum Action {
     Explain,
     Optimize,
     Translate,
-    ReadHeap,
 }
 
 #[derive(Debug, PartialEq)]
@@ -21,7 +20,7 @@ pub enum ExecutorState {
 }
 
 state_machine! {
-    #[state_machine(input(protocol::Packet), state(crate::fsm::ExecutorState), output(crate::fsm::Action))]
+    #[state_machine(input(protocol::ControlPacket), state(crate::fsm::ExecutorState), output(crate::fsm::Action))]
     pub executor(Initialized)
 
     Initialized => {
@@ -41,6 +40,5 @@ state_machine! {
     PhysicalPlan => {
         Failure => Initialized[Flush],
         Explain => Initialized[Explain],
-        Heap => PhysicalPlan[ReadHeap],
     }
 }

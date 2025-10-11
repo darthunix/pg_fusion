@@ -1,5 +1,5 @@
 // moved from block.rs; heap-page oriented messages
-use crate::{write_header, Direction, Flag, Header, Packet, Tape};
+use crate::{write_header, DataPacket, Direction, Flag, Header, Tape};
 use anyhow::Result;
 use rmp::decode::{read_u16, read_u32};
 use rmp::encode::{write_u16, write_u32};
@@ -14,7 +14,7 @@ use std::io::{Read, Write};
 pub fn request_heap_block(stream: &mut impl Write, table_oid: u32, slot_id: u16) -> Result<()> {
     let header = Header {
         direction: Direction::ToClient,
-        packet: Packet::Heap,
+        tag: DataPacket::Heap as u8,
         flag: Flag::Last,
         length: (size_of::<u32>() + size_of::<u16>()) as u16,
     };
@@ -105,7 +105,7 @@ where
     let length = u16::try_from(len_final - len_init)?;
     let header = Header {
         direction: Direction::ToServer,
-        packet: Packet::Heap,
+        tag: DataPacket::Heap as u8,
         flag: Flag::Last,
         length,
     };
@@ -233,7 +233,7 @@ pub fn heap_bitmap_positions<'a, R: Read + ?Sized>(
 pub fn prepare_heap_block_eof(stream: &mut impl Write, slot_id: u16) -> Result<()> {
     let header = Header {
         direction: Direction::ToServer,
-        packet: Packet::Heap,
+        tag: DataPacket::Heap as u8,
         flag: Flag::Last,
         length: size_of::<u16>() as u16,
     };

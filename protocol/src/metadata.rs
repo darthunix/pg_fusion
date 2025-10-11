@@ -1,4 +1,4 @@
-use crate::{write_c_str, write_header, Direction, Flag, Header, Packet, Tape};
+use crate::{write_c_str, write_header, ControlPacket, Direction, Flag, Header, Tape};
 use anyhow::{bail, Result};
 use common::FusionError;
 use datafusion_sql::TableReference;
@@ -37,7 +37,7 @@ pub fn prepare_table_refs(stream: &mut impl Tape, tables: &[TableReference]) -> 
     let length = u16::try_from(len_final - len_init)?;
     let header = Header {
         direction: Direction::ToClient,
-        packet: Packet::Metadata,
+        tag: ControlPacket::Metadata as u8,
         length,
         flag: Flag::Last,
     };
@@ -54,7 +54,7 @@ pub fn prepare_table_refs(stream: &mut impl Tape, tables: &[TableReference]) -> 
 pub fn prepare_empty_metadata(stream: &mut impl Write) -> Result<()> {
     let header = Header {
         direction: Direction::ToServer,
-        packet: Packet::Metadata,
+        tag: ControlPacket::Metadata as u8,
         length: size_of::<u8>() as u16,
         flag: Flag::Last,
     };
@@ -121,7 +121,7 @@ where
     let length = u16::try_from(len_final - len_init)?;
     let header = Header {
         direction: Direction::ToServer,
-        packet: Packet::Metadata,
+        tag: ControlPacket::Metadata as u8,
         length,
         flag: Flag::Last,
     };

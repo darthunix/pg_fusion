@@ -19,7 +19,7 @@ use protocol::failure::prepare_error;
 use protocol::metadata::prepare_table_refs;
 use protocol::parse::read_query;
 use protocol::Tape;
-use protocol::{consume_header, Direction, Packet};
+use protocol::{consume_header, ControlPacket, Direction};
 use smol_str::{format_smolstr, SmolStr};
 use std::sync::atomic::{AtomicI32, Ordering};
 use std::sync::Arc;
@@ -113,7 +113,7 @@ impl<'bytes> Connection<'bytes> {
         let header = consume_header(&mut self.recv_socket.buffer)?;
         debug!(
             direction = ?header.direction,
-            packet = ?header.packet,
+            tag = header.tag,
             flag = ?header.flag,
             length = header.length,
             recv_unread = self.recv_socket.buffer.len(),
@@ -124,7 +124,7 @@ impl<'bytes> Connection<'bytes> {
             trace!("process_message: header direction ToClient, ignoring");
             return Ok(());
         }
-        let mut packet = header.packet.clone();
+        let mut packet = ControlPacket::try_from(header.tag)?;
         let mut skip_metadata = false;
         loop {
             let action = storage.state.consume(&packet)?;
@@ -201,10 +201,6 @@ impl<'bytes> Connection<'bytes> {
                     trace!("process_message: Action::Translate");
                     translate(plan).await
                 }
-                Some(Action::ReadHeap) => {
-                    trace!("process_message: Action::ReadHeap (heap packet received, placeholder)");
-                    Ok(TaskResult::Noop)
-                }
                 None => {
                     bail!(FusionError::NotFound(
                         "find an action".into(),
@@ -221,7 +217,7 @@ impl<'bytes> Connection<'bytes> {
                     );
                     storage.logical_plan = Some(plan);
                     // Immediately schedule an Optimize pass for the next loop iteration.
-                    packet = Packet::Optimize;
+                    packet = ControlPacket::Optimize;
                     trace!("process_message: scheduling Optimize after Bind");
                     continue;
                 }
@@ -232,7 +228,7 @@ impl<'bytes> Connection<'bytes> {
                 }
                 TaskResult::Optimized(plan) => {
                     storage.logical_plan = Some(plan);
-                    packet = Packet::Translate;
+                    packet = ControlPacket::Translate;
                     trace!("process_message: scheduling Translate after Optimize");
                     continue;
                 }
@@ -256,8 +252,8 @@ impl<'bytes> Connection<'bytes> {
                         // We don't need any table metadata for this query.
                         // Let's move connection to the next state.
                         skip_metadata = true;
-                        packet = Packet::Metadata;
-                        trace!("process_message: no tables, skipping metadata, forcing Packet::Metadata");
+                        packet = ControlPacket::Metadata;
+                        trace!("process_message: no tables, skipping metadata, forcing ControlPacket::Metadata");
                         continue;
                     } else {
                         trace!(
@@ -368,6 +364,7 @@ mod tests {
     use protocol::explain::request_explain;
     use protocol::metadata::process_metadata_with_response;
     use protocol::parse::prepare_query;
+    use protocol::ControlPacket;
     use rmp::decode::read_bin_len;
     use std::cell::UnsafeCell;
     use std::ffi::CStr;
@@ -550,7 +547,7 @@ mod tests {
             let header =
                 consume_header(&mut conn.send_buffer).expect("Failed to consume metadata header");
             assert_eq!(header.direction, Direction::ToClient);
-            assert_eq!(header.packet, Packet::Metadata);
+            assert_eq!(header.tag, ControlPacket::Metadata as u8);
             process_metadata_with_response(
                 &mut conn.send_buffer,
                 &mut conn.recv_socket.buffer,
@@ -570,7 +567,7 @@ mod tests {
             let header =
                 consume_header(&mut conn.send_buffer).expect("Failed to consume bind header");
             assert_eq!(header.direction, Direction::ToClient);
-            assert_eq!(header.packet, Packet::Bind);
+            assert_eq!(header.tag, ControlPacket::Bind as u8);
             prepare_params(&mut conn.recv_socket.buffer, || {
                 (1, vec![Ok(ScalarValue::Int32(Some(1)))].into_iter())
             })
@@ -587,7 +584,7 @@ mod tests {
             let header =
                 consume_header(&mut conn.send_buffer).expect("Failed to consume bind header");
             assert_eq!(header.direction, Direction::ToClient);
-            assert_eq!(header.packet, Packet::Columns);
+            assert_eq!(header.tag, ControlPacket::Columns as u8);
             type Payload = (i16, u8, Vec<u8>);
             let mut columns: Vec<Payload> = Vec::new();
             let columns_ptr = &mut columns as *mut Vec<Payload> as *mut c_void;
@@ -610,7 +607,7 @@ mod tests {
             let header =
                 consume_header(&mut conn.send_buffer).expect("Failed to consume explain header");
             assert_eq!(header.direction, Direction::ToClient);
-            assert_eq!(header.packet, Packet::Explain);
+            assert_eq!(header.tag, ControlPacket::Explain as u8);
             let len =
                 read_bin_len(&mut conn.send_buffer).expect("Failed to get explain length") as usize;
             let mut buffer = vec![0u8; len];

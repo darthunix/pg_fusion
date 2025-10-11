@@ -1,6 +1,6 @@
 use crate::data_type::EncodedType;
 use crate::metadata::NAMEDATALEN;
-use crate::{write_header, Direction, Flag, Header, Packet, Tape};
+use crate::{write_header, ControlPacket, Direction, Flag, Header, Tape};
 use anyhow::Result;
 use datafusion::arrow::datatypes::Fields;
 use rmp::decode::{read_array_len, read_bin_len, read_u8};
@@ -25,7 +25,7 @@ pub fn prepare_columns(stream: &mut impl Tape, columns: &Fields) -> Result<()> {
     let length = u16::try_from(len_final - len_init)?;
     let header = Header {
         direction: Direction::ToClient,
-        packet: Packet::Columns,
+        tag: ControlPacket::Columns as u8,
         length,
         flag: Flag::Last,
     };
