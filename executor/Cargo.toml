@@ -27,6 +27,8 @@ protocol = { path = "../protocol", version = "25.0" }
 common = { path = "../common", version = "25.0" }
 async-trait = "0.1"
 datafusion-catalog = "44.0"
+datafusion-physical-expr = "44.0.0"
+datafusion-execution = "44.0.0"
 
 [dev-dependencies]
 bitflags = "2"
