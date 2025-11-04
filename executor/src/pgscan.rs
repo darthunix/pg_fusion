@@ -112,7 +112,7 @@ impl TableProvider for PgTableProvider {
         &self,
         _filters: &[&Expr],
     ) -> DFResult<Vec<TableProviderFilterPushDown>> {
-        Ok(vec![])
+        Ok(vec![TableProviderFilterPushDown::Unsupported])
     }
 
     async fn scan(
