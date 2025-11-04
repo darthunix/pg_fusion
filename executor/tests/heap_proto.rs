@@ -14,9 +14,10 @@ fn test_request_and_read_block_request_lockfree() {
     assert!(!base.is_null());
     let mut buf = unsafe { LockFreeBuffer::from_layout(base, layout) };
 
+    let scan_id = 1001u64;
     let table_oid = 42u32;
     let slot_id = 7u16;
-    request_heap_block(&mut buf, table_oid, slot_id).expect("request_heap_block");
+    request_heap_block(&mut buf, scan_id, table_oid, slot_id).expect("request_heap_block");
 
     let header = consume_header(&mut buf).expect("header");
     assert_eq!(header.direction, Direction::ToClient);
@@ -24,10 +25,11 @@ fn test_request_and_read_block_request_lockfree() {
     assert_eq!(header.flag, Flag::Last);
     assert_eq!(
         header.length as usize,
-        core::mem::size_of::<u32>() + core::mem::size_of::<u16>()
+        core::mem::size_of::<u64>() + core::mem::size_of::<u32>() + core::mem::size_of::<u16>()
     );
 
-    let (t, s) = read_heap_block_request(&mut buf).expect("read request");
+    let (sid, t, s) = read_heap_block_request(&mut buf).expect("read request");
+    assert_eq!(sid, scan_id);
     assert_eq!(t, table_oid);
     assert_eq!(s, slot_id);
 
@@ -41,6 +43,7 @@ fn test_prepare_and_read_block_bitmap_lockfree() {
     assert!(!base.is_null());
     let mut buf = unsafe { LockFreeBuffer::from_layout(base, layout) };
 
+    let scan_id = 55u64;
     let slot_id = 3u16;
     let table_oid = 777u32;
     let blkno = 1234u32;
@@ -59,7 +62,7 @@ fn test_prepare_and_read_block_bitmap_lockfree() {
         let bit = 1u8 << (idx as u8 % 8);
         (b & bit) != 0
     });
-    prepare_heap_block_bitmap(&mut buf, slot_id, table_oid, blkno, num_offsets, positions)
+    prepare_heap_block_bitmap(&mut buf, scan_id, slot_id, table_oid, blkno, num_offsets, positions)
         .expect("prepare_heap_block_bitmap");
 
     let header = consume_header(&mut buf).expect("header");
@@ -69,6 +72,7 @@ fn test_prepare_and_read_block_bitmap_lockfree() {
 
     let meta = read_heap_block_bitmap_meta(&mut buf, header.length).expect("bitmap meta");
     assert_eq!(meta.slot_id, slot_id);
+    assert_eq!(meta.scan_id, scan_id);
     assert_eq!(meta.table_oid, table_oid);
     assert_eq!(meta.blkno, blkno);
     assert_eq!(meta.num_offsets, num_offsets);
@@ -91,14 +95,16 @@ fn test_prepare_block_eof_lockfree() {
     assert!(!base.is_null());
     let mut buf = unsafe { LockFreeBuffer::from_layout(base, layout) };
 
+    let scan_id = 999u64;
     let slot_id = 1u16;
-    prepare_heap_block_eof(&mut buf, slot_id).expect("eof");
+    prepare_heap_block_eof(&mut buf, scan_id, slot_id).expect("eof");
 
     let header = consume_header(&mut buf).expect("header");
     assert_eq!(header.direction, Direction::ToServer);
     assert_eq!(header.tag, DataPacket::Heap as u8);
-    assert_eq!(header.length, core::mem::size_of::<u16>() as u16);
-    let echoed = read_heap_block_eof(&mut buf).expect("read eof");
+    assert_eq!(header.length, (core::mem::size_of::<u64>() + core::mem::size_of::<u16>()) as u16);
+    let (sid, echoed) = read_heap_block_eof(&mut buf).expect("read eof");
+    assert_eq!(sid, scan_id);
     assert_eq!(echoed, slot_id);
 
     unsafe { std::alloc::dealloc(base, layout.layout) };

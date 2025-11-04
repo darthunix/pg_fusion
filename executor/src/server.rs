@@ -3,6 +3,8 @@ use crate::fsm::executor::StateMachine;
 use crate::fsm::Action;
 use crate::ipc::Socket;
 use crate::sql::Catalog;
+use crate::pgscan::{count_scans, for_each_scan, ScanRegistry};
+use anyhow::Error;
 use anyhow::{bail, Result};
 use common::FusionError;
 use datafusion::execution::SessionStateBuilder;
@@ -31,11 +33,15 @@ pub struct Storage {
     statement: Option<Statement>,
     logical_plan: Option<LogicalPlan>,
     physical_plan: Option<Arc<dyn ExecutionPlan>>,
+    registry: Arc<ScanRegistry>,
 }
 
 impl Storage {
     pub fn flush(&mut self) {
+        // Preserve the registry across flushes
+        let registry = Arc::clone(&self.registry);
         *self = Self::default();
+        self.registry = registry;
     }
 }
 
@@ -149,9 +155,9 @@ impl<'bytes> Connection<'bytes> {
                         ));
                     };
                     let catalog = if skip_metadata {
-                        Catalog::default()
+                        Catalog::with_registry(Arc::clone(&storage.registry))
                     } else {
-                        Catalog::from_stream(&mut self.recv_socket.buffer)?
+                        Catalog::from_stream(&mut self.recv_socket.buffer, Arc::clone(&storage.registry))?
                     };
                     trace!(
                         skip_metadata,
@@ -203,7 +209,7 @@ impl<'bytes> Connection<'bytes> {
                 }
                 Some(Action::OpenDataFlow) => {
                     trace!("process_message: Action::OpenDataFlow");
-                    open_data_flow(storage)
+                    open_data_flow(self, storage)
                 }
                 Some(Action::StartDataFlow) => {
                     trace!("process_message: Action::StartDataFlow");
@@ -354,14 +360,25 @@ fn parse(query: SmolStr) -> Result<TaskResult> {
     Ok(TaskResult::Parsing((stmt, tables)))
 }
 
-fn open_data_flow(storage: &mut Storage) -> Result<TaskResult> {
+fn open_data_flow(_conn: &mut Connection, storage: &mut Storage) -> Result<TaskResult> {
     if storage.physical_plan.is_none() {
         bail!(FusionError::NotFound(
             "Physical plan".into(),
             "open data flow requires a physical plan".into(),
         ));
     }
-    // TODO: create data sockets/queues and prime ScanRegistry channels if needed
+    let phys = storage
+        .physical_plan
+        .as_ref()
+        .expect("checked above");
+    // Reserve capacity to avoid HashMap reallocation while registering
+    let scan_count = count_scans(phys) as usize;
+    storage.registry.reserve(scan_count);
+    // Register channels per scan in the connection-local registry; no response payload
+    let _ = for_each_scan::<_, Error>(phys, |id, _table_oid| {
+        let _ = storage.registry.register(id, 16);
+        Ok(())
+    });
     Ok(TaskResult::Noop)
 }
 
@@ -510,7 +527,8 @@ mod tests {
         static SERVER_PID: AtomicI32 = AtomicI32::new(0);
         static CLIENT_PID: AtomicI32 = AtomicI32::new(0);
         let mut conn = Connection::new(socket, send_buffer, &SERVER_PID, &CLIENT_PID);
-        let storage = Storage::default();
+        let mut storage = Storage::default();
+        storage.registry = Arc::new(ScanRegistry::new());
         tokio::spawn(async move {
             let mut storage = storage;
             // Test parsing a query with tables.
@@ -537,7 +555,7 @@ mod tests {
             let Ok(TaskResult::Parsing((stmt, _))) = parse(sql.into()) else {
                 unreachable!();
             };
-            let Ok(TaskResult::Compilation(plan)) = compile(stmt, &Catalog::default()) else {
+            let Ok(TaskResult::Compilation(plan)) = compile(stmt, &Catalog::with_registry(Arc::new(ScanRegistry::new()))) else {
                 unreachable!();
             };
             assert_eq!(storage.logical_plan, Some(plan));
@@ -664,6 +682,84 @@ mod tests {
             assert!(explain.contains("Exec"));
         })
         .await?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_begin_scan_registers_scans_on_begin() -> Result<()> {
+        use crate::layout::{connection_layout, connection_ptrs};
+        use protocol::exec::request_begin_scan;
+
+        static BYTES: ConnMemory = ConnMemory::new();
+        let state = Arc::new(SharedState::new(unsafe { &*BYTES.flags.get() }));
+
+        let layout = connection_layout(PAYLOAD_SIZE, PAYLOAD_SIZE).expect("layout");
+        let base = unsafe { (*BYTES.conn.get()).as_mut_ptr() };
+        let (recv_base, send_base, _pid_ptr) = unsafe { connection_ptrs(base, layout) };
+
+        let socket = unsafe {
+            Socket::from_layout_with_state(
+                0,
+                Arc::clone(&state),
+                recv_base,
+                layout.recv_socket_layout,
+            )
+        };
+        let send_buffer =
+            unsafe { LockFreeBuffer::from_layout(send_base, layout.send_buffer_layout) };
+        static SERVER_PID: AtomicI32 = AtomicI32::new(0);
+        static CLIENT_PID: AtomicI32 = AtomicI32::new(0);
+        let mut conn = Connection::new(socket, send_buffer, &SERVER_PID, &CLIENT_PID);
+        let storage = Storage::default();
+        tokio::spawn(async move {
+            let mut storage = storage;
+            // Drive to PhysicalPlan state for a query that touches one table
+            assert_eq!(storage.state.state(), &ExecutorState::Initialized);
+            let sql = "select a from public.t1 where b = $1";
+            prepare_query(&mut conn.recv_socket.buffer, sql).expect("prepare SQL");
+            conn.process_message(&mut storage).await.expect("process parse");
+            // Metadata request -> supply it
+            let header = consume_header(&mut conn.send_buffer).expect("consume metadata hdr");
+            assert_eq!(header.direction, Direction::ToClient);
+            assert_eq!(header.tag, ControlPacket::Metadata as u8);
+            process_metadata_with_response(
+                &mut conn.send_buffer,
+                &mut conn.recv_socket.buffer,
+                mock_schema_table_lookup,
+                mock_table_lookup,
+                mock_table_serialize,
+            )
+            .expect("process metadata");
+            // Compile -> Bind request
+            conn.process_message(&mut storage).await.expect("process metadata msg");
+            let header = consume_header(&mut conn.send_buffer).expect("consume bind hdr");
+            assert_eq!(header.direction, Direction::ToClient);
+            assert_eq!(header.tag, ControlPacket::Bind as u8);
+            // Provide params then proceed to PhysicalPlan
+            prepare_params(&mut conn.recv_socket.buffer, || {
+                (1, vec![Ok(ScalarValue::Int32(Some(1)))].into_iter())
+            })
+            .expect("prepare params");
+            conn.process_message(&mut storage)
+                .await
+                .expect("bind/opt/translate");
+            assert_eq!(storage.state.state(), &ExecutorState::PhysicalPlan);
+
+            // Now send BeginScan; executor should register channels without sending payload
+            request_begin_scan(&mut conn.recv_socket.buffer).expect("write BeginScan");
+            let before = conn.send_buffer.len();
+            conn.process_message(&mut storage)
+                .await
+                .expect("process begin-scan");
+            // No additional response expected
+            assert_eq!(conn.send_buffer.len(), before);
+
+            // Verify a receiver was registered for this scan id
+            let rx = storage.registry.take_receiver(42u64);
+            assert!(rx.is_some());
+        })
+        .await?;
+
         Ok(())
     }
 }

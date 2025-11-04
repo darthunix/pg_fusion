@@ -83,27 +83,19 @@ impl Builtin {
 pub struct Catalog {
     builtin: Arc<Builtin>,
     tables: AHashMap<TableReference, Arc<dyn TableSource>>,
-    pub registry: Arc<ScanRegistry>,
-}
-
-impl Default for Catalog {
-    fn default() -> Self {
-        Self {
-            builtin: Arc::clone(&*BUILDIN),
-            tables: AHashMap::new(),
-            registry: Arc::new(ScanRegistry::new()),
-        }
-    }
+    registry: Arc<ScanRegistry>,
 }
 
 impl Catalog {
-    pub fn from_stream(stream: &mut impl Read) -> Result<Self> {
-        let registry = Arc::new(ScanRegistry::new());
-        Ok(Self {
-            builtin: Arc::clone(&*BUILDIN),
-            tables: consume_metadata_exec(stream, Arc::clone(&registry))?,
-            registry,
-        })
+    pub fn with_registry(registry: Arc<ScanRegistry>) -> Self {
+        Self { builtin: Arc::clone(&*BUILDIN), tables: AHashMap::new(), registry }
+    }
+
+    pub fn from_stream(stream: &mut impl Read, registry: Arc<ScanRegistry>) -> Result<Self> {
+        // Temporarily create a placeholder to pass registry into provider construction
+        let mut catalog = Self { builtin: Arc::clone(&*BUILDIN), tables: AHashMap::new(), registry };
+        catalog.tables = catalog.consume_metadata_exec(stream)?;
+        Ok(catalog)
     }
 }
 
@@ -161,9 +153,10 @@ impl ContextProvider for Catalog {
     }
 }
 
+impl Catalog {
 fn consume_metadata_exec(
+    &self,
     stream: &mut impl Read,
-    registry: Arc<ScanRegistry>,
 ) -> Result<AHashMap<TableReference, Arc<dyn TableSource>>> {
     let table_num = read_array_len(stream)?;
     let mut tables = AHashMap::with_capacity(table_num as usize);
@@ -212,9 +205,11 @@ fn consume_metadata_exec(
         let schema = Arc::new(datafusion::arrow::datatypes::Schema::new(fields));
         // Register PgTableProvider backed by ScanRegistry; use OID as scan_id for now.
         let scan_id = oid as u64;
-        let provider = Arc::new(PgTableProvider::new(scan_id, Arc::clone(&schema), Arc::clone(&registry)));
+        // Provider uses connection-local registry; injected later via Catalog
+        let provider = Arc::new(PgTableProvider::new(scan_id, Arc::clone(&schema), Arc::clone(&self.registry)));
         let source = Arc::new(DefaultTableSource::new(provider));
         tables.insert(table_ref, source as Arc<dyn TableSource>);
     }
     Ok(tables)
+}
 }
