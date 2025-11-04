@@ -1,7 +1,7 @@
 use std::any::Any;
 use std::collections::HashMap;
 use std::pin::Pin;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, MutexGuard};
 use std::task::{Context, Poll};
 
 use async_trait::async_trait;
@@ -53,9 +53,21 @@ impl ScanRegistry {
         Self::default()
     }
 
+    #[inline]
+    fn lock(&self) -> MutexGuard<HashMap<ScanId, Entry>> {
+        // Avoid panics on poisoned mutex by recovering the inner state
+        self.inner.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// Reserve space for at least `additional` more scan entries.
+    pub fn reserve(&self, additional: usize) {
+        let mut map = self.lock();
+        map.reserve(additional);
+    }
+
     pub fn register(&self, scan_id: ScanId, capacity: usize) -> mpsc::Sender<HeapBlock> {
         let (tx, rx) = mpsc::channel(capacity);
-        let mut map = self.inner.lock().unwrap();
+        let mut map = self.lock();
         map.insert(
             scan_id,
             Entry {
@@ -67,15 +79,17 @@ impl ScanRegistry {
     }
 
     pub fn sender(&self, scan_id: ScanId) -> Option<mpsc::Sender<HeapBlock>> {
-        let map = self.inner.lock().unwrap();
+        let map = self.lock();
         map.get(&scan_id).map(|e| e.sender.clone())
     }
 
     pub fn take_receiver(&self, scan_id: ScanId) -> Option<mpsc::Receiver<HeapBlock>> {
-        let mut map = self.inner.lock().unwrap();
+        let mut map = self.lock();
         map.get_mut(&scan_id).and_then(|e| e.receiver.take())
     }
 }
+
+// No global registry; registries are per-connection and owned by the server Storage.
 
 #[derive(Debug)]
 pub struct PgTableProvider {
@@ -244,4 +258,39 @@ impl RecordBatchStream for PgScanStream {
     fn schema(&self) -> SchemaRef {
         Arc::clone(&self.schema)
     }
+}
+
+pub fn count_scans(plan: &Arc<dyn ExecutionPlan>) -> usize {
+    fn visit(node: &Arc<dyn ExecutionPlan>) -> usize {
+        let mut n = 0usize;
+        if node.as_any().downcast_ref::<PgScanExec>().is_some() {
+            n += 1;
+        }
+        for child in node.children() {
+            n += visit(child);
+        }
+        n
+    }
+    visit(plan)
+}
+
+pub fn for_each_scan<F, E>(plan: &Arc<dyn ExecutionPlan>, mut f: F) -> Result<(), E>
+where
+    F: FnMut(ScanId, u32) -> Result<(), E>,
+{
+    fn visit<F, E>(node: &Arc<dyn ExecutionPlan>, f: &mut F) -> Result<(), E>
+    where
+        F: FnMut(ScanId, u32) -> Result<(), E>,
+    {
+        if let Some(p) = node.as_any().downcast_ref::<PgScanExec>() {
+            let id = p.scan_id;
+            let table_oid = id as u32; // current convention
+            f(id, table_oid)?;
+        }
+        for child in node.children() {
+            visit(child, f)?;
+        }
+        Ok(())
+    }
+    visit(plan, &mut f)
 }

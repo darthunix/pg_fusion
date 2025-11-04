@@ -291,6 +291,7 @@ unsafe extern "C-unwind" fn create_df_scan_state(cscan: *mut pg_sys::CustomScan)
                 }
                 break;
             }
+            
             Ok(ControlPacket::Parse)
             | Ok(ControlPacket::Explain)
             | Ok(ControlPacket::Optimize)
@@ -333,7 +334,7 @@ unsafe extern "C-unwind" fn begin_df_scan(
     _estate: *mut pg_sys::EState,
     _eflags: i32,
 ) {
-    // Notify executor to prepare data channel (Data socket) for upcoming scan
+    // Notify executor to prepare data channels for upcoming scan(s)
     let id = match connection_id() {
         Ok(v) => v,
         Err(e) => error!("Failed to acquire connection id: {}", e),
@@ -350,6 +351,7 @@ unsafe extern "C-unwind" fn begin_df_scan(
     if let Err(err) = shared.signal_server() {
         error!("Failed to signal server: {}", err);
     }
+    // No explicit handshake payload expected; executor registers channels internally.
 }
 
 #[pg_guard]

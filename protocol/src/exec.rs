@@ -9,7 +9,10 @@ fn write_empty_control(stream: &mut impl std::io::Write, tag: u8) -> Result<()> 
         flag: Flag::Last,
         length: 0,
     };
-    write_header(stream, &header)
+    write_header(stream, &header)?;
+    // Ensure tail is committed for lock-free buffers implementing Write
+    stream.flush()?;
+    Ok(())
 }
 
 pub fn request_begin_scan(stream: &mut impl std::io::Write) -> Result<()> {
@@ -23,4 +26,3 @@ pub fn request_exec_scan(stream: &mut impl std::io::Write) -> Result<()> {
 pub fn request_end_scan(stream: &mut impl std::io::Write) -> Result<()> {
     write_empty_control(stream, crate::ControlPacket::EndScan as u8)
 }
-

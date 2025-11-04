@@ -1,8 +1,8 @@
 // moved from block.rs; heap-page oriented messages
 use crate::{write_header, DataPacket, Direction, Flag, Header, Tape};
 use anyhow::Result;
-use rmp::decode::{read_u16, read_u32};
-use rmp::encode::{write_u16, write_u32};
+use rmp::decode::{read_u16, read_u32, read_u64};
+use rmp::encode::{write_u16, write_u32, write_u64};
 use std::io::{Read, Write};
 
 /// Request a new table heap page to be copied into a shared-memory slot.
@@ -11,14 +11,20 @@ use std::io::{Read, Write};
 /// Payload layout:
 /// - u32: table OID
 /// - u16: slot id in shared memory where BLCKSZ bytes must be written
-pub fn request_heap_block(stream: &mut impl Write, table_oid: u32, slot_id: u16) -> Result<()> {
+pub fn request_heap_block(
+    stream: &mut impl Write,
+    scan_id: u64,
+    table_oid: u32,
+    slot_id: u16,
+) -> Result<()> {
     let header = Header {
         direction: Direction::ToClient,
         tag: DataPacket::Heap as u8,
         flag: Flag::Last,
-        length: (size_of::<u32>() + size_of::<u16>()) as u16,
+        length: (size_of::<u64>() + size_of::<u32>() + size_of::<u16>()) as u16,
     };
     write_header(stream, &header)?;
+    write_u64(stream, scan_id)?;
     write_u32(stream, table_oid)?;
     write_u16(stream, slot_id)?;
     stream.flush()?;
@@ -26,10 +32,11 @@ pub fn request_heap_block(stream: &mut impl Write, table_oid: u32, slot_id: u16)
 }
 
 /// Consume a heap page request on the backend.
-pub fn read_heap_block_request(stream: &mut impl Read) -> Result<(u32, u16)> {
+pub fn read_heap_block_request(stream: &mut impl Read) -> Result<(u64, u32, u16)> {
+    let scan_id = read_u64(stream)?;
     let table_oid = read_u32(stream)?;
     let slot_id = read_u16(stream)?;
-    Ok((table_oid, slot_id))
+    Ok((scan_id, table_oid, slot_id))
 }
 
 /// Response with visibility bitmap for the copied heap page.
@@ -50,6 +57,7 @@ pub fn read_heap_block_request(stream: &mut impl Read) -> Result<(u32, u16)> {
 /// - u16: bitmap length in bytes (echoed at the end)
 pub fn prepare_heap_block_bitmap<PosIter>(
     stream: &mut impl Tape,
+    scan_id: u64,
     slot_id: u16,
     table_oid: u32,
     blkno: u32,
@@ -65,6 +73,7 @@ where
     write_header(stream, &Header::default())?;
     let len_init = stream.uncommitted_len();
     write_u16(stream, slot_id)?;
+    write_u64(stream, scan_id)?;
     write_u32(stream, table_oid)?;
     write_u32(stream, blkno)?;
     // Encode the count of offsets (not the index of the last bit).
@@ -123,6 +132,7 @@ where
 /// control the underlying buffer (e.g., a lock-free ring) to access them
 /// without allocation and advance the read head manually.
 pub struct HeapBitmapMeta {
+    pub scan_id: u64,
     pub slot_id: u16,
     pub table_oid: u32,
     pub blkno: u32,
@@ -138,15 +148,17 @@ pub fn read_heap_block_bitmap_meta(
     payload_len: u16,
 ) -> Result<HeapBitmapMeta> {
     let slot_id = read_u16(stream)?;
+    let scan_id = read_u64(stream)?;
     let table_oid = read_u32(stream)?;
     let blkno = read_u32(stream)?;
     let num_offsets = read_u16(stream)?;
     // Payload layout with MessagePack integer encoding sizes:
-    // slot_id (u16 -> 3) + table_oid (u32 -> 5) + blkno (u32 -> 5)
+    // slot_id (u16 -> 3) + scan_id (u64 -> 9) + table_oid (u32 -> 5) + blkno (u32 -> 5)
     // + num_offsets (u16 -> 3) + trailing bitmap_len (u16 -> 3)
-    let fixed = 3 + 5 + 5 + 3 + 3; // = 19 bytes
+    let fixed = 3 + 9 + 5 + 5 + 3 + 3; // = 28 bytes
     let bitmap_len = payload_len.saturating_sub(fixed);
     Ok(HeapBitmapMeta {
+        scan_id,
         slot_id,
         table_oid,
         blkno,
@@ -230,21 +242,23 @@ pub fn heap_bitmap_positions<'a, R: Read + ?Sized>(
 ///
 /// To make slot ownership explicit even with deeper pipelines, EOF echoes the
 /// `slot_id` (2 bytes) as payload. This lets the consumer free exactly that slot.
-pub fn prepare_heap_block_eof(stream: &mut impl Write, slot_id: u16) -> Result<()> {
+pub fn prepare_heap_block_eof(stream: &mut impl Write, scan_id: u64, slot_id: u16) -> Result<()> {
     let header = Header {
         direction: Direction::ToServer,
         tag: DataPacket::Heap as u8,
         flag: Flag::Last,
-        length: size_of::<u16>() as u16,
+        length: (size_of::<u64>() + size_of::<u16>()) as u16,
     };
     write_header(stream, &header)?;
+    write_u64(stream, scan_id)?;
     write_u16(stream, slot_id)?;
     stream.flush()?;
     Ok(())
 }
 
 /// Read EOF payload and return the echoed `slot_id`.
-pub fn read_heap_block_eof(stream: &mut impl Read) -> Result<u16> {
+pub fn read_heap_block_eof(stream: &mut impl Read) -> Result<(u64, u16)> {
+    let scan_id = read_u64(stream)?;
     let slot = read_u16(stream)?;
-    Ok(slot)
+    Ok((scan_id, slot))
 }
