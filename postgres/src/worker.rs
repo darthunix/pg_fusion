@@ -86,6 +86,8 @@ pub unsafe extern "C-unwind" fn init_shmem() {
         // zero-init the whole region
         let base_u8 = base as *mut u8;
         std::ptr::write_bytes(base_u8, 0, total);
+        // Publish base and layout to executor module for in-process access
+        executor::shm::set_slot_blocks(base_u8, layout);
         info!(
             "init_shmem: allocated slot blocks: bytes_per_conn={} total_bytes={} slots_per_conn={} blocks_per_slot={} blksz={} count={}",
             layout.layout.size(), total, SLOTS_PER_CONN, BLOCKS_PER_SLOT, blksz, num

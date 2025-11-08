@@ -8,3 +8,4 @@ pub mod pgscan;
 pub mod server;
 pub mod sql;
 pub mod stack;
+pub mod shm;
