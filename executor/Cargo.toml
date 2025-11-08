@@ -29,6 +29,8 @@ async-trait = "0.1"
 datafusion-catalog = "44.0"
 datafusion-physical-expr = "44.0.0"
 datafusion-execution = "44.0.0"
+storage = { path = "../storage", version = "25.0" }
+pgrx-pg-sys = { version = "0.16.0", package = "pgrx-pg-sys" }
 
 [dev-dependencies]
 bitflags = "2"
