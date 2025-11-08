@@ -21,10 +21,12 @@ use protocol::metadata::process_metadata_with_response;
 use protocol::parse::prepare_query;
 use protocol::Tape;
 use protocol::{ControlPacket, DataPacket, Direction};
-use protocol::heap::prepare_heap_block_meta_shm;
+use protocol::heap::{prepare_heap_block_meta_shm, read_heap_block_request};
 use crate::worker::{slot_blocks_base_for, slot_blocks_layout};
-use executor::layout::slot_block_vis_ptr;
+use executor::layout::{slot_block_ptr, slot_block_vis_ptr};
 use std::slice;
+use std::collections::HashMap;
+use std::sync::{Mutex, LazyLock};
 use rmp::decode::read_bin_len;
 use rmp::encode::{write_array_len, write_bool, write_str, write_u32, write_u8};
 use smallvec::SmallVec;
@@ -411,7 +413,50 @@ unsafe extern "C-unwind" fn exec_df_scan(
             _ => continue,
         }
     }
-    // Execution not implemented yet; return NULL slot to indicate no tuples
+    // Try to process at most one pending heap page request from the executor.
+    // This keeps ExecCustomScan non-blocking while still making progress.
+    if shared.send.len() > 0 {
+        if let Ok(header) = consume_header(&mut shared.send) {
+            if header.direction == Direction::ToClient {
+                if let Ok(dp) = DataPacket::try_from(header.tag) {
+                    match dp {
+                        DataPacket::Heap => {
+                            if let Ok((scan_id, table_oid, slot_id)) =
+                                read_heap_block_request(&mut shared.send)
+                            {
+                                // Determine next block number for this scan
+                                static PROGRESS: LazyLock<Mutex<HashMap<u64, u32>>> =
+                                    LazyLock::new(|| Mutex::new(HashMap::new()));
+                                let blkno = {
+                                    let mut map = PROGRESS.lock().unwrap();
+                                    let e = map.entry(scan_id).or_insert(0);
+                                    let cur = *e;
+                                    *e = e.saturating_add(1);
+                                    cur
+                                };
+
+                                // For now, publish an empty page with no visible tuples.
+                                let blksz = pg_sys::BLCKSZ as usize;
+                                let page = vec![0u8; blksz];
+                                let vis: [u8; 0] = [];
+                                let _ = publish_heap_page(
+                                    &mut shared,
+                                    scan_id,
+                                    slot_id,
+                                    table_oid,
+                                    blkno,
+                                    0u16,
+                                    &page,
+                                    &vis,
+                                );
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+    // No tuples are produced by the backend; DataFusion executor consumes from shared memory.
     std::ptr::null_mut()
 }
 
@@ -600,6 +645,21 @@ fn shm_write_visibility(slot_id: u16, src: &[u8]) -> AnyResult<u16> {
     Ok(u16::try_from(n).unwrap_or(u16::MAX))
 }
 
+/// Copy a heap page into the shared memory buffer for the given `slot_id`.
+/// Returns the number of bytes copied (clamped to `layout.block_len`).
+fn shm_write_heap_block(slot_id: u16, page: &[u8]) -> AnyResult<u32> {
+    let conn = connection_id()? as usize;
+    let base = slot_blocks_base_for(conn);
+    let layout = slot_blocks_layout();
+    // For now use block index 0; double-buffering can rotate indices later.
+    let dst = unsafe { slot_block_ptr(base, layout, slot_id as usize, 0) };
+    let n = std::cmp::min(layout.block_len, page.len());
+    unsafe {
+        std::ptr::copy_nonoverlapping(page.as_ptr(), dst, n);
+    }
+    Ok(u32::try_from(n).unwrap_or(layout.block_len as u32))
+}
+
 /// Publish heap visibility metadata for a page: copy the bitmap to shared memory and
 /// send a lightweight `DataPacket::Heap` metadata packet to the executor.
 fn publish_heap_visibility(
@@ -624,6 +684,22 @@ fn publish_heap_visibility(
     // Notify the executor that a data packet is available
     let _ = shared.signal_server();
     Ok(())
+}
+
+/// Publish a full heap page: copy page bytes and its visibility bitmap into shared memory,
+/// then send a metadata packet to the executor indicating `vis_len` and other identifiers.
+fn publish_heap_page(
+    shared: &mut ConnectionShared,
+    scan_id: u64,
+    slot_id: u16,
+    table_oid: u32,
+    blkno: u32,
+    num_offsets: u16,
+    page: &[u8],
+    vis: &[u8],
+) -> AnyResult<()> {
+    let _ = shm_write_heap_block(slot_id, page)?;
+    publish_heap_visibility(shared, scan_id, slot_id, table_oid, blkno, num_offsets, vis)
 }
 
 #[inline]
