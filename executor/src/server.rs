@@ -21,7 +21,9 @@ use protocol::failure::prepare_error;
 use protocol::metadata::prepare_table_refs;
 use protocol::parse::read_query;
 use protocol::Tape;
-use protocol::{consume_header, ControlPacket, Direction};
+use protocol::{consume_header, ControlPacket, Direction, DataPacket, is_data_tag};
+use protocol::heap::{read_heap_block_bitmap_meta};
+use rmp::decode::read_u16 as read_u16_msgpack;
 use smol_str::{format_smolstr, SmolStr};
 use std::sync::atomic::{AtomicI32, Ordering};
 use std::sync::Arc;
@@ -136,6 +138,54 @@ impl<'bytes> Connection<'bytes> {
         if header.direction == Direction::ToClient {
             trace!("process_message: header direction ToClient, ignoring");
             return Ok(());
+        }
+        // Data packets are handled out-of-band: push heap blocks into registry channels.
+        if is_data_tag(header.tag) {
+            match DataPacket::try_from(header.tag) {
+                Ok(DataPacket::Heap) => {
+                    // Read metadata; we expect the visibility bitmap to be stored in shared memory.
+                    let meta = read_heap_block_bitmap_meta(&mut self.recv_socket.buffer, header.length)?;
+                    // If payload included inline bitmap bytes (legacy), drain them without allocation.
+                    let mut remaining = meta.bitmap_len as usize;
+                    while remaining > 0 {
+                        let mut buf = [0u8; 256];
+                        let chunk = remaining.min(buf.len());
+                        std::io::Read::read_exact(&mut self.recv_socket.buffer, &mut buf[..chunk])?;
+                        remaining -= chunk;
+                    }
+                    // Trailing u16 carries the visibility bitmap length in shared memory
+                    let vis_len = read_u16_msgpack(&mut self.recv_socket.buffer)?;
+                    if let Some(tx) = storage.registry.sender(meta.scan_id as u64) {
+                        let block = crate::pgscan::HeapBlock {
+                            scan_id: meta.scan_id as u64,
+                            slot_id: meta.slot_id,
+                            table_oid: meta.table_oid,
+                            blkno: meta.blkno,
+                            num_offsets: meta.num_offsets,
+                            vis_len,
+                        };
+                        // Best-effort send; if the channel is full, await until space is available
+                        if let Err(e) = tx.send(block).await {
+                            tracing::warn!(
+                                target = "pg_fusion::server",
+                                "failed to enqueue heap block for scan {}: {e}", meta.scan_id
+                            );
+                        }
+                    } else {
+                        trace!(
+                            target = "pg_fusion::server",
+                            scan_id = meta.scan_id,
+                            "received heap block for unknown scan_id; dropping"
+                        );
+                        // Drop the payload (already consumed above)
+                    }
+                    return Ok(());
+                }
+                _ => {
+                    trace!("process_message: unrecognized data packet, ignoring");
+                    return Ok(());
+                }
+            }
         }
         let mut packet = ControlPacket::try_from(header.tag)?;
         let mut skip_metadata = false;

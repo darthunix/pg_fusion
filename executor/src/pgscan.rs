@@ -34,7 +34,7 @@ pub struct HeapBlock {
     pub num_offsets: u16,
     pub vis_len: u16,
     // Note: page bytes and visibility bitmap reside in shared memory,
-    // addressed by `slot_id`. No heap allocations here.
+    // addressed by `slot_id` with `vis_len` bytes for visibility bitmap.
 }
 
 #[derive(Debug, Default)]
