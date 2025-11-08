@@ -87,6 +87,13 @@ impl ScanRegistry {
         let mut map = self.lock();
         map.get_mut(&scan_id).and_then(|e| e.receiver.take())
     }
+
+    /// Close all channels and clear the registry.
+    /// Dropping the senders will cause receivers to observe stream termination.
+    pub fn close_and_clear(&self) {
+        let mut map = self.lock();
+        map.clear();
+    }
 }
 
 // No global registry; registries are per-connection and owned by the server Storage.
