@@ -223,6 +223,8 @@ pub struct SlotBlocksLayout {
     pub block_len: usize,
     /// Number of block-sized buffers reserved per slot (e.g., 2 for double-buffering).
     pub blocks_per_slot: usize,
+    /// Reserved bytes per block for the visibility bitmap stored adjacent to the block.
+    pub vis_bytes_per_block: usize,
 }
 
 /// Compute a memory layout for `slot_count` slots, each with `blocks_per_slot` buffers of
@@ -236,10 +238,21 @@ pub fn slot_blocks_layout(
     assert!(slot_count > 0, "slot_count must be > 0");
     assert!(block_len > 0, "block_len must be > 0");
     assert!(blocks_per_slot > 0, "blocks_per_slot must be > 0");
-    // Total bytes required for all slots and both buffers per slot.
-    let total = slot_count
+    // Reserve visibility bitmap per block. Upper bound approximation:
+    // max_offsets ~= block_len / size_of::<ItemIdData>() (ignoring header/special),
+    // bitmap bytes ~= ceil(max_offsets / 8). Use block_len / 32 as a safe upper bound.
+    let vis_bytes_per_block = (block_len + 31) / 32; // ceil(block_len / 32)
+
+    // Total bytes required for all slots and buffers per slot,
+    // accounting for visibility bitmap region after each block.
+    let per_block = block_len
+        .checked_add(vis_bytes_per_block)
+        .expect("per-block size overflow");
+    let per_slot = per_block
         .checked_mul(blocks_per_slot)
-        .and_then(|v| v.checked_mul(block_len))
+        .expect("per-slot size overflow");
+    let total = slot_count
+        .checked_mul(per_slot)
         .expect("slot buffers size overflow");
     let region = Layout::array::<u8>(total)?;
     Ok(SlotBlocksLayout {
@@ -247,6 +260,7 @@ pub fn slot_blocks_layout(
         slot_count,
         block_len,
         blocks_per_slot,
+        vis_bytes_per_block,
     })
 }
 
@@ -261,14 +275,12 @@ pub unsafe fn slot_blocks_ptrs(
     slot: usize,
 ) -> (*mut u8, *mut u8) {
     assert!(slot < layout.slot_count, "slot index out of range");
-    assert!(
-        layout.blocks_per_slot >= 2,
-        "need at least 2 blocks per slot to return a pair"
-    );
-    let stride = layout.blocks_per_slot * layout.block_len;
+    assert!(layout.blocks_per_slot >= 2, "need at least 2 blocks per slot to return a pair");
+    let per_block = layout.block_len + layout.vis_bytes_per_block;
+    let stride = layout.blocks_per_slot * per_block;
     let slot_base = base.add(slot * stride);
     let buf0 = slot_base;
-    let buf1 = slot_base.add(layout.block_len);
+    let buf1 = slot_base.add(per_block);
     (buf0, buf1)
 }
 
@@ -288,7 +300,23 @@ pub unsafe fn slot_block_ptr(
         block_idx < layout.blocks_per_slot,
         "block index out of range"
     );
-    let stride = layout.blocks_per_slot * layout.block_len;
+    let per_block = layout.block_len + layout.vis_bytes_per_block;
+    let stride = layout.blocks_per_slot * per_block;
     let slot_base = base.add(slot * stride);
-    slot_base.add(block_idx * layout.block_len)
+    slot_base.add(block_idx * per_block)
+}
+
+/// Return a pointer to the visibility bitmap buffer associated with `block_idx` within `slot`.
+/// The caller must ensure it only reads/writes the first `layout.vis_bytes_per_block` bytes.
+///
+/// # Safety
+/// - Same safety requirements as `slot_blocks_ptrs`.
+pub unsafe fn slot_block_vis_ptr(
+    base: *mut u8,
+    layout: SlotBlocksLayout,
+    slot: usize,
+    block_idx: usize,
+) -> *mut u8 {
+    let block_ptr = slot_block_ptr(base, layout, slot, block_idx);
+    block_ptr.add(layout.block_len)
 }
