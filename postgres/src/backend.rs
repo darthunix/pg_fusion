@@ -434,21 +434,94 @@ unsafe extern "C-unwind" fn exec_df_scan(
                                     *e = e.saturating_add(1);
                                     cur
                                 };
-
-                                // For now, publish an empty page with no visible tuples.
-                                let blksz = pg_sys::BLCKSZ as usize;
-                                let page = vec![0u8; blksz];
-                                let vis: [u8; 0] = [];
-                                let _ = publish_heap_page(
-                                    &mut shared,
-                                    scan_id,
-                                    slot_id,
-                                    table_oid,
-                                    blkno,
-                                    0u16,
-                                    &page,
-                                    &vis,
-                                );
+                                // Open relation and validate block number
+                                let rel_oid = Oid::from(table_oid);
+                                let rel = unsafe { pg_sys::RelationIdGetRelation(rel_oid) };
+                                if rel.is_null() {
+                                    // Relation not found; cannot serve this request
+                                    // (leave without publishing)
+                                } else {
+                                    let nblocks = unsafe {
+                                        pg_sys::table_block_relation_size(
+                                            rel,
+                                            pg_sys::ForkNumber::MAIN_FORKNUM,
+                                        )
+                                    } as u32;
+                                    if blkno >= nblocks {
+                                        unsafe { pg_sys::RelationClose(rel) };
+                                    } else {
+                                        // Read the requested block
+                                        let buf = unsafe {
+                                            pg_sys::ReadBufferExtended(
+                                                rel,
+                                                pg_sys::ForkNumber::MAIN_FORKNUM,
+                                                blkno as pg_sys::BlockNumber,
+                                                pg_sys::ReadBufferMode::RBM_NORMAL,
+                                                std::ptr::null_mut(),
+                                            )
+                                        };
+                                        if buf <= 0 {
+                                            unsafe { pg_sys::RelationClose(rel) };
+                                        } else {
+                                            // Lock buffer for shared access while copying
+                                            unsafe {
+                                                pg_sys::LockBuffer(
+                                                    buf,
+                                                    pg_sys::BUFFER_LOCK_SHARE as i32,
+                                                );
+                                            }
+                                            let blksz = pg_sys::BLCKSZ as usize;
+                                            let page_ptr =
+                                                unsafe { pg_sys::BufferGetPage(buf) } as *const u8;
+                                            let page = unsafe {
+                                                std::slice::from_raw_parts(page_ptr, blksz)
+                                            };
+                                            // Compute number of offsets (max line pointer number)
+                                            let hdr = unsafe {
+                                                &*(page_ptr as *const pg_sys::PageHeaderData)
+                                            };
+                                            let lower = hdr.pd_lower as usize;
+                                            let num_offsets = if lower
+                                                < std::mem::size_of::<pg_sys::PageHeaderData>()
+                                            {
+                                                0u16
+                                            } else {
+                                                let cnt = (lower
+                                                    - std::mem::size_of::<pg_sys::PageHeaderData>())
+                                                    / std::mem::size_of::<pg_sys::ItemIdData>();
+                                                u16::try_from(cnt).unwrap_or(u16::MAX)
+                                            };
+                                            // Prepare visibility bitmap with all tuples visible
+                                            let bytes = ((num_offsets as usize) + 7) / 8;
+                                            let mut vis = vec![0xFFu8; bytes];
+                                            if num_offsets > 0 {
+                                                let rem = (num_offsets as usize) % 8;
+                                                if rem != 0 {
+                                                    let mask = (1u8 << rem) - 1;
+                                                    if let Some(last) = vis.last_mut() {
+                                                        *last = mask;
+                                                    }
+                                                }
+                                            }
+                                            // Publish to shared memory + notify executor
+                                            let _ = publish_heap_page(
+                                                &mut shared,
+                                                scan_id,
+                                                slot_id,
+                                                table_oid,
+                                                blkno,
+                                                num_offsets,
+                                                page,
+                                                &vis,
+                                            );
+                                            // Unlock and release buffer; close relation
+                                            unsafe {
+                                                pg_sys::UnlockReleaseBuffer(buf);
+                                                pg_sys::RelationClose(rel);
+                                            }
+                                        }
+                                    }
+                                }
                             }
                         }
                     }
