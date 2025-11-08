@@ -238,6 +238,50 @@ pub fn heap_bitmap_positions<'a, R: Read + ?Sized>(
     }
 }
 
+/// Prepare only heap block metadata for a page whose visibility bitmap is stored in shared memory.
+///
+/// Sent by the backend (client) to the executor (server).
+/// Payload layout:
+/// - u16: slot id
+/// - u64: scan id
+/// - u32: table oid
+/// - u32: block number
+/// - u16: number of offsets on the page
+/// - u16: visibility bitmap length in bytes (residing in shared memory)
+pub fn prepare_heap_block_meta_shm(
+    stream: &mut impl Tape,
+    scan_id: u64,
+    slot_id: u16,
+    table_oid: u32,
+    blkno: u32,
+    num_offsets: u16,
+    vis_len: u16,
+) -> Result<()> {
+    // Two-phase header write to respect variable-length integer encodings
+    write_header(stream, &Header::default())?;
+    let len_init = stream.uncommitted_len();
+    write_u16(stream, slot_id)?;
+    write_u64(stream, scan_id)?;
+    write_u32(stream, table_oid)?;
+    write_u32(stream, blkno)?;
+    write_u16(stream, num_offsets)?;
+    write_u16(stream, vis_len)?;
+
+    let len_final = stream.uncommitted_len();
+    let length = u16::try_from(len_final - len_init)?;
+    let header = Header {
+        direction: Direction::ToServer,
+        tag: DataPacket::Heap as u8,
+        flag: Flag::Last,
+        length,
+    };
+    stream.rollback();
+    write_header(stream, &header)?;
+    stream.fast_forward(length as u32)?;
+    stream.flush()?;
+    Ok(())
+}
+
 /// Signal end-of-scan: no more heap pages available for the relation.
 ///
 /// To make slot ownership explicit even with deeper pipelines, EOF echoes the

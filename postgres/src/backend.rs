@@ -1,4 +1,4 @@
-use crate::ipc::{connection_id, connection_shared};
+use crate::ipc::{connection_id, connection_shared, ConnectionShared};
 use anyhow::Result as AnyResult;
 use common::FusionError;
 use datafusion::arrow::datatypes::DataType;
@@ -21,6 +21,10 @@ use protocol::metadata::process_metadata_with_response;
 use protocol::parse::prepare_query;
 use protocol::Tape;
 use protocol::{ControlPacket, DataPacket, Direction};
+use protocol::heap::prepare_heap_block_meta_shm;
+use crate::worker::{slot_blocks_base_for, slot_blocks_layout};
+use executor::layout::slot_block_vis_ptr;
+use std::slice;
 use rmp::decode::read_bin_len;
 use rmp::encode::{write_array_len, write_bool, write_str, write_u32, write_u8};
 use smallvec::SmallVec;
@@ -577,6 +581,49 @@ fn type_to_oid(dtype: &DataType) -> AnyResult<pg_sys::Oid> {
         }
     };
     Ok(oid)
+}
+
+/// Write the visibility bitmap bytes for a given `slot_id` into the per-connection
+/// shared memory area reserved for that slot, returning the number of bytes written
+/// (clamped to the reserved capacity for a single block's bitmap).
+fn shm_write_visibility(slot_id: u16, src: &[u8]) -> AnyResult<u16> {
+    let conn = connection_id()? as usize;
+    let base = slot_blocks_base_for(conn);
+    let layout = slot_blocks_layout();
+    // For now use block index 0; double-buffering can rotate indices later.
+    let vis_ptr = unsafe { slot_block_vis_ptr(base, layout, slot_id as usize, 0) };
+    let cap = layout.vis_bytes_per_block;
+    let n = std::cmp::min(cap, src.len());
+    unsafe {
+        std::ptr::copy_nonoverlapping(src.as_ptr(), vis_ptr, n);
+    }
+    Ok(u16::try_from(n).unwrap_or(u16::MAX))
+}
+
+/// Publish heap visibility metadata for a page: copy the bitmap to shared memory and
+/// send a lightweight `DataPacket::Heap` metadata packet to the executor.
+fn publish_heap_visibility(
+    shared: &mut ConnectionShared,
+    scan_id: u64,
+    slot_id: u16,
+    table_oid: u32,
+    blkno: u32,
+    num_offsets: u16,
+    vis: &[u8],
+) -> AnyResult<()> {
+    let vis_len = shm_write_visibility(slot_id, vis)?;
+    prepare_heap_block_meta_shm(
+        &mut shared.recv,
+        scan_id,
+        slot_id,
+        table_oid,
+        blkno,
+        num_offsets,
+        vis_len,
+    )?;
+    // Notify the executor that a data packet is available
+    let _ = shared.signal_server();
+    Ok(())
 }
 
 #[inline]
