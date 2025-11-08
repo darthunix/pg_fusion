@@ -101,6 +101,7 @@ impl TryFrom<u8> for ControlPacket {
 #[derive(Clone, Debug, PartialEq)]
 pub enum DataPacket {
     Heap = 9,
+    Eof = 10,
 }
 
 impl TryFrom<u8> for DataPacket {
@@ -110,6 +111,7 @@ impl TryFrom<u8> for DataPacket {
         assert!(value < 128);
         match value {
             9 => Ok(DataPacket::Heap),
+            10 => Ok(DataPacket::Eof),
             _ => Err(FusionError::Deserialize("data_packet".into(), value.into())),
         }
     }
@@ -118,7 +120,7 @@ impl TryFrom<u8> for DataPacket {
 /// Helper to check whether a tag is a data packet value.
 #[inline]
 pub fn is_data_tag(tag: u8) -> bool {
-    matches!(tag, x if x == DataPacket::Heap as u8)
+    matches!(tag, x if x == DataPacket::Heap as u8 || x == DataPacket::Eof as u8)
 }
 
 #[repr(u8)]

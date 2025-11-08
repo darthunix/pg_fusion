@@ -23,7 +23,8 @@ use protocol::parse::read_query;
 use protocol::Tape;
 use protocol::{consume_header, ControlPacket, Direction, DataPacket, is_data_tag};
 use protocol::heap::{read_heap_block_bitmap_meta};
-use rmp::decode::read_u16 as read_u16_msgpack;
+use protocol::heap::request_heap_block;
+use rmp::decode::{read_u16 as read_u16_msgpack, read_u64 as read_u64_msgpack};
 use smol_str::{format_smolstr, SmolStr};
 use std::sync::atomic::{AtomicI32, Ordering};
 use std::sync::Arc;
@@ -171,6 +172,19 @@ impl<'bytes> Connection<'bytes> {
                                 "failed to enqueue heap block for scan {}: {e}", meta.scan_id
                             );
                         }
+                        // Request the next heap block for this scan using the same slot
+                        if let Err(e) = request_heap_block(
+                            &mut self.send_buffer,
+                            meta.scan_id,
+                            meta.table_oid,
+                            meta.slot_id,
+                        ) {
+                            tracing::error!(
+                                target = "pg_fusion::server",
+                                "failed to request next heap block for scan {}: {e}",
+                                meta.scan_id
+                            );
+                        }
                     } else {
                         trace!(
                             target = "pg_fusion::server",
@@ -179,6 +193,12 @@ impl<'bytes> Connection<'bytes> {
                         );
                         // Drop the payload (already consumed above)
                     }
+                    return Ok(());
+                }
+                Ok(DataPacket::Eof) => {
+                    // Per-scan EOF notification
+                    let scan_id = read_u64_msgpack(&mut self.recv_socket.buffer)?;
+                    storage.registry.close(scan_id as u64);
                     return Ok(());
                 }
                 _ => {
@@ -482,6 +502,13 @@ fn start_data_flow(conn: &mut Connection, storage: &mut Storage) -> Result<TaskR
     storage.exec_task = Some(handle);
     // Send a tiny ack to the backend indicating execution is ready
     protocol::exec::prepare_exec_ready(&mut conn.send_buffer)?;
+    // Kick off initial heap block requests for each scan using slot 0
+    if let Some(phys) = storage.physical_plan.as_ref() {
+        let _ = for_each_scan::<_, Error>(phys, |id, table_oid| {
+            request_heap_block(&mut conn.send_buffer, id, table_oid, 0)?;
+            Ok(())
+        });
+    }
     Ok(TaskResult::Noop)
 }
 

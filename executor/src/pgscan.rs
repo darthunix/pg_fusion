@@ -94,6 +94,12 @@ impl ScanRegistry {
         let mut map = self.lock();
         map.clear();
     }
+
+    /// Close a single scan by dropping its sender; receiver will eventually see EOF.
+    pub fn close(&self, scan_id: ScanId) {
+        let mut map = self.lock();
+        let _ = map.remove(&scan_id);
+    }
 }
 
 // No global registry; registries are per-connection and owned by the server Storage.
