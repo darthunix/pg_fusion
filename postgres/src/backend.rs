@@ -22,6 +22,7 @@ use protocol::parse::prepare_query;
 use protocol::Tape;
 use protocol::{ControlPacket, DataPacket, Direction};
 use protocol::heap::{prepare_heap_block_meta_shm, read_heap_block_request};
+use protocol::exec::prepare_scan_eof;
 use crate::worker::{slot_blocks_base_for, slot_blocks_layout};
 use executor::layout::{slot_block_ptr, slot_block_vis_ptr};
 use std::slice;
@@ -448,6 +449,9 @@ unsafe extern "C-unwind" fn exec_df_scan(
                                         )
                                     } as u32;
                                     if blkno >= nblocks {
+                                        // End of relation reached: send EOF for this scan
+                                        let _ = prepare_scan_eof(&mut shared.recv, scan_id);
+                                        let _ = shared.signal_server();
                                         unsafe { pg_sys::RelationClose(rel) };
                                     } else {
                                         // Read the requested block
@@ -523,6 +527,9 @@ unsafe extern "C-unwind" fn exec_df_scan(
                                     }
                                 }
                             }
+                        }
+                        DataPacket::Eof => {
+                            // Ignore EOF from executor in backend context
                         }
                     }
                 }
