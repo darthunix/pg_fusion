@@ -26,6 +26,8 @@ use smol_str::{format_smolstr, SmolStr};
 use std::sync::atomic::{AtomicI32, Ordering};
 use std::sync::Arc;
 use tracing::{debug, trace};
+use futures::StreamExt;
+use tokio::task::JoinHandle;
 
 #[derive(Default)]
 pub struct Storage {
@@ -34,12 +36,17 @@ pub struct Storage {
     logical_plan: Option<LogicalPlan>,
     physical_plan: Option<Arc<dyn ExecutionPlan>>,
     registry: Arc<ScanRegistry>,
+    exec_task: Option<JoinHandle<()>>,
 }
 
 impl Storage {
     pub fn flush(&mut self) {
         // Preserve the registry across flushes
         let registry = Arc::clone(&self.registry);
+        // Abort any running execution task to avoid leaks
+        if let Some(handle) = self.exec_task.take() {
+            handle.abort();
+        }
         *self = Self::default();
         self.registry = registry;
     }
@@ -389,12 +396,50 @@ fn start_data_flow(storage: &mut Storage) -> Result<TaskResult> {
             "start data flow requires a physical plan".into(),
         ));
     }
-    // TODO: spawn DataFusion execution and start consuming data
+    // If a task is already running, don't start another
+    if storage.exec_task.is_some() {
+        trace!("start_data_flow: execution already running, skipping");
+        return Ok(TaskResult::Noop);
+    }
+
+    let plan = Arc::clone(storage
+        .physical_plan
+        .as_ref()
+        .expect("checked above"));
+    // Build a fresh TaskContext for execution
+    let state = SessionStateBuilder::new().build();
+    let ctx = state.task_ctx();
+
+    let handle = tokio::spawn(async move {
+        // Execute a single partition; PgScanExec uses a single stream
+        match plan.execute(0, ctx) {
+            Ok(mut stream) => {
+                // Drain the stream to drive execution. Downstream delivery
+                // (back to Postgres) will be wired later.
+                while let Some(res) = stream.next().await {
+                    if let Err(e) = res {
+                        tracing::error!(target = "pg_fusion::server", "execution stream error: {e}");
+                        break;
+                    }
+                }
+                tracing::trace!(target = "pg_fusion::server", "execution stream completed");
+            }
+            Err(e) => {
+                tracing::error!(target = "pg_fusion::server", "failed to start execution: {e}");
+            }
+        }
+    });
+    storage.exec_task = Some(handle);
     Ok(TaskResult::Noop)
 }
 
-fn end_data_flow(_storage: &mut Storage) -> Result<TaskResult> {
-    // TODO: cancel/await execution and close data channels
+fn end_data_flow(storage: &mut Storage) -> Result<TaskResult> {
+    // Cancel running execution task if present
+    if let Some(handle) = storage.exec_task.take() {
+        handle.abort();
+    }
+    // Close and clear all registered scan channels
+    storage.registry.close_and_clear();
     Ok(TaskResult::Noop)
 }
 
