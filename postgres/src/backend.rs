@@ -305,7 +305,8 @@ unsafe extern "C-unwind" fn create_df_scan_state(cscan: *mut pg_sys::CustomScan)
             }
             Ok(ControlPacket::BeginScan)
             | Ok(ControlPacket::ExecScan)
-            | Ok(ControlPacket::EndScan) => {
+            | Ok(ControlPacket::EndScan)
+            | Ok(ControlPacket::ExecReady) => {
                 // Ignore execution-time control messages during planning
                 continue;
             }
@@ -375,6 +376,36 @@ unsafe extern "C-unwind" fn exec_df_scan(
     }
     if let Err(err) = shared.signal_server() {
         error!("Failed to signal server: {}", err);
+    }
+    // Wait until executor confirms it is ready to consume data
+    loop {
+        wait_latch(None);
+        if shared.send.len() == 0 {
+            continue;
+        }
+        let header = match consume_header(&mut shared.send) {
+            Ok(h) => h,
+            Err(err) => {
+                let _ = request_failure(&mut shared.recv);
+                let _ = shared.signal_server();
+                error!("Failed to consume header: {}", err)
+            }
+        };
+        if header.direction != Direction::ToClient {
+            continue;
+        }
+        match ControlPacket::try_from(header.tag) {
+            Ok(ControlPacket::ExecReady) => break,
+            Ok(ControlPacket::Failure) => match read_error(&mut shared.send) {
+                Ok(msg) => error!("Executor failed to start: {}", msg),
+                Err(err) => error!("Double error: {}", err),
+            },
+            Err(_) if DataPacket::try_from(header.tag).is_ok() => {
+                // Ignore data packets here
+                continue;
+            }
+            _ => continue,
+        }
     }
     // Execution not implemented yet; return NULL slot to indicate no tuples
     std::ptr::null_mut()
