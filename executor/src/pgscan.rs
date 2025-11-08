@@ -171,6 +171,7 @@ pub struct PgScanExec {
     scan_id: ScanId,
     registry: Arc<ScanRegistry>,
     props: PlanProperties,
+    attrs: Arc<Vec<PgAttrMeta>>,
 }
 
 impl PgScanExec {
@@ -184,11 +185,13 @@ impl PgScanExec {
                 requires_infinite_memory: false,
             },
         );
+        let attrs = Arc::new(attrs_from_schema(&schema));
         Self {
             schema,
             scan_id,
             registry,
             props,
+            attrs,
         }
     }
 }
@@ -238,7 +241,7 @@ impl ExecutionPlan for PgScanExec {
 
     fn execute(&self, _partition: usize, _ctx: Arc<TaskContext>) -> DFResult<SendableRecordBatchStream> {
         let rx = self.registry.take_receiver(self.scan_id);
-        let stream = PgScanStream::new(Arc::clone(&self.schema), rx);
+        let stream = PgScanStream::new(Arc::clone(&self.schema), Arc::clone(&self.attrs), rx);
         Ok(Box::pin(stream))
     }
 
@@ -249,12 +252,13 @@ impl ExecutionPlan for PgScanExec {
 
 pub struct PgScanStream {
     schema: SchemaRef,
+    attrs: Arc<Vec<PgAttrMeta>>,
     rx: Option<mpsc::Receiver<HeapBlock>>,
 }
 
 impl PgScanStream {
-    pub fn new(schema: SchemaRef, rx: Option<mpsc::Receiver<HeapBlock>>) -> Self {
-        Self { schema, rx }
+    pub fn new(schema: SchemaRef, attrs: Arc<Vec<PgAttrMeta>>, rx: Option<mpsc::Receiver<HeapBlock>>) -> Self {
+        Self { schema, attrs, rx }
     }
 }
 
@@ -274,9 +278,8 @@ impl Stream for PgScanStream {
                     Some(unsafe { shm::vis_slice(block.slot_id as usize, block.vis_len as usize) })
                 } else { None };
 
-                // Prepare decoding metadata: attrs and projection (all columns)
-                let attrs = attrs_from_schema(&this.schema);
-                let projection: Vec<usize> = (0..this.schema.fields().len()).collect();
+                // Prepare decoding metadata: attrs (precomputed once) and projection (all columns)
+                let total_cols = this.schema.fields().len();
 
                 // Create a HeapPage view and iterate tuples
                 let hp = unsafe { HeapPage::from_slice(page) };
@@ -287,7 +290,7 @@ impl Stream for PgScanStream {
                 };
 
                 // Prepare per-column builders
-                let col_count = projection.len();
+                let col_count = total_cols;
                 let mut builders = make_builders(&this.schema, block.num_offsets as usize)
                     .map_err(|e| datafusion::error::DataFusionError::Execution(format!("{e}")))?;
                 // Use tuples_by_offset to iterate LP_NORMAL tuples in page order
@@ -295,12 +298,12 @@ impl Stream for PgScanStream {
                 let mut it = hp.tuples_by_offset(None, std::ptr::null_mut(), &mut pairs);
                 let page_hdr = unsafe { &*(page.as_ptr() as *const pg_sys::PageHeaderData) } as *const pg_sys::PageHeaderData;
                 while let Some(tup) = it.next() {
-                    // Decode projected columns for tuple
-                    let iter = unsafe { decode_tuple_project(page_hdr, tup, &attrs, &projection) };
+                    // Decode projected columns for tuple using iterator over all columns
+                    let iter = unsafe { decode_tuple_project(page_hdr, tup, &this.attrs, 0..total_cols) };
                     let Ok(mut iter) = iter else {
                         continue;
                     };
-                    for (col_idx, _proj) in projection.iter().enumerate() {
+                    for col_idx in 0..total_cols {
                         match iter.next() {
                             Some(Ok(v)) => append_scalar(&mut builders[col_idx], v),
                             Some(Err(_e)) => append_null(&mut builders[col_idx]),
