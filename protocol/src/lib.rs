@@ -66,6 +66,7 @@ pub enum ControlPacket {
     BeginScan = 10,
     ExecScan = 11,
     EndScan = 12,
+    ExecReady = 13,
 }
 
 impl TryFrom<u8> for ControlPacket {
@@ -86,6 +87,7 @@ impl TryFrom<u8> for ControlPacket {
             10 => Ok(ControlPacket::BeginScan),
             11 => Ok(ControlPacket::ExecScan),
             12 => Ok(ControlPacket::EndScan),
+            13 => Ok(ControlPacket::ExecReady),
             _ => Err(FusionError::Deserialize(
                 "control_packet".into(),
                 value.into(),

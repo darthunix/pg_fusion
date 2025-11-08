@@ -26,3 +26,21 @@ pub fn request_exec_scan(stream: &mut impl std::io::Write) -> Result<()> {
 pub fn request_end_scan(stream: &mut impl std::io::Write) -> Result<()> {
     write_empty_control(stream, crate::ControlPacket::EndScan as u8)
 }
+
+#[inline]
+fn write_empty_to_client(stream: &mut impl std::io::Write, tag: u8) -> Result<()> {
+    let header = Header {
+        direction: Direction::ToClient,
+        tag,
+        flag: Flag::Last,
+        length: 0,
+    };
+    write_header(stream, &header)?;
+    // Ensure tail is committed for lock-free buffers implementing Write
+    stream.flush()?;
+    Ok(())
+}
+
+pub fn prepare_exec_ready(stream: &mut impl std::io::Write) -> Result<()> {
+    write_empty_to_client(stream, crate::ControlPacket::ExecReady as u8)
+}

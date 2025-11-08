@@ -220,7 +220,7 @@ impl<'bytes> Connection<'bytes> {
                 }
                 Some(Action::StartDataFlow) => {
                     trace!("process_message: Action::StartDataFlow");
-                    start_data_flow(storage)
+                    start_data_flow(self, storage)
                 }
                 Some(Action::EndDataFlow) => {
                     trace!("process_message: Action::EndDataFlow");
@@ -389,7 +389,7 @@ fn open_data_flow(_conn: &mut Connection, storage: &mut Storage) -> Result<TaskR
     Ok(TaskResult::Noop)
 }
 
-fn start_data_flow(storage: &mut Storage) -> Result<TaskResult> {
+fn start_data_flow(conn: &mut Connection, storage: &mut Storage) -> Result<TaskResult> {
     if storage.physical_plan.is_none() {
         bail!(FusionError::NotFound(
             "Physical plan".into(),
@@ -430,6 +430,8 @@ fn start_data_flow(storage: &mut Storage) -> Result<TaskResult> {
         }
     });
     storage.exec_task = Some(handle);
+    // Send a tiny ack to the backend indicating execution is ready
+    protocol::exec::prepare_exec_ready(&mut conn.send_buffer)?;
     Ok(TaskResult::Noop)
 }
 
