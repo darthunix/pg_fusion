@@ -552,20 +552,33 @@ unsafe extern "C-unwind" fn exec_df_scan(
     if ring.len() == 0 {
         return std::ptr::null_mut();
     }
-    // Minimal row reader: u16 natts, u16 nullmap_len, nullmap, then a single Utf8 value
-    let natts = match rmp::decode::read_u16(&mut ring) { Ok(v) => v, Err(_) => return std::ptr::null_mut() } as usize;
-    let _nmap = match rmp::decode::read_u16(&mut ring) { Ok(v) => v, Err(_) => return std::ptr::null_mut() } as usize;
-    let mut nullmap = vec![0u8; _nmap];
     use std::io::Read;
-    if ring.read_exact(&mut nullmap).is_err() { return std::ptr::null_mut(); }
-    // For demo: assume 1 column Utf8
-    let len = match rmp::decode::read_u32(&mut ring) { Ok(v) => v as usize, Err(_) => return std::ptr::null_mut() };
-    let mut buf = vec![0u8; len];
-    if ring.read_exact(&mut buf).is_err() { return std::ptr::null_mut(); }
+    // Read fixed 4-byte little-endian row_len
+    let row_len = match protocol::result::read_frame_len(&mut ring) { Ok(v) => v as usize, Err(_) => return std::ptr::null_mut() };
+    if row_len == 0 {
+        // EOF sentinel
+        return std::ptr::null_mut();
+    }
+    // Decode row body directly from ring using a limited reader
+    let mut limited = ring.by_ref().take(row_len as u64);
+    let natts = match rmp::decode::read_array_len(&mut limited) { Ok(v) => v as usize, Err(_) => return std::ptr::null_mut() };
+    let mut buf = Vec::new();
+    if natts >= 1 {
+        // Expect str for demo
+        let l = match rmp::decode::read_str_len(&mut limited) { Ok(v) => v as usize, Err(_) => return std::ptr::null_mut() };
+        buf.resize(l, 0);
+        if std::io::Read::read_exact(&mut limited, &mut buf).is_err() { return std::ptr::null_mut(); }
+    }
+    // Drain any remaining bytes in the frame (for future extra cols) to keep head aligned
+    let mut scratch = [0u8; 256];
+    while limited.limit() > 0 {
+        let to_read = std::cmp::min(limited.limit() as usize, scratch.len());
+        if std::io::Read::read(&mut limited, &mut scratch[..to_read]).unwrap_or(0) == 0 { break; }
+    }
     unsafe {
         pg_sys::ExecClearTuple(tupslot);
         let cstr = std::ffi::CString::new(buf).unwrap();
-        let txt = pg_sys::cstring_to_text_with_len(cstr.as_ptr(), len as i32);
+        let txt = pg_sys::cstring_to_text_with_len(cstr.as_ptr(), (cstr.as_bytes().len()) as i32);
         // Write first attr
         *(*tupslot).tts_values.add(0) = pg_sys::PointerGetDatum(txt as *mut std::ffi::c_void);
         *(*tupslot).tts_isnull.add(0) = false;
