@@ -56,6 +56,7 @@ impl Storage {
 }
 
 pub struct Connection<'bytes> {
+    id: usize,
     recv_socket: Socket<'bytes>,
     send_buffer: LockFreeBuffer<'bytes>,
     result_buffer: Option<LockFreeBuffer<'bytes>>,
@@ -65,12 +66,14 @@ pub struct Connection<'bytes> {
 
 impl<'bytes> Connection<'bytes> {
     pub fn new(
+        id: usize,
         recv_socket: Socket<'bytes>,
         send_buffer: LockFreeBuffer<'bytes>,
         server_pid: &'bytes AtomicI32,
         client_pid: &'bytes AtomicI32,
     ) -> Self {
         Self {
+            id,
             recv_socket,
             send_buffer,
             result_buffer: None,
@@ -489,6 +492,7 @@ fn start_data_flow(conn: &mut Connection, storage: &mut Storage) -> Result<TaskR
     let state = SessionStateBuilder::new().build();
     let ctx = state.task_ctx();
 
+    let conn_id = conn.id;
     let handle = tokio::spawn(async move {
         // Execute a single partition; PgScanExec uses a single stream
         match plan.execute(0, ctx) {
@@ -502,6 +506,9 @@ fn start_data_flow(conn: &mut Connection, storage: &mut Storage) -> Result<TaskR
                     }
                 }
                 tracing::trace!(target = "pg_fusion::server", "execution stream completed");
+                // Write EOF sentinel row to result ring to unblock backend
+                let mut ring = crate::shm::result_ring_writer_for(conn_id);
+                let _ = protocol::result::write_eof(&mut ring);
             }
             Err(e) => {
                 tracing::error!(target = "pg_fusion::server", "failed to start execution: {e}");
@@ -513,18 +520,7 @@ fn start_data_flow(conn: &mut Connection, storage: &mut Storage) -> Result<TaskR
     protocol::exec::prepare_exec_ready(&mut conn.send_buffer)?;
     // Write a minimal demo row into result ring (if available): one Utf8 column with value "ok"
     if let Some(ring) = conn.result_buffer.as_mut() {
-        // Row format: u16 natts, u16 nullmap_len, nullmap bytes, then values for NOT NULL cols
-        // Here: natts=1, nullmap_len=1, nullmap=0x01 (not null), value: u32 len + bytes("ok")
-        use std::io::Write;
-        let mut w = ring as &mut dyn std::io::Write;
-        rmp::encode::write_u16(&mut w, 1).ok();
-        rmp::encode::write_u16(&mut w, 1).ok();
-        w.write_all(&[0x01]).ok();
-        rmp::encode::write_u32(&mut w, 2).ok();
-        w.write_all(b"ok").ok();
-        // Flush to make visible
-        let _ = w.flush();
-        // Notify backend
+        let _ = protocol::result::write_row1_str(ring, "ok");
         let _ = conn.signal_client();
     }
     // Kick off initial heap block requests for each scan using slot 0

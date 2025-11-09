@@ -230,7 +230,7 @@ pub extern "C-unwind" fn worker_main(_arg: pg_sys::Datum) {
             let send_buffer = unsafe {
                 executor::buffer::LockFreeBuffer::from_layout(send_base, layout.send_buffer_layout)
             };
-            let mut conn = Connection::new(socket, send_buffer, unsafe { &*srv_pid_ptr }, unsafe {
+            let mut conn = Connection::new(id, socket, send_buffer, unsafe { &*srv_pid_ptr }, unsafe {
                 &*client_ptr
             });
             // Attach result ring buffer for this connection

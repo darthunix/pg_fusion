@@ -14,6 +14,7 @@ pub mod heap;
 pub mod metadata;
 pub mod parse;
 pub mod exec;
+pub mod result;
 
 pub const DATA_SIZE: usize = 8 * 1024;
 
