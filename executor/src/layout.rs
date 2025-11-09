@@ -80,6 +80,12 @@ pub fn lockfree_buffer_layout(capacity: usize) -> Result<BufferLayout, LayoutErr
     })
 }
 
+/// Layout for a per-connection result ring (reuses BufferLayout semantics).
+#[inline]
+pub fn result_ring_layout(capacity: usize) -> Result<BufferLayout, LayoutError> {
+    lockfree_buffer_layout(capacity)
+}
+
 /// Given a base pointer and `BufferLayout`, return typed pointers to head, tail and data.
 ///
 /// # Safety

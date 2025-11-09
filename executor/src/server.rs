@@ -58,6 +58,7 @@ impl Storage {
 pub struct Connection<'bytes> {
     recv_socket: Socket<'bytes>,
     send_buffer: LockFreeBuffer<'bytes>,
+    result_buffer: Option<LockFreeBuffer<'bytes>>,
     client_pid: &'bytes AtomicI32,
     server_pid: &'bytes AtomicI32,
 }
@@ -72,6 +73,7 @@ impl<'bytes> Connection<'bytes> {
         Self {
             recv_socket,
             send_buffer,
+            result_buffer: None,
             client_pid,
             server_pid,
         }
@@ -379,6 +381,13 @@ impl<'bytes> Connection<'bytes> {
     }
 }
 
+impl<'bytes> Connection<'bytes> {
+    /// For worker setup: set the per-connection result ring buffer writer.
+    pub fn set_result_buffer(&mut self, buf: LockFreeBuffer<'bytes>) {
+        self.result_buffer = Some(buf);
+    }
+}
+
 fn bind(plan: LogicalPlan, params: Vec<ScalarValue>) -> Result<TaskResult> {
     let new_plan = plan.with_param_values(params)?;
     Ok(TaskResult::Bind(new_plan))
@@ -502,6 +511,22 @@ fn start_data_flow(conn: &mut Connection, storage: &mut Storage) -> Result<TaskR
     storage.exec_task = Some(handle);
     // Send a tiny ack to the backend indicating execution is ready
     protocol::exec::prepare_exec_ready(&mut conn.send_buffer)?;
+    // Write a minimal demo row into result ring (if available): one Utf8 column with value "ok"
+    if let Some(ring) = conn.result_buffer.as_mut() {
+        // Row format: u16 natts, u16 nullmap_len, nullmap bytes, then values for NOT NULL cols
+        // Here: natts=1, nullmap_len=1, nullmap=0x01 (not null), value: u32 len + bytes("ok")
+        use std::io::Write;
+        let mut w = ring as &mut dyn std::io::Write;
+        rmp::encode::write_u16(&mut w, 1).ok();
+        rmp::encode::write_u16(&mut w, 1).ok();
+        w.write_all(&[0x01]).ok();
+        rmp::encode::write_u32(&mut w, 2).ok();
+        w.write_all(b"ok").ok();
+        // Flush to make visible
+        let _ = w.flush();
+        // Notify backend
+        let _ = conn.signal_client();
+    }
     // Kick off initial heap block requests for each scan using slot 0
     if let Some(phys) = storage.physical_plan.as_ref() {
         let _ = for_each_scan::<_, Error>(phys, |id, table_oid| {
