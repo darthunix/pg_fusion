@@ -3,6 +3,8 @@ use std::sync::{OnceLock, atomic::{AtomicPtr, Ordering}};
 
 static SLOT_BLOCKS_BASE: AtomicPtr<u8> = AtomicPtr::new(std::ptr::null_mut());
 static SLOT_BLOCKS_LAYOUT: OnceLock<SlotBlocksLayout> = OnceLock::new();
+static RESULT_RING_BASE: AtomicPtr<u8> = AtomicPtr::new(std::ptr::null_mut());
+static RESULT_RING_LAYOUT: OnceLock<crate::layout::BufferLayout> = OnceLock::new();
 
 pub fn set_slot_blocks(base: *mut u8, layout: SlotBlocksLayout) {
     SLOT_BLOCKS_BASE.store(base, Ordering::Release);
@@ -48,4 +50,18 @@ pub unsafe fn vis_slice(slot: usize, vis_len: usize) -> &'static [u8] {
     let ptr = vis_ptr_calc(base, layout, slot, 0);
     let len = vis_len.min(layout.vis_bytes_per_block);
     std::slice::from_raw_parts(ptr, len)
+}
+
+pub fn set_result_ring(base: *mut u8, layout: crate::layout::BufferLayout) {
+    RESULT_RING_BASE.store(base, Ordering::Release);
+    let _ = RESULT_RING_LAYOUT.set(layout);
+}
+
+pub fn result_ring_writer_for(conn_offset: usize) -> crate::buffer::LockFreeBuffer<'static> {
+    let base = RESULT_RING_BASE.load(Ordering::Acquire);
+    assert!(!base.is_null(), "result ring base not set");
+    let layout = *RESULT_RING_LAYOUT.get().expect("result ring layout not set");
+    let per = layout.layout.size();
+    let ptr = unsafe { base.add(conn_offset * per) };
+    unsafe { crate::buffer::LockFreeBuffer::from_layout(ptr, layout) }
 }

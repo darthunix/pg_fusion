@@ -21,6 +21,7 @@ use protocol::metadata::process_metadata_with_response;
 use protocol::parse::prepare_query;
 use protocol::Tape;
 use protocol::{ControlPacket, DataPacket, Direction};
+use crate::worker::{result_ring_base_for, result_ring_layout};
 use protocol::heap::{prepare_heap_block_meta_shm, read_heap_block_request};
 use protocol::exec::prepare_scan_eof;
 use crate::worker::{slot_blocks_base_for, slot_blocks_layout};
@@ -536,8 +537,42 @@ unsafe extern "C-unwind" fn exec_df_scan(
             }
         }
     }
-    // No tuples are produced by the backend; DataFusion executor consumes from shared memory.
-    std::ptr::null_mut()
+    // Try to read one result row from the per-connection result ring and fill a virtual slot
+    let tupslot = unsafe { (*_node).ss.ss_ScanTupleSlot };
+    if tupslot.is_null() {
+        return std::ptr::null_mut();
+    }
+    let conn_id = match connection_id() {
+        Ok(v) => v as usize,
+        Err(_) => 0,
+    };
+    let base = result_ring_base_for(conn_id);
+    let layout = result_ring_layout();
+    let mut ring = unsafe { executor::buffer::LockFreeBuffer::from_layout(base, layout) };
+    if ring.len() == 0 {
+        return std::ptr::null_mut();
+    }
+    // Minimal row reader: u16 natts, u16 nullmap_len, nullmap, then a single Utf8 value
+    let natts = match rmp::decode::read_u16(&mut ring) { Ok(v) => v, Err(_) => return std::ptr::null_mut() } as usize;
+    let _nmap = match rmp::decode::read_u16(&mut ring) { Ok(v) => v, Err(_) => return std::ptr::null_mut() } as usize;
+    let mut nullmap = vec![0u8; _nmap];
+    use std::io::Read;
+    if ring.read_exact(&mut nullmap).is_err() { return std::ptr::null_mut(); }
+    // For demo: assume 1 column Utf8
+    let len = match rmp::decode::read_u32(&mut ring) { Ok(v) => v as usize, Err(_) => return std::ptr::null_mut() };
+    let mut buf = vec![0u8; len];
+    if ring.read_exact(&mut buf).is_err() { return std::ptr::null_mut(); }
+    unsafe {
+        pg_sys::ExecClearTuple(tupslot);
+        let cstr = std::ffi::CString::new(buf).unwrap();
+        let txt = pg_sys::cstring_to_text_with_len(cstr.as_ptr(), len as i32);
+        // Write first attr
+        *(*tupslot).tts_values.add(0) = pg_sys::PointerGetDatum(txt as *mut std::ffi::c_void);
+        *(*tupslot).tts_isnull.add(0) = false;
+        for i in 1..natts { *(*tupslot).tts_isnull.add(i) = true; }
+        pg_sys::ExecStoreVirtualTuple(tupslot);
+    }
+    tupslot
 }
 
 #[pg_guard]

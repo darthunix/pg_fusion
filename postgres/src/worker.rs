@@ -20,6 +20,7 @@ pub(crate) const SEND_CAP: usize = 8192;
 // Heap block buffer configuration per connection
 const SLOTS_PER_CONN: usize = 2; // two logical slots per connection
 const BLOCKS_PER_SLOT: usize = 2; // double buffering inside each slot
+const RESULT_RING_CAP: usize = 64 * 1024; // bytes per-connection for result rows
 
 #[pg_guard]
 pub(crate) unsafe extern "C-unwind" fn init_datafusion_worker() {
@@ -125,6 +126,22 @@ pub unsafe extern "C-unwind" fn init_shmem() {
             layout.layout.size()
         );
     }
+
+    // Allocate per-connection result ring buffers.
+    {
+        let layout = executor::layout::result_ring_layout(RESULT_RING_CAP).expect("result_ring_layout");
+        let total = layout.layout.size() * num;
+        let base = pgrx::pg_sys::ShmemAlloc(total);
+        RESULT_RING_PTR.store(base as *mut u8, Ordering::Release);
+        let base_u8 = base as *mut u8;
+        std::ptr::write_bytes(base_u8, 0, total);
+        // Publish base and layout to executor module
+        executor::shm::set_result_ring(base_u8, layout);
+        info!(
+            "init_shmem: allocated result ring: bytes_per_conn={} total_bytes={} cap={} count={}",
+            layout.layout.size(), total, RESULT_RING_CAP, num
+        );
+    }
 }
 
 fn signal_client(conn: &Connection, id: usize) {
@@ -216,6 +233,11 @@ pub extern "C-unwind" fn worker_main(_arg: pg_sys::Datum) {
             let mut conn = Connection::new(socket, send_buffer, unsafe { &*srv_pid_ptr }, unsafe {
                 &*client_ptr
             });
+            // Attach result ring buffer for this connection
+            let res_base = result_ring_base_for(id);
+            let res_layout = result_ring_layout();
+            let res_buf = unsafe { executor::buffer::LockFreeBuffer::from_layout(res_base, res_layout) };
+            conn.set_result_buffer(res_buf);
 
             tokio::spawn(async move {
                 tracing::trace!(connection_id = id, "connection task started");
@@ -313,6 +335,7 @@ static CONNS_PTR: AtomicPtr<u8> = AtomicPtr::new(core::ptr::null_mut());
 static STACK_PTR: AtomicPtr<u8> = AtomicPtr::new(core::ptr::null_mut());
 static SERVER_PID_PTR: AtomicPtr<u8> = AtomicPtr::new(core::ptr::null_mut());
 static SLOT_BLOCKS_PTR: AtomicPtr<u8> = AtomicPtr::new(core::ptr::null_mut());
+static RESULT_RING_PTR: AtomicPtr<u8> = AtomicPtr::new(core::ptr::null_mut());
 
 // Accessor for Treiber stack stored in shared memory
 pub(crate) fn treiber_stack() -> &'static TreiberStack {
@@ -372,5 +395,18 @@ pub(crate) fn server_pid_atomic() -> &'static AtomicI32 {
         let layout = executor::layout::server_pid_layout().expect("server pid layout");
         let pid_ptr = executor::layout::server_pid_ptr(base, layout);
         &*pid_ptr
+    }
+}
+
+pub(crate) fn result_ring_layout() -> executor::layout::BufferLayout {
+    executor::layout::result_ring_layout(RESULT_RING_CAP).expect("result ring layout")
+}
+
+pub(crate) fn result_ring_base_for(conn_id: usize) -> *mut u8 {
+    unsafe {
+        let base = RESULT_RING_PTR.load(Ordering::Acquire);
+        assert!(!base.is_null(), "RESULT_RING_PTR not set");
+        let layout = result_ring_layout();
+        base.add(conn_id * layout.layout.size())
     }
 }
