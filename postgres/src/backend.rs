@@ -24,6 +24,7 @@ use protocol::failure::{read_error, request_failure};
 use protocol::heap::{prepare_heap_block_meta_shm, read_heap_block_request};
 use protocol::metadata::process_metadata_with_response;
 use protocol::parse::prepare_query;
+use protocol::tuple::{prepare_column_layout, PgAttrWire};
 use protocol::Tape;
 use protocol::{ControlPacket, DataPacket, Direction};
 use rmp::decode::read_bin_len;
@@ -257,45 +258,74 @@ unsafe extern "C-unwind" fn create_df_scan_state(cscan: *mut pg_sys::CustomScan)
             }
             Ok(ControlPacket::Columns) => {
                 let list_ptr = (*cscan).custom_scan_tlist as *mut c_void;
-                let repack =
-                    |pos: i16, etype: u8, name: &[u8], ptr: *mut c_void| -> anyhow::Result<()> {
-                        let pos = pos + 1;
-                        let oid = type_to_oid(&EncodedType::try_from(etype)?.to_arrow())?;
-                        unsafe {
-                            let list = ptr as *mut List;
-                            let tuple = pg_sys::SearchSysCache1(
-                                TYPEOID as i32,
-                                pg_sys::ObjectIdGetDatum(oid),
-                            );
-                            if tuple.is_null() {
-                                anyhow::bail!(FusionError::UnsupportedType(format_smolstr!(
-                                    "{:?}", oid
-                                )));
-                            }
-                            let typtup = pg_sys::GETSTRUCT(tuple) as pg_sys::Form_pg_type;
-                            let expr = pg_sys::makeVar(
-                                pg_sys::INDEX_VAR,
-                                pos,
-                                oid,
-                                (*typtup).typtypmod,
-                                (*typtup).typcollation,
-                                0,
-                            );
-                            let col_name = palloc0(name.len()) as *mut u8;
-                            std::ptr::copy_nonoverlapping(name.as_ptr(), col_name, name.len());
-                            let entry = pg_sys::makeTargetEntry(
-                                expr as *mut pg_sys::Expr,
-                                pos,
-                                col_name as *mut i8,
-                                false,
-                            );
-                            pg_sys::ReleaseSysCache(tuple);
-                            pg_sys::list_append_unique_ptr(list, entry as *mut c_void);
+                // Collect per-attribute layout to return back to executor
+                let mut attr_layout: Vec<PgAttrWire> = Vec::new();
+                let repack = |pos: i16,
+                              etype: u8,
+                              nullable: bool,
+                              name: &[u8],
+                              ptr: *mut c_void|
+                 -> anyhow::Result<()> {
+                    let pos = pos + 1;
+                    let oid = type_to_oid(&EncodedType::try_from(etype)?.to_arrow())?;
+                    unsafe {
+                        let list = ptr as *mut List;
+                        let tuple =
+                            pg_sys::SearchSysCache1(TYPEOID as i32, pg_sys::ObjectIdGetDatum(oid));
+                        if tuple.is_null() {
+                            anyhow::bail!(FusionError::UnsupportedType(format_smolstr!(
+                                "{:?}", oid
+                            )));
                         }
-                        Ok(())
-                    };
+                        let typtup = pg_sys::GETSTRUCT(tuple) as pg_sys::Form_pg_type;
+                        let expr = pg_sys::makeVar(
+                            pg_sys::INDEX_VAR,
+                            pos,
+                            oid,
+                            (*typtup).typtypmod,
+                            (*typtup).typcollation,
+                            0,
+                        );
+                        // Record wire layout for this attribute
+                        let align = match (*typtup).typalign as u8 as char {
+                            'c' => 1u8,
+                            's' => 2u8,
+                            'i' => 4u8,
+                            'd' => 8u8,
+                            _ => 1u8,
+                        };
+                        attr_layout.push(PgAttrWire {
+                            atttypid: oid.to_u32(),
+                            typmod: (*typtup).typtypmod,
+                            attlen: (*typtup).typlen,
+                            attalign: align,
+                            attbyval: (*typtup).typbyval,
+                            nullable,
+                        });
+                        let col_name = palloc0(name.len()) as *mut u8;
+                        std::ptr::copy_nonoverlapping(name.as_ptr(), col_name, name.len());
+                        let entry = pg_sys::makeTargetEntry(
+                            expr as *mut pg_sys::Expr,
+                            pos,
+                            col_name as *mut i8,
+                            false,
+                        );
+                        pg_sys::ReleaseSysCache(tuple);
+                        pg_sys::list_append_unique_ptr(list, entry as *mut c_void);
+                    }
+                    Ok(())
+                };
                 if let Err(e) = consume_columns(&mut shared.send, list_ptr, repack) {
                     error!("Failed to consume columns: {e}");
+                }
+                // Send the collected layout back to the executor
+                if let Err(err) = prepare_column_layout(&mut shared.recv, &attr_layout) {
+                    let _ = request_failure(&mut shared.recv);
+                    let _ = shared.signal_server();
+                    error!("Failed to send column layout: {}", err);
+                }
+                if let Err(err) = shared.signal_server() {
+                    error!("Failed to signal server: {}", err);
                 }
                 break;
             }
@@ -318,7 +348,8 @@ unsafe extern "C-unwind" fn create_df_scan_state(cscan: *mut pg_sys::CustomScan)
                 // Ignore execution-time control messages during planning
                 continue;
             }
-            Err(_) => continue,
+            Ok(ControlPacket::ColumnLayout) => continue,
+            Ok(_) | Err(_) => continue,
         }
     }
 

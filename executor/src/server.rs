@@ -23,6 +23,7 @@ use protocol::heap::read_heap_block_bitmap_meta;
 use protocol::heap::request_heap_block;
 use protocol::metadata::prepare_table_refs;
 use protocol::parse::read_query;
+use protocol::tuple::{consume_column_layout, PgAttrWire};
 use protocol::Tape;
 use protocol::{consume_header, is_data_tag, ControlPacket, DataPacket, Direction};
 use rmp::decode::{read_u16 as read_u16_msgpack, read_u64 as read_u64_msgpack};
@@ -40,6 +41,7 @@ pub struct Storage {
     physical_plan: Option<Arc<dyn ExecutionPlan>>,
     registry: Arc<ScanRegistry>,
     exec_task: Option<JoinHandle<()>>,
+    pg_attrs: Option<Vec<PgAttrWire>>,
 }
 
 impl Storage {
@@ -143,6 +145,12 @@ impl<'bytes> Connection<'bytes> {
         );
         if header.direction == Direction::ToClient {
             trace!("process_message: header direction ToClient, ignoring");
+            return Ok(());
+        }
+        // Column layout arrives during planning/prepare; store it for later encoding use.
+        if header.tag == ControlPacket::ColumnLayout as u8 {
+            let attrs = consume_column_layout(&mut self.recv_socket.buffer)?;
+            storage.pg_attrs = Some(attrs);
             return Ok(());
         }
         // Data packets are handled out-of-band: push heap blocks into registry channels.
@@ -574,7 +582,7 @@ mod tests {
     use rmp::decode::read_bin_len;
     use std::cell::UnsafeCell;
     use std::ffi::CStr;
-    use std::io::Read;
+    use std::io::{Read, Write};
     use std::os::raw::c_void;
     use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU32};
     use std::sync::Arc;
@@ -676,7 +684,7 @@ mod tests {
             unsafe { LockFreeBuffer::from_layout(send_base, layout.send_buffer_layout) };
         static SERVER_PID: AtomicI32 = AtomicI32::new(0);
         static CLIENT_PID: AtomicI32 = AtomicI32::new(0);
-        let mut conn = Connection::new(socket, send_buffer, &SERVER_PID, &CLIENT_PID);
+        let mut conn = Connection::new(0, socket, send_buffer, &SERVER_PID, &CLIENT_PID);
         let mut storage = Storage::default();
         storage.registry = Arc::new(ScanRegistry::new());
         tokio::spawn(async move {
@@ -739,7 +747,7 @@ mod tests {
             unsafe { LockFreeBuffer::from_layout(send_base, layout.send_buffer_layout) };
         static SERVER_PID: AtomicI32 = AtomicI32::new(0);
         static CLIENT_PID: AtomicI32 = AtomicI32::new(0);
-        let mut conn = Connection::new(socket, send_buffer, &SERVER_PID, &CLIENT_PID);
+        let mut conn = Connection::new(0, socket, send_buffer, &SERVER_PID, &CLIENT_PID);
         let storage = Storage::default();
         tokio::spawn(async move {
             let mut storage = storage;
@@ -794,18 +802,19 @@ mod tests {
                 consume_header(&mut conn.send_buffer).expect("Failed to consume bind header");
             assert_eq!(header.direction, Direction::ToClient);
             assert_eq!(header.tag, ControlPacket::Columns as u8);
-            type Payload = (i16, u8, Vec<u8>);
+            type Payload = (i16, u8, bool, Vec<u8>);
             let mut columns: Vec<Payload> = Vec::new();
             let columns_ptr = &mut columns as *mut Vec<Payload> as *mut c_void;
-            let repack = |pos: i16, etype: u8, name: &[u8], ptr: *mut c_void| -> Result<()> {
+            let repack =
+                |pos: i16, etype: u8, nullable: bool, name: &[u8], ptr: *mut c_void| -> Result<()> {
                 let columns: &mut Vec<Payload> = unsafe { &mut *(ptr as *mut Vec<Payload>) };
-                columns.push((pos, etype, name.to_vec()));
+                columns.push((pos, etype, nullable, name.to_vec()));
                 Ok(())
             };
             consume_columns(&mut conn.send_buffer, columns_ptr, repack)
                 .expect("Failed to consume columns");
             assert_eq!(columns.len(), 1);
-            assert_eq!(columns[0], (0, 4, b"a\0".into()));
+            assert_eq!(columns[0], (0, 4, true, b"a\0".into()));
 
             request_explain(&mut conn.recv_socket.buffer).expect("Failed to request explain");
             conn.process_message(&mut storage)
@@ -861,7 +870,7 @@ mod tests {
             unsafe { LockFreeBuffer::from_layout(send_base, layout.send_buffer_layout) };
         static SERVER_PID: AtomicI32 = AtomicI32::new(0);
         static CLIENT_PID: AtomicI32 = AtomicI32::new(0);
-        let mut conn = Connection::new(socket, send_buffer, &SERVER_PID, &CLIENT_PID);
+        let mut conn = Connection::new(0, socket, send_buffer, &SERVER_PID, &CLIENT_PID);
         let storage = Storage::default();
         tokio::spawn(async move {
             let mut storage = storage;
@@ -903,6 +912,9 @@ mod tests {
 
             // Now send BeginScan; executor should register channels without sending payload
             request_begin_scan(&mut conn.recv_socket.buffer).expect("write BeginScan");
+            // Ensure header is committed in the ring; defensively flush and assert
+            conn.recv_socket.buffer.flush().expect("flush begin-scan header");
+            assert!(conn.recv_socket.buffer.len() >= 5, "begin-scan header not queued");
             let before = conn.send_buffer.len();
             conn.process_message(&mut storage)
                 .await
