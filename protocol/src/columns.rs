@@ -20,6 +20,8 @@ pub fn prepare_columns(stream: &mut impl Tape, columns: &Fields) -> Result<()> {
         write_bin_len(stream, len)?;
         stream.write_all(column.name().as_bytes())?;
         write_pfix(stream, 0)?;
+        // Also send nullability so backend can reflect it in ColumnLayout
+        rmp::encode::write_bool(stream, column.is_nullable())?;
     }
     let len_final = stream.uncommitted_len();
     let length = u16::try_from(len_final - len_init)?;
@@ -42,10 +44,10 @@ pub fn prepare_columns(stream: &mut impl Tape, columns: &Fields) -> Result<()> {
 pub fn consume_columns<ColumnRepack>(
     stream: &mut impl Read,
     opaque: *mut c_void,
-    repack: ColumnRepack,
+    mut repack: ColumnRepack,
 ) -> Result<()>
 where
-    ColumnRepack: Fn(i16, u8, &[u8], *mut c_void) -> Result<()>,
+    ColumnRepack: FnMut(i16, u8, bool, &[u8], *mut c_void) -> Result<()>,
 {
     let column_len = read_array_len(stream)?;
     debug_assert!(column_len < i16::MAX as u32);
@@ -56,7 +58,8 @@ where
         column_name.resize(column_len as usize, 0);
         let len = stream.read(&mut column_name)?;
         debug_assert_eq!(column_len as usize, len);
-        repack(pos as i16, etype, column_name.as_slice(), opaque)?;
+        let nullable = rmp::decode::read_bool(stream)?;
+        repack(pos as i16, etype, nullable, column_name.as_slice(), opaque)?;
     }
     Ok(())
 }
