@@ -78,7 +78,7 @@ pub unsafe extern "C-unwind" fn init_shmem() {
     // Allocate per-connection heap block buffers (SlotBlocksLayout).
     {
         use executor::layout::slot_blocks_layout;
-        let blksz = unsafe { pgrx::pg_sys::BLCKSZ as usize };
+        let blksz = pgrx::pg_sys::BLCKSZ as usize;
         let layout =
             slot_blocks_layout(SLOTS_PER_CONN, blksz, BLOCKS_PER_SLOT).expect("slot_blocks_layout");
         let total = layout.layout.size() * num;
@@ -375,7 +375,7 @@ pub(crate) fn connections_base() -> *mut u8 {
 }
 
 pub(crate) fn slot_blocks_layout() -> executor::layout::SlotBlocksLayout {
-    let blksz = unsafe { pgrx::pg_sys::BLCKSZ as usize };
+    let blksz = pgrx::pg_sys::BLCKSZ as usize;
     executor::layout::slot_blocks_layout(SLOTS_PER_CONN, blksz, BLOCKS_PER_SLOT)
         .expect("slot_blocks_layout")
 }
