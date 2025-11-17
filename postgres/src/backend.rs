@@ -35,7 +35,6 @@ use std::collections::HashMap;
 use std::ffi::c_char;
 use std::ffi::CStr;
 use std::os::raw::c_void;
-use std::slice;
 use std::sync::{LazyLock, Mutex};
 use std::time::Duration;
 
@@ -349,7 +348,7 @@ unsafe extern "C-unwind" fn create_df_scan_state(cscan: *mut pg_sys::CustomScan)
                 continue;
             }
             Ok(ControlPacket::ColumnLayout) => continue,
-            Ok(_) | Err(_) => continue,
+            Err(_) => continue,
         }
     }
 
