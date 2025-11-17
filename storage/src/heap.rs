@@ -435,7 +435,11 @@ impl<'bytes, I: Iterator<Item = usize>> DecodedIter<'bytes, I> {
         if hoff > tuple.len() {
             bail!(FusionError::BufferTooSmall(tuple.len()));
         }
-        let bits_ptr = if hasnull { hdr.t_bits.as_ptr() } else { core::ptr::null() };
+        let bits_ptr = if hasnull {
+            hdr.t_bits.as_ptr()
+        } else {
+            core::ptr::null()
+        };
         Ok(Self {
             page_hdr,
             tuple,
@@ -460,70 +464,156 @@ impl<'bytes, I: Iterator<Item = usize>> DecodedIter<'bytes, I> {
     }
 
     #[inline]
-    fn varlena_is_1b(b0: u8) -> bool { if cfg!(target_endian = "little") { (b0 & 0x01) == 0x01 } else { (b0 & 0x80) == 0x80 } }
+    fn varlena_is_1b(b0: u8) -> bool {
+        if cfg!(target_endian = "little") {
+            (b0 & 0x01) == 0x01
+        } else {
+            (b0 & 0x80) == 0x80
+        }
+    }
     #[inline]
-    fn varlena_is_1b_external(b0: u8) -> bool { if cfg!(target_endian = "little") { b0 == 0x01 } else { b0 == 0x80 } }
+    fn varlena_is_1b_external(b0: u8) -> bool {
+        if cfg!(target_endian = "little") {
+            b0 == 0x01
+        } else {
+            b0 == 0x80
+        }
+    }
     #[inline]
-    fn varlena_1b_data_len(b0: u8) -> usize { if cfg!(target_endian = "little") { (b0 as usize) >> 1 } else { (b0 as usize) & 0x7F } }
+    fn varlena_1b_data_len(b0: u8) -> usize {
+        if cfg!(target_endian = "little") {
+            (b0 as usize) >> 1
+        } else {
+            (b0 as usize) & 0x7F
+        }
+    }
     #[inline]
-    fn varlena_4b_total_len(hdr_u32: u32) -> usize { if cfg!(target_endian = "little") { (hdr_u32 >> 2) as usize } else { (hdr_u32 & 0x3FFF_FFFF) as usize } }
+    fn varlena_4b_total_len(hdr_u32: u32) -> usize {
+        if cfg!(target_endian = "little") {
+            (hdr_u32 >> 2) as usize
+        } else {
+            (hdr_u32 & 0x3FFF_FFFF) as usize
+        }
+    }
     #[inline]
-    fn varlena_4b_is_compressed(hdr_u32: u32) -> bool { if cfg!(target_endian = "little") { (hdr_u32 & 0x03) == 0x02 } else { ((hdr_u32 >> 30) & 0x03) == 0x01 } }
+    fn varlena_4b_is_compressed(hdr_u32: u32) -> bool {
+        if cfg!(target_endian = "little") {
+            (hdr_u32 & 0x03) == 0x02
+        } else {
+            ((hdr_u32 >> 30) & 0x03) == 0x01
+        }
+    }
 
     unsafe fn decode_att(&mut self, att_idx: usize) -> Result<ScalarValue> {
-        if att_idx < self.last_attno { self.last_attno = 0; self.off = self.hoff; }
+        if att_idx < self.last_attno {
+            self.last_attno = 0;
+            self.off = self.hoff;
+        }
         while self.last_attno < att_idx {
-            let meta = self.attrs.get(self.last_attno).ok_or_else(|| OutOfBound(format_smolstr!("attr {}", self.last_attno)))?;
+            let meta = self
+                .attrs
+                .get(self.last_attno)
+                .ok_or_else(|| OutOfBound(format_smolstr!("attr {}", self.last_attno)))?;
             if !self.att_is_null(self.last_attno) {
                 if meta.attlen > 0 {
                     self.off = align_up(self.off, meta.attalign);
                     let len = meta.attlen as usize;
-                    if self.off + len > self.tuple.len() { bail!(FusionError::BufferTooSmall(self.tuple.len())); }
+                    if self.off + len > self.tuple.len() {
+                        bail!(FusionError::BufferTooSmall(self.tuple.len()));
+                    }
                     self.off += len;
                 } else {
-                    if self.off >= self.tuple.len() { bail!(FusionError::BufferTooSmall(self.tuple.len())); }
+                    if self.off >= self.tuple.len() {
+                        bail!(FusionError::BufferTooSmall(self.tuple.len()));
+                    }
                     let b0 = self.tuple[self.off];
                     if Self::varlena_is_1b(b0) {
                         let is_external = Self::varlena_is_1b_external(b0);
-                        if is_external { let total = 1usize + 18usize; self.off = self.off.saturating_add(total); }
-                        else { let total = Self::varlena_1b_data_len(b0); if self.off + total > self.tuple.len() { bail!(FusionError::BufferTooSmall(self.tuple.len())); } self.off += total; }
+                        if is_external {
+                            let total = 1usize + 18usize;
+                            self.off = self.off.saturating_add(total);
+                        } else {
+                            let total = Self::varlena_1b_data_len(b0);
+                            if self.off + total > self.tuple.len() {
+                                bail!(FusionError::BufferTooSmall(self.tuple.len()));
+                            }
+                            self.off += total;
+                        }
                     } else {
-                        if self.off + 4 > self.tuple.len() { bail!(FusionError::BufferTooSmall(self.tuple.len())); }
-                        let hdr_u32 = u32::from_ne_bytes(self.tuple[self.off..self.off + 4].try_into().unwrap());
+                        if self.off + 4 > self.tuple.len() {
+                            bail!(FusionError::BufferTooSmall(self.tuple.len()));
+                        }
+                        let hdr_u32 = u32::from_ne_bytes(
+                            self.tuple[self.off..self.off + 4].try_into().unwrap(),
+                        );
                         let total_len = Self::varlena_4b_total_len(hdr_u32);
-                        if total_len < 4 || self.off + total_len > self.tuple.len() { bail!(FusionError::BufferTooSmall(self.tuple.len())); }
+                        if total_len < 4 || self.off + total_len > self.tuple.len() {
+                            bail!(FusionError::BufferTooSmall(self.tuple.len()));
+                        }
                         self.off += total_len;
                     }
                 }
             }
             self.last_attno += 1;
         }
-        let meta = self.attrs.get(att_idx).ok_or_else(|| OutOfBound(format_smolstr!("attr {}", att_idx)))?;
-        if self.att_is_null(att_idx) { self.last_attno = att_idx + 1; return Ok(typed_null_for(meta.atttypid)); }
+        let meta = self
+            .attrs
+            .get(att_idx)
+            .ok_or_else(|| OutOfBound(format_smolstr!("attr {}", att_idx)))?;
+        if self.att_is_null(att_idx) {
+            self.last_attno = att_idx + 1;
+            return Ok(typed_null_for(meta.atttypid));
+        }
         self.off = align_up(self.off, meta.attalign);
         if meta.attlen > 0 {
-            let len = meta.attlen as usize; if self.off + len > self.tuple.len() { bail!(FusionError::BufferTooSmall(self.tuple.len())); }
-            let v = decode_fixed_width(meta.atttypid, &self.tuple[self.off..self.off + len])?.unwrap_or(ScalarValue::Null);
-            self.off += len; self.last_attno = att_idx + 1; return Ok(v);
+            let len = meta.attlen as usize;
+            if self.off + len > self.tuple.len() {
+                bail!(FusionError::BufferTooSmall(self.tuple.len()));
+            }
+            let v = decode_fixed_width(meta.atttypid, &self.tuple[self.off..self.off + len])?
+                .unwrap_or(ScalarValue::Null);
+            self.off += len;
+            self.last_attno = att_idx + 1;
+            return Ok(v);
         }
-        if self.off >= self.tuple.len() { bail!(FusionError::BufferTooSmall(self.tuple.len())); }
+        if self.off >= self.tuple.len() {
+            bail!(FusionError::BufferTooSmall(self.tuple.len()));
+        }
         let b0 = self.tuple[self.off];
         if Self::varlena_is_1b(b0) {
             let is_external = Self::varlena_is_1b_external(b0);
-            if is_external { let total = 1usize + 18usize; self.off = self.off.saturating_add(total); self.last_attno = att_idx + 1; bail!(anyhow!("external toasted value is not supported")); }
-            let total = Self::varlena_1b_data_len(b0); if self.off + total > self.tuple.len() { bail!(FusionError::BufferTooSmall(self.tuple.len())); }
+            if is_external {
+                let total = 1usize + 18usize;
+                self.off = self.off.saturating_add(total);
+                self.last_attno = att_idx + 1;
+                bail!(anyhow!("external toasted value is not supported"));
+            }
+            let total = Self::varlena_1b_data_len(b0);
+            if self.off + total > self.tuple.len() {
+                bail!(FusionError::BufferTooSmall(self.tuple.len()));
+            }
             let data = &self.tuple[self.off + 1..self.off + total];
             let v = decode_varlena_inline(meta.atttypid, data)?.unwrap_or(ScalarValue::Null);
-            self.off += total; self.last_attno = att_idx + 1; Ok(v)
+            self.off += total;
+            self.last_attno = att_idx + 1;
+            Ok(v)
         } else {
             self.off = align_up(self.off, meta.attalign);
-            if self.off + 4 > self.tuple.len() { bail!(FusionError::BufferTooSmall(self.tuple.len())); }
-            let hdr_u32 = u32::from_ne_bytes(self.tuple[self.off..self.off + 4].try_into().unwrap());
+            if self.off + 4 > self.tuple.len() {
+                bail!(FusionError::BufferTooSmall(self.tuple.len()));
+            }
+            let hdr_u32 =
+                u32::from_ne_bytes(self.tuple[self.off..self.off + 4].try_into().unwrap());
             let total_len = Self::varlena_4b_total_len(hdr_u32);
-            if total_len < 4 || self.off + total_len > self.tuple.len() { bail!(FusionError::BufferTooSmall(self.tuple.len())); }
+            if total_len < 4 || self.off + total_len > self.tuple.len() {
+                bail!(FusionError::BufferTooSmall(self.tuple.len()));
+            }
             let is_compressed = Self::varlena_4b_is_compressed(hdr_u32);
-            self.off += total_len; self.last_attno = att_idx + 1;
-            if is_compressed { bail!(anyhow!("compressed varlena is not supported")); }
+            self.off += total_len;
+            self.last_attno = att_idx + 1;
+            if is_compressed {
+                bail!(anyhow!("compressed varlena is not supported"));
+            }
             let data = &self.tuple[self.off - total_len + 4..self.off];
             let v = decode_varlena_inline(meta.atttypid, data)?.unwrap_or(ScalarValue::Null);
             Ok(v)
@@ -534,8 +624,12 @@ impl<'bytes, I: Iterator<Item = usize>> DecodedIter<'bytes, I> {
 impl<'bytes, I: Iterator<Item = usize>> Iterator for DecodedIter<'bytes, I> {
     type Item = Result<ScalarValue>;
     fn next(&mut self) -> Option<Self::Item> {
-        let Some(att_idx) = self.iter.next() else { return None; };
-        if let Some(err) = self.pending_err.take() { return Some(Err(err)); }
+        let Some(att_idx) = self.iter.next() else {
+            return None;
+        };
+        if let Some(err) = self.pending_err.take() {
+            return Some(Err(err));
+        }
         Some(unsafe { self.decode_att(att_idx) })
     }
 }

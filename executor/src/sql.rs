@@ -88,12 +88,20 @@ pub struct Catalog {
 
 impl Catalog {
     pub fn with_registry(registry: Arc<ScanRegistry>) -> Self {
-        Self { builtin: Arc::clone(&*BUILDIN), tables: AHashMap::new(), registry }
+        Self {
+            builtin: Arc::clone(&*BUILDIN),
+            tables: AHashMap::new(),
+            registry,
+        }
     }
 
     pub fn from_stream(stream: &mut impl Read, registry: Arc<ScanRegistry>) -> Result<Self> {
         // Temporarily create a placeholder to pass registry into provider construction
-        let mut catalog = Self { builtin: Arc::clone(&*BUILDIN), tables: AHashMap::new(), registry };
+        let mut catalog = Self {
+            builtin: Arc::clone(&*BUILDIN),
+            tables: AHashMap::new(),
+            registry,
+        };
         catalog.tables = catalog.consume_metadata_exec(stream)?;
         Ok(catalog)
     }
@@ -154,62 +162,66 @@ impl ContextProvider for Catalog {
 }
 
 impl Catalog {
-fn consume_metadata_exec(
-    &self,
-    stream: &mut impl Read,
-) -> Result<AHashMap<TableReference, Arc<dyn TableSource>>> {
-    let table_num = read_array_len(stream)?;
-    let mut tables = AHashMap::with_capacity(table_num as usize);
+    fn consume_metadata_exec(
+        &self,
+        stream: &mut impl Read,
+    ) -> Result<AHashMap<TableReference, Arc<dyn TableSource>>> {
+        let table_num = read_array_len(stream)?;
+        let mut tables = AHashMap::with_capacity(table_num as usize);
 
-    let mut schema_buf = SmallVec::<[u8; NAMEDATALEN]>::new();
-    let mut name_buf = SmallVec::<[u8; NAMEDATALEN]>::new();
+        let mut schema_buf = SmallVec::<[u8; NAMEDATALEN]>::new();
+        let mut name_buf = SmallVec::<[u8; NAMEDATALEN]>::new();
 
-    for _ in 0..table_num {
-        let name_part_num = read_array_len(stream)?;
-        debug_assert!(name_part_num == 2 || name_part_num == 3);
-        let oid = read_u32(stream)?;
-        let mut schema = None;
-        if name_part_num == 3 {
-            let ns_len = read_str_len(stream)?;
-            schema_buf.resize(ns_len as usize, 0);
-            std::io::Read::read_exact(stream, &mut schema_buf)?;
-            schema = Some(from_utf8(schema_buf.as_slice())?);
-        }
-        let name_len = read_str_len(stream)?;
-        name_buf.resize(name_len as usize, 0);
-        std::io::Read::read_exact(stream, &mut name_buf)?;
-        let name = from_utf8(name_buf.as_slice())?;
-        let table_ref = match schema {
-            Some(schema) => TableReference::partial(schema, name),
-            None => TableReference::bare(name),
-        };
-        schema_buf.clear();
-        name_buf.clear();
-
-        let column_num = read_array_len(stream)?;
-        let mut fields = Vec::with_capacity(column_num as usize);
-        for _ in 0..column_num {
-            let elem_num = read_array_len(stream)?;
-            debug_assert_eq!(elem_num, 3);
-            let etype = read_u8(stream)?;
-            let df_type = protocol::data_type::EncodedType::try_from(etype)?.to_arrow();
-            let is_nullable = read_bool(stream)?;
+        for _ in 0..table_num {
+            let name_part_num = read_array_len(stream)?;
+            debug_assert!(name_part_num == 2 || name_part_num == 3);
+            let oid = read_u32(stream)?;
+            let mut schema = None;
+            if name_part_num == 3 {
+                let ns_len = read_str_len(stream)?;
+                schema_buf.resize(ns_len as usize, 0);
+                std::io::Read::read_exact(stream, &mut schema_buf)?;
+                schema = Some(from_utf8(schema_buf.as_slice())?);
+            }
             let name_len = read_str_len(stream)?;
             name_buf.resize(name_len as usize, 0);
             std::io::Read::read_exact(stream, &mut name_buf)?;
             let name = from_utf8(name_buf.as_slice())?;
-            let field = datafusion::arrow::datatypes::Field::new(name, df_type, is_nullable);
+            let table_ref = match schema {
+                Some(schema) => TableReference::partial(schema, name),
+                None => TableReference::bare(name),
+            };
+            schema_buf.clear();
             name_buf.clear();
-            fields.push(field);
+
+            let column_num = read_array_len(stream)?;
+            let mut fields = Vec::with_capacity(column_num as usize);
+            for _ in 0..column_num {
+                let elem_num = read_array_len(stream)?;
+                debug_assert_eq!(elem_num, 3);
+                let etype = read_u8(stream)?;
+                let df_type = protocol::data_type::EncodedType::try_from(etype)?.to_arrow();
+                let is_nullable = read_bool(stream)?;
+                let name_len = read_str_len(stream)?;
+                name_buf.resize(name_len as usize, 0);
+                std::io::Read::read_exact(stream, &mut name_buf)?;
+                let name = from_utf8(name_buf.as_slice())?;
+                let field = datafusion::arrow::datatypes::Field::new(name, df_type, is_nullable);
+                name_buf.clear();
+                fields.push(field);
+            }
+            let schema = Arc::new(datafusion::arrow::datatypes::Schema::new(fields));
+            // Register PgTableProvider backed by ScanRegistry; use OID as scan_id for now.
+            let scan_id = oid as u64;
+            // Provider uses connection-local registry; injected later via Catalog
+            let provider = Arc::new(PgTableProvider::new(
+                scan_id,
+                Arc::clone(&schema),
+                Arc::clone(&self.registry),
+            ));
+            let source = Arc::new(DefaultTableSource::new(provider));
+            tables.insert(table_ref, source as Arc<dyn TableSource>);
         }
-        let schema = Arc::new(datafusion::arrow::datatypes::Schema::new(fields));
-        // Register PgTableProvider backed by ScanRegistry; use OID as scan_id for now.
-        let scan_id = oid as u64;
-        // Provider uses connection-local registry; injected later via Catalog
-        let provider = Arc::new(PgTableProvider::new(scan_id, Arc::clone(&schema), Arc::clone(&self.registry)));
-        let source = Arc::new(DefaultTableSource::new(provider));
-        tables.insert(table_ref, source as Arc<dyn TableSource>);
+        Ok(tables)
     }
-    Ok(tables)
-}
 }

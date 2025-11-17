@@ -48,7 +48,12 @@ mod tests {
                 let slice = std::slice::from_raw_parts(base, pg_sys::BLCKSZ as usize);
                 let hp = HeapPage::from_slice(slice)?;
                 for tup_bytes in hp.tuples(None, ptr::null_mut::<c_void>()) {
-                    let it = decode_tuple_project(page_hdr, tup_bytes, attrs, projection.iter().copied())?;
+                    let it = decode_tuple_project(
+                        page_hdr,
+                        tup_bytes,
+                        attrs,
+                        projection.iter().copied(),
+                    )?;
                     let vals: Result<Vec<_>, _> = it.collect();
                     rows.push(vals?);
                 }
@@ -86,7 +91,12 @@ mod tests {
                 let slice = std::slice::from_raw_parts(base, pg_sys::BLCKSZ as usize);
                 if let Ok(hp) = HeapPage::from_slice(slice) {
                     'tuples: for tup_bytes in hp.tuples(None, ptr::null_mut::<c_void>()) {
-                        match decode_tuple_project(page_hdr, tup_bytes, attrs, projection.iter().copied()) {
+                        match decode_tuple_project(
+                            page_hdr,
+                            tup_bytes,
+                            attrs,
+                            projection.iter().copied(),
+                        ) {
                             Ok(mut it) => {
                                 if let Some(Err(_)) = it.next() {
                                     saw_err = true;

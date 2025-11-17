@@ -281,7 +281,10 @@ pub unsafe fn slot_blocks_ptrs(
     slot: usize,
 ) -> (*mut u8, *mut u8) {
     assert!(slot < layout.slot_count, "slot index out of range");
-    assert!(layout.blocks_per_slot >= 2, "need at least 2 blocks per slot to return a pair");
+    assert!(
+        layout.blocks_per_slot >= 2,
+        "need at least 2 blocks per slot to return a pair"
+    );
     let per_block = layout.block_len + layout.vis_bytes_per_block;
     let stride = layout.blocks_per_slot * per_block;
     let slot_base = base.add(slot * stride);

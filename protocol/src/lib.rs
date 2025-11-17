@@ -8,12 +8,12 @@ use std::io::{Read, Write};
 
 pub mod bind;
 pub mod columns;
+pub mod exec;
 pub mod explain;
 pub mod failure;
 pub mod heap;
 pub mod metadata;
 pub mod parse;
-pub mod exec;
 pub mod result;
 
 pub const DATA_SIZE: usize = 8 * 1024;
