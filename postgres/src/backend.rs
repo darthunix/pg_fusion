@@ -1,8 +1,11 @@
 use crate::ipc::{connection_id, connection_shared, ConnectionShared};
+use crate::worker::{result_ring_base_for, result_ring_layout};
+use crate::worker::{slot_blocks_base_for, slot_blocks_layout};
 use anyhow::Result as AnyResult;
 use common::FusionError;
 use datafusion::arrow::datatypes::DataType;
 use executor::buffer::LockFreeBuffer;
+use executor::layout::{slot_block_ptr, slot_block_vis_ptr};
 use libc::c_long;
 use pgrx::pg_sys::SysCacheIdentifier::TYPEOID;
 use pgrx::pg_sys::{
@@ -14,28 +17,25 @@ use protocol::bind::prepare_params;
 use protocol::columns::consume_columns;
 use protocol::consume_header;
 use protocol::data_type::EncodedType;
-use protocol::explain::request_explain;
+use protocol::exec::prepare_scan_eof;
 use protocol::exec::{request_begin_scan, request_end_scan, request_exec_scan};
+use protocol::explain::request_explain;
 use protocol::failure::{read_error, request_failure};
+use protocol::heap::{prepare_heap_block_meta_shm, read_heap_block_request};
 use protocol::metadata::process_metadata_with_response;
 use protocol::parse::prepare_query;
 use protocol::Tape;
 use protocol::{ControlPacket, DataPacket, Direction};
-use crate::worker::{result_ring_base_for, result_ring_layout};
-use protocol::heap::{prepare_heap_block_meta_shm, read_heap_block_request};
-use protocol::exec::prepare_scan_eof;
-use crate::worker::{slot_blocks_base_for, slot_blocks_layout};
-use executor::layout::{slot_block_ptr, slot_block_vis_ptr};
-use std::slice;
-use std::collections::HashMap;
-use std::sync::{Mutex, LazyLock};
 use rmp::decode::read_bin_len;
 use rmp::encode::{write_array_len, write_bool, write_str, write_u32, write_u8};
 use smallvec::SmallVec;
 use smol_str::format_smolstr;
+use std::collections::HashMap;
 use std::ffi::c_char;
 use std::ffi::CStr;
 use std::os::raw::c_void;
+use std::slice;
+use std::sync::{LazyLock, Mutex};
 use std::time::Duration;
 
 fn handle_metadata(send: &mut LockFreeBuffer, recv: &mut LockFreeBuffer) -> AnyResult<()> {
@@ -299,7 +299,7 @@ unsafe extern "C-unwind" fn create_df_scan_state(cscan: *mut pg_sys::CustomScan)
                 }
                 break;
             }
-            
+
             Ok(ControlPacket::Parse)
             | Ok(ControlPacket::Explain)
             | Ok(ControlPacket::Optimize)
@@ -417,174 +417,244 @@ unsafe extern "C-unwind" fn exec_df_scan(
     }
     // Try to process at most one pending heap page request from the executor.
     // This keeps ExecCustomScan non-blocking while still making progress.
-    if shared.send.len() > 0 {
-        if let Ok(header) = consume_header(&mut shared.send) {
-            if header.direction == Direction::ToClient {
-                if let Ok(dp) = DataPacket::try_from(header.tag) {
-                    match dp {
-                        DataPacket::Heap => {
-                            if let Ok((scan_id, table_oid, slot_id)) =
-                                read_heap_block_request(&mut shared.send)
-                            {
-                                // Determine next block number for this scan
-                                static PROGRESS: LazyLock<Mutex<HashMap<u64, u32>>> =
-                                    LazyLock::new(|| Mutex::new(HashMap::new()));
-                                let blkno = {
-                                    let mut map = PROGRESS.lock().unwrap();
-                                    let e = map.entry(scan_id).or_insert(0);
-                                    let cur = *e;
-                                    *e = e.saturating_add(1);
-                                    cur
-                                };
-                                // Open relation and validate block number
-                                let rel_oid = Oid::from(table_oid);
-                                let rel = unsafe { pg_sys::RelationIdGetRelation(rel_oid) };
-                                if rel.is_null() {
-                                    // Relation not found; cannot serve this request
-                                    // (leave without publishing)
-                                } else {
-                                    let nblocks = unsafe {
-                                        pg_sys::table_block_relation_size(
-                                            rel,
-                                            pg_sys::ForkNumber::MAIN_FORKNUM,
-                                        )
-                                    } as u32;
-                                    if blkno >= nblocks {
-                                        // End of relation reached: send EOF for this scan
-                                        let _ = prepare_scan_eof(&mut shared.recv, scan_id);
-                                        let _ = shared.signal_server();
-                                        unsafe { pg_sys::RelationClose(rel) };
-                                    } else {
-                                        // Read the requested block
-                                        let buf = unsafe {
-                                            pg_sys::ReadBufferExtended(
-                                                rel,
-                                                pg_sys::ForkNumber::MAIN_FORKNUM,
-                                                blkno as pg_sys::BlockNumber,
-                                                pg_sys::ReadBufferMode::RBM_NORMAL,
-                                                std::ptr::null_mut(),
-                                            )
-                                        };
-                                        if buf <= 0 {
-                                            unsafe { pg_sys::RelationClose(rel) };
-                                        } else {
-                                            // Lock buffer for shared access while copying
-                                            unsafe {
-                                                pg_sys::LockBuffer(
-                                                    buf,
-                                                    pg_sys::BUFFER_LOCK_SHARE as i32,
-                                                );
-                                            }
-                                            let blksz = pg_sys::BLCKSZ as usize;
-                                            let page_ptr =
-                                                unsafe { pg_sys::BufferGetPage(buf) } as *const u8;
-                                            let page = unsafe {
-                                                std::slice::from_raw_parts(page_ptr, blksz)
-                                            };
-                                            // Compute number of offsets (max line pointer number)
-                                            let hdr = unsafe {
-                                                &*(page_ptr as *const pg_sys::PageHeaderData)
-                                            };
-                                            let lower = hdr.pd_lower as usize;
-                                            let num_offsets = if lower
-                                                < std::mem::size_of::<pg_sys::PageHeaderData>()
-                                            {
-                                                0u16
-                                            } else {
-                                                let cnt = (lower
-                                                    - std::mem::size_of::<pg_sys::PageHeaderData>())
-                                                    / std::mem::size_of::<pg_sys::ItemIdData>();
-                                                u16::try_from(cnt).unwrap_or(u16::MAX)
-                                            };
-                                            // Prepare visibility bitmap with all tuples visible
-                                            let bytes = ((num_offsets as usize) + 7) / 8;
-                                            let mut vis = vec![0xFFu8; bytes];
-                                            if num_offsets > 0 {
-                                                let rem = (num_offsets as usize) % 8;
-                                                if rem != 0 {
-                                                    let mask = (1u8 << rem) - 1;
-                                                    if let Some(last) = vis.last_mut() {
-                                                        *last = mask;
-                                                    }
-                                                }
-                                            }
-                                            // Publish to shared memory + notify executor
-                                            let _ = publish_heap_page(
-                                                &mut shared,
-                                                scan_id,
-                                                slot_id,
-                                                table_oid,
-                                                blkno,
-                                                num_offsets,
-                                                page,
-                                                &vis,
-                                            );
-                                            // Unlock and release buffer; close relation
-                                            unsafe {
-                                                pg_sys::UnlockReleaseBuffer(buf);
-                                                pg_sys::RelationClose(rel);
-                                            }
-                                        }
-                                    }
-                                }
-                            }
-                        }
-                        DataPacket::Eof => {
-                            // Ignore EOF from executor in backend context
-                        }
-                    }
-                }
-            }
-        }
-    }
+    process_pending_heap_request(&mut shared);
     // Try to read one result row from the per-connection result ring and fill a virtual slot
     let tupslot = unsafe { (*_node).ss.ss_ScanTupleSlot };
     if tupslot.is_null() {
         return std::ptr::null_mut();
     }
+    return unsafe { try_fill_slot_from_result(tupslot) };
+}
+
+/// Try to process at most one pending heap page request from the executor.
+/// Non-blocking and best-effort: silently returns if no applicable message is queued.
+fn process_pending_heap_request(shared: &mut ConnectionShared) {
+    if shared.send.len() == 0 {
+        return;
+    }
+    if let Ok(header) = consume_header(&mut shared.send) {
+        if header.direction != Direction::ToClient {
+            return;
+        }
+        if let Ok(dp) = DataPacket::try_from(header.tag) {
+            match dp {
+                DataPacket::Heap => {
+                    if let Ok((scan_id, table_oid, slot_id)) =
+                        read_heap_block_request(&mut shared.send)
+                    {
+                        // Determine next block number for this scan
+                        static PROGRESS: LazyLock<Mutex<HashMap<u64, u32>>> =
+                            LazyLock::new(|| Mutex::new(HashMap::new()));
+                        let blkno = {
+                            let mut map = PROGRESS.lock().unwrap();
+                            let e = map.entry(scan_id).or_insert(0);
+                            let cur = *e;
+                            *e = e.saturating_add(1);
+                            cur
+                        };
+                        // Open relation and validate block number
+                        let rel_oid = Oid::from(table_oid);
+                        let rel = unsafe { pg_sys::RelationIdGetRelation(rel_oid) };
+                        if rel.is_null() {
+                            // Relation not found; cannot serve this request
+                            return;
+                        }
+                        let nblocks = unsafe {
+                            pg_sys::table_block_relation_size(rel, pg_sys::ForkNumber::MAIN_FORKNUM)
+                        } as u32;
+                        if blkno >= nblocks {
+                            // End of relation reached: send EOF for this scan
+                            let _ = prepare_scan_eof(&mut shared.recv, scan_id);
+                            let _ = shared.signal_server();
+                            unsafe { pg_sys::RelationClose(rel) };
+                            return;
+                        }
+                        // Read the requested block
+                        let buf = unsafe {
+                            pg_sys::ReadBufferExtended(
+                                rel,
+                                pg_sys::ForkNumber::MAIN_FORKNUM,
+                                blkno as pg_sys::BlockNumber,
+                                pg_sys::ReadBufferMode::RBM_NORMAL,
+                                std::ptr::null_mut(),
+                            )
+                        };
+                        if buf <= 0 {
+                            unsafe { pg_sys::RelationClose(rel) };
+                            return;
+                        }
+                        // Lock buffer for shared access while copying
+                        unsafe {
+                            pg_sys::LockBuffer(buf, pg_sys::BUFFER_LOCK_SHARE as i32);
+                        }
+                        let blksz = pg_sys::BLCKSZ as usize;
+                        let page_ptr = unsafe { pg_sys::BufferGetPage(buf) } as *const u8;
+                        let page = unsafe { std::slice::from_raw_parts(page_ptr, blksz) };
+                        // Compute number of offsets (max line pointer number)
+                        let hdr = unsafe { &*(page_ptr as *const pg_sys::PageHeaderData) };
+                        let lower = hdr.pd_lower as usize;
+                        let num_offsets = if lower < std::mem::size_of::<pg_sys::PageHeaderData>() {
+                            0u16
+                        } else {
+                            let cnt = (lower - std::mem::size_of::<pg_sys::PageHeaderData>())
+                                / std::mem::size_of::<pg_sys::ItemIdData>();
+                            u16::try_from(cnt).unwrap_or(u16::MAX)
+                        };
+                        // Prepare visibility bitmap with all tuples visible
+                        let bytes = ((num_offsets as usize) + 7) / 8;
+                        let mut vis = vec![0xFFu8; bytes];
+                        if num_offsets > 0 {
+                            let rem = (num_offsets as usize) % 8;
+                            if rem != 0 {
+                                let mask = (1u8 << rem) - 1;
+                                if let Some(last) = vis.last_mut() {
+                                    *last = mask;
+                                }
+                            }
+                        }
+                        // Publish to shared memory + notify executor
+                        let _ = publish_heap_page(
+                            shared,
+                            scan_id,
+                            slot_id,
+                            table_oid,
+                            blkno,
+                            num_offsets,
+                            page,
+                            &vis,
+                        );
+                        // Unlock and release buffer; close relation
+                        unsafe {
+                            pg_sys::UnlockReleaseBuffer(buf);
+                            pg_sys::RelationClose(rel);
+                        }
+                    }
+                }
+                DataPacket::Eof => {
+                    // Ignore EOF from executor in backend context
+                    return;
+                }
+            }
+        }
+    }
+}
+
+/// Read one row from the result ring and populate `tupslot`.
+/// Returns `tupslot` on success, or null on EOF/empty ring/error.
+unsafe fn try_fill_slot_from_result(
+    tupslot: *mut pg_sys::TupleTableSlot,
+) -> *mut pg_sys::TupleTableSlot {
     let conn_id = match connection_id() {
         Ok(v) => v as usize,
         Err(_) => 0,
     };
     let base = result_ring_base_for(conn_id);
     let layout = result_ring_layout();
-    let mut ring = unsafe { executor::buffer::LockFreeBuffer::from_layout(base, layout) };
+    let mut ring = LockFreeBuffer::from_layout(base, layout);
     if ring.len() == 0 {
         return std::ptr::null_mut();
     }
     use std::io::Read;
     // Read fixed 4-byte little-endian row_len
-    let row_len = match protocol::result::read_frame_len(&mut ring) { Ok(v) => v as usize, Err(_) => return std::ptr::null_mut() };
+    let row_len = match protocol::result::read_frame_len(&mut ring) {
+        Ok(v) => v as usize,
+        Err(_) => return std::ptr::null_mut(),
+    };
     if row_len == 0 {
         // EOF sentinel
         return std::ptr::null_mut();
     }
     // Decode row body directly from ring using a limited reader
     let mut limited = ring.by_ref().take(row_len as u64);
-    let natts = match rmp::decode::read_array_len(&mut limited) { Ok(v) => v as usize, Err(_) => return std::ptr::null_mut() };
-    let mut buf = Vec::new();
-    if natts >= 1 {
-        // Expect str for demo
-        let l = match rmp::decode::read_str_len(&mut limited) { Ok(v) => v as usize, Err(_) => return std::ptr::null_mut() };
-        buf.resize(l, 0);
-        if std::io::Read::read_exact(&mut limited, &mut buf).is_err() { return std::ptr::null_mut(); }
+    let natts_in = match rmp::decode::read_array_len(&mut limited) {
+        Ok(v) => v as usize,
+        Err(_) => return std::ptr::null_mut(),
+    };
+    let tdesc = (*tupslot).tts_tupleDescriptor;
+    let natts_td = (*tdesc).natts as usize;
+    let natts = std::cmp::min(natts_in, natts_td);
+    pg_sys::ExecClearTuple(tupslot);
+    for i in 0..natts {
+        let attoid = (*tdesc).attrs.as_slice((*tdesc).natts as _)[i].atttypid;
+        match attoid {
+            o if o == pg_sys::TEXTOID => {
+                let l = match rmp::decode::read_str_len(&mut limited) {
+                    Ok(v) => v as usize,
+                    Err(_) => return std::ptr::null_mut(),
+                };
+                let mut buf = vec![0u8; l];
+                if Read::read_exact(&mut limited, &mut buf).is_err() {
+                    return std::ptr::null_mut();
+                }
+                let cstr = std::ffi::CString::new(buf).unwrap();
+                let txt = pg_sys::cstring_to_text_with_len(cstr.as_ptr(), l as i32);
+                *(*tupslot).tts_values.add(i) =
+                    pg_sys::PointerGetDatum(txt as *mut std::ffi::c_void);
+                *(*tupslot).tts_isnull.add(i) = false;
+            }
+            o if o == pg_sys::BOOLOID => {
+                let v = match rmp::decode::read_bool(&mut limited) {
+                    Ok(v) => v,
+                    Err(_) => return std::ptr::null_mut(),
+                };
+                *(*tupslot).tts_values.add(i) = pg_sys::BoolGetDatum(v);
+                *(*tupslot).tts_isnull.add(i) = false;
+            }
+            o if o == pg_sys::INT2OID => {
+                let v = match rmp::decode::read_i64(&mut limited) {
+                    Ok(v) => v as i16,
+                    Err(_) => return std::ptr::null_mut(),
+                };
+                *(*tupslot).tts_values.add(i) = pg_sys::Int16GetDatum(v);
+                *(*tupslot).tts_isnull.add(i) = false;
+            }
+            o if o == pg_sys::INT4OID => {
+                let v = match rmp::decode::read_i64(&mut limited) {
+                    Ok(v) => v as i32,
+                    Err(_) => return std::ptr::null_mut(),
+                };
+                *(*tupslot).tts_values.add(i) = pg_sys::Int32GetDatum(v);
+                *(*tupslot).tts_isnull.add(i) = false;
+            }
+            o if o == pg_sys::INT8OID => {
+                let v = match rmp::decode::read_i64(&mut limited) {
+                    Ok(v) => v as i64,
+                    Err(_) => return std::ptr::null_mut(),
+                };
+                *(*tupslot).tts_values.add(i) = pg_sys::Int64GetDatum(v);
+                *(*tupslot).tts_isnull.add(i) = false;
+            }
+            o if o == pg_sys::FLOAT4OID => {
+                let v = match rmp::decode::read_f64(&mut limited) {
+                    Ok(v) => v as f32,
+                    Err(_) => return std::ptr::null_mut(),
+                };
+                *(*tupslot).tts_values.add(i) = pg_sys::Float4GetDatum(v);
+                *(*tupslot).tts_isnull.add(i) = false;
+            }
+            o if o == pg_sys::FLOAT8OID => {
+                let v = match rmp::decode::read_f64(&mut limited) {
+                    Ok(v) => v as f64,
+                    Err(_) => return std::ptr::null_mut(),
+                };
+                *(*tupslot).tts_values.add(i) = pg_sys::Float8GetDatum(v);
+                *(*tupslot).tts_isnull.add(i) = false;
+            }
+            _ => {
+                // Unsupported type in demo: set NULL
+                *(*tupslot).tts_isnull.add(i) = true;
+            }
+        }
     }
-    // Drain any remaining bytes in the frame (for future extra cols) to keep head aligned
+    // Drain any remaining bytes in the frame to keep head aligned
     let mut scratch = [0u8; 256];
     while limited.limit() > 0 {
         let to_read = std::cmp::min(limited.limit() as usize, scratch.len());
-        if std::io::Read::read(&mut limited, &mut scratch[..to_read]).unwrap_or(0) == 0 { break; }
+        if Read::read(&mut limited, &mut scratch[..to_read]).unwrap_or(0) == 0 {
+            break;
+        }
     }
-    unsafe {
-        pg_sys::ExecClearTuple(tupslot);
-        let cstr = std::ffi::CString::new(buf).unwrap();
-        let txt = pg_sys::cstring_to_text_with_len(cstr.as_ptr(), (cstr.as_bytes().len()) as i32);
-        // Write first attr
-        *(*tupslot).tts_values.add(0) = pg_sys::PointerGetDatum(txt as *mut std::ffi::c_void);
-        *(*tupslot).tts_isnull.add(0) = false;
-        for i in 1..natts { *(*tupslot).tts_isnull.add(i) = true; }
-        pg_sys::ExecStoreVirtualTuple(tupslot);
-    }
+    pg_sys::ExecStoreVirtualTuple(tupslot);
     tupslot
 }
 

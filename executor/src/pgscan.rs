@@ -4,35 +4,35 @@ use std::pin::Pin;
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::task::{Context, Poll};
 
+use crate::shm;
 use async_trait::async_trait;
-use datafusion::arrow::datatypes::SchemaRef;
-use datafusion::arrow::record_batch::RecordBatch;
 use datafusion::arrow::array::{
-    ArrayRef, BooleanBuilder, Int16Builder, Int32Builder, Int64Builder,
-    Float32Builder, Float64Builder, StringBuilder, Date32Builder,
-    Time64MicrosecondBuilder, TimestampMicrosecondBuilder, IntervalMonthDayNanoBuilder,
+    ArrayRef, BooleanBuilder, Date32Builder, Float32Builder, Float64Builder, Int16Builder,
+    Int32Builder, Int64Builder, IntervalMonthDayNanoBuilder, StringBuilder,
+    Time64MicrosecondBuilder, TimestampMicrosecondBuilder,
 };
 use datafusion::arrow::datatypes::DataType as ArrowDataType;
-use datafusion::error::DataFusionError;
-use datafusion::scalar::ScalarValue;
+use datafusion::arrow::datatypes::SchemaRef;
+use datafusion::arrow::record_batch::RecordBatch;
 use datafusion::common::Result as DFResult;
+use datafusion::error::DataFusionError;
 use datafusion::logical_expr::TableProviderFilterPushDown;
-use datafusion::physical_plan::SendableRecordBatchStream;
 use datafusion::logical_expr::{Expr, TableType};
+use datafusion::physical_plan::execution_plan::{Boundedness, EmissionType};
+use datafusion::physical_plan::Partitioning;
+use datafusion::physical_plan::RecordBatchStream;
+use datafusion::physical_plan::SendableRecordBatchStream;
 use datafusion::physical_plan::{
     DisplayAs, DisplayFormatType, ExecutionPlan, PlanProperties, Statistics,
 };
-use datafusion::physical_plan::execution_plan::{Boundedness, EmissionType};
-use datafusion::physical_plan::Partitioning;
+use datafusion::scalar::ScalarValue;
 use datafusion_catalog::{Session, TableProvider};
-use datafusion::physical_plan::RecordBatchStream;
 use datafusion_execution::TaskContext;
 use datafusion_physical_expr::EquivalenceProperties;
 use futures::Stream;
-use tokio::sync::mpsc;
-use storage::heap::{HeapPage, PgAttrMeta, decode_tuple_project};
 use pgrx_pg_sys as pg_sys;
-use crate::shm;
+use storage::heap::{decode_tuple_project, HeapPage, PgAttrMeta};
+use tokio::sync::mpsc;
 
 pub type ScanId = u64;
 
@@ -160,7 +160,11 @@ impl TableProvider for PgTableProvider {
         _filters: &[Expr],
         _limit: Option<usize>,
     ) -> DFResult<Arc<dyn ExecutionPlan>> {
-        let exec = PgScanExec::new(self.scan_id, Arc::clone(&self.schema), Arc::clone(&self.registry));
+        let exec = PgScanExec::new(
+            self.scan_id,
+            Arc::clone(&self.schema),
+            Arc::clone(&self.registry),
+        );
         Ok(Arc::new(exec))
     }
 }
@@ -239,7 +243,11 @@ impl ExecutionPlan for PgScanExec {
         }
     }
 
-    fn execute(&self, _partition: usize, _ctx: Arc<TaskContext>) -> DFResult<SendableRecordBatchStream> {
+    fn execute(
+        &self,
+        _partition: usize,
+        _ctx: Arc<TaskContext>,
+    ) -> DFResult<SendableRecordBatchStream> {
         let rx = self.registry.take_receiver(self.scan_id);
         let stream = PgScanStream::new(Arc::clone(&self.schema), Arc::clone(&self.attrs), rx);
         Ok(Box::pin(stream))
@@ -257,7 +265,11 @@ pub struct PgScanStream {
 }
 
 impl PgScanStream {
-    pub fn new(schema: SchemaRef, attrs: Arc<Vec<PgAttrMeta>>, rx: Option<mpsc::Receiver<HeapBlock>>) -> Self {
+    pub fn new(
+        schema: SchemaRef,
+        attrs: Arc<Vec<PgAttrMeta>>,
+        rx: Option<mpsc::Receiver<HeapBlock>>,
+    ) -> Self {
         Self { schema, attrs, rx }
     }
 }
@@ -276,7 +288,9 @@ impl Stream for PgScanStream {
                 let page = unsafe { shm::block_slice(block.slot_id as usize) };
                 let _vis = if block.vis_len > 0 {
                     Some(unsafe { shm::vis_slice(block.slot_id as usize, block.vis_len as usize) })
-                } else { None };
+                } else {
+                    None
+                };
 
                 // Prepare decoding metadata: attrs (precomputed once) and projection (all columns)
                 let total_cols = this.schema.fields().len();
@@ -296,10 +310,12 @@ impl Stream for PgScanStream {
                 // Use tuples_by_offset to iterate LP_NORMAL tuples in page order
                 let mut pairs: Vec<(u16, u16)> = Vec::new();
                 let mut it = hp.tuples_by_offset(None, std::ptr::null_mut(), &mut pairs);
-                let page_hdr = unsafe { &*(page.as_ptr() as *const pg_sys::PageHeaderData) } as *const pg_sys::PageHeaderData;
+                let page_hdr = unsafe { &*(page.as_ptr() as *const pg_sys::PageHeaderData) }
+                    as *const pg_sys::PageHeaderData;
                 while let Some(tup) = it.next() {
                     // Decode projected columns for tuple using iterator over all columns
-                    let iter = unsafe { decode_tuple_project(page_hdr, tup, &this.attrs, 0..total_cols) };
+                    let iter =
+                        unsafe { decode_tuple_project(page_hdr, tup, &this.attrs, 0..total_cols) };
                     let Ok(mut iter) = iter else {
                         continue;
                     };
@@ -332,18 +348,66 @@ fn attrs_from_schema(schema: &SchemaRef) -> Vec<PgAttrMeta> {
         .fields()
         .iter()
         .map(|f| match f.data_type() {
-            datafusion::arrow::datatypes::DataType::Boolean => PgAttrMeta { atttypid: pg_sys::BOOLOID, attlen: 1, attalign: b'c' },
-            datafusion::arrow::datatypes::DataType::Utf8 => PgAttrMeta { atttypid: pg_sys::TEXTOID, attlen: -1, attalign: b'i' },
-            datafusion::arrow::datatypes::DataType::Int16 => PgAttrMeta { atttypid: pg_sys::INT2OID, attlen: 2, attalign: b's' },
-            datafusion::arrow::datatypes::DataType::Int32 => PgAttrMeta { atttypid: pg_sys::INT4OID, attlen: 4, attalign: b'i' },
-            datafusion::arrow::datatypes::DataType::Int64 => PgAttrMeta { atttypid: pg_sys::INT8OID, attlen: 8, attalign: b'd' },
-            datafusion::arrow::datatypes::DataType::Float32 => PgAttrMeta { atttypid: pg_sys::FLOAT4OID, attlen: 4, attalign: b'i' },
-            datafusion::arrow::datatypes::DataType::Float64 => PgAttrMeta { atttypid: pg_sys::FLOAT8OID, attlen: 8, attalign: b'd' },
-            datafusion::arrow::datatypes::DataType::Date32 => PgAttrMeta { atttypid: pg_sys::DATEOID, attlen: 4, attalign: b'i' },
-            datafusion::arrow::datatypes::DataType::Time64(_) => PgAttrMeta { atttypid: pg_sys::TIMEOID, attlen: 8, attalign: b'd' },
-            datafusion::arrow::datatypes::DataType::Timestamp(_, _) => PgAttrMeta { atttypid: pg_sys::TIMESTAMPOID, attlen: 8, attalign: b'd' },
-            datafusion::arrow::datatypes::DataType::Interval(_) => PgAttrMeta { atttypid: pg_sys::INTERVALOID, attlen: 16, attalign: b'd' },
-            _ => PgAttrMeta { atttypid: pg_sys::InvalidOid, attlen: -1, attalign: b'c' },
+            datafusion::arrow::datatypes::DataType::Boolean => PgAttrMeta {
+                atttypid: pg_sys::BOOLOID,
+                attlen: 1,
+                attalign: b'c',
+            },
+            datafusion::arrow::datatypes::DataType::Utf8 => PgAttrMeta {
+                atttypid: pg_sys::TEXTOID,
+                attlen: -1,
+                attalign: b'i',
+            },
+            datafusion::arrow::datatypes::DataType::Int16 => PgAttrMeta {
+                atttypid: pg_sys::INT2OID,
+                attlen: 2,
+                attalign: b's',
+            },
+            datafusion::arrow::datatypes::DataType::Int32 => PgAttrMeta {
+                atttypid: pg_sys::INT4OID,
+                attlen: 4,
+                attalign: b'i',
+            },
+            datafusion::arrow::datatypes::DataType::Int64 => PgAttrMeta {
+                atttypid: pg_sys::INT8OID,
+                attlen: 8,
+                attalign: b'd',
+            },
+            datafusion::arrow::datatypes::DataType::Float32 => PgAttrMeta {
+                atttypid: pg_sys::FLOAT4OID,
+                attlen: 4,
+                attalign: b'i',
+            },
+            datafusion::arrow::datatypes::DataType::Float64 => PgAttrMeta {
+                atttypid: pg_sys::FLOAT8OID,
+                attlen: 8,
+                attalign: b'd',
+            },
+            datafusion::arrow::datatypes::DataType::Date32 => PgAttrMeta {
+                atttypid: pg_sys::DATEOID,
+                attlen: 4,
+                attalign: b'i',
+            },
+            datafusion::arrow::datatypes::DataType::Time64(_) => PgAttrMeta {
+                atttypid: pg_sys::TIMEOID,
+                attlen: 8,
+                attalign: b'd',
+            },
+            datafusion::arrow::datatypes::DataType::Timestamp(_, _) => PgAttrMeta {
+                atttypid: pg_sys::TIMESTAMPOID,
+                attlen: 8,
+                attalign: b'd',
+            },
+            datafusion::arrow::datatypes::DataType::Interval(_) => PgAttrMeta {
+                atttypid: pg_sys::INTERVALOID,
+                attlen: 16,
+                attalign: b'd',
+            },
+            _ => PgAttrMeta {
+                atttypid: pg_sys::InvalidOid,
+                attlen: -1,
+                attalign: b'c',
+            },
         })
         .collect()
 }
@@ -372,12 +436,24 @@ fn make_builders(schema: &SchemaRef, capacity: usize) -> Result<Vec<ColBuilder>,
             ArrowDataType::Int64 => ColBuilder::I64(Int64Builder::with_capacity(capacity)),
             ArrowDataType::Float32 => ColBuilder::F32(Float32Builder::with_capacity(capacity)),
             ArrowDataType::Float64 => ColBuilder::F64(Float64Builder::with_capacity(capacity)),
-            ArrowDataType::Utf8 => ColBuilder::Utf8(StringBuilder::with_capacity(capacity, capacity * 8)),
+            ArrowDataType::Utf8 => {
+                ColBuilder::Utf8(StringBuilder::with_capacity(capacity, capacity * 8))
+            }
             ArrowDataType::Date32 => ColBuilder::Date32(Date32Builder::with_capacity(capacity)),
-            ArrowDataType::Time64(_) => ColBuilder::Time64Us(Time64MicrosecondBuilder::with_capacity(capacity)),
-            ArrowDataType::Timestamp(_, _) => ColBuilder::TsUs(TimestampMicrosecondBuilder::with_capacity(capacity)),
-            ArrowDataType::Interval(_) => ColBuilder::Interval(IntervalMonthDayNanoBuilder::with_capacity(capacity)),
-            other => return Err(DataFusionError::Execution(format!("unsupported type in builder: {other:?}"))),
+            ArrowDataType::Time64(_) => {
+                ColBuilder::Time64Us(Time64MicrosecondBuilder::with_capacity(capacity))
+            }
+            ArrowDataType::Timestamp(_, _) => {
+                ColBuilder::TsUs(TimestampMicrosecondBuilder::with_capacity(capacity))
+            }
+            ArrowDataType::Interval(_) => {
+                ColBuilder::Interval(IntervalMonthDayNanoBuilder::with_capacity(capacity))
+            }
+            other => {
+                return Err(DataFusionError::Execution(format!(
+                    "unsupported type in builder: {other:?}"
+                )))
+            }
         };
         out.push(b);
     }
@@ -422,33 +498,37 @@ fn append_scalar(b: &mut ColBuilder, v: ScalarValue) {
     }
 }
 
-fn append_null(b: &mut ColBuilder) { match b {
-    ColBuilder::Bool(b) => b.append_null(),
-    ColBuilder::I16(b) => b.append_null(),
-    ColBuilder::I32(b) => b.append_null(),
-    ColBuilder::I64(b) => b.append_null(),
-    ColBuilder::F32(b) => b.append_null(),
-    ColBuilder::F64(b) => b.append_null(),
-    ColBuilder::Utf8(b) => b.append_null(),
-    ColBuilder::Date32(b) => b.append_null(),
-    ColBuilder::Time64Us(b) => b.append_null(),
-    ColBuilder::TsUs(b) => b.append_null(),
-    ColBuilder::Interval(b) => b.append_null(),
-} }
+fn append_null(b: &mut ColBuilder) {
+    match b {
+        ColBuilder::Bool(b) => b.append_null(),
+        ColBuilder::I16(b) => b.append_null(),
+        ColBuilder::I32(b) => b.append_null(),
+        ColBuilder::I64(b) => b.append_null(),
+        ColBuilder::F32(b) => b.append_null(),
+        ColBuilder::F64(b) => b.append_null(),
+        ColBuilder::Utf8(b) => b.append_null(),
+        ColBuilder::Date32(b) => b.append_null(),
+        ColBuilder::Time64Us(b) => b.append_null(),
+        ColBuilder::TsUs(b) => b.append_null(),
+        ColBuilder::Interval(b) => b.append_null(),
+    }
+}
 
-fn finish_builder(b: ColBuilder) -> ArrayRef { match b {
-    ColBuilder::Bool(mut b) => Arc::new(b.finish()),
-    ColBuilder::I16(mut b) => Arc::new(b.finish()),
-    ColBuilder::I32(mut b) => Arc::new(b.finish()),
-    ColBuilder::I64(mut b) => Arc::new(b.finish()),
-    ColBuilder::F32(mut b) => Arc::new(b.finish()),
-    ColBuilder::F64(mut b) => Arc::new(b.finish()),
-    ColBuilder::Utf8(mut b) => Arc::new(b.finish()),
-    ColBuilder::Date32(mut b) => Arc::new(b.finish()),
-    ColBuilder::Time64Us(mut b) => Arc::new(b.finish()),
-    ColBuilder::TsUs(mut b) => Arc::new(b.finish()),
-    ColBuilder::Interval(mut b) => Arc::new(b.finish()),
-} }
+fn finish_builder(b: ColBuilder) -> ArrayRef {
+    match b {
+        ColBuilder::Bool(mut b) => Arc::new(b.finish()),
+        ColBuilder::I16(mut b) => Arc::new(b.finish()),
+        ColBuilder::I32(mut b) => Arc::new(b.finish()),
+        ColBuilder::I64(mut b) => Arc::new(b.finish()),
+        ColBuilder::F32(mut b) => Arc::new(b.finish()),
+        ColBuilder::F64(mut b) => Arc::new(b.finish()),
+        ColBuilder::Utf8(mut b) => Arc::new(b.finish()),
+        ColBuilder::Date32(mut b) => Arc::new(b.finish()),
+        ColBuilder::Time64Us(mut b) => Arc::new(b.finish()),
+        ColBuilder::TsUs(mut b) => Arc::new(b.finish()),
+        ColBuilder::Interval(mut b) => Arc::new(b.finish()),
+    }
+}
 
 impl RecordBatchStream for PgScanStream {
     fn schema(&self) -> SchemaRef {

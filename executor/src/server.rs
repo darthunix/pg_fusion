@@ -2,8 +2,8 @@ use crate::buffer::LockFreeBuffer;
 use crate::fsm::executor::StateMachine;
 use crate::fsm::Action;
 use crate::ipc::Socket;
-use crate::sql::Catalog;
 use crate::pgscan::{count_scans, for_each_scan, ScanRegistry};
+use crate::sql::Catalog;
 use anyhow::Error;
 use anyhow::{bail, Result};
 use common::FusionError;
@@ -14,23 +14,23 @@ use datafusion::scalar::ScalarValue;
 use datafusion_sql::parser::{DFParser, Statement};
 use datafusion_sql::planner::SqlToRel;
 use datafusion_sql::TableReference;
+use futures::StreamExt;
 use protocol::bind::{read_params, request_params};
 use protocol::columns::prepare_columns;
 use protocol::explain::prepare_explain;
 use protocol::failure::prepare_error;
+use protocol::heap::read_heap_block_bitmap_meta;
+use protocol::heap::request_heap_block;
 use protocol::metadata::prepare_table_refs;
 use protocol::parse::read_query;
 use protocol::Tape;
-use protocol::{consume_header, ControlPacket, Direction, DataPacket, is_data_tag};
-use protocol::heap::{read_heap_block_bitmap_meta};
-use protocol::heap::request_heap_block;
+use protocol::{consume_header, is_data_tag, ControlPacket, DataPacket, Direction};
 use rmp::decode::{read_u16 as read_u16_msgpack, read_u64 as read_u64_msgpack};
 use smol_str::{format_smolstr, SmolStr};
 use std::sync::atomic::{AtomicI32, Ordering};
 use std::sync::Arc;
-use tracing::{debug, trace};
-use futures::StreamExt;
 use tokio::task::JoinHandle;
+use tracing::{debug, trace};
 
 #[derive(Default)]
 pub struct Storage {
@@ -150,7 +150,8 @@ impl<'bytes> Connection<'bytes> {
             match DataPacket::try_from(header.tag) {
                 Ok(DataPacket::Heap) => {
                     // Read metadata; we expect the visibility bitmap to be stored in shared memory.
-                    let meta = read_heap_block_bitmap_meta(&mut self.recv_socket.buffer, header.length)?;
+                    let meta =
+                        read_heap_block_bitmap_meta(&mut self.recv_socket.buffer, header.length)?;
                     // If payload included inline bitmap bytes (legacy), drain them without allocation.
                     let mut remaining = meta.bitmap_len as usize;
                     while remaining > 0 {
@@ -174,7 +175,8 @@ impl<'bytes> Connection<'bytes> {
                         if let Err(e) = tx.send(block).await {
                             tracing::warn!(
                                 target = "pg_fusion::server",
-                                "failed to enqueue heap block for scan {}: {e}", meta.scan_id
+                                "failed to enqueue heap block for scan {}: {e}",
+                                meta.scan_id
                             );
                         }
                         // Request the next heap block for this scan using the same slot
@@ -239,7 +241,10 @@ impl<'bytes> Connection<'bytes> {
                     let catalog = if skip_metadata {
                         Catalog::with_registry(Arc::clone(&storage.registry))
                     } else {
-                        Catalog::from_stream(&mut self.recv_socket.buffer, Arc::clone(&storage.registry))?
+                        Catalog::from_stream(
+                            &mut self.recv_socket.buffer,
+                            Arc::clone(&storage.registry),
+                        )?
                     };
                     trace!(
                         skip_metadata,
@@ -456,10 +461,7 @@ fn open_data_flow(_conn: &mut Connection, storage: &mut Storage) -> Result<TaskR
             "open data flow requires a physical plan".into(),
         ));
     }
-    let phys = storage
-        .physical_plan
-        .as_ref()
-        .expect("checked above");
+    let phys = storage.physical_plan.as_ref().expect("checked above");
     // Reserve capacity to avoid HashMap reallocation while registering
     let scan_count = count_scans(phys) as usize;
     storage.registry.reserve(scan_count);
@@ -484,10 +486,7 @@ fn start_data_flow(conn: &mut Connection, storage: &mut Storage) -> Result<TaskR
         return Ok(TaskResult::Noop);
     }
 
-    let plan = Arc::clone(storage
-        .physical_plan
-        .as_ref()
-        .expect("checked above"));
+    let plan = Arc::clone(storage.physical_plan.as_ref().expect("checked above"));
     // Build a fresh TaskContext for execution
     let state = SessionStateBuilder::new().build();
     let ctx = state.task_ctx();
@@ -501,7 +500,10 @@ fn start_data_flow(conn: &mut Connection, storage: &mut Storage) -> Result<TaskR
                 // (back to Postgres) will be wired later.
                 while let Some(res) = stream.next().await {
                     if let Err(e) = res {
-                        tracing::error!(target = "pg_fusion::server", "execution stream error: {e}");
+                        tracing::error!(
+                            target = "pg_fusion::server",
+                            "execution stream error: {e}"
+                        );
                         break;
                     }
                 }
@@ -511,7 +513,10 @@ fn start_data_flow(conn: &mut Connection, storage: &mut Storage) -> Result<TaskR
                 let _ = protocol::result::write_eof(&mut ring);
             }
             Err(e) => {
-                tracing::error!(target = "pg_fusion::server", "failed to start execution: {e}");
+                tracing::error!(
+                    target = "pg_fusion::server",
+                    "failed to start execution: {e}"
+                );
             }
         }
     });
@@ -700,7 +705,9 @@ mod tests {
             let Ok(TaskResult::Parsing((stmt, _))) = parse(sql.into()) else {
                 unreachable!();
             };
-            let Ok(TaskResult::Compilation(plan)) = compile(stmt, &Catalog::with_registry(Arc::new(ScanRegistry::new()))) else {
+            let Ok(TaskResult::Compilation(plan)) =
+                compile(stmt, &Catalog::with_registry(Arc::new(ScanRegistry::new())))
+            else {
                 unreachable!();
             };
             assert_eq!(storage.logical_plan, Some(plan));
@@ -862,7 +869,9 @@ mod tests {
             assert_eq!(storage.state.state(), &ExecutorState::Initialized);
             let sql = "select a from public.t1 where b = $1";
             prepare_query(&mut conn.recv_socket.buffer, sql).expect("prepare SQL");
-            conn.process_message(&mut storage).await.expect("process parse");
+            conn.process_message(&mut storage)
+                .await
+                .expect("process parse");
             // Metadata request -> supply it
             let header = consume_header(&mut conn.send_buffer).expect("consume metadata hdr");
             assert_eq!(header.direction, Direction::ToClient);
@@ -876,7 +885,9 @@ mod tests {
             )
             .expect("process metadata");
             // Compile -> Bind request
-            conn.process_message(&mut storage).await.expect("process metadata msg");
+            conn.process_message(&mut storage)
+                .await
+                .expect("process metadata msg");
             let header = consume_header(&mut conn.send_buffer).expect("consume bind hdr");
             assert_eq!(header.direction, Direction::ToClient);
             assert_eq!(header.tag, ControlPacket::Bind as u8);

@@ -6,6 +6,6 @@ pub mod layout;
 pub mod heap;
 pub mod pgscan;
 pub mod server;
+pub mod shm;
 pub mod sql;
 pub mod stack;
-pub mod shm;

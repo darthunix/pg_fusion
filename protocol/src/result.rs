@@ -6,8 +6,13 @@ use std::io::{Read, Write};
 /// corresponds to a column (nil for NULL).
 struct CountingWrite(usize);
 impl Write for CountingWrite {
-    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> { self.0 += buf.len(); Ok(buf.len()) }
-    fn flush(&mut self) -> std::io::Result<()> { Ok(()) }
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        self.0 += buf.len();
+        Ok(buf.len())
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
 }
 
 /// Write a single-row MessagePack frame with exactly one Utf8 string value.

@@ -129,7 +129,8 @@ pub unsafe extern "C-unwind" fn init_shmem() {
 
     // Allocate per-connection result ring buffers.
     {
-        let layout = executor::layout::result_ring_layout(RESULT_RING_CAP).expect("result_ring_layout");
+        let layout =
+            executor::layout::result_ring_layout(RESULT_RING_CAP).expect("result_ring_layout");
         let total = layout.layout.size() * num;
         let base = pgrx::pg_sys::ShmemAlloc(total);
         RESULT_RING_PTR.store(base as *mut u8, Ordering::Release);
@@ -139,7 +140,10 @@ pub unsafe extern "C-unwind" fn init_shmem() {
         executor::shm::set_result_ring(base_u8, layout);
         info!(
             "init_shmem: allocated result ring: bytes_per_conn={} total_bytes={} cap={} count={}",
-            layout.layout.size(), total, RESULT_RING_CAP, num
+            layout.layout.size(),
+            total,
+            RESULT_RING_CAP,
+            num
         );
     }
 }
@@ -230,13 +234,15 @@ pub extern "C-unwind" fn worker_main(_arg: pg_sys::Datum) {
             let send_buffer = unsafe {
                 executor::buffer::LockFreeBuffer::from_layout(send_base, layout.send_buffer_layout)
             };
-            let mut conn = Connection::new(id, socket, send_buffer, unsafe { &*srv_pid_ptr }, unsafe {
-                &*client_ptr
-            });
+            let mut conn =
+                Connection::new(id, socket, send_buffer, unsafe { &*srv_pid_ptr }, unsafe {
+                    &*client_ptr
+                });
             // Attach result ring buffer for this connection
             let res_base = result_ring_base_for(id);
             let res_layout = result_ring_layout();
-            let res_buf = unsafe { executor::buffer::LockFreeBuffer::from_layout(res_base, res_layout) };
+            let res_buf =
+                unsafe { executor::buffer::LockFreeBuffer::from_layout(res_base, res_layout) };
             conn.set_result_buffer(res_buf);
 
             tokio::spawn(async move {

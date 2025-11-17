@@ -1,5 +1,10 @@
-use crate::layout::{slot_block_ptr as slot_ptr_calc, slot_block_vis_ptr as vis_ptr_calc, SlotBlocksLayout};
-use std::sync::{OnceLock, atomic::{AtomicPtr, Ordering}};
+use crate::layout::{
+    slot_block_ptr as slot_ptr_calc, slot_block_vis_ptr as vis_ptr_calc, SlotBlocksLayout,
+};
+use std::sync::{
+    atomic::{AtomicPtr, Ordering},
+    OnceLock,
+};
 
 static SLOT_BLOCKS_BASE: AtomicPtr<u8> = AtomicPtr::new(std::ptr::null_mut());
 static SLOT_BLOCKS_LAYOUT: OnceLock<SlotBlocksLayout> = OnceLock::new();
@@ -14,7 +19,9 @@ pub fn set_slot_blocks(base: *mut u8, layout: SlotBlocksLayout) {
 fn get() -> (*mut u8, SlotBlocksLayout) {
     let base = SLOT_BLOCKS_BASE.load(Ordering::Acquire);
     assert!(!base.is_null(), "slot blocks base not set");
-    let layout = *SLOT_BLOCKS_LAYOUT.get().expect("slot blocks layout not set");
+    let layout = *SLOT_BLOCKS_LAYOUT
+        .get()
+        .expect("slot blocks layout not set");
     (base, layout)
 }
 
@@ -60,7 +67,9 @@ pub fn set_result_ring(base: *mut u8, layout: crate::layout::BufferLayout) {
 pub fn result_ring_writer_for(conn_offset: usize) -> crate::buffer::LockFreeBuffer<'static> {
     let base = RESULT_RING_BASE.load(Ordering::Acquire);
     assert!(!base.is_null(), "result ring base not set");
-    let layout = *RESULT_RING_LAYOUT.get().expect("result ring layout not set");
+    let layout = *RESULT_RING_LAYOUT
+        .get()
+        .expect("result ring layout not set");
     let per = layout.layout.size();
     let ptr = unsafe { base.add(conn_offset * per) };
     unsafe { crate::buffer::LockFreeBuffer::from_layout(ptr, layout) }

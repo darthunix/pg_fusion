@@ -62,8 +62,16 @@ fn test_prepare_and_read_block_bitmap_lockfree() {
         let bit = 1u8 << (idx as u8 % 8);
         (b & bit) != 0
     });
-    prepare_heap_block_bitmap(&mut buf, scan_id, slot_id, table_oid, blkno, num_offsets, positions)
-        .expect("prepare_heap_block_bitmap");
+    prepare_heap_block_bitmap(
+        &mut buf,
+        scan_id,
+        slot_id,
+        table_oid,
+        blkno,
+        num_offsets,
+        positions,
+    )
+    .expect("prepare_heap_block_bitmap");
 
     let header = consume_header(&mut buf).expect("header");
     assert_eq!(header.direction, Direction::ToServer);
@@ -102,7 +110,10 @@ fn test_prepare_block_eof_lockfree() {
     let header = consume_header(&mut buf).expect("header");
     assert_eq!(header.direction, Direction::ToServer);
     assert_eq!(header.tag, DataPacket::Heap as u8);
-    assert_eq!(header.length, (core::mem::size_of::<u64>() + core::mem::size_of::<u16>()) as u16);
+    assert_eq!(
+        header.length,
+        (core::mem::size_of::<u64>() + core::mem::size_of::<u16>()) as u16
+    );
     let (sid, echoed) = read_heap_block_eof(&mut buf).expect("read eof");
     assert_eq!(sid, scan_id);
     assert_eq!(echoed, slot_id);
