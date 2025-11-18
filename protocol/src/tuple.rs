@@ -346,13 +346,8 @@ mod tests {
     #[test]
     fn test_encode_decode_with_null_bitmap_and_varlena() -> Result<()> {
         let attrs = attrs_int4_text();
-        // Build a simple varlena text payload: 4-byte len + bytes "hi"
-        // PG varlena header for 2 bytes content is 4 + 2 = 6 bytes; here we just test passthrough
-        let mut varlena = Vec::new();
-        let total_len = 2u32 + 4; // pretend 4-byte header + 2 bytes
-        varlena.extend_from_slice(&total_len.to_be_bytes()); // endianness here is not enforced by wire; PG will expect native
-        varlena.extend_from_slice(b"hi");
-        let fields = [Field::Null, Field::ByRef(&varlena)];
+        // ByRef for varlena encodes: u32 LE length + raw bytes; executor sends raw UTF-8 "hi"
+        let fields = [Field::Null, Field::ByRef(b"hi")];
         let mut out = Vec::new();
         encode_wire_tuple(&mut out, &attrs, &fields)?;
         let (hdr, bitmap, data) = decode_wire_tuple(&out)?;
@@ -361,8 +356,10 @@ mod tests {
         assert_eq!(bitmap.len(), 1);
         // bit0 set (first attr is null)
         assert_eq!(bitmap[0] & 0x01, 0x01);
-        // Data starts at hoff and contains only the second attribute payload
-        assert_eq!(data, &varlena);
+        // Data: [u32 LE 2] + b"hi"
+        assert_eq!(data.len(), 4 + 2);
+        assert_eq!(&data[0..4], &(2u32).to_le_bytes());
+        assert_eq!(&data[4..], b"hi");
         Ok(())
     }
 }
