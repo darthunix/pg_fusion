@@ -89,10 +89,27 @@ unsafe extern "C-unwind" fn pg_fusion_shmem_request_hook() {
         .layout
         .size();
 
+    // Slot blocks (per-connection heap page buffers)
+    let blksz = pgrx::pg_sys::BLCKSZ as usize;
+    let slot_blocks_layout = executor::layout::slot_blocks_layout(
+        worker::SLOTS_PER_CONN,
+        blksz,
+        worker::BLOCKS_PER_SLOT,
+    )
+    .expect("slot_blocks_layout");
+    let slot_blocks_sz = slot_blocks_layout.layout.size() * num;
+
+    // Per-connection result ring buffers
+    let result_ring_layout =
+        executor::layout::result_ring_layout(worker::RESULT_RING_CAP).expect("result_ring_layout");
+    let result_ring_sz = result_ring_layout.layout.size() * num;
+
     let total = flags_sz
         .saturating_add(conns_sz)
         .saturating_add(stack_sz)
-        .saturating_add(pid_sz);
+        .saturating_add(pid_sz)
+        .saturating_add(slot_blocks_sz)
+        .saturating_add(result_ring_sz);
 
     pgrx::pg_sys::RequestAddinShmemSpace(total);
 }

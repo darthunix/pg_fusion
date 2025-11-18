@@ -583,6 +583,9 @@ fn start_data_flow(conn: &mut Connection, storage: &mut Storage) -> Result<TaskR
     let ctx = state.task_ctx();
 
     let conn_id = conn.id;
+    let client_pid_val = conn
+        .client_pid
+        .load(std::sync::atomic::Ordering::Relaxed); // snapshot pid
     let handle = tokio::spawn(async move {
         // Execute a single partition; PgScanExec uses a single stream
         match plan.execute(0, ctx) {
@@ -602,7 +605,13 @@ fn start_data_flow(conn: &mut Connection, storage: &mut Storage) -> Result<TaskR
                             if pg_attrs.is_empty() {
                                 continue;
                             }
-                            let _ = encode_and_write_rows(&batch, &pg_attrs, &mut ring);
+                            let wrote = encode_and_write_rows(&batch, &pg_attrs, &mut ring);
+                            if wrote > 0 {
+                                let pid = client_pid_val;
+                                if pid > 0 && pid != i32::MAX {
+                                    unsafe { libc::kill(pid as libc::pid_t, libc::SIGUSR1) };
+                                }
+                            }
                         }
                     }
                 }

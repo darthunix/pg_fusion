@@ -18,9 +18,9 @@ const TOKIO_THREAD_NUMBER: usize = 1;
 pub(crate) const RECV_CAP: usize = 8192;
 pub(crate) const SEND_CAP: usize = 8192;
 // Heap block buffer configuration per connection
-const SLOTS_PER_CONN: usize = 2; // two logical slots per connection
-const BLOCKS_PER_SLOT: usize = 2; // double buffering inside each slot
-const RESULT_RING_CAP: usize = 64 * 1024; // bytes per-connection for result rows
+pub(crate) const SLOTS_PER_CONN: usize = 2; // two logical slots per connection
+pub(crate) const BLOCKS_PER_SLOT: usize = 2; // double buffering inside each slot
+pub(crate) const RESULT_RING_CAP: usize = 64 * 1024; // bytes per-connection for result rows
 
 #[pg_guard]
 pub(crate) unsafe extern "C-unwind" fn init_datafusion_worker() {
