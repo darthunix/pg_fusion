@@ -933,3 +933,103 @@ fn oid_to_encoded_type(oid: pg_sys::Oid) -> Option<EncodedType> {
         _ => None,
     }
 }
+
+#[cfg(feature = "pg_test")]
+mod tests {
+    use super::*;
+    use pgrx::prelude::*;
+    use protocol::tuple::{encode_wire_tuple, Field as F};
+
+    #[pg_test]
+    fn wire_tuple_int4_text_roundtrip() {
+        // Create a temp table to obtain a real TupleDesc
+        Spi::run("CREATE TEMP TABLE wtt(a int4, b text)").expect("create temp table");
+        let rel = pgrx::PgRelation::open_with_name("pg_temp.wtt").expect("open temp table");
+        let tdesc = rel.tuple_desc();
+        unsafe {
+            // Build PgAttrWire from TupleDesc
+            let natts = (*tdesc.as_ptr()).natts as usize;
+            assert!(natts >= 2);
+            let attrs = (*tdesc.as_ptr()).attrs.as_slice((*tdesc.as_ptr()).natts as _);
+            let mut wires: Vec<PgAttrWire> = Vec::with_capacity(2);
+            for i in 0..2 {
+                let a = &attrs[i];
+                let oid = a.atttypid;
+                let tuple = pg_sys::SearchSysCache1(TYPEOID as i32, pg_sys::ObjectIdGetDatum(oid));
+                assert!(!tuple.is_null());
+                let typtup = pg_sys::GETSTRUCT(tuple) as pg_sys::Form_pg_type;
+                let align = match (*typtup).typalign as u8 as char {
+                    'c' => 1u8,
+                    's' => 2u8,
+                    'i' => 4u8,
+                    'd' => 8u8,
+                    _ => 1u8,
+                };
+                wires.push(PgAttrWire {
+                    atttypid: oid.to_u32(),
+                    typmod: (*typtup).typtypmod,
+                    attlen: (*typtup).typlen,
+                    attalign: align,
+                    attbyval: (*typtup).typbyval,
+                    nullable: !a.attnotnull,
+                });
+                pg_sys::ReleaseSysCache(tuple);
+            }
+            // Encode one row: a=123, b="hi"
+            let mut payload = Vec::new();
+            let fields = [F::ByVal4(123i32.to_le_bytes()), F::ByRef("hi".as_bytes())];
+            encode_wire_tuple(&mut payload, &wires, &fields).expect("encode wire tuple");
+            // Decode and build Datums via the same logic as in try_store_wire_tuple_from_result
+            let (hdr, bitmap, data) = decode_wire_tuple(&payload).expect("decode wire tuple");
+            assert_eq!(hdr.nattrs, 2);
+            let mut values: Vec<pg_sys::Datum> = vec![pg_sys::Datum::from(0usize); 2];
+            let mut nulls: Vec<bool> = vec![false; 2];
+            let mut off: usize = 0;
+            for i in 0..2 {
+                if (hdr.flags & 0x01) != 0 {
+                    let byte = i / 8;
+                    let bit = i % 8;
+                    if byte < bitmap.len() && (bitmap[byte] & (1u8 << bit)) != 0 {
+                        nulls[i] = true;
+                        continue;
+                    }
+                }
+                let att = &attrs[i];
+                let align = match att.attalign as u8 as char { 'c' => 1usize, 's' => 2, 'i' => 4, 'd' => 8, _ => 1 };
+                if align > 1 {
+                    let rem = off % align;
+                    if rem != 0 { off += align - rem; }
+                }
+                if att.attlen == -1 {
+                    assert!(off + 4 <= data.len());
+                    let len = u32::from_le_bytes([data[off], data[off+1], data[off+2], data[off+3]]) as usize;
+                    off += 4;
+                    assert!(off + len <= data.len());
+                    let src = &data[off..off+len];
+                    let cptr = src.as_ptr() as *const i8;
+                    let txt = pg_sys::cstring_to_text_with_len(cptr, len as i32);
+                    values[i] = pg_sys::PointerGetDatum(txt as *mut std::ffi::c_void);
+                    nulls[i] = false;
+                    off += len;
+                } else {
+                    let need = att.attlen as usize;
+                    assert!(off + need <= data.len());
+                    let mut tmp = [0u8; 8];
+                    tmp[..need].copy_from_slice(&data[off..off+need]);
+                    let v = u64::from_le_bytes(tmp);
+                    values[i] = pg_sys::Datum::from(v as usize);
+                    nulls[i] = false;
+                    off += need;
+                }
+            }
+            // Validate values: int4=123, text="hi"
+            // For text, convert varlena back to CString for comparison
+            let ival: i32 = pg_sys::DatumGetInt32(values[0]);
+            assert_eq!(ival, 123);
+            let txt_ptr = pg_sys::DatumGetPointer(values[1]) as *mut pg_sys::text;
+            let cstr = pg_sys::text_to_cstring(txt_ptr);
+            let s = std::ffi::CStr::from_ptr(cstr).to_str().unwrap();
+            assert_eq!(s, "hi");
+        }
+    }
+}
