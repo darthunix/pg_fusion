@@ -25,6 +25,7 @@ use protocol::heap::{prepare_heap_block_meta_shm, read_heap_block_request};
 use protocol::metadata::process_metadata_with_response;
 use protocol::parse::prepare_query;
 use protocol::tuple::{prepare_column_layout, PgAttrWire};
+use protocol::tuple::decode_wire_tuple;
 use protocol::Tape;
 use protocol::{ControlPacket, DataPacket, Direction};
 use rmp::decode::read_bin_len;
@@ -448,12 +449,12 @@ unsafe extern "C-unwind" fn exec_df_scan(
     // Try to process at most one pending heap page request from the executor.
     // This keeps ExecCustomScan non-blocking while still making progress.
     process_pending_heap_request(&mut shared);
-    // Try to read one result row from the per-connection result ring and fill a virtual slot
+    // Try to read one result row from the per-connection result ring and fill a tuple slot
     let tupslot = unsafe { (*_node).ss.ss_ScanTupleSlot };
     if tupslot.is_null() {
         return std::ptr::null_mut();
     }
-    return unsafe { try_fill_slot_from_result(tupslot) };
+    return unsafe { try_store_wire_tuple_from_result(tupslot) };
 }
 
 /// Try to process at most one pending heap page request from the executor.
@@ -571,7 +572,7 @@ fn process_pending_heap_request(shared: &mut ConnectionShared) {
 
 /// Read one row from the result ring and populate `tupslot`.
 /// Returns `tupslot` on success, or null on EOF/empty ring/error.
-unsafe fn try_fill_slot_from_result(
+unsafe fn try_store_wire_tuple_from_result(
     tupslot: *mut pg_sys::TupleTableSlot,
 ) -> *mut pg_sys::TupleTableSlot {
     let conn_id = match connection_id() {
@@ -594,97 +595,67 @@ unsafe fn try_fill_slot_from_result(
         // EOF sentinel
         return std::ptr::null_mut();
     }
-    // Decode row body directly from ring using a limited reader
-    let mut limited = ring.by_ref().take(row_len as u64);
-    let natts_in = match rmp::decode::read_array_len(&mut limited) {
-        Ok(v) => v as usize,
+    // Read payload into buffer
+    let mut buf = vec![0u8; row_len];
+    if Read::read_exact(&mut ring, &mut buf).is_err() {
+        return std::ptr::null_mut();
+    }
+    let (hdr, bitmap, data) = match decode_wire_tuple(&buf) {
+        Ok(v) => v,
         Err(_) => return std::ptr::null_mut(),
     };
+    // Build Datum/isnull arrays according to TupleDesc
     let tdesc = (*tupslot).tts_tupleDescriptor;
     let natts_td = (*tdesc).natts as usize;
-    let natts = std::cmp::min(natts_in, natts_td);
-    pg_sys::ExecClearTuple(tupslot);
+    let natts = std::cmp::min(natts_td, hdr.nattrs as usize);
+    let attrs = (*tdesc).attrs.as_slice((*tdesc).natts as _);
+    let mut values: Vec<pg_sys::Datum> = vec![pg_sys::Datum::from(0usize); natts];
+    let mut nulls: Vec<bool> = vec![false; natts];
+    let mut off: usize = 0;
     for i in 0..natts {
-        let attoid = (*tdesc).attrs.as_slice((*tdesc).natts as _)[i].atttypid;
-        match attoid {
-            o if o == pg_sys::TEXTOID => {
-                let l = match rmp::decode::read_str_len(&mut limited) {
-                    Ok(v) => v as usize,
-                    Err(_) => return std::ptr::null_mut(),
-                };
-                let mut buf = vec![0u8; l];
-                if Read::read_exact(&mut limited, &mut buf).is_err() {
-                    return std::ptr::null_mut();
-                }
-                let cstr = std::ffi::CString::new(buf).unwrap();
-                let txt = pg_sys::cstring_to_text_with_len(cstr.as_ptr(), l as i32);
-                *(*tupslot).tts_values.add(i) =
-                    pg_sys::PointerGetDatum(txt as *mut std::ffi::c_void);
-                *(*tupslot).tts_isnull.add(i) = false;
-            }
-            o if o == pg_sys::BOOLOID => {
-                let v = match rmp::decode::read_bool(&mut limited) {
-                    Ok(v) => v,
-                    Err(_) => return std::ptr::null_mut(),
-                };
-                *(*tupslot).tts_values.add(i) = pg_sys::BoolGetDatum(v);
-                *(*tupslot).tts_isnull.add(i) = false;
-            }
-            o if o == pg_sys::INT2OID => {
-                let v = match rmp::decode::read_i64(&mut limited) {
-                    Ok(v) => v as i16,
-                    Err(_) => return std::ptr::null_mut(),
-                };
-                *(*tupslot).tts_values.add(i) = pg_sys::Int16GetDatum(v);
-                *(*tupslot).tts_isnull.add(i) = false;
-            }
-            o if o == pg_sys::INT4OID => {
-                let v = match rmp::decode::read_i64(&mut limited) {
-                    Ok(v) => v as i32,
-                    Err(_) => return std::ptr::null_mut(),
-                };
-                *(*tupslot).tts_values.add(i) = pg_sys::Int32GetDatum(v);
-                *(*tupslot).tts_isnull.add(i) = false;
-            }
-            o if o == pg_sys::INT8OID => {
-                let v = match rmp::decode::read_i64(&mut limited) {
-                    Ok(v) => v as i64,
-                    Err(_) => return std::ptr::null_mut(),
-                };
-                *(*tupslot).tts_values.add(i) = pg_sys::Int64GetDatum(v);
-                *(*tupslot).tts_isnull.add(i) = false;
-            }
-            o if o == pg_sys::FLOAT4OID => {
-                let v = match rmp::decode::read_f64(&mut limited) {
-                    Ok(v) => v as f32,
-                    Err(_) => return std::ptr::null_mut(),
-                };
-                *(*tupslot).tts_values.add(i) = pg_sys::Float4GetDatum(v);
-                *(*tupslot).tts_isnull.add(i) = false;
-            }
-            o if o == pg_sys::FLOAT8OID => {
-                let v = match rmp::decode::read_f64(&mut limited) {
-                    Ok(v) => v as f64,
-                    Err(_) => return std::ptr::null_mut(),
-                };
-                *(*tupslot).tts_values.add(i) = pg_sys::Float8GetDatum(v);
-                *(*tupslot).tts_isnull.add(i) = false;
-            }
-            _ => {
-                // Unsupported type in demo: set NULL
-                *(*tupslot).tts_isnull.add(i) = true;
+        // null bitmap: bit set means NULL
+        if (hdr.flags & 0x01) != 0 {
+            let byte = i / 8;
+            let bit = i % 8;
+            if byte < bitmap.len() && (bitmap[byte] & (1u8 << bit)) != 0 {
+                nulls[i] = true;
+                continue;
             }
         }
-    }
-    // Drain any remaining bytes in the frame to keep head aligned
-    let mut scratch = [0u8; 256];
-    while limited.limit() > 0 {
-        let to_read = std::cmp::min(limited.limit() as usize, scratch.len());
-        if Read::read(&mut limited, &mut scratch[..to_read]).unwrap_or(0) == 0 {
-            break;
+        let att = &attrs[i];
+        let align = match att.attalign as u8 as char { 'c' => 1usize, 's' => 2, 'i' => 4, 'd' => 8, _ => 1 };
+        if align > 1 {
+            let rem = off % align;
+            if rem != 0 { off += align - rem; }
+        }
+        if att.attlen == -1 {
+            // varlena: wire encodes u32 length prefix then bytes
+            if off + 4 > data.len() { nulls[i] = true; continue; }
+            let len = u32::from_le_bytes([data[off], data[off+1], data[off+2], data[off+3]]) as usize;
+            off += 4;
+            if off + len > data.len() { nulls[i] = true; continue; }
+            let src = &data[off..off+len];
+            // For now, build TEXT varlena; for generic varlena types, need per-oid handling
+            let cptr = src.as_ptr() as *const i8;
+            let txt = pg_sys::cstring_to_text_with_len(cptr, len as i32);
+            values[i] = pg_sys::PointerGetDatum(txt as *mut std::ffi::c_void);
+            nulls[i] = false;
+            off += len;
+        } else {
+            let need = att.attlen as usize;
+            if off + need > data.len() { nulls[i] = true; continue; }
+            // Read little-endian bytes into Datum
+            let mut tmp = [0u8; 8];
+            tmp[..need].copy_from_slice(&data[off..off+need]);
+            let v = u64::from_le_bytes(tmp);
+            values[i] = pg_sys::Datum::from(v as usize);
+            nulls[i] = false;
+            off += need;
         }
     }
-    pg_sys::ExecStoreVirtualTuple(tupslot);
+    // Form MinimalTuple and store in slot
+    let mtup = pg_sys::heap_form_minimal_tuple(tdesc, values.as_mut_ptr(), nulls.as_mut_ptr());
+    pg_sys::ExecStoreMinimalTuple(mtup, tupslot, false);
     tupslot
 }
 
