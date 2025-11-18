@@ -42,3 +42,12 @@ pub fn read_frame_len(stream: &mut impl Read) -> Result<u32> {
     let v = rmp::decode::read_u32(stream)?;
     Ok(v)
 }
+
+/// Write a generic frame: u32 length prefix followed by raw bytes.
+pub fn write_frame(stream: &mut impl Write, payload: &[u8]) -> Result<()> {
+    let len = u32::try_from(payload.len())?;
+    rmp::encode::write_u32(stream, len)?;
+    stream.write_all(payload)?;
+    stream.flush()?;
+    Ok(())
+}
