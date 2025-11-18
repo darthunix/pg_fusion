@@ -8,6 +8,8 @@ use anyhow::Error;
 use anyhow::{bail, Result};
 use common::FusionError;
 use datafusion::execution::SessionStateBuilder;
+use datafusion::arrow::array::{Array, Int32Array, StringArray};
+use datafusion::arrow::record_batch::RecordBatch;
 use datafusion::logical_expr::LogicalPlan;
 use datafusion::physical_plan::{displayable, ExecutionPlan};
 use datafusion::scalar::ScalarValue;
@@ -397,6 +399,86 @@ impl<'bytes> Connection<'bytes> {
     }
 }
 
+/// Encode a RecordBatch into wire tuples and write them to the result ring.
+/// Returns the number of rows written.
+fn encode_and_write_rows(
+    batch: &RecordBatch,
+    attrs: &[PgAttrWire],
+    ring: &mut LockFreeBuffer,
+) -> usize {
+    use protocol::tuple::{encode_wire_tuple, Field as F};
+    // write_frame used via full path
+    let rows = batch.num_rows();
+    let cols = std::cmp::min(batch.num_columns(), attrs.len());
+    if cols == 0 || rows == 0 {
+        return 0;
+    }
+    // Working buffers reused across rows to minimize allocations
+    let mut byref_idx: Vec<Option<usize>> = vec![None; cols];
+    let mut owned: Vec<Vec<u8>> = Vec::with_capacity(cols);
+    let mut buf: Vec<u8> = Vec::with_capacity(256);
+    let mut written = 0usize;
+    for row in 0..rows {
+        // First pass: collect byref bytes and remember their indices
+        owned.clear();
+        for i in 0..cols {
+            byref_idx[i] = None;
+            let array = batch.column(i);
+            if array.is_null(row) {
+                continue;
+            }
+            match array.data_type() {
+                datafusion::arrow::datatypes::DataType::Utf8 => {
+                    let a = array
+                        .as_any()
+                        .downcast_ref::<StringArray>()
+                        .expect("utf8 array");
+                    let s = a.value(row);
+                    let idx = owned.len();
+                    owned.push(s.as_bytes().to_vec());
+                    byref_idx[i] = Some(idx);
+                }
+                _ => {}
+            }
+        }
+        // Second pass: build Field view and encode (scope fields to drop borrows before next row)
+        {
+            let mut fields: Vec<F> = Vec::with_capacity(cols);
+            for i in 0..cols {
+                let array = batch.column(i);
+                if array.is_null(row) {
+                    fields.push(F::Null);
+                    continue;
+                }
+                match array.data_type() {
+                    datafusion::arrow::datatypes::DataType::Int32 => {
+                        let a = array
+                            .as_any()
+                            .downcast_ref::<Int32Array>()
+                            .expect("int32 array");
+                        let v = a.value(row);
+                        fields.push(F::ByVal4(v.to_le_bytes()));
+                    }
+                    datafusion::arrow::datatypes::DataType::Utf8 => {
+                        if let Some(idx) = byref_idx[i] {
+                            fields.push(F::ByRef(owned[idx].as_slice()));
+                        } else {
+                            fields.push(F::Null);
+                        }
+                    }
+                    _ => fields.push(F::Null),
+                }
+            }
+            buf.clear();
+            if encode_wire_tuple(&mut buf, &attrs[..cols], &fields).is_ok() {
+                let _ = protocol::result::write_frame(ring, &buf);
+                written += 1;
+            }
+        }
+    }
+    written
+}
+
 impl<'bytes> Connection<'bytes> {
     /// For worker setup: set the per-connection result ring buffer writer.
     pub fn set_result_buffer(&mut self, buf: LockFreeBuffer<'bytes>) {
@@ -495,6 +577,7 @@ fn start_data_flow(conn: &mut Connection, storage: &mut Storage) -> Result<TaskR
     }
 
     let plan = Arc::clone(storage.physical_plan.as_ref().expect("checked above"));
+    let pg_attrs = storage.pg_attrs.clone().unwrap_or_default();
     // Build a fresh TaskContext for execution
     let state = SessionStateBuilder::new().build();
     let ctx = state.task_ctx();
@@ -504,20 +587,27 @@ fn start_data_flow(conn: &mut Connection, storage: &mut Storage) -> Result<TaskR
         // Execute a single partition; PgScanExec uses a single stream
         match plan.execute(0, ctx) {
             Ok(mut stream) => {
-                // Drain the stream to drive execution. Downstream delivery
-                // (back to Postgres) will be wired later.
+                // Drain the stream, encode rows into wire tuples, and write to result ring
+                let mut ring = crate::shm::result_ring_writer_for(conn_id);
                 while let Some(res) = stream.next().await {
-                    if let Err(e) = res {
-                        tracing::error!(
-                            target = "pg_fusion::server",
-                            "execution stream error: {e}"
-                        );
-                        break;
+                    match res {
+                        Err(e) => {
+                            tracing::error!(
+                                target = "pg_fusion::server",
+                                "execution stream error: {e}"
+                            );
+                            break;
+                        }
+                        Ok(batch) => {
+                            if pg_attrs.is_empty() {
+                                continue;
+                            }
+                            let _ = encode_and_write_rows(&batch, &pg_attrs, &mut ring);
+                        }
                     }
                 }
                 tracing::trace!(target = "pg_fusion::server", "execution stream completed");
                 // Write EOF sentinel row to result ring to unblock backend
-                let mut ring = crate::shm::result_ring_writer_for(conn_id);
                 let _ = protocol::result::write_eof(&mut ring);
             }
             Err(e) => {
@@ -531,11 +621,7 @@ fn start_data_flow(conn: &mut Connection, storage: &mut Storage) -> Result<TaskR
     storage.exec_task = Some(handle);
     // Send a tiny ack to the backend indicating execution is ready
     protocol::exec::prepare_exec_ready(&mut conn.send_buffer)?;
-    // Write a minimal demo row into result ring (if available): one Utf8 column with value "ok"
-    if let Some(ring) = conn.result_buffer.as_mut() {
-        let _ = protocol::result::write_row1_str(ring, "ok");
-        let _ = conn.signal_client();
-    }
+    // No demo row: result rows will be written by the execution task
     // Kick off initial heap block requests for each scan using slot 0
     if let Some(phys) = storage.physical_plan.as_ref() {
         let _ = for_each_scan::<_, Error>(phys, |id, table_oid| {
