@@ -162,7 +162,8 @@ fn compute_data_len(attrs: &[PgAttrWire], fields: &[Field<'_>], hoff: usize) -> 
             (2, Field::ByVal2(_)) => off += 2,
             (4, Field::ByVal4(_)) => off += 4,
             (8, Field::ByVal8(_)) => off += 8,
-            (-1, Field::ByRef(bytes)) => off += bytes.len(), // varlena already encoded
+            // For varlena, encode length prefix (u32 LE) followed by bytes
+            (-1, Field::ByRef(bytes)) => off += 4 + bytes.len(),
             (len, Field::ByRef(bytes)) if len > 0 => off += bytes.len(),
             _ => bail!("unsupported field/attlen combination for atttypid {}", a.atttypid),
         }
@@ -235,8 +236,15 @@ pub fn encode_wire_tuple(mut out: &mut impl std::io::Write, attrs: &[PgAttrWire]
                 off += 8;
             }
             Field::ByRef(bytes) => {
-                out.write_all(bytes)?;
-                off += bytes.len();
+                if a.attlen == -1 {
+                    // varlena: write length prefix (u32 LE), then bytes
+                    write_u32_le(&mut out, u32::try_from(bytes.len())?)?;
+                    out.write_all(bytes)?;
+                    off += 4 + bytes.len();
+                } else {
+                    out.write_all(bytes)?;
+                    off += bytes.len();
+                }
             }
         }
     }
