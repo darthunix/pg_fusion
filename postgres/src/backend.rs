@@ -36,6 +36,7 @@ use std::collections::HashMap;
 use std::ffi::c_char;
 use std::ffi::CStr;
 use std::os::raw::c_void;
+use std::cell::Cell;
 use std::sync::{LazyLock, Mutex};
 use std::time::Duration;
 
@@ -257,7 +258,10 @@ unsafe extern "C-unwind" fn create_df_scan_state(cscan: *mut pg_sys::CustomScan)
                 }
             }
             Ok(ControlPacket::Columns) => {
-                let list_ptr = (*cscan).custom_scan_tlist as *mut c_void;
+                // We'll build a Postgres TargetEntry list for the scan's output
+                // and assign it to custom_scan_tlist after consumption.
+                let mut tlist: *mut List = std::ptr::null_mut();
+                let list_ptr = (&mut tlist as *mut *mut List) as *mut c_void;
                 // Collect per-attribute layout to return back to executor
                 let mut attr_layout: Vec<PgAttrWire> = Vec::new();
                 let repack = |pos: i16,
@@ -269,7 +273,9 @@ unsafe extern "C-unwind" fn create_df_scan_state(cscan: *mut pg_sys::CustomScan)
                     let pos = pos + 1;
                     let oid = type_to_oid(&EncodedType::try_from(etype)?.to_arrow())?;
                     unsafe {
-                        let list = ptr as *mut List;
+                        // ptr carries a *mut *mut List — update it with the new head after append
+                        let list_pp = ptr as *mut *mut List;
+                        let mut list = *list_pp;
                         let tuple =
                             pg_sys::SearchSysCache1(TYPEOID as i32, pg_sys::ObjectIdGetDatum(oid));
                         if tuple.is_null() {
@@ -310,13 +316,21 @@ unsafe extern "C-unwind" fn create_df_scan_state(cscan: *mut pg_sys::CustomScan)
                             col_name as *mut i8,
                             false,
                         );
+                        // Append and update list head
+                        list = pg_sys::list_append_unique_ptr(list, entry as *mut c_void);
+                        *list_pp = list;
                         pg_sys::ReleaseSysCache(tuple);
-                        pg_sys::list_append_unique_ptr(list, entry as *mut c_void);
                     }
                     Ok(())
                 };
                 if let Err(e) = consume_columns(&mut shared.send, list_ptr, repack) {
                     error!("Failed to consume columns: {e}");
+                }
+                // Assign the constructed target list back to the CustomScan plan node
+                unsafe {
+                    (*cscan).custom_scan_tlist = tlist;
+                    // Also set the plan's targetlist to keep executor/RowDescription in sync
+                    (*cscan).scan.plan.targetlist = tlist;
                 }
                 // Send the collected layout back to the executor
                 if let Err(err) = prepare_column_layout(&mut shared.recv, &attr_layout) {
@@ -374,6 +388,34 @@ unsafe extern "C-unwind" fn begin_df_scan(
     _estate: *mut pg_sys::EState,
     _eflags: i32,
 ) {
+    EXEC_SCAN_STARTED.with(|f| f.set(false));
+    RESULT_RING_EOF.with(|f| f.set(false));
+    HEAP_EOF_SENT.with(|f| f.set(false));
+    EMPTY_SPINS.with(|f| f.set(0));
+    // Initialize ScanTupleSlot as a MinimalTuple slot with a TupleDesc
+    unsafe {
+        // Derive TupleDesc from the CustomScan's target list
+        let plan_ptr = (*_node).ss.ps.plan;
+        if !plan_ptr.is_null() {
+            let cscan = plan_ptr as *mut pg_sys::CustomScan;
+            let tlist = (*cscan).custom_scan_tlist;
+            if !tlist.is_null() {
+                let tupdesc = pg_sys::ExecTypeFromTL(tlist);
+                if !tupdesc.is_null() {
+                    // Use MinimalTuple slot ops to match ExecStoreMinimalTuple
+                    pg_sys::ExecInitScanTupleSlot(
+                        _estate,
+                        &mut (*_node).ss,
+                        tupdesc,
+                        &pg_sys::TTSOpsMinimalTuple,
+                    );
+                    // Initialize a result slot matching the same TupleDesc
+                    let resslot = pg_sys::MakeSingleTupleTableSlot(tupdesc, &pg_sys::TTSOpsMinimalTuple);
+                    (*_node).ss.ps.ps_ResultTupleSlot = resslot;
+                }
+            }
+        }
+    }
     // Notify executor to prepare data channels for upcoming scan(s)
     let id = match connection_id() {
         Ok(v) => v,
@@ -383,6 +425,7 @@ unsafe extern "C-unwind" fn begin_df_scan(
         Ok(s) => s,
         Err(e) => error!("Failed to map shared connection: {}", e),
     };
+    pgrx::info!("begin_df_scan: requesting BeginScan (conn={})", id);
     if let Err(err) = request_begin_scan(&mut shared.recv) {
         let _ = request_failure(&mut shared.recv);
         let _ = shared.signal_server();
@@ -399,6 +442,40 @@ unsafe extern "C-unwind" fn begin_df_scan(
 unsafe extern "C-unwind" fn exec_df_scan(
     _node: *mut CustomScanState,
 ) -> *mut pg_sys::TupleTableSlot {
+    // Ensure scan tuple slot is compatible with MinimalTuple before storing
+    unsafe {
+        let estate = (*_node).ss.ps.state;
+        if !estate.is_null() {
+            let mut need_minimal = false;
+            let mut tupdesc: *mut pg_sys::TupleDescData = std::ptr::null_mut();
+            let slot = (*_node).ss.ss_ScanTupleSlot;
+            if slot.is_null() {
+                need_minimal = true;
+            } else if (*slot).tts_ops != &pg_sys::TTSOpsMinimalTuple {
+                need_minimal = true;
+                tupdesc = (*slot).tts_tupleDescriptor;
+            } else {
+                tupdesc = (*slot).tts_tupleDescriptor;
+            }
+            if tupdesc.is_null() {
+                let plan_ptr = (*_node).ss.ps.plan as *mut pg_sys::CustomScan;
+                if !plan_ptr.is_null() {
+                    let tlist = (*plan_ptr).custom_scan_tlist;
+                    if !tlist.is_null() {
+                        tupdesc = pg_sys::ExecTypeFromTL(tlist);
+                    }
+                }
+            }
+            if need_minimal && !tupdesc.is_null() {
+                pg_sys::ExecInitScanTupleSlot(
+                    estate,
+                    &mut (*_node).ss,
+                    tupdesc,
+                    &pg_sys::TTSOpsMinimalTuple,
+                );
+            }
+        }
+    }
     // Notify executor that backend is switching to data flow (begin producing/consuming data)
     let id = match connection_id() {
         Ok(v) => v,
@@ -408,53 +485,94 @@ unsafe extern "C-unwind" fn exec_df_scan(
         Ok(s) => s,
         Err(e) => error!("Failed to map shared connection: {}", e),
     };
-    if let Err(err) = request_exec_scan(&mut shared.recv) {
-        let _ = request_failure(&mut shared.recv);
-        let _ = shared.signal_server();
-        error!("Failed to request exec scan: {}", err);
-    }
-    if let Err(err) = shared.signal_server() {
-        error!("Failed to signal server: {}", err);
-    }
-    // Wait until executor confirms it is ready to consume data
-    loop {
-        wait_latch(None);
-        if shared.send.len() == 0 {
-            continue;
-        }
-        let header = match consume_header(&mut shared.send) {
-            Ok(h) => h,
-            Err(err) => {
+    EXEC_SCAN_STARTED.with(|started| {
+        if !started.get() {
+            pgrx::info!("exec_df_scan: requesting ExecScan (conn={})", id);
+            if let Err(err) = request_exec_scan(&mut shared.recv) {
                 let _ = request_failure(&mut shared.recv);
                 let _ = shared.signal_server();
-                error!("Failed to consume header: {}", err)
+                error!("Failed to request exec scan: {}", err);
             }
-        };
-        if header.direction != Direction::ToClient {
-            continue;
+            if let Err(err) = shared.signal_server() {
+                error!("Failed to signal server: {}", err);
+            }
+            started.set(true);
         }
-        match ControlPacket::try_from(header.tag) {
-            Ok(ControlPacket::ExecReady) => break,
-            Ok(ControlPacket::Failure) => match read_error(&mut shared.send) {
-                Ok(msg) => error!("Executor failed to start: {}", msg),
-                Err(err) => error!("Double error: {}", err),
-            },
-            Err(_) if DataPacket::try_from(header.tag).is_ok() => {
-                // Ignore data packets here
-                continue;
+    });
+    // Wait until executor confirms it is ready to consume data (only once per scan)
+    let mut need_wait = true;
+    EXEC_READY_SEEN.with(|seen| { if seen.get() { need_wait = false; } });
+    if need_wait {
+        loop {
+            wait_latch(None);
+            if shared.send.len() == 0 { continue; }
+            let header = match consume_header(&mut shared.send) {
+                Ok(h) => h,
+                Err(err) => {
+                    let _ = request_failure(&mut shared.recv);
+                    let _ = shared.signal_server();
+                    error!("Failed to consume header: {}", err)
+                }
+            };
+            if header.direction != Direction::ToClient { continue; }
+            match ControlPacket::try_from(header.tag) {
+                Ok(ControlPacket::ExecReady) => {
+                    pgrx::info!("exec_df_scan: ExecReady received (conn={})", id);
+                    EXEC_READY_SEEN.with(|seen| seen.set(true));
+                    break;
+                },
+                Ok(ControlPacket::Failure) => match read_error(&mut shared.send) {
+                    Ok(msg) => error!("Executor failed to start: {}", msg),
+                    Err(err) => error!("Double error: {}", err),
+                },
+                Err(_) if DataPacket::try_from(header.tag).is_ok() => { continue; }
+                _ => continue,
             }
-            _ => continue,
         }
     }
-    // Try to process at most one pending heap page request from the executor.
-    // This keeps ExecCustomScan non-blocking while still making progress.
-    process_pending_heap_request(&mut shared);
-    // Try to read one result row from the per-connection result ring and fill a tuple slot
+    // Loop until we either produce a row or observe EOF.
     let tupslot = unsafe { (*_node).ss.ss_ScanTupleSlot };
     if tupslot.is_null() {
         return std::ptr::null_mut();
     }
-    return unsafe { try_store_wire_tuple_from_result(tupslot) };
+    loop {
+        // Make progress on any pending heap block request.
+        process_pending_heap_request(&mut shared);
+    // Try to fetch a row from result ring
+        if let Some(slot) = unsafe { try_store_wire_tuple_from_result(_node) } {
+            EMPTY_SPINS.with(|f| f.set(0));
+            return slot;
+        }
+        // If EOF sentinel was seen, terminate scan
+        if RESULT_RING_EOF.with(|f| f.get()) {
+            RESULT_RING_EOF.with(|f| f.set(false));
+            HEAP_EOF_SENT.with(|f| f.set(false));
+            EMPTY_SPINS.with(|f| f.set(0));
+            return std::ptr::null_mut();
+        }
+        // Conservative bailout after sending heap EOF
+        let mut bail = false;
+        HEAP_EOF_SENT.with(|eof_sent| {
+            if eof_sent.get() {
+                EMPTY_SPINS.with(|spins| {
+                    let cur = spins.get().saturating_add(1);
+                    spins.set(cur);
+                    if cur > 200 { // ~10s with 50ms waits
+                        bail = true;
+                    }
+                });
+            }
+        });
+        if bail {
+            pgrx::warning!("result_ring: bailout after EOF (no frames observed)");
+            RESULT_RING_EOF.with(|f| f.set(false));
+            HEAP_EOF_SENT.with(|f| f.set(false));
+            EMPTY_SPINS.with(|f| f.set(0));
+            return std::ptr::null_mut();
+        }
+        // Otherwise, wait to be signaled and retry
+        wait_latch(Some(Duration::from_millis(50)));
+    }
 }
 
 /// Try to process at most one pending heap page request from the executor.
@@ -470,9 +588,11 @@ fn process_pending_heap_request(shared: &mut ConnectionShared) {
         if let Ok(dp) = DataPacket::try_from(header.tag) {
             match dp {
                 DataPacket::Heap => {
-                    if let Ok((scan_id, table_oid, slot_id)) =
-                        read_heap_block_request(&mut shared.send)
-                    {
+                    if let Ok((scan_id, table_oid, slot_id)) = read_heap_block_request(&mut shared.send) {
+                        pgrx::info!(
+                            "process_pending_heap_request: heap request received scan_id={} table_oid={} slot_id={}",
+                            scan_id, table_oid, slot_id
+                        );
                         // Determine next block number for this scan
                         static PROGRESS: LazyLock<Mutex<HashMap<u64, u32>>> =
                             LazyLock::new(|| Mutex::new(HashMap::new()));
@@ -483,21 +603,44 @@ fn process_pending_heap_request(shared: &mut ConnectionShared) {
                             *e = e.saturating_add(1);
                             cur
                         };
-                        // Open relation and validate block number
+                        pgrx::info!(
+                            "process_pending_heap_request: computed blkno={} for scan_id={}",
+                            blkno, scan_id
+                        );
+                        // Open relation with AccessShareLock and validate block number
                         let rel_oid = Oid::from(table_oid);
-                        let rel = unsafe { pg_sys::RelationIdGetRelation(rel_oid) };
+                        let rel = unsafe {
+                            pg_sys::relation_open(rel_oid, pg_sys::AccessShareLock as pg_sys::LOCKMODE)
+                        };
                         if rel.is_null() {
                             // Relation not found; cannot serve this request
+                            pgrx::warning!("process_pending_heap_request: relation {} not found", table_oid);
                             return;
                         }
+                        // Use RelationGetNumberOfBlocksInFork to get heap size in blocks
                         let nblocks = unsafe {
-                            pg_sys::table_block_relation_size(rel, pg_sys::ForkNumber::MAIN_FORKNUM)
+                            pg_sys::RelationGetNumberOfBlocksInFork(
+                                rel,
+                                pg_sys::ForkNumber::MAIN_FORKNUM,
+                            )
                         } as u32;
                         if blkno >= nblocks {
                             // End of relation reached: send EOF for this scan
+                            pgrx::info!(
+                                "process_pending_heap_request: EOF scan_id={} slot_id={} (blkno {} >= nblocks {})",
+                                scan_id, slot_id, blkno, nblocks
+                            );
                             let _ = prepare_scan_eof(&mut shared.recv, scan_id);
                             let _ = shared.signal_server();
-                            unsafe { pg_sys::RelationClose(rel) };
+                            // Reset scan progress for this scan_id to allow future scans to start from 0
+                            {
+                                let mut map = PROGRESS.lock().unwrap();
+                                map.remove(&scan_id);
+                            }
+                            HEAP_EOF_SENT.with(|f| f.set(true));
+                            unsafe {
+                                pg_sys::relation_close(rel, pg_sys::AccessShareLock as pg_sys::LOCKMODE)
+                            };
                             return;
                         }
                         // Read the requested block
@@ -512,6 +655,7 @@ fn process_pending_heap_request(shared: &mut ConnectionShared) {
                         };
                         if buf <= 0 {
                             unsafe { pg_sys::RelationClose(rel) };
+                            pgrx::warning!("process_pending_heap_request: ReadBufferExtended failed");
                             return;
                         }
                         // Lock buffer for shared access while copying
@@ -544,6 +688,10 @@ fn process_pending_heap_request(shared: &mut ConnectionShared) {
                             }
                         }
                         // Publish to shared memory + notify executor
+                        pgrx::info!(
+                            "process_pending_heap_request: publishing page scan_id={} slot_id={} table_oid={} blkno={} num_offsets={} vis_bytes={}",
+                            scan_id, slot_id, table_oid, blkno, num_offsets, vis.len()
+                        );
                         let _ = publish_heap_page(
                             shared,
                             scan_id,
@@ -557,7 +705,7 @@ fn process_pending_heap_request(shared: &mut ConnectionShared) {
                         // Unlock and release buffer; close relation
                         unsafe {
                             pg_sys::UnlockReleaseBuffer(buf);
-                            pg_sys::RelationClose(rel);
+                            pg_sys::relation_close(rel, pg_sys::AccessShareLock as pg_sys::LOCKMODE);
                         }
                     }
                 }
@@ -572,9 +720,17 @@ fn process_pending_heap_request(shared: &mut ConnectionShared) {
 
 /// Read one row from the result ring and populate `tupslot`.
 /// Returns `tupslot` on success, or null on EOF/empty ring/error.
+thread_local! {
+    static RESULT_RING_EOF: Cell<bool> = Cell::new(false);
+    static EXEC_SCAN_STARTED: Cell<bool> = Cell::new(false);
+    static EXEC_READY_SEEN: Cell<bool> = Cell::new(false);
+    static HEAP_EOF_SENT: Cell<bool> = Cell::new(false);
+    static EMPTY_SPINS: Cell<u32> = Cell::new(0);
+}
+
 unsafe fn try_store_wire_tuple_from_result(
-    tupslot: *mut pg_sys::TupleTableSlot,
-) -> *mut pg_sys::TupleTableSlot {
+    node: *mut CustomScanState,
+) -> Option<*mut pg_sys::TupleTableSlot> {
     let conn_id = match connection_id() {
         Ok(v) => v as usize,
         Err(_) => 0,
@@ -582,43 +738,58 @@ unsafe fn try_store_wire_tuple_from_result(
     let base = result_ring_base_for(conn_id);
     let layout = result_ring_layout();
     let mut ring = LockFreeBuffer::from_layout(base, layout);
-    if ring.len() == 0 {
-        return std::ptr::null_mut();
+    let avail = ring.len();
+    if avail == 0 {
+        pgrx::info!("result_ring: empty (conn={})", conn_id);
+        return None;
     }
+    pgrx::info!("result_ring: bytes available={} (conn={})", avail, conn_id);
     use std::io::Read;
     // Read fixed 4-byte little-endian row_len
     let row_len = match protocol::result::read_frame_len(&mut ring) {
         Ok(v) => v as usize,
-        Err(_) => return std::ptr::null_mut(),
+        Err(e) => {
+            pgrx::warning!("result_ring: failed to read frame len: {} (conn={})", e, conn_id);
+            return None;
+        }
     };
+    pgrx::info!("result_ring: frame_len={} (conn={})", row_len, conn_id);
     if row_len == 0 {
         // EOF sentinel
-        return std::ptr::null_mut();
+        pgrx::info!("result_ring: EOF sentinel (conn={})", conn_id);
+        RESULT_RING_EOF.with(|f| f.set(true));
+        return None;
     }
     // Read payload into buffer
     let mut buf = vec![0u8; row_len];
     if Read::read_exact(&mut ring, &mut buf).is_err() {
-        return std::ptr::null_mut();
+        pgrx::warning!("result_ring: failed to read frame payload (len={})", row_len);
+        return None;
     }
     let (hdr, bitmap, data) = match decode_wire_tuple(&buf) {
         Ok(v) => v,
-        Err(_) => return std::ptr::null_mut(),
+        Err(e) => {
+            pgrx::warning!("result_ring: decode error: {}", e);
+            return None;
+        }
     };
-    // Build Datum/isnull arrays according to TupleDesc
-    let tdesc = (*tupslot).tts_tupleDescriptor;
+    // Use the scan slot; core ExecScan will handle projection into result slot
+    let scanslot = (*node).ss.ss_ScanTupleSlot;
+    let tdesc = (*scanslot).tts_tupleDescriptor;
     let natts_td = (*tdesc).natts as usize;
-    let natts = std::cmp::min(natts_td, hdr.nattrs as usize);
+    let natts_wire = hdr.nattrs as usize;
+    let limit = std::cmp::min(natts_td, natts_wire);
     let attrs = (*tdesc).attrs.as_slice((*tdesc).natts as _);
-    let mut values: Vec<pg_sys::Datum> = vec![pg_sys::Datum::from(0usize); natts];
-    let mut nulls: Vec<bool> = vec![false; natts];
+    let mut values: Vec<pg_sys::Datum> = vec![pg_sys::Datum::from(0usize); natts_td];
+    let mut nulls: Vec<bool> = vec![true; natts_td];
     let mut off: usize = 0;
-    for i in 0..natts {
+    for i in 0..limit {
         // null bitmap: bit set means NULL
         if (hdr.flags & 0x01) != 0 {
             let byte = i / 8;
             let bit = i % 8;
             if byte < bitmap.len() && (bitmap[byte] & (1u8 << bit)) != 0 {
-                nulls[i] = true;
+                nulls[i] = true; // remains NULL
                 continue;
             }
         }
@@ -655,8 +826,8 @@ unsafe fn try_store_wire_tuple_from_result(
     }
     // Form MinimalTuple and store in slot
     let mtup = pg_sys::heap_form_minimal_tuple(tdesc, values.as_mut_ptr(), nulls.as_mut_ptr());
-    pg_sys::ExecStoreMinimalTuple(mtup, tupslot, false);
-    tupslot
+    pg_sys::ExecStoreMinimalTuple(mtup, scanslot, false);
+    Some(scanslot)
 }
 
 #[pg_guard]
@@ -793,7 +964,8 @@ fn wait_latch(timeout: Option<Duration>) {
     };
     check_for_interrupts!();
     if rc & WL_TIMEOUT as i32 != 0 {
-        error!("Waiting latch timeout exceeded");
+        // Timeout is expected in non-blocking polling; do not raise ERROR.
+        pgrx::info!("wait_latch: timeout (non-fatal)");
     } else if rc & WL_POSTMASTER_DEATH as i32 != 0 {
         panic!("Postmaster is dead");
     }

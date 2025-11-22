@@ -1,13 +1,14 @@
 use executor::server::{Connection, Storage};
+use executor::pgscan::ScanRegistry;
 use executor::stack::TreiberStack;
 use pgrx::bgworkers::{BackgroundWorker, BackgroundWorkerBuilder, SignalWakeFlags};
 use pgrx::prelude::*;
-// Use thread-safe OnceLock for globals instead of OnceCell on a mutable static.
+use pgrx::pg_sys::AsPgCStr;
 use std::fs;
 use std::path::Path;
 use std::ptr;
 use std::slice;
-use std::sync::atomic::{AtomicBool, AtomicI32, AtomicPtr, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI32, Ordering};
 use std::sync::Arc;
 use std::sync::OnceLock;
 use tokio::runtime::Builder;
@@ -37,113 +38,145 @@ pub(crate) unsafe extern "C-unwind" fn init_datafusion_worker() {
 pub unsafe extern "C-unwind" fn init_shmem() {
     let num = crate::max_backends() as usize;
 
-    // Allocate flags region: one `AtomicBool` per backend connection.
+    // Flags region: one AtomicBool per backend connection.
     {
         use executor::layout::shared_state_layout;
         let shared = shared_state_layout(num).expect("shared_state_layout");
-        let ptr = pgrx::pg_sys::ShmemAlloc(shared.layout.size());
-        FLAGS_PTR.store(ptr as *mut u8, Ordering::Release);
-        // Zero-initialize flags
-        std::ptr::write_bytes(ptr as *mut u8, 0, shared.layout.size());
-        info!(
-            "init_shmem: allocated flags region: bytes={} count={}",
+        let mut found = false;
+        let base = pgrx::pg_sys::ShmemInitStruct(
+            "pg_fusion:flags".as_pg_cstr(),
             shared.layout.size(),
-            num
+            &mut found,
+        ) as *mut u8;
+        if !found {
+            std::ptr::write_bytes(base, 0, shared.layout.size());
+        }
+        info!(
+            "init_shmem: flags region ready: bytes={} count={} found={}",
+            shared.layout.size(),
+            num,
+            found
         );
     }
 
-    // Allocate connection regions: one `ConnectionLayout` per backend connection.
+    // Connection regions: one ConnectionLayout per backend connection.
     {
         use executor::layout::connection_layout;
         const RECV_CAP: usize = 8192;
         const SEND_CAP: usize = 8192;
         let layout = connection_layout(RECV_CAP, SEND_CAP).expect("connection_layout");
         let total = layout.layout.size() * num;
-        let base = pgrx::pg_sys::ShmemAlloc(total);
-        CONNS_PTR.store(base as *mut u8, Ordering::Release);
-        // Zero-initialize and set client pid to i32::MAX
-        let base_u8 = base as *mut u8;
-        std::ptr::write_bytes(base_u8, 0, total);
-        for i in 0..num {
-            let conn_base = base_u8.add(i * layout.layout.size());
-            let (_, _, client_ptr) = executor::layout::connection_ptrs(conn_base, layout);
-            (*client_ptr).store(i32::MAX, Ordering::Relaxed);
+        let mut found = false;
+        let base = pgrx::pg_sys::ShmemInitStruct(
+            "pg_fusion:conns".as_pg_cstr(),
+            total,
+            &mut found,
+        ) as *mut u8;
+        if !found {
+            std::ptr::write_bytes(base, 0, total);
+            for i in 0..num {
+                let conn_base = unsafe { base.add(i * layout.layout.size()) };
+                let (_, _, client_ptr) = executor::layout::connection_ptrs(conn_base, layout);
+                unsafe { (*client_ptr).store(i32::MAX, Ordering::Relaxed) };
+            }
         }
         info!(
-            "init_shmem: allocated connections region: bytes_per_conn={} total_bytes={} recv_cap={} send_cap={} count={}",
-            layout.layout.size(), total, RECV_CAP, SEND_CAP, num
+            "init_shmem: connections region ready: bytes_per_conn={} total_bytes={} recv_cap={} send_cap={} count={} found={}",
+            layout.layout.size(), total, RECV_CAP, SEND_CAP, num, found
         );
     }
 
-    // Allocate per-connection heap block buffers (SlotBlocksLayout).
+    // Per-connection heap block buffers (SlotBlocksLayout).
     {
         use executor::layout::slot_blocks_layout;
         let blksz = pgrx::pg_sys::BLCKSZ as usize;
         let layout =
             slot_blocks_layout(SLOTS_PER_CONN, blksz, BLOCKS_PER_SLOT).expect("slot_blocks_layout");
         let total = layout.layout.size() * num;
-        let base = pgrx::pg_sys::ShmemAlloc(total);
-        SLOT_BLOCKS_PTR.store(base as *mut u8, Ordering::Release);
-        // zero-init the whole region
-        let base_u8 = base as *mut u8;
-        std::ptr::write_bytes(base_u8, 0, total);
+        let mut found = false;
+        let base = pgrx::pg_sys::ShmemInitStruct(
+            "pg_fusion:slot_blocks".as_pg_cstr(),
+            total,
+            &mut found,
+        ) as *mut u8;
+        if !found {
+            std::ptr::write_bytes(base, 0, total);
+        }
         // Publish base and layout to executor module for in-process access
-        executor::shm::set_slot_blocks(base_u8, layout);
+        executor::shm::set_slot_blocks(base, layout);
         info!(
-            "init_shmem: allocated slot blocks: bytes_per_conn={} total_bytes={} slots_per_conn={} blocks_per_slot={} blksz={} count={}",
-            layout.layout.size(), total, SLOTS_PER_CONN, BLOCKS_PER_SLOT, blksz, num
+            "init_shmem: slot blocks ready: bytes_per_conn={} total_bytes={} slots_per_conn={} blocks_per_slot={} blksz={} count={} found={}",
+            layout.layout.size(), total, SLOTS_PER_CONN, BLOCKS_PER_SLOT, blksz, num, found
         );
     }
 
-    // Allocate Treiber stack region.
+    // Treiber stack region.
     {
         use executor::layout::{treiber_stack_layout, treiber_stack_ptrs};
         let layout = treiber_stack_layout(num).expect("treiber_stack_layout");
-        let base = pgrx::pg_sys::ShmemAlloc(layout.layout.size());
-        STACK_PTR.store(base as *mut u8, Ordering::Release);
-        // Initialize memory and construct stack header in place
-        let base_u8 = base as *mut u8;
-        std::ptr::write_bytes(base_u8, 0, layout.layout.size());
-        let (hdr_ptr, next_ptr) = treiber_stack_ptrs(base_u8, layout);
-        let stack = unsafe { TreiberStack::new(next_ptr, num) };
-        unsafe { ptr::write(hdr_ptr, stack) };
-        info!(
-            "init_shmem: allocated treiber stack: bytes={} nodes={}",
+        let mut found = false;
+        let base = pgrx::pg_sys::ShmemInitStruct(
+            "pg_fusion:stack".as_pg_cstr(),
             layout.layout.size(),
-            num
+            &mut found,
+        ) as *mut u8;
+        let base_u8 = base as *mut u8;
+        if !found {
+            std::ptr::write_bytes(base_u8, 0, layout.layout.size());
+            let (hdr_ptr, next_ptr) = treiber_stack_ptrs(base_u8, layout);
+            let stack = TreiberStack::new(next_ptr, num);
+            ptr::write(hdr_ptr, stack);
+        }
+        info!(
+            "init_shmem: treiber stack ready: bytes={} nodes={} found={}",
+            layout.layout.size(),
+            num,
+            found
         );
     }
 
-    // Allocate shared server PID cell
+    // Shared server PID cell
     {
         let layout = executor::layout::server_pid_layout().expect("server pid layout");
-        let base = pgrx::pg_sys::ShmemAlloc(layout.layout.size());
-        SERVER_PID_PTR.store(base as *mut u8, Ordering::Release);
-        // zero-init, value will be set in worker_main
-        std::ptr::write_bytes(base as *mut u8, 0, layout.layout.size());
+        let mut found = false;
+        let base = pgrx::pg_sys::ShmemInitStruct(
+            "pg_fusion:server_pid".as_pg_cstr(),
+            layout.layout.size(),
+            &mut found,
+        ) as *mut u8;
+        if !found {
+            std::ptr::write_bytes(base as *mut u8, 0, layout.layout.size());
+        }
         info!(
-            "init_shmem: allocated server pid cell: bytes={}",
-            layout.layout.size()
+            "init_shmem: server pid cell ready: bytes={} found={}",
+            layout.layout.size(),
+            found
         );
     }
 
-    // Allocate per-connection result ring buffers.
+    // Per-connection result ring buffers.
     {
         let layout =
             executor::layout::result_ring_layout(RESULT_RING_CAP).expect("result_ring_layout");
         let total = layout.layout.size() * num;
-        let base = pgrx::pg_sys::ShmemAlloc(total);
-        RESULT_RING_PTR.store(base as *mut u8, Ordering::Release);
-        let base_u8 = base as *mut u8;
-        std::ptr::write_bytes(base_u8, 0, total);
+        let mut found = false;
+        let base = pgrx::pg_sys::ShmemInitStruct(
+            "pg_fusion:result_ring".as_pg_cstr(),
+            total,
+            &mut found,
+        ) as *mut u8;
+        if !found {
+            std::ptr::write_bytes(base, 0, total);
+        }
         // Publish base and layout to executor module
-        executor::shm::set_result_ring(base_u8, layout);
+        executor::shm::set_result_ring(base, layout);
         info!(
-            "init_shmem: allocated result ring: bytes_per_conn={} total_bytes={} cap={} count={}",
+            "init_shmem: result ring ready: bytes_per_conn={} total_bytes={} cap={} count={} found={}",
             layout.layout.size(),
             total,
             RESULT_RING_CAP,
-            num
+            num,
+            found
         );
     }
 }
@@ -171,10 +204,14 @@ pub extern "C-unwind" fn worker_main(_arg: pg_sys::Datum) {
 
     // Build SharedState from shared flags
     let flags_slice = unsafe {
-        let flags_base = FLAGS_PTR.load(Ordering::Acquire);
-        assert!(!flags_base.is_null(), "FLAGS_PTR not set");
         let layout = executor::layout::shared_state_layout(num).expect("flags layout");
-        let flags_ptr = executor::layout::shared_state_flags_ptr(flags_base, layout);
+        let mut found = false;
+        let base = pgrx::pg_sys::ShmemInitStruct(
+            "pg_fusion:flags".as_pg_cstr(),
+            layout.layout.size(),
+            &mut found,
+        ) as *mut u8;
+        let flags_ptr = executor::layout::shared_state_flags_ptr(base, layout);
         slice::from_raw_parts(flags_ptr, num)
     };
     let state = Arc::new(executor::ipc::SharedState::new(flags_slice));
@@ -185,9 +222,13 @@ pub extern "C-unwind" fn worker_main(_arg: pg_sys::Datum) {
 
     // Set server PID in shared memory (OS pid)
     unsafe {
-        let base = SERVER_PID_PTR.load(Ordering::Acquire);
-        assert!(!base.is_null(), "SERVER_PID_PTR not set");
         let layout = executor::layout::server_pid_layout().expect("server pid layout");
+        let mut found = false;
+        let base = pgrx::pg_sys::ShmemInitStruct(
+            "pg_fusion:server_pid".as_pg_cstr(),
+            layout.layout.size(),
+            &mut found,
+        ) as *mut u8;
         let pid_ptr = executor::layout::server_pid_ptr(base, layout);
         let pid = libc::getpid();
         (*pid_ptr).store(pid as i32, Ordering::Relaxed);
@@ -210,19 +251,35 @@ pub extern "C-unwind" fn worker_main(_arg: pg_sys::Datum) {
         // Spawn shared signal listener (wakes sockets on SIGUSR1)
         tokio::spawn(executor::ipc::signal_listener(Arc::clone(&state)));
 
-        let base = CONNS_PTR.load(Ordering::Acquire);
-        assert!(!base.is_null(), "CONNS_PTR not set");
         let layout = executor::layout::connection_layout(RECV_CAP, SEND_CAP).expect("conn layout");
+        let mut conns_found = false;
+        let base = unsafe {
+            pgrx::pg_sys::ShmemInitStruct(
+                "pg_fusion:conns".as_pg_cstr(),
+                layout.layout.size() * num,
+                &mut conns_found,
+            ) as *mut u8
+        };
         let srv_pid_ptr = unsafe {
-            let base = SERVER_PID_PTR.load(Ordering::Acquire);
-            assert!(!base.is_null(), "SERVER_PID_PTR not set");
             let l = executor::layout::server_pid_layout().expect("server pid layout");
+            let mut found = false;
+            let base = pgrx::pg_sys::ShmemInitStruct(
+                "pg_fusion:server_pid".as_pg_cstr(),
+                l.layout.size(),
+                &mut found,
+            ) as *mut u8;
             executor::layout::server_pid_ptr(base, l)
         };
         for id in 0..num {
             let conn_base = unsafe { base.add(id * layout.layout.size()) };
             let (recv_base, send_base, client_ptr) =
                 unsafe { executor::layout::connection_ptrs(conn_base, layout) };
+            tracing::trace!(
+                connection_id = id,
+                recv_base = ?recv_base,
+                send_base = ?send_base,
+                "worker_main: connection bases"
+            );
             let socket = unsafe {
                 executor::ipc::Socket::from_layout_with_state(
                     id,
@@ -239,8 +296,16 @@ pub extern "C-unwind" fn worker_main(_arg: pg_sys::Datum) {
                     &*client_ptr
                 });
             // Attach result ring buffer for this connection
-            let res_base = result_ring_base_for(id);
             let res_layout = result_ring_layout();
+            let mut rr_found = false;
+            let rr_base = unsafe {
+                pgrx::pg_sys::ShmemInitStruct(
+                    "pg_fusion:result_ring".as_pg_cstr(),
+                    res_layout.layout.size() * num,
+                    &mut rr_found,
+                ) as *mut u8
+            };
+            let res_base = unsafe { rr_base.add(id * res_layout.layout.size()) };
             let res_buf =
                 unsafe { executor::buffer::LockFreeBuffer::from_layout(res_base, res_layout) };
             conn.set_result_buffer(res_buf);
@@ -248,6 +313,8 @@ pub extern "C-unwind" fn worker_main(_arg: pg_sys::Datum) {
             tokio::spawn(async move {
                 tracing::trace!(connection_id = id, "connection task started");
                 let mut storage = Storage::default();
+                // Ensure registry knows this connection id for SHM addressing
+                storage.set_registry_conn(id);
                 loop {
                     let res = match conn.poll().await {
                         Ok(_) => {
@@ -335,21 +402,17 @@ fn init_tracing_file_logger() {
     let _ = GUARD.set(guard);
 }
 
-// Shared pointers to newly allocated regions (atomic raw pointers)
-static FLAGS_PTR: AtomicPtr<u8> = AtomicPtr::new(core::ptr::null_mut());
-static CONNS_PTR: AtomicPtr<u8> = AtomicPtr::new(core::ptr::null_mut());
-static STACK_PTR: AtomicPtr<u8> = AtomicPtr::new(core::ptr::null_mut());
-static SERVER_PID_PTR: AtomicPtr<u8> = AtomicPtr::new(core::ptr::null_mut());
-static SLOT_BLOCKS_PTR: AtomicPtr<u8> = AtomicPtr::new(core::ptr::null_mut());
-static RESULT_RING_PTR: AtomicPtr<u8> = AtomicPtr::new(core::ptr::null_mut());
-
 // Accessor for Treiber stack stored in shared memory
 pub(crate) fn treiber_stack() -> &'static TreiberStack {
     unsafe {
-        let base = STACK_PTR.load(Ordering::Acquire);
-        assert!(!base.is_null(), "STACK_PTR not set");
-        let layout = executor::layout::treiber_stack_layout(crate::max_backends() as usize)
-            .expect("treiber_stack_layout");
+        let num = crate::max_backends() as usize;
+        let layout = executor::layout::treiber_stack_layout(num).expect("treiber_stack_layout");
+        let mut found = false;
+        let base = pgrx::pg_sys::ShmemInitStruct(
+            "pg_fusion:stack".as_pg_cstr(),
+            layout.layout.size(),
+            &mut found,
+        ) as *mut u8;
         let (hdr_ptr, _next_ptr) = executor::layout::treiber_stack_ptrs(base, layout);
         &*hdr_ptr
     }
@@ -358,10 +421,14 @@ pub(crate) fn treiber_stack() -> &'static TreiberStack {
 pub(crate) fn shared_flags_slice() -> &'static [AtomicBool] {
     let num = crate::max_backends() as usize;
     unsafe {
-        let flags_base = FLAGS_PTR.load(Ordering::Acquire);
-        assert!(!flags_base.is_null(), "FLAGS_PTR not set");
         let layout = executor::layout::shared_state_layout(num).expect("flags layout");
-        let flags_ptr = executor::layout::shared_state_flags_ptr(flags_base, layout);
+        let mut found = false;
+        let base = pgrx::pg_sys::ShmemInitStruct(
+            "pg_fusion:flags".as_pg_cstr(),
+            layout.layout.size(),
+            &mut found,
+        ) as *mut u8;
+        let flags_ptr = executor::layout::shared_state_flags_ptr(base, layout);
         std::slice::from_raw_parts(flags_ptr, num)
     }
 }
@@ -371,7 +438,16 @@ pub(crate) fn connections_layout() -> executor::layout::ConnectionLayout {
 }
 
 pub(crate) fn connections_base() -> *mut u8 {
-    CONNS_PTR.load(Ordering::Acquire)
+    let num = crate::max_backends() as usize;
+    let layout = connections_layout();
+    let mut found = false;
+    unsafe {
+        pgrx::pg_sys::ShmemInitStruct(
+            "pg_fusion:conns".as_pg_cstr(),
+            layout.layout.size() * num,
+            &mut found,
+        ) as *mut u8
+    }
 }
 
 pub(crate) fn slot_blocks_layout() -> executor::layout::SlotBlocksLayout {
@@ -381,24 +457,42 @@ pub(crate) fn slot_blocks_layout() -> executor::layout::SlotBlocksLayout {
 }
 
 pub(crate) fn slot_blocks_base() -> *mut u8 {
-    SLOT_BLOCKS_PTR.load(Ordering::Acquire)
+    let num = crate::max_backends() as usize;
+    let layout = slot_blocks_layout();
+    let mut found = false;
+    unsafe {
+        pgrx::pg_sys::ShmemInitStruct(
+            "pg_fusion:slot_blocks".as_pg_cstr(),
+            layout.layout.size() * num,
+            &mut found,
+        ) as *mut u8
+    }
 }
 
 /// Return the base pointer for the slot blocks region of a specific connection id.
 pub(crate) fn slot_blocks_base_for(conn_id: usize) -> *mut u8 {
     unsafe {
-        let base = SLOT_BLOCKS_PTR.load(Ordering::Acquire);
-        assert!(!base.is_null(), "SLOT_BLOCKS_PTR not set");
         let layout = slot_blocks_layout();
+        let num = crate::max_backends() as usize;
+        let mut found = false;
+        let base = pgrx::pg_sys::ShmemInitStruct(
+            "pg_fusion:slot_blocks".as_pg_cstr(),
+            layout.layout.size() * num,
+            &mut found,
+        ) as *mut u8;
         base.add(conn_id * layout.layout.size())
     }
 }
 
 pub(crate) fn server_pid_atomic() -> &'static AtomicI32 {
     unsafe {
-        let base = SERVER_PID_PTR.load(Ordering::Acquire);
-        assert!(!base.is_null(), "SERVER_PID_PTR not set");
         let layout = executor::layout::server_pid_layout().expect("server pid layout");
+        let mut found = false;
+        let base = pgrx::pg_sys::ShmemInitStruct(
+            "pg_fusion:server_pid".as_pg_cstr(),
+            layout.layout.size(),
+            &mut found,
+        ) as *mut u8;
         let pid_ptr = executor::layout::server_pid_ptr(base, layout);
         &*pid_ptr
     }
@@ -410,9 +504,14 @@ pub(crate) fn result_ring_layout() -> executor::layout::BufferLayout {
 
 pub(crate) fn result_ring_base_for(conn_id: usize) -> *mut u8 {
     unsafe {
-        let base = RESULT_RING_PTR.load(Ordering::Acquire);
-        assert!(!base.is_null(), "RESULT_RING_PTR not set");
         let layout = result_ring_layout();
+        let num = crate::max_backends() as usize;
+        let mut found = false;
+        let base = pgrx::pg_sys::ShmemInitStruct(
+            "pg_fusion:result_ring".as_pg_cstr(),
+            layout.layout.size() * num,
+            &mut found,
+        ) as *mut u8;
         base.add(conn_id * layout.layout.size())
     }
 }

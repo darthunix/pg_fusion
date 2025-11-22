@@ -3,7 +3,7 @@ use anyhow::Result as AnyResult;
 use executor::buffer::LockFreeBuffer;
 use executor::layout::{connection_ptrs, socket_ptrs, ConnectionLayout};
 use pgrx::warning;
-use std::cell::OnceCell;
+use std::sync::OnceLock;
 use std::sync::atomic::{AtomicBool, AtomicI32, Ordering};
 
 /// RAII guard that acquires a free connection id from the global Treiber stack
@@ -32,20 +32,19 @@ impl Drop for ConnectionHandle {
     }
 }
 
-// Thread-local, one-per-backend handle that returns to the stack on thread exit.
-thread_local! {
-    static CONNECTION_HANDLE: OnceCell<ConnectionHandle> = const { OnceCell::new() };
-}
+// Process-global, one-per-backend handle.
+// Postgres backends are single-threaded; using a global avoids mismatches
+// if callbacks are invoked on different Rust threads.
+static CONNECTION_HANDLE: OnceLock<ConnectionHandle> = OnceLock::new();
 
 /// Get the current backend's connection id, initializing lazily on first use.
 pub(crate) fn connection_id() -> AnyResult<u32> {
-    CONNECTION_HANDLE.with(|cell| {
-        if cell.get().is_none() {
-            let handle = ConnectionHandle::acquire()?;
-            let _ = cell.set(handle);
-        }
-        Ok(cell.get().unwrap().id())
-    })
+    if let Some(h) = CONNECTION_HANDLE.get() {
+        return Ok(h.id());
+    }
+    let handle = ConnectionHandle::acquire()?;
+    let _ = CONNECTION_HANDLE.set(handle);
+    Ok(CONNECTION_HANDLE.get().unwrap().id())
 }
 
 pub(crate) struct ConnectionShared<'a> {
@@ -75,6 +74,12 @@ impl ConnectionShared<'_> {
             // runtime (when it starts or is already running) will see our flag
             // on its next poll without requiring a signal.
             self.flag.store(true, Ordering::Release);
+            // Best-effort diagnostics
+            if let Ok(id) = crate::ipc::connection_id() {
+                pgrx::info!("signal_server: flag set (conn={})", id);
+            } else {
+                pgrx::info!("signal_server: flag set (conn=?), pid unknown");
+            }
 
             // Best-effort: wait briefly for the worker to publish PID.
             let mut pid = self.server_pid.load(Ordering::Relaxed);
@@ -97,6 +102,9 @@ impl ConnectionShared<'_> {
             let rc = unsafe { libc::kill(pid as libc::pid_t, libc::SIGUSR1) };
             if rc == -1 {
                 return Err(std::io::Error::last_os_error().into());
+            }
+            if let Ok(id) = crate::ipc::connection_id() {
+                pgrx::info!("signal_server: SIGUSR1 sent (conn={} pid={})", id, pid);
             }
             Ok(())
         }
@@ -133,6 +141,13 @@ pub(crate) fn connection_shared(id: u32) -> AnyResult<ConnectionShared<'static>>
     let send = unsafe { LockFreeBuffer::from_layout(send_base, layout.send_buffer_layout) };
     let client_pid_ref: &'static AtomicI32 = unsafe { &*client_ptr };
     let server_pid_ref: &'static AtomicI32 = crate::worker::server_pid_atomic();
+
+    // Diagnostics: log addresses once per call (cheap and helps correlate with worker)
+    pgrx::info!(
+        "connection_shared: id={} recv_base={:?} recv_buf={:?} send_base={:?}",
+        id,
+        recv_base, recv_buf_base, send_base
+    );
 
     Ok(ConnectionShared {
         flag: flag_ref,
