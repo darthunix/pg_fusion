@@ -51,6 +51,7 @@ pub struct HeapBlock {
 #[derive(Debug, Default)]
 pub struct ScanRegistry {
     inner: Mutex<HashMap<ScanId, Entry>>,
+    conn_id: usize,
 }
 
 #[derive(Debug)]
@@ -60,9 +61,9 @@ struct Entry {
 }
 
 impl ScanRegistry {
-    pub fn new() -> Self {
-        Self::default()
-    }
+    pub fn new() -> Self { Self { inner: Mutex::new(HashMap::new()), conn_id: 0 } }
+
+    pub fn with_conn(conn_id: usize) -> Self { Self { inner: Mutex::new(HashMap::new()), conn_id } }
 
     #[inline]
     fn lock(&self) -> MutexGuard<HashMap<ScanId, Entry>> {
@@ -111,6 +112,9 @@ impl ScanRegistry {
         let mut map = self.lock();
         let _ = map.remove(&scan_id);
     }
+
+    #[inline]
+    pub fn conn_id(&self) -> usize { self.conn_id }
 }
 
 // No global registry; registries are per-connection and owned by the server Storage.
@@ -249,7 +253,9 @@ impl ExecutionPlan for PgScanExec {
         _ctx: Arc<TaskContext>,
     ) -> DFResult<SendableRecordBatchStream> {
         let rx = self.registry.take_receiver(self.scan_id);
-        let stream = PgScanStream::new(Arc::clone(&self.schema), Arc::clone(&self.attrs), rx);
+        // Use connection id stored in registry to address per-connection slot buffers
+        let conn_id = self.registry.conn_id();
+        let stream = PgScanStream::new(Arc::clone(&self.schema), Arc::clone(&self.attrs), rx, conn_id);
         Ok(Box::pin(stream))
     }
 
@@ -262,6 +268,7 @@ pub struct PgScanStream {
     schema: SchemaRef,
     attrs: Arc<Vec<PgAttrMeta>>,
     rx: Option<mpsc::Receiver<HeapBlock>>,
+    conn_id: usize,
 }
 
 impl PgScanStream {
@@ -269,8 +276,9 @@ impl PgScanStream {
         schema: SchemaRef,
         attrs: Arc<Vec<PgAttrMeta>>,
         rx: Option<mpsc::Receiver<HeapBlock>>,
+        conn_id: usize,
     ) -> Self {
-        Self { schema, attrs, rx }
+        Self { schema, attrs, rx, conn_id }
     }
 }
 
@@ -285,9 +293,9 @@ impl Stream for PgScanStream {
         match rx.poll_recv(cx) {
             Poll::Ready(Some(block)) => {
                 // Borrow page and (optional) visibility bitmap from shared memory (no copy)
-                let page = unsafe { shm::block_slice(block.slot_id as usize) };
+                let page = unsafe { shm::block_slice(this.conn_id, block.slot_id as usize) };
                 let _vis = if block.vis_len > 0 {
-                    Some(unsafe { shm::vis_slice(block.slot_id as usize, block.vis_len as usize) })
+                    Some(unsafe { shm::vis_slice(this.conn_id, block.slot_id as usize, block.vis_len as usize) })
                 } else {
                     None
                 };
@@ -309,9 +317,23 @@ impl Stream for PgScanStream {
                     .map_err(|e| datafusion::error::DataFusionError::Execution(format!("{e}")))?;
                 // Use tuples_by_offset to iterate LP_NORMAL tuples in page order
                 let mut pairs: Vec<(u16, u16)> = Vec::new();
+                // Pre-scan to populate pairs and log LP_NORMAL count
+                {
+                    let _ = hp.tuples_by_offset(None, std::ptr::null_mut(), &mut pairs);
+                }
+                let pairs_len = pairs.len();
+                // Create iterator borrowing the filled pairs slice
                 let mut it = hp.tuples_by_offset(None, std::ptr::null_mut(), &mut pairs);
+                tracing::trace!(
+                    target = "executor::server",
+                    blkno = block.blkno,
+                    num_offsets = block.num_offsets,
+                    lp_normal = pairs_len,
+                    "pgscan: tuples_by_offset summary"
+                );
                 let page_hdr = unsafe { &*(page.as_ptr() as *const pg_sys::PageHeaderData) }
                     as *const pg_sys::PageHeaderData;
+                let mut decoded_rows = 0usize;
                 while let Some(tup) = it.next() {
                     // Decode projected columns for tuple using iterator over all columns
                     let iter =
@@ -326,6 +348,7 @@ impl Stream for PgScanStream {
                             None => append_null(&mut builders[col_idx]),
                         }
                     }
+                    decoded_rows += 1;
                 }
 
                 // Build Arrow arrays and RecordBatch
@@ -335,6 +358,12 @@ impl Stream for PgScanStream {
                 }
                 let rb = RecordBatch::try_new(Arc::clone(&this.schema), arrs)
                     .map_err(|e| datafusion::error::DataFusionError::Execution(format!("{e}")))?;
+                tracing::trace!(
+                    target = "executor::server",
+                    rows = decoded_rows,
+                    blkno = block.blkno,
+                    "pgscan: decoded rows"
+                );
                 Poll::Ready(Some(Ok(rb)))
             }
             Poll::Ready(None) => Poll::Ready(None),

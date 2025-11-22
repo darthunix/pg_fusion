@@ -41,20 +41,24 @@ pub fn copy_vis(slot: usize, vis_len: usize) -> Vec<u8> {
     unsafe { std::slice::from_raw_parts(ptr, len) }.to_vec()
 }
 
-/// Borrow the heap page bytes from shared memory for the given `slot`.
+/// Borrow the heap page bytes from shared memory for the given connection and `slot`.
 /// Lifetime is 'static since the region lives for the process lifetime; caller
 /// must ensure the producer won't mutate the slot while reading.
-pub unsafe fn block_slice(slot: usize) -> &'static [u8] {
+pub unsafe fn block_slice(conn_offset: usize, slot: usize) -> &'static [u8] {
     let (base, layout) = get();
-    let ptr = slot_ptr_calc(base, layout, slot, 0);
+    let per = layout.layout.size();
+    let conn_base = base.add(conn_offset * per);
+    let ptr = slot_ptr_calc(conn_base, layout, slot, 0);
     std::slice::from_raw_parts(ptr, layout.block_len)
 }
 
 /// Borrow the visibility bitmap bytes from shared memory for the given `slot`.
 /// Lifetime is 'static; see notes in `block_slice`.
-pub unsafe fn vis_slice(slot: usize, vis_len: usize) -> &'static [u8] {
+pub unsafe fn vis_slice(conn_offset: usize, slot: usize, vis_len: usize) -> &'static [u8] {
     let (base, layout) = get();
-    let ptr = vis_ptr_calc(base, layout, slot, 0);
+    let per = layout.layout.size();
+    let conn_base = base.add(conn_offset * per);
+    let ptr = vis_ptr_calc(conn_base, layout, slot, 0);
     let len = vis_len.min(layout.vis_bytes_per_block);
     std::slice::from_raw_parts(ptr, len)
 }

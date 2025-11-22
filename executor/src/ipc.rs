@@ -30,10 +30,16 @@ pub async fn signal_listener(state: Arc<SharedState<'_>>) {
     let mut signal = signal(SignalKind::user_defined1()).expect("failed to create signal");
     while signal.recv().await.is_some() {
         // Notify affected sockets that the signal has been received.
+        let mut woke = 0usize;
         for i in 0..state.size {
             if state.flags[i].load(Ordering::Acquire) {
                 state.wakers[i].wake();
+                woke += 1;
+                tracing::trace!(target = "executor::ipc", conn_id = i, "signal_listener: woke socket");
             }
+        }
+        if woke == 0 {
+            tracing::trace!(target = "executor::ipc", "signal_listener: signal received but no flags set");
         }
     }
 }

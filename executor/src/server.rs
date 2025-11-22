@@ -57,6 +57,10 @@ impl Storage {
         *self = Self::default();
         self.registry = registry;
     }
+
+    pub fn set_registry_conn(&mut self, conn_id: usize) {
+        self.registry = Arc::new(crate::pgscan::ScanRegistry::with_conn(conn_id));
+    }
 }
 
 pub struct Connection<'bytes> {
@@ -87,6 +91,11 @@ impl<'bytes> Connection<'bytes> {
     }
 
     pub async fn poll(&mut self) -> Result<()> {
+        let pending = self.recv_socket.buffer.len();
+        if pending > 0 {
+            trace!("poll: data already available: {} bytes", pending);
+            return Ok(());
+        }
         trace!("poll: waiting for socket signal");
         (&mut self.recv_socket).await?;
         trace!(
@@ -135,6 +144,13 @@ impl<'bytes> Connection<'bytes> {
     }
 
     pub async fn process_message(&mut self, storage: &mut Storage) -> Result<()> {
+        // Guard against spurious wakeups where no bytes are available yet.
+        let pending = self.recv_socket.buffer.len();
+        if pending < 6 {
+            // Header is at least 6 bytes (3 fixints + u16)
+            trace!("process_message: woke but no header bytes available",);
+            return Ok(());
+        }
         let header = consume_header(&mut self.recv_socket.buffer)?;
         debug!(
             direction = ?header.direction,
@@ -152,6 +168,8 @@ impl<'bytes> Connection<'bytes> {
         // Column layout arrives during planning/prepare; store it for later encoding use.
         if header.tag == ControlPacket::ColumnLayout as u8 {
             let attrs = consume_column_layout(&mut self.recv_socket.buffer)?;
+            let len = attrs.len();
+            tracing::trace!(target = "executor::server", pg_attrs = len, "column layout received");
             storage.pg_attrs = Some(attrs);
             return Ok(());
         }
@@ -162,6 +180,16 @@ impl<'bytes> Connection<'bytes> {
                     // Read metadata; we expect the visibility bitmap to be stored in shared memory.
                     let meta =
                         read_heap_block_bitmap_meta(&mut self.recv_socket.buffer, header.length)?;
+                    trace!(
+                        target = "executor::server",
+                        scan_id = meta.scan_id,
+                        slot_id = meta.slot_id,
+                        table_oid = meta.table_oid,
+                        blkno = meta.blkno,
+                        num_offsets = meta.num_offsets,
+                        bitmap_inline_len = meta.bitmap_len,
+                        "heap bitmap meta received"
+                    );
                     // If payload included inline bitmap bytes (legacy), drain them without allocation.
                     let mut remaining = meta.bitmap_len as usize;
                     while remaining > 0 {
@@ -172,6 +200,13 @@ impl<'bytes> Connection<'bytes> {
                     }
                     // Trailing u16 carries the visibility bitmap length in shared memory
                     let vis_len = read_u16_msgpack(&mut self.recv_socket.buffer)?;
+                    trace!(
+                        target = "executor::server",
+                        scan_id = meta.scan_id,
+                        slot_id = meta.slot_id,
+                        vis_len,
+                        "heap bitmap vis_len (shm) received"
+                    );
                     if let Some(tx) = storage.registry.sender(meta.scan_id as u64) {
                         let block = crate::pgscan::HeapBlock {
                             scan_id: meta.scan_id as u64,
@@ -190,6 +225,13 @@ impl<'bytes> Connection<'bytes> {
                             );
                         }
                         // Request the next heap block for this scan using the same slot
+                        trace!(
+                            target = "executor::server",
+                            scan_id = meta.scan_id,
+                            table_oid = meta.table_oid,
+                            slot_id = meta.slot_id,
+                            "requesting next heap block"
+                        );
                         if let Err(e) = request_heap_block(
                             &mut self.send_buffer,
                             meta.scan_id,
@@ -411,6 +453,13 @@ fn encode_and_write_rows(
     let rows = batch.num_rows();
     let cols = std::cmp::min(batch.num_columns(), attrs.len());
     if cols == 0 || rows == 0 {
+        tracing::trace!(
+            target = "executor::server",
+            rows,
+            cols,
+            attrs = attrs.len(),
+            "execution: empty batch or no attrs; skipping write"
+        );
         return 0;
     }
     // Working buffers reused across rows to minimize allocations
@@ -554,9 +603,11 @@ fn open_data_flow(_conn: &mut Connection, storage: &mut Storage) -> Result<TaskR
     let phys = storage.physical_plan.as_ref().expect("checked above");
     // Reserve capacity to avoid HashMap reallocation while registering
     let scan_count = count_scans(phys) as usize;
+    trace!(scan_count, "open_data_flow: reserving scan registry capacity");
     storage.registry.reserve(scan_count);
     // Register channels per scan in the connection-local registry; no response payload
-    let _ = for_each_scan::<_, Error>(phys, |id, _table_oid| {
+    let _ = for_each_scan::<_, Error>(phys, |id, table_oid| {
+        trace!(scan_id = id, table_oid, "open_data_flow: registering scan channel");
         let _ = storage.registry.register(id, 16);
         Ok(())
     });
@@ -578,6 +629,7 @@ fn start_data_flow(conn: &mut Connection, storage: &mut Storage) -> Result<TaskR
 
     let plan = Arc::clone(storage.physical_plan.as_ref().expect("checked above"));
     let pg_attrs = storage.pg_attrs.clone().unwrap_or_default();
+    tracing::trace!(target = "executor::server", pg_attrs = pg_attrs.len(), "start_data_flow: attrs snapshot");
     // Build a fresh TaskContext for execution
     let state = SessionStateBuilder::new().build();
     let ctx = state.task_ctx();
@@ -586,6 +638,7 @@ fn start_data_flow(conn: &mut Connection, storage: &mut Storage) -> Result<TaskR
     let client_pid_val = conn
         .client_pid
         .load(std::sync::atomic::Ordering::Relaxed); // snapshot pid
+    trace!(conn_id, "start_data_flow: spawning execution task");
     let handle = tokio::spawn(async move {
         // Execute a single partition; PgScanExec uses a single stream
         match plan.execute(0, ctx) {
@@ -606,6 +659,12 @@ fn start_data_flow(conn: &mut Connection, storage: &mut Storage) -> Result<TaskR
                                 continue;
                             }
                             let wrote = encode_and_write_rows(&batch, &pg_attrs, &mut ring);
+                            tracing::trace!(
+                                target = "executor::server",
+                                rows = wrote,
+                                cols = batch.num_columns(),
+                                "execution: batch encoded and written"
+                            );
                             if wrote > 0 {
                                 let pid = client_pid_val;
                                 if pid > 0 && pid != i32::MAX {
@@ -618,6 +677,11 @@ fn start_data_flow(conn: &mut Connection, storage: &mut Storage) -> Result<TaskR
                 tracing::trace!(target = "pg_fusion::server", "execution stream completed");
                 // Write EOF sentinel row to result ring to unblock backend
                 let _ = protocol::result::write_eof(&mut ring);
+                // Nudge the backend in case it is waiting on latch
+                let pid = client_pid_val;
+                if pid > 0 && pid != i32::MAX {
+                    unsafe { libc::kill(pid as libc::pid_t, libc::SIGUSR1) };
+                }
             }
             Err(e) => {
                 tracing::error!(
@@ -629,11 +693,13 @@ fn start_data_flow(conn: &mut Connection, storage: &mut Storage) -> Result<TaskR
     });
     storage.exec_task = Some(handle);
     // Send a tiny ack to the backend indicating execution is ready
+    trace!("start_data_flow: sending ExecReady to backend");
     protocol::exec::prepare_exec_ready(&mut conn.send_buffer)?;
     // No demo row: result rows will be written by the execution task
     // Kick off initial heap block requests for each scan using slot 0
     if let Some(phys) = storage.physical_plan.as_ref() {
         let _ = for_each_scan::<_, Error>(phys, |id, table_oid| {
+            trace!(scan_id = id, table_oid, slot_id = 0, "start_data_flow: initial heap request");
             request_heap_block(&mut conn.send_buffer, id, table_oid, 0)?;
             Ok(())
         });
@@ -642,12 +708,9 @@ fn start_data_flow(conn: &mut Connection, storage: &mut Storage) -> Result<TaskR
 }
 
 fn end_data_flow(storage: &mut Storage) -> Result<TaskResult> {
-    // Cancel running execution task if present
-    if let Some(handle) = storage.exec_task.take() {
-        handle.abort();
-    }
-    // Close and clear all registered scan channels
-    storage.registry.close_and_clear();
+    // Use unified reset to ensure state machine returns to Initialized and
+    // any in-flight execution task is aborted, while preserving registry object.
+    storage.flush();
     Ok(TaskResult::Noop)
 }
 

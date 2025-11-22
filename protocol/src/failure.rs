@@ -1,6 +1,6 @@
 use crate::{str_prefix_len, write_header, ControlPacket, Direction, Flag, Header};
 use anyhow::Result;
-use rmp::decode::read_str_len;
+use rmp::decode::read_bin_len;
 use rmp::encode::write_bin_len;
 use smol_str::SmolStr;
 use std::error::Error;
@@ -23,10 +23,10 @@ pub fn prepare_error(stream: &mut impl Write, message: &str) -> Result<()> {
 }
 
 pub fn read_error(stream: &mut impl Read) -> Result<String> {
-    let len = read_str_len(stream)?;
-    let mut buf = vec![0u8; len as usize];
-    let read = stream.read(&mut buf)?;
-    debug_assert_eq!(read, len as usize);
+    // Errors are encoded as MsgPack bin with explicit length
+    let len = read_bin_len(stream)? as usize;
+    let mut buf = vec![0u8; len];
+    std::io::Read::read_exact(stream, &mut buf)?;
     Ok(String::from_utf8(buf)?)
 }
 
