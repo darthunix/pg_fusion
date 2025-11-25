@@ -8,10 +8,11 @@ use anyhow::Error;
 use anyhow::{bail, Result};
 use common::FusionError;
 use datafusion::execution::SessionStateBuilder;
-use datafusion::arrow::array::{Array, Int32Array, StringArray};
+use datafusion::config::ConfigOptions;
+use datafusion::arrow::array::{Array, Int32Array, Int64Array, StringArray};
 use datafusion::arrow::record_batch::RecordBatch;
 use datafusion::logical_expr::LogicalPlan;
-use datafusion::physical_plan::{displayable, ExecutionPlan};
+use datafusion::physical_plan::{displayable, ExecutionPlan, ExecutionPlanProperties};
 use datafusion::scalar::ScalarValue;
 use datafusion_sql::parser::{DFParser, Statement};
 use datafusion_sql::planner::SqlToRel;
@@ -508,6 +509,14 @@ fn encode_and_write_rows(
                         let v = a.value(row);
                         fields.push(F::ByVal4(v.to_le_bytes()));
                     }
+                    datafusion::arrow::datatypes::DataType::Int64 => {
+                        let a = array
+                            .as_any()
+                            .downcast_ref::<Int64Array>()
+                            .expect("int64 array");
+                        let v = a.value(row);
+                        fields.push(F::ByVal8(v.to_le_bytes()));
+                    }
                     datafusion::arrow::datatypes::DataType::Utf8 => {
                         if let Some(idx) = byref_idx[i] {
                             fields.push(F::ByRef(owned[idx].as_slice()));
@@ -552,19 +561,30 @@ fn explain_physical(plan: &Arc<dyn ExecutionPlan>) -> Result<TaskResult> {
 }
 
 fn optimize(plan: LogicalPlan) -> Result<TaskResult> {
-    let state = SessionStateBuilder::new().build();
+    // Force single-partition planning to keep all operators in one pipeline
+    let mut opts = ConfigOptions::default();
+    opts.execution.target_partitions = 1;
+    let state = SessionStateBuilder::new().with_config(opts.into()).build();
     let optimized = state.optimize(&plan)?;
     Ok(TaskResult::Optimized(optimized))
 }
 
 async fn translate(plan: LogicalPlan) -> Result<TaskResult> {
-    let state = SessionStateBuilder::new().build();
+    // Ensure physical planning also uses single-partition execution
+    let mut opts = ConfigOptions::default();
+    opts.execution.target_partitions = 1;
+    let state = SessionStateBuilder::new().with_config(opts.into()).build();
     let optimized = state.optimize(&plan)?; // ensure optimized prior to physical
     match state.create_physical_plan(&optimized).await {
         Ok(physical) => Ok(TaskResult::Translated(Some(physical))),
         Err(e) => {
+            // Propagate the actual physical planning error so the backend can report it
+            // instead of failing later during OpenDataFlow.
             tracing::warn!("translate: failed to build physical plan: {e}");
-            Ok(TaskResult::Translated(None))
+            anyhow::bail!(FusionError::FailedTo(
+                "build physical plan".into(),
+                format_smolstr!("{e}")
+            ))
         }
     }
 }
@@ -630,8 +650,10 @@ fn start_data_flow(conn: &mut Connection, storage: &mut Storage) -> Result<TaskR
     let plan = Arc::clone(storage.physical_plan.as_ref().expect("checked above"));
     let pg_attrs = storage.pg_attrs.clone().unwrap_or_default();
     tracing::trace!(target = "executor::server", pg_attrs = pg_attrs.len(), "start_data_flow: attrs snapshot");
-    // Build a fresh TaskContext for execution
-    let state = SessionStateBuilder::new().build();
+    // Build a fresh TaskContext for execution (single partition)
+    let mut opts = ConfigOptions::default();
+    opts.execution.target_partitions = 1;
+    let state = SessionStateBuilder::new().with_config(opts.into()).build();
     let ctx = state.task_ctx();
 
     let conn_id = conn.id;
@@ -640,55 +662,53 @@ fn start_data_flow(conn: &mut Connection, storage: &mut Storage) -> Result<TaskR
         .load(std::sync::atomic::Ordering::Relaxed); // snapshot pid
     trace!(conn_id, "start_data_flow: spawning execution task");
     let handle = tokio::spawn(async move {
-        // Execute a single partition; PgScanExec uses a single stream
-        match plan.execute(0, ctx) {
-            Ok(mut stream) => {
-                // Drain the stream, encode rows into wire tuples, and write to result ring
-                let mut ring = crate::shm::result_ring_writer_for(conn_id);
-                while let Some(res) = stream.next().await {
-                    match res {
-                        Err(e) => {
-                            tracing::error!(
-                                target = "pg_fusion::server",
-                                "execution stream error: {e}"
-                            );
-                            break;
-                        }
-                        Ok(batch) => {
-                            if pg_attrs.is_empty() {
-                                continue;
+        // Execute all output partitions and merge them into the single result ring
+        let mut ring = crate::shm::result_ring_writer_for(conn_id);
+        let part_count = plan.output_partitioning().partition_count();
+        tracing::trace!(target = "executor::server", partitions = part_count, "execution: determined output partitions");
+        for part in 0..part_count {
+            match plan.execute(part, Arc::clone(&ctx)) {
+                Ok(mut stream) => {
+                    while let Some(res) = stream.next().await {
+                        match res {
+                            Err(e) => {
+                                tracing::error!(target = "pg_fusion::server", "execution stream error (part {part}): {e}");
+                                break;
                             }
-                            let wrote = encode_and_write_rows(&batch, &pg_attrs, &mut ring);
-                            tracing::trace!(
-                                target = "executor::server",
-                                rows = wrote,
-                                cols = batch.num_columns(),
-                                "execution: batch encoded and written"
-                            );
-                            if wrote > 0 {
-                                let pid = client_pid_val;
-                                if pid > 0 && pid != i32::MAX {
-                                    unsafe { libc::kill(pid as libc::pid_t, libc::SIGUSR1) };
+                            Ok(batch) => {
+                                if pg_attrs.is_empty() {
+                                    continue;
+                                }
+                                let wrote = encode_and_write_rows(&batch, &pg_attrs, &mut ring);
+                                tracing::trace!(
+                                    target = "executor::server",
+                                    rows = wrote,
+                                    cols = batch.num_columns(),
+                                    partition = part,
+                                    "execution: batch encoded and written"
+                                );
+                                if wrote > 0 {
+                                    let pid = client_pid_val;
+                                    if pid > 0 && pid != i32::MAX {
+                                        unsafe { libc::kill(pid as libc::pid_t, libc::SIGUSR1) };
+                                    }
                                 }
                             }
                         }
                     }
                 }
-                tracing::trace!(target = "pg_fusion::server", "execution stream completed");
-                // Write EOF sentinel row to result ring to unblock backend
-                let _ = protocol::result::write_eof(&mut ring);
-                // Nudge the backend in case it is waiting on latch
-                let pid = client_pid_val;
-                if pid > 0 && pid != i32::MAX {
-                    unsafe { libc::kill(pid as libc::pid_t, libc::SIGUSR1) };
+                Err(e) => {
+                    tracing::error!(target = "pg_fusion::server", "failed to start partition {part}: {e}");
                 }
             }
-            Err(e) => {
-                tracing::error!(
-                    target = "pg_fusion::server",
-                    "failed to start execution: {e}"
-                );
-            }
+        }
+        tracing::trace!(target = "pg_fusion::server", "execution streams completed for all partitions");
+        // Write EOF sentinel row to result ring to unblock backend
+        let _ = protocol::result::write_eof(&mut ring);
+        // Nudge the backend in case it is waiting on latch
+        let pid = client_pid_val;
+        if pid > 0 && pid != i32::MAX {
+            unsafe { libc::kill(pid as libc::pid_t, libc::SIGUSR1) };
         }
     });
     storage.exec_task = Some(handle);
@@ -696,11 +716,13 @@ fn start_data_flow(conn: &mut Connection, storage: &mut Storage) -> Result<TaskR
     trace!("start_data_flow: sending ExecReady to backend");
     protocol::exec::prepare_exec_ready(&mut conn.send_buffer)?;
     // No demo row: result rows will be written by the execution task
-    // Kick off initial heap block requests for each scan using slot 0
+    // Kick off initial heap block requests for each scan using per-scan assigned slot
     if let Some(phys) = storage.physical_plan.as_ref() {
+        let registry = Arc::clone(&storage.registry);
         let _ = for_each_scan::<_, Error>(phys, |id, table_oid| {
-            trace!(scan_id = id, table_oid, slot_id = 0, "start_data_flow: initial heap request");
-            request_heap_block(&mut conn.send_buffer, id, table_oid, 0)?;
+            let slot = registry.slot_for(id).unwrap_or(0);
+            trace!(scan_id = id, table_oid, slot_id = slot, "start_data_flow: initial heap request");
+            request_heap_block(&mut conn.send_buffer, id, table_oid, slot)?;
             Ok(())
         });
     }
