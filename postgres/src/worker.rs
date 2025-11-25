@@ -1,9 +1,8 @@
 use executor::server::{Connection, Storage};
-use executor::pgscan::ScanRegistry;
 use executor::stack::TreiberStack;
 use pgrx::bgworkers::{BackgroundWorker, BackgroundWorkerBuilder, SignalWakeFlags};
-use pgrx::prelude::*;
 use pgrx::pg_sys::AsPgCStr;
+use pgrx::prelude::*;
 use std::fs;
 use std::path::Path;
 use std::ptr;
@@ -67,11 +66,8 @@ pub unsafe extern "C-unwind" fn init_shmem() {
         let layout = connection_layout(RECV_CAP, SEND_CAP).expect("connection_layout");
         let total = layout.layout.size() * num;
         let mut found = false;
-        let base = pgrx::pg_sys::ShmemInitStruct(
-            "pg_fusion:conns".as_pg_cstr(),
-            total,
-            &mut found,
-        ) as *mut u8;
+        let base = pgrx::pg_sys::ShmemInitStruct("pg_fusion:conns".as_pg_cstr(), total, &mut found)
+            as *mut u8;
         if !found {
             std::ptr::write_bytes(base, 0, total);
             for i in 0..num {
@@ -94,11 +90,9 @@ pub unsafe extern "C-unwind" fn init_shmem() {
             slot_blocks_layout(SLOTS_PER_CONN, blksz, BLOCKS_PER_SLOT).expect("slot_blocks_layout");
         let total = layout.layout.size() * num;
         let mut found = false;
-        let base = pgrx::pg_sys::ShmemInitStruct(
-            "pg_fusion:slot_blocks".as_pg_cstr(),
-            total,
-            &mut found,
-        ) as *mut u8;
+        let base =
+            pgrx::pg_sys::ShmemInitStruct("pg_fusion:slot_blocks".as_pg_cstr(), total, &mut found)
+                as *mut u8;
         if !found {
             std::ptr::write_bytes(base, 0, total);
         }
@@ -160,11 +154,9 @@ pub unsafe extern "C-unwind" fn init_shmem() {
             executor::layout::result_ring_layout(RESULT_RING_CAP).expect("result_ring_layout");
         let total = layout.layout.size() * num;
         let mut found = false;
-        let base = pgrx::pg_sys::ShmemInitStruct(
-            "pg_fusion:result_ring".as_pg_cstr(),
-            total,
-            &mut found,
-        ) as *mut u8;
+        let base =
+            pgrx::pg_sys::ShmemInitStruct("pg_fusion:result_ring".as_pg_cstr(), total, &mut found)
+                as *mut u8;
         if !found {
             std::ptr::write_bytes(base, 0, total);
         }

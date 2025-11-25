@@ -168,7 +168,7 @@ mod tests {
             if let (Some(oid_i32), Some(len), Some(align_s)) = (atttypid_i32, attlen, attalign_txt)
             {
                 let atttypid = pg_sys::Oid::from(oid_i32 as u32);
-                let attalign = align_s.as_bytes().get(0).copied().unwrap_or(b'i');
+                let attalign = align_s.as_bytes().first().copied().unwrap_or(b'i');
                 out.push(PgAttrMeta {
                     atttypid,
                     attlen: len,
