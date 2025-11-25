@@ -7,10 +7,10 @@ use crate::sql::Catalog;
 use anyhow::Error;
 use anyhow::{bail, Result};
 use common::FusionError;
-use datafusion::execution::SessionStateBuilder;
-use datafusion::config::ConfigOptions;
 use datafusion::arrow::array::{Array, Int32Array, Int64Array, StringArray};
 use datafusion::arrow::record_batch::RecordBatch;
+use datafusion::config::ConfigOptions;
+use datafusion::execution::SessionStateBuilder;
 use datafusion::logical_expr::LogicalPlan;
 use datafusion::physical_plan::{displayable, ExecutionPlan, ExecutionPlanProperties};
 use datafusion::scalar::ScalarValue;
@@ -170,7 +170,11 @@ impl<'bytes> Connection<'bytes> {
         if header.tag == ControlPacket::ColumnLayout as u8 {
             let attrs = consume_column_layout(&mut self.recv_socket.buffer)?;
             let len = attrs.len();
-            tracing::trace!(target = "executor::server", pg_attrs = len, "column layout received");
+            tracing::trace!(
+                target = "executor::server",
+                pg_attrs = len,
+                "column layout received"
+            );
             storage.pg_attrs = Some(attrs);
             return Ok(());
         }
@@ -471,30 +475,27 @@ fn encode_and_write_rows(
     for row in 0..rows {
         // First pass: collect byref bytes and remember their indices
         owned.clear();
-        for i in 0..cols {
-            byref_idx[i] = None;
+        for (i, idx_ref) in byref_idx.iter_mut().enumerate().take(cols) {
+            *idx_ref = None;
             let array = batch.column(i);
             if array.is_null(row) {
                 continue;
             }
-            match array.data_type() {
-                datafusion::arrow::datatypes::DataType::Utf8 => {
-                    let a = array
-                        .as_any()
-                        .downcast_ref::<StringArray>()
-                        .expect("utf8 array");
-                    let s = a.value(row);
-                    let idx = owned.len();
-                    owned.push(s.as_bytes().to_vec());
-                    byref_idx[i] = Some(idx);
-                }
-                _ => {}
+            if array.data_type() == &datafusion::arrow::datatypes::DataType::Utf8 {
+                let a = array
+                    .as_any()
+                    .downcast_ref::<StringArray>()
+                    .expect("utf8 array");
+                let s = a.value(row);
+                let idx = owned.len();
+                owned.push(s.as_bytes().to_vec());
+                *idx_ref = Some(idx);
             }
         }
         // Second pass: build Field view and encode (scope fields to drop borrows before next row)
         {
             let mut fields: Vec<F> = Vec::with_capacity(cols);
-            for i in 0..cols {
+            for (i, idx_ref) in byref_idx.iter().enumerate().take(cols) {
                 let array = batch.column(i);
                 if array.is_null(row) {
                     fields.push(F::Null);
@@ -518,8 +519,8 @@ fn encode_and_write_rows(
                         fields.push(F::ByVal8(v.to_le_bytes()));
                     }
                     datafusion::arrow::datatypes::DataType::Utf8 => {
-                        if let Some(idx) = byref_idx[i] {
-                            fields.push(F::ByRef(owned[idx].as_slice()));
+                        if let Some(idx) = idx_ref {
+                            fields.push(F::ByRef(owned[*idx].as_slice()));
                         } else {
                             fields.push(F::Null);
                         }
@@ -601,9 +602,8 @@ fn parse(query: SmolStr) -> Result<TaskResult> {
         Statement::Explain(inner) => {
             // Attempt to unwrap inner statement of EXPLAIN
             #[allow(clippy::redundant_clone)]
-            match *inner.statement.clone() {
-                s => s,
-            }
+            let s = *inner.statement.clone();
+            s
         }
         other => other,
     };
@@ -622,12 +622,19 @@ fn open_data_flow(_conn: &mut Connection, storage: &mut Storage) -> Result<TaskR
     }
     let phys = storage.physical_plan.as_ref().expect("checked above");
     // Reserve capacity to avoid HashMap reallocation while registering
-    let scan_count = count_scans(phys) as usize;
-    trace!(scan_count, "open_data_flow: reserving scan registry capacity");
+    let scan_count = count_scans(phys);
+    trace!(
+        scan_count,
+        "open_data_flow: reserving scan registry capacity"
+    );
     storage.registry.reserve(scan_count);
     // Register channels per scan in the connection-local registry; no response payload
     let _ = for_each_scan::<_, Error>(phys, |id, table_oid| {
-        trace!(scan_id = id, table_oid, "open_data_flow: registering scan channel");
+        trace!(
+            scan_id = id,
+            table_oid,
+            "open_data_flow: registering scan channel"
+        );
         let _ = storage.registry.register(id, 16);
         Ok(())
     });
@@ -649,7 +656,11 @@ fn start_data_flow(conn: &mut Connection, storage: &mut Storage) -> Result<TaskR
 
     let plan = Arc::clone(storage.physical_plan.as_ref().expect("checked above"));
     let pg_attrs = storage.pg_attrs.clone().unwrap_or_default();
-    tracing::trace!(target = "executor::server", pg_attrs = pg_attrs.len(), "start_data_flow: attrs snapshot");
+    tracing::trace!(
+        target = "executor::server",
+        pg_attrs = pg_attrs.len(),
+        "start_data_flow: attrs snapshot"
+    );
     // Build a fresh TaskContext for execution (single partition)
     let mut opts = ConfigOptions::default();
     opts.execution.target_partitions = 1;
@@ -657,22 +668,27 @@ fn start_data_flow(conn: &mut Connection, storage: &mut Storage) -> Result<TaskR
     let ctx = state.task_ctx();
 
     let conn_id = conn.id;
-    let client_pid_val = conn
-        .client_pid
-        .load(std::sync::atomic::Ordering::Relaxed); // snapshot pid
+    let client_pid_val = conn.client_pid.load(std::sync::atomic::Ordering::Relaxed); // snapshot pid
     trace!(conn_id, "start_data_flow: spawning execution task");
     let handle = tokio::spawn(async move {
         // Execute all output partitions and merge them into the single result ring
         let mut ring = crate::shm::result_ring_writer_for(conn_id);
         let part_count = plan.output_partitioning().partition_count();
-        tracing::trace!(target = "executor::server", partitions = part_count, "execution: determined output partitions");
+        tracing::trace!(
+            target = "executor::server",
+            partitions = part_count,
+            "execution: determined output partitions"
+        );
         for part in 0..part_count {
             match plan.execute(part, Arc::clone(&ctx)) {
                 Ok(mut stream) => {
                     while let Some(res) = stream.next().await {
                         match res {
                             Err(e) => {
-                                tracing::error!(target = "pg_fusion::server", "execution stream error (part {part}): {e}");
+                                tracing::error!(
+                                    target = "pg_fusion::server",
+                                    "execution stream error (part {part}): {e}"
+                                );
                                 break;
                             }
                             Ok(batch) => {
@@ -698,11 +714,17 @@ fn start_data_flow(conn: &mut Connection, storage: &mut Storage) -> Result<TaskR
                     }
                 }
                 Err(e) => {
-                    tracing::error!(target = "pg_fusion::server", "failed to start partition {part}: {e}");
+                    tracing::error!(
+                        target = "pg_fusion::server",
+                        "failed to start partition {part}: {e}"
+                    );
                 }
             }
         }
-        tracing::trace!(target = "pg_fusion::server", "execution streams completed for all partitions");
+        tracing::trace!(
+            target = "pg_fusion::server",
+            "execution streams completed for all partitions"
+        );
         // Write EOF sentinel row to result ring to unblock backend
         let _ = protocol::result::write_eof(&mut ring);
         // Nudge the backend in case it is waiting on latch
@@ -721,7 +743,12 @@ fn start_data_flow(conn: &mut Connection, storage: &mut Storage) -> Result<TaskR
         let registry = Arc::clone(&storage.registry);
         let _ = for_each_scan::<_, Error>(phys, |id, table_oid| {
             let slot = registry.slot_for(id).unwrap_or(0);
-            trace!(scan_id = id, table_oid, slot_id = slot, "start_data_flow: initial heap request");
+            trace!(
+                scan_id = id,
+                table_oid,
+                slot_id = slot,
+                "start_data_flow: initial heap request"
+            );
             request_heap_block(&mut conn.send_buffer, id, table_oid, slot)?;
             Ok(())
         });
@@ -865,8 +892,10 @@ mod tests {
         static SERVER_PID: AtomicI32 = AtomicI32::new(0);
         static CLIENT_PID: AtomicI32 = AtomicI32::new(0);
         let mut conn = Connection::new(0, socket, send_buffer, &SERVER_PID, &CLIENT_PID);
-        let mut storage = Storage::default();
-        storage.registry = Arc::new(ScanRegistry::new());
+        let storage = Storage {
+            registry: Arc::new(ScanRegistry::new()),
+            ..Default::default()
+        };
         tokio::spawn(async move {
             let mut storage = storage;
             // Test parsing a query with tables.
@@ -928,7 +957,10 @@ mod tests {
         static SERVER_PID: AtomicI32 = AtomicI32::new(0);
         static CLIENT_PID: AtomicI32 = AtomicI32::new(0);
         let mut conn = Connection::new(0, socket, send_buffer, &SERVER_PID, &CLIENT_PID);
-        let storage = Storage::default();
+        let storage = Storage {
+            registry: Arc::new(ScanRegistry::new()),
+            ..Default::default()
+        };
         tokio::spawn(async move {
             let mut storage = storage;
             assert_eq!(storage.state.state(), &ExecutorState::Initialized);
@@ -985,8 +1017,12 @@ mod tests {
             type Payload = (i16, u8, bool, Vec<u8>);
             let mut columns: Vec<Payload> = Vec::new();
             let columns_ptr = &mut columns as *mut Vec<Payload> as *mut c_void;
-            let repack =
-                |pos: i16, etype: u8, nullable: bool, name: &[u8], ptr: *mut c_void| -> Result<()> {
+            let repack = |pos: i16,
+                          etype: u8,
+                          nullable: bool,
+                          name: &[u8],
+                          ptr: *mut c_void|
+             -> Result<()> {
                 let columns: &mut Vec<Payload> = unsafe { &mut *(ptr as *mut Vec<Payload>) };
                 columns.push((pos, etype, nullable, name.to_vec()));
                 Ok(())
@@ -1051,7 +1087,10 @@ mod tests {
         static SERVER_PID: AtomicI32 = AtomicI32::new(0);
         static CLIENT_PID: AtomicI32 = AtomicI32::new(0);
         let mut conn = Connection::new(0, socket, send_buffer, &SERVER_PID, &CLIENT_PID);
-        let storage = Storage::default();
+        let storage = Storage {
+            registry: Arc::new(ScanRegistry::new()),
+            ..Default::default()
+        };
         tokio::spawn(async move {
             let mut storage = storage;
             // Drive to PhysicalPlan state for a query that touches one table
@@ -1093,8 +1132,14 @@ mod tests {
             // Now send BeginScan; executor should register channels without sending payload
             request_begin_scan(&mut conn.recv_socket.buffer).expect("write BeginScan");
             // Ensure header is committed in the ring; defensively flush and assert
-            conn.recv_socket.buffer.flush().expect("flush begin-scan header");
-            assert!(conn.recv_socket.buffer.len() >= 5, "begin-scan header not queued");
+            conn.recv_socket
+                .buffer
+                .flush()
+                .expect("flush begin-scan header");
+            assert!(
+                conn.recv_socket.buffer.len() >= 5,
+                "begin-scan header not queued"
+            );
             let before = conn.send_buffer.len();
             conn.process_message(&mut storage)
                 .await
@@ -1102,8 +1147,18 @@ mod tests {
             // No additional response expected
             assert_eq!(conn.send_buffer.len(), before);
 
-            // Verify a receiver was registered for this scan id
-            let rx = storage.registry.take_receiver(42u64);
+            // Verify a receiver was registered for the scan with table_oid 42
+            let mut scan_id_opt: Option<u64> = None;
+            if let Some(phys) = storage.physical_plan.as_ref() {
+                let _ = for_each_scan::<_, anyhow::Error>(phys, |id, table_oid| {
+                    if table_oid == 42 {
+                        scan_id_opt = Some(id);
+                    }
+                    Ok(())
+                });
+            }
+            let scan_id = scan_id_opt.expect("scan id for table_oid 42 not found");
+            let rx = storage.registry.take_receiver(scan_id);
             assert!(rx.is_some());
         })
         .await?;

@@ -3,8 +3,8 @@ use anyhow::Result as AnyResult;
 use executor::buffer::LockFreeBuffer;
 use executor::layout::{connection_ptrs, socket_ptrs, ConnectionLayout};
 use pgrx::warning;
-use std::sync::OnceLock;
 use std::sync::atomic::{AtomicBool, AtomicI32, Ordering};
+use std::sync::OnceLock;
 
 /// RAII guard that acquires a free connection id from the global Treiber stack
 /// and returns it back on drop.
@@ -146,7 +146,9 @@ pub(crate) fn connection_shared(id: u32) -> AnyResult<ConnectionShared<'static>>
     pgrx::info!(
         "connection_shared: id={} recv_base={:?} recv_buf={:?} send_base={:?}",
         id,
-        recv_base, recv_buf_base, send_base
+        recv_base,
+        recv_buf_base,
+        send_base
     );
 
     Ok(ConnectionShared {
