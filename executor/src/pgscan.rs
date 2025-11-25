@@ -1,8 +1,8 @@
 use std::any::Any;
 use std::collections::HashMap;
 use std::pin::Pin;
+use std::sync::atomic::{AtomicU16, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
-use std::sync::atomic::{AtomicU64, Ordering, AtomicU16};
 use std::task::{Context, Poll};
 
 use crate::shm;
@@ -66,11 +66,21 @@ struct Entry {
 
 impl ScanRegistry {
     pub fn new() -> Self {
-        Self { inner: Mutex::new(HashMap::new()), conn_id: 0, next_id: AtomicU64::new(1), next_slot: AtomicU16::new(0) }
+        Self {
+            inner: Mutex::new(HashMap::new()),
+            conn_id: 0,
+            next_id: AtomicU64::new(1),
+            next_slot: AtomicU16::new(0),
+        }
     }
 
     pub fn with_conn(conn_id: usize) -> Self {
-        Self { inner: Mutex::new(HashMap::new()), conn_id, next_id: AtomicU64::new(1), next_slot: AtomicU16::new(0) }
+        Self {
+            inner: Mutex::new(HashMap::new()),
+            conn_id,
+            next_id: AtomicU64::new(1),
+            next_slot: AtomicU16::new(0),
+        }
     }
 
     #[inline]
@@ -136,7 +146,9 @@ impl ScanRegistry {
     }
 
     #[inline]
-    pub fn conn_id(&self) -> usize { self.conn_id }
+    pub fn conn_id(&self) -> usize {
+        self.conn_id
+    }
 }
 
 // No global registry; registries are per-connection and owned by the server Storage.
@@ -204,7 +216,7 @@ impl TableProvider for PgTableProvider {
             scan_id,
             self.table_oid,
             Arc::clone(&self.schema), // full schema for decoding
-            proj_schema,               // physical output schema
+            proj_schema,              // physical output schema
             proj_indices,
             Arc::clone(&self.registry),
         );
@@ -215,7 +227,7 @@ impl TableProvider for PgTableProvider {
 #[derive(Debug)]
 pub struct PgScanExec {
     // Full table schema (all columns) used to compute attribute metadata for decoding
-    full_schema: SchemaRef,
+    _full_schema: SchemaRef,
     // Projected schema exposed by this plan node
     proj_schema: SchemaRef,
     // Postgres table OID for this scan
@@ -248,7 +260,7 @@ impl PgScanExec {
         );
         let attrs_full = Arc::new(attrs_from_schema(&full_schema));
         Self {
-            full_schema,
+            _full_schema: full_schema,
             proj_schema,
             table_oid,
             scan_id,
@@ -345,7 +357,13 @@ impl PgScanStream {
         rx: Option<mpsc::Receiver<HeapBlock>>,
         conn_id: usize,
     ) -> Self {
-        Self { proj_schema, attrs_full, proj_indices, rx, conn_id }
+        Self {
+            proj_schema,
+            attrs_full,
+            proj_indices,
+            rx,
+            conn_id,
+        }
     }
 }
 
@@ -362,7 +380,9 @@ impl Stream for PgScanStream {
                 // Borrow page and (optional) visibility bitmap from shared memory (no copy)
                 let page = unsafe { shm::block_slice(this.conn_id, block.slot_id as usize) };
                 let _vis = if block.vis_len > 0 {
-                    Some(unsafe { shm::vis_slice(this.conn_id, block.slot_id as usize, block.vis_len as usize) })
+                    Some(unsafe {
+                        shm::vis_slice(this.conn_id, block.slot_id as usize, block.vis_len as usize)
+                    })
                 } else {
                     None
                 };
@@ -390,7 +410,7 @@ impl Stream for PgScanStream {
                 }
                 let pairs_len = pairs.len();
                 // Create iterator borrowing the filled pairs slice
-                let mut it = hp.tuples_by_offset(None, std::ptr::null_mut(), &mut pairs);
+                let it = hp.tuples_by_offset(None, std::ptr::null_mut(), &mut pairs);
                 tracing::trace!(
                     target = "executor::server",
                     blkno = block.blkno,
@@ -401,7 +421,7 @@ impl Stream for PgScanStream {
                 let page_hdr = unsafe { &*(page.as_ptr() as *const pg_sys::PageHeaderData) }
                     as *const pg_sys::PageHeaderData;
                 let mut decoded_rows = 0usize;
-                while let Some(tup) = it.next() {
+                for tup in it {
                     // Decode projected columns for tuple using iterator over requested projection
                     let iter = unsafe {
                         decode_tuple_project(
@@ -415,11 +435,11 @@ impl Stream for PgScanStream {
                         continue;
                     };
                     // Iterate over projected columns in order
-                    for col_idx in 0..total_cols {
+                    for b in builders.iter_mut().take(total_cols) {
                         match iter.next() {
-                            Some(Ok(v)) => append_scalar(&mut builders[col_idx], v),
-                            Some(Err(_e)) => append_null(&mut builders[col_idx]),
-                            None => append_null(&mut builders[col_idx]),
+                            Some(Ok(v)) => append_scalar(b, v),
+                            Some(Err(_e)) => append_null(b),
+                            None => append_null(b),
                         }
                     }
                     decoded_rows += 1;
@@ -434,10 +454,13 @@ impl Stream for PgScanStream {
                     // Special case: empty projection — use row_count to communicate the number of rows
                     let opts = RecordBatchOptions::new().with_row_count(Some(decoded_rows));
                     RecordBatch::try_new_with_options(Arc::clone(&this.proj_schema), vec![], &opts)
-                        .map_err(|e| datafusion::error::DataFusionError::Execution(format!("{e}")))?
+                        .map_err(|e| {
+                            datafusion::error::DataFusionError::Execution(format!("{e}"))
+                        })?
                 } else {
-                    RecordBatch::try_new(Arc::clone(&this.proj_schema), arrs)
-                        .map_err(|e| datafusion::error::DataFusionError::Execution(format!("{e}")))?
+                    RecordBatch::try_new(Arc::clone(&this.proj_schema), arrs).map_err(|e| {
+                        datafusion::error::DataFusionError::Execution(format!("{e}"))
+                    })?
                 };
                 tracing::trace!(
                     target = "executor::server",

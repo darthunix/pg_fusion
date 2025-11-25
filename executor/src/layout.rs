@@ -117,7 +117,9 @@ pub fn shared_state_layout(num_flags: usize) -> Result<SharedStateLayout, Layout
 
 /// Return a pointer to the first flag for a SharedState region.
 /// The caller can create `&[AtomicBool]` of length `num_flags` from it.
-/// # Safety: `base` must be valid for at least `layout.layout.size()` bytes.
+///
+/// # Safety
+/// `base` must be valid for at least `layout.layout.size()` bytes.
 pub unsafe fn shared_state_flags_ptr(base: *mut u8, _layout: SharedStateLayout) -> *mut AtomicBool {
     base as *mut AtomicBool
 }
@@ -143,7 +145,9 @@ pub fn socket_layout(capacity: usize) -> Result<SocketLayout, LayoutError> {
 }
 
 /// Given the base pointer and computed `SocketLayout`, return the start of the buffer region.
-/// # Safety: `base` must be non-null and properly aligned; memory must be at least `layout.layout.size()` bytes long.
+///
+/// # Safety
+/// `base` must be non-null and properly aligned; memory must be at least `layout.layout.size()` bytes long.
 pub unsafe fn socket_ptrs(base: *mut u8, layout: SocketLayout) -> *mut u8 {
     base.add(layout.buffer_offset)
 }
@@ -247,7 +251,7 @@ pub fn slot_blocks_layout(
     // Reserve visibility bitmap per block. Upper bound approximation:
     // max_offsets ~= block_len / size_of::<ItemIdData>() (ignoring header/special),
     // bitmap bytes ~= ceil(max_offsets / 8). Use block_len / 32 as a safe upper bound.
-    let vis_bytes_per_block = (block_len + 31) / 32; // ceil(block_len / 32)
+    let vis_bytes_per_block = block_len.div_ceil(32); // ceil(block_len / 32)
 
     // Total bytes required for all slots and buffers per slot,
     // accounting for visibility bitmap region after each block.

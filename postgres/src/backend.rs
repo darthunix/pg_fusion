@@ -24,19 +24,19 @@ use protocol::failure::{read_error, request_failure};
 use protocol::heap::{prepare_heap_block_meta_shm, read_heap_block_request};
 use protocol::metadata::process_metadata_with_response;
 use protocol::parse::prepare_query;
-use protocol::tuple::{prepare_column_layout, PgAttrWire};
 use protocol::tuple::decode_wire_tuple;
+use protocol::tuple::{prepare_column_layout, PgAttrWire};
 use protocol::Tape;
 use protocol::{ControlPacket, DataPacket, Direction};
 use rmp::decode::read_bin_len;
 use rmp::encode::{write_array_len, write_bool, write_str, write_u32, write_u8};
 use smallvec::SmallVec;
 use smol_str::format_smolstr;
+use std::cell::Cell;
 use std::collections::HashMap;
 use std::ffi::c_char;
 use std::ffi::CStr;
 use std::os::raw::c_void;
-use std::cell::Cell;
 use std::sync::{LazyLock, Mutex};
 use std::time::Duration;
 
@@ -410,7 +410,8 @@ unsafe extern "C-unwind" fn begin_df_scan(
                         &pg_sys::TTSOpsMinimalTuple,
                     );
                     // Initialize a result slot matching the same TupleDesc
-                    let resslot = pg_sys::MakeSingleTupleTableSlot(tupdesc, &pg_sys::TTSOpsMinimalTuple);
+                    let resslot =
+                        pg_sys::MakeSingleTupleTableSlot(tupdesc, &pg_sys::TTSOpsMinimalTuple);
                     (*_node).ss.ps.ps_ResultTupleSlot = resslot;
                 }
             }
@@ -501,11 +502,17 @@ unsafe extern "C-unwind" fn exec_df_scan(
     });
     // Wait until executor confirms it is ready to consume data (only once per scan)
     let mut need_wait = true;
-    EXEC_READY_SEEN.with(|seen| { if seen.get() { need_wait = false; } });
+    EXEC_READY_SEEN.with(|seen| {
+        if seen.get() {
+            need_wait = false;
+        }
+    });
     if need_wait {
         loop {
             wait_latch(None);
-            if shared.send.len() == 0 { continue; }
+            if shared.send.len() == 0 {
+                continue;
+            }
             let header = match consume_header(&mut shared.send) {
                 Ok(h) => h,
                 Err(err) => {
@@ -514,18 +521,22 @@ unsafe extern "C-unwind" fn exec_df_scan(
                     error!("Failed to consume header: {}", err)
                 }
             };
-            if header.direction != Direction::ToClient { continue; }
+            if header.direction != Direction::ToClient {
+                continue;
+            }
             match ControlPacket::try_from(header.tag) {
                 Ok(ControlPacket::ExecReady) => {
                     pgrx::info!("exec_df_scan: ExecReady received (conn={})", id);
                     EXEC_READY_SEEN.with(|seen| seen.set(true));
                     break;
-                },
+                }
                 Ok(ControlPacket::Failure) => match read_error(&mut shared.send) {
                     Ok(msg) => error!("Executor failed to start: {}", msg),
                     Err(err) => error!("Double error: {}", err),
                 },
-                Err(_) if DataPacket::try_from(header.tag).is_ok() => { continue; }
+                Err(_) if DataPacket::try_from(header.tag).is_ok() => {
+                    continue;
+                }
                 _ => continue,
             }
         }
@@ -538,7 +549,7 @@ unsafe extern "C-unwind" fn exec_df_scan(
     loop {
         // Make progress on any pending heap block request.
         process_pending_heap_request(&mut shared);
-    // Try to fetch a row from result ring
+        // Try to fetch a row from result ring
         if let Some(slot) = unsafe { try_store_wire_tuple_from_result(_node) } {
             EMPTY_SPINS.with(|f| f.set(0));
             return slot;
@@ -557,7 +568,8 @@ unsafe extern "C-unwind" fn exec_df_scan(
                 EMPTY_SPINS.with(|spins| {
                     let cur = spins.get().saturating_add(1);
                     spins.set(cur);
-                    if cur > 200 { // ~10s with 50ms waits
+                    if cur > 200 {
+                        // ~10s with 50ms waits
                         bail = true;
                     }
                 });
@@ -588,7 +600,9 @@ fn process_pending_heap_request(shared: &mut ConnectionShared) {
         if let Ok(dp) = DataPacket::try_from(header.tag) {
             match dp {
                 DataPacket::Heap => {
-                    if let Ok((scan_id, table_oid, slot_id)) = read_heap_block_request(&mut shared.send) {
+                    if let Ok((scan_id, table_oid, slot_id)) =
+                        read_heap_block_request(&mut shared.send)
+                    {
                         pgrx::info!(
                             "process_pending_heap_request: heap request received scan_id={} table_oid={} slot_id={}",
                             scan_id, table_oid, slot_id
@@ -605,16 +619,23 @@ fn process_pending_heap_request(shared: &mut ConnectionShared) {
                         };
                         pgrx::info!(
                             "process_pending_heap_request: computed blkno={} for scan_id={}",
-                            blkno, scan_id
+                            blkno,
+                            scan_id
                         );
                         // Open relation with AccessShareLock and validate block number
                         let rel_oid = Oid::from(table_oid);
                         let rel = unsafe {
-                            pg_sys::relation_open(rel_oid, pg_sys::AccessShareLock as pg_sys::LOCKMODE)
+                            pg_sys::relation_open(
+                                rel_oid,
+                                pg_sys::AccessShareLock as pg_sys::LOCKMODE,
+                            )
                         };
                         if rel.is_null() {
                             // Relation not found; cannot serve this request
-                            pgrx::warning!("process_pending_heap_request: relation {} not found", table_oid);
+                            pgrx::warning!(
+                                "process_pending_heap_request: relation {} not found",
+                                table_oid
+                            );
                             return;
                         }
                         // Use RelationGetNumberOfBlocksInFork to get heap size in blocks
@@ -639,7 +660,10 @@ fn process_pending_heap_request(shared: &mut ConnectionShared) {
                             }
                             HEAP_EOF_SENT.with(|f| f.set(true));
                             unsafe {
-                                pg_sys::relation_close(rel, pg_sys::AccessShareLock as pg_sys::LOCKMODE)
+                                pg_sys::relation_close(
+                                    rel,
+                                    pg_sys::AccessShareLock as pg_sys::LOCKMODE,
+                                )
                             };
                             return;
                         }
@@ -655,7 +679,9 @@ fn process_pending_heap_request(shared: &mut ConnectionShared) {
                         };
                         if buf <= 0 {
                             unsafe { pg_sys::RelationClose(rel) };
-                            pgrx::warning!("process_pending_heap_request: ReadBufferExtended failed");
+                            pgrx::warning!(
+                                "process_pending_heap_request: ReadBufferExtended failed"
+                            );
                             return;
                         }
                         // Lock buffer for shared access while copying
@@ -676,7 +702,7 @@ fn process_pending_heap_request(shared: &mut ConnectionShared) {
                             u16::try_from(cnt).unwrap_or(u16::MAX)
                         };
                         // Prepare visibility bitmap with all tuples visible
-                        let bytes = ((num_offsets as usize) + 7) / 8;
+                        let bytes = (num_offsets as usize).div_ceil(8);
                         let mut vis = vec![0xFFu8; bytes];
                         if num_offsets > 0 {
                             let rem = (num_offsets as usize) % 8;
@@ -705,21 +731,21 @@ fn process_pending_heap_request(shared: &mut ConnectionShared) {
                         // Unlock and release buffer; close relation
                         unsafe {
                             pg_sys::UnlockReleaseBuffer(buf);
-                            pg_sys::relation_close(rel, pg_sys::AccessShareLock as pg_sys::LOCKMODE);
+                            pg_sys::relation_close(
+                                rel,
+                                pg_sys::AccessShareLock as pg_sys::LOCKMODE,
+                            );
                         }
                     }
                 }
                 DataPacket::Eof => {
                     // Ignore EOF from executor in backend context
-                    return;
                 }
             }
         }
     }
 }
 
-/// Read one row from the result ring and populate `tupslot`.
-/// Returns `tupslot` on success, or null on EOF/empty ring/error.
 thread_local! {
     static RESULT_RING_EOF: Cell<bool> = Cell::new(false);
     static EXEC_SCAN_STARTED: Cell<bool> = Cell::new(false);
@@ -728,6 +754,8 @@ thread_local! {
     static EMPTY_SPINS: Cell<u32> = Cell::new(0);
 }
 
+/// Read one row from the result ring and populate `tupslot`.
+/// Returns `tupslot` on success, or null on EOF/empty ring/error.
 unsafe fn try_store_wire_tuple_from_result(
     node: *mut CustomScanState,
 ) -> Option<*mut pg_sys::TupleTableSlot> {
@@ -749,7 +777,11 @@ unsafe fn try_store_wire_tuple_from_result(
     let row_len = match protocol::result::read_frame_len(&mut ring) {
         Ok(v) => v as usize,
         Err(e) => {
-            pgrx::warning!("result_ring: failed to read frame len: {} (conn={})", e, conn_id);
+            pgrx::warning!(
+                "result_ring: failed to read frame len: {} (conn={})",
+                e,
+                conn_id
+            );
             return None;
         }
     };
@@ -763,7 +795,10 @@ unsafe fn try_store_wire_tuple_from_result(
     // Read payload into buffer
     let mut buf = vec![0u8; row_len];
     if Read::read_exact(&mut ring, &mut buf).is_err() {
-        pgrx::warning!("result_ring: failed to read frame payload (len={})", row_len);
+        pgrx::warning!(
+            "result_ring: failed to read frame payload (len={})",
+            row_len
+        );
         return None;
     }
     let (hdr, bitmap, data) = match decode_wire_tuple(&buf) {
@@ -794,18 +829,33 @@ unsafe fn try_store_wire_tuple_from_result(
             }
         }
         let att = &attrs[i];
-        let align = match att.attalign as u8 as char { 'c' => 1usize, 's' => 2, 'i' => 4, 'd' => 8, _ => 1 };
+        let align = match att.attalign as u8 as char {
+            'c' => 1usize,
+            's' => 2,
+            'i' => 4,
+            'd' => 8,
+            _ => 1,
+        };
         if align > 1 {
             let rem = off % align;
-            if rem != 0 { off += align - rem; }
+            if rem != 0 {
+                off += align - rem;
+            }
         }
         if att.attlen == -1 {
             // varlena: wire encodes u32 length prefix then bytes
-            if off + 4 > data.len() { nulls[i] = true; continue; }
-            let len = u32::from_le_bytes([data[off], data[off+1], data[off+2], data[off+3]]) as usize;
+            if off + 4 > data.len() {
+                nulls[i] = true;
+                continue;
+            }
+            let len = u32::from_le_bytes([data[off], data[off + 1], data[off + 2], data[off + 3]])
+                as usize;
             off += 4;
-            if off + len > data.len() { nulls[i] = true; continue; }
-            let src = &data[off..off+len];
+            if off + len > data.len() {
+                nulls[i] = true;
+                continue;
+            }
+            let src = &data[off..off + len];
             // For now, build TEXT varlena; for generic varlena types, need per-oid handling
             let cptr = src.as_ptr() as *const i8;
             let txt = pg_sys::cstring_to_text_with_len(cptr, len as i32);
@@ -814,10 +864,13 @@ unsafe fn try_store_wire_tuple_from_result(
             off += len;
         } else {
             let need = att.attlen as usize;
-            if off + need > data.len() { nulls[i] = true; continue; }
+            if off + need > data.len() {
+                nulls[i] = true;
+                continue;
+            }
             // Read little-endian bytes into Datum
             let mut tmp = [0u8; 8];
-            tmp[..need].copy_from_slice(&data[off..off+need]);
+            tmp[..need].copy_from_slice(&data[off..off + need]);
             let v = u64::from_le_bytes(tmp);
             values[i] = pg_sys::Datum::from(v as usize);
             nulls[i] = false;
@@ -1112,17 +1165,20 @@ mod tests {
     use pgrx::prelude::*;
     use protocol::tuple::{encode_wire_tuple, Field as F};
 
-    #[pg_test]
+    #[test]
     fn wire_tuple_int4_text_roundtrip() {
         // Create a temp table to obtain a real TupleDesc
         Spi::run("CREATE TEMP TABLE wtt(a int4, b text)").expect("create temp table");
-        let rel = pgrx::PgRelation::open_with_name("pg_temp.wtt").expect("open temp table");
+        let rel =
+            unsafe { pgrx::PgRelation::open_with_name("pg_temp.wtt") }.expect("open temp table");
         let tdesc = rel.tuple_desc();
         unsafe {
             // Build PgAttrWire from TupleDesc
             let natts = (*tdesc.as_ptr()).natts as usize;
             assert!(natts >= 2);
-            let attrs = (*tdesc.as_ptr()).attrs.as_slice((*tdesc.as_ptr()).natts as _);
+            let attrs = (*tdesc.as_ptr())
+                .attrs
+                .as_slice((*tdesc.as_ptr()).natts as _);
             let mut wires: Vec<PgAttrWire> = Vec::with_capacity(2);
             for i in 0..2 {
                 let a = &attrs[i];
@@ -1167,17 +1223,30 @@ mod tests {
                     }
                 }
                 let att = &attrs[i];
-                let align = match att.attalign as u8 as char { 'c' => 1usize, 's' => 2, 'i' => 4, 'd' => 8, _ => 1 };
+                let align = match att.attalign as u8 as char {
+                    'c' => 1usize,
+                    's' => 2,
+                    'i' => 4,
+                    'd' => 8,
+                    _ => 1,
+                };
                 if align > 1 {
                     let rem = off % align;
-                    if rem != 0 { off += align - rem; }
+                    if rem != 0 {
+                        off += align - rem;
+                    }
                 }
                 if att.attlen == -1 {
                     assert!(off + 4 <= data.len());
-                    let len = u32::from_le_bytes([data[off], data[off+1], data[off+2], data[off+3]]) as usize;
+                    let len = u32::from_le_bytes([
+                        data[off],
+                        data[off + 1],
+                        data[off + 2],
+                        data[off + 3],
+                    ]) as usize;
                     off += 4;
                     assert!(off + len <= data.len());
-                    let src = &data[off..off+len];
+                    let src = &data[off..off + len];
                     let cptr = src.as_ptr() as *const i8;
                     let txt = pg_sys::cstring_to_text_with_len(cptr, len as i32);
                     values[i] = pg_sys::PointerGetDatum(txt as *mut std::ffi::c_void);
@@ -1187,7 +1256,7 @@ mod tests {
                     let need = att.attlen as usize;
                     assert!(off + need <= data.len());
                     let mut tmp = [0u8; 8];
-                    tmp[..need].copy_from_slice(&data[off..off+need]);
+                    tmp[..need].copy_from_slice(&data[off..off + need]);
                     let v = u64::from_le_bytes(tmp);
                     values[i] = pg_sys::Datum::from(v as usize);
                     nulls[i] = false;

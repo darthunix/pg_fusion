@@ -49,10 +49,10 @@ pub fn read_heap_block_request(stream: &mut impl Read) -> Result<(u64, u32, u16)
 /// - u32: table OID (echo)
 /// - u32: block number
 /// - u16: number of meaningful offsets on the page (`num_offsets`),
-///        equal to `PageGetMaxOffsetNumber(page)` in PostgreSQL.
-///        Offsets are 1-based (1..=num_offsets). The bitmap encodes
-///        visibility for each offset; trailing pad bits in the last
-///        byte (if any) must be ignored.
+///   equal to `PageGetMaxOffsetNumber(page)` in PostgreSQL.
+///   Offsets are 1-based (1..=num_offsets). The bitmap encodes
+///   visibility for each offset; trailing pad bits in the last
+///   byte (if any) must be ignored.
 /// - [u8; bitmap_len]: visibility bitmap (1 bit per offset, LSB-first)
 /// - u16: bitmap length in bytes (echoed at the end)
 pub fn prepare_heap_block_bitmap<PosIter>(
@@ -86,13 +86,17 @@ where
     let mut written: usize = 0;
     for off in 1..=total {
         if let Some(p) = next {
-            if p == off {
-                byte_acc |= 1u8 << bit_idx;
-                next = positions.next();
-            } else if p < off {
-                // Skip any positions less than current (should not happen if sorted)
-                // and fetch next
-                next = positions.next();
+            match p.cmp(&off) {
+                std::cmp::Ordering::Equal => {
+                    byte_acc |= 1u8 << bit_idx;
+                    next = positions.next();
+                }
+                std::cmp::Ordering::Less => {
+                    // Skip any positions less than current (should not happen if sorted)
+                    // and fetch next
+                    next = positions.next();
+                }
+                std::cmp::Ordering::Greater => {}
             }
         }
         bit_idx += 1;
@@ -183,7 +187,7 @@ pub struct HeapBitmapIter<'a, R: Read + ?Sized> {
     have_byte: bool,
 }
 
-impl<'a, R: Read + ?Sized> Iterator for HeapBitmapIter<'a, R> {
+impl<R: Read + ?Sized> Iterator for HeapBitmapIter<'_, R> {
     type Item = usize;
 
     fn next(&mut self) -> Option<Self::Item> {
@@ -222,11 +226,11 @@ impl<'a, R: Read + ?Sized> Iterator for HeapBitmapIter<'a, R> {
 }
 
 /// Create an iterator over set positions in the heap bitmap.
-pub fn heap_bitmap_positions<'a, R: Read + ?Sized>(
-    reader: &'a mut R,
+pub fn heap_bitmap_positions<R: Read + ?Sized>(
+    reader: &mut R,
     num_offsets: u16,
     bitmap_len: u16,
-) -> HeapBitmapIter<'a, R> {
+) -> HeapBitmapIter<'_, R> {
     HeapBitmapIter {
         reader,
         remaining_bytes: bitmap_len as usize,

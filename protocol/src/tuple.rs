@@ -98,7 +98,7 @@ pub enum Field<'a> {
 #[inline]
 const fn max_align(off: usize, align: u8) -> usize {
     let a = align as usize;
-    ((off + (a - 1)) / a) * a
+    off.div_ceil(a) * a
 }
 
 /// WireMinimalTuple header (protocol-specific), designed to be cheaply converted
@@ -109,7 +109,7 @@ const fn max_align(off: usize, align: u8) -> usize {
 /// - u8: hoff (aligned offset where data area begins)
 /// - u16: bitmap_bytes
 /// - u32: data_bytes
-/// Followed by:
+///   Followed by:
 /// - [bitmap_bytes] optional null bitmap (LSB-first per attribute)
 /// - [data_bytes] attribute payload area with proper alignment per `PgAttrWire.attalign`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -150,7 +150,11 @@ fn read_u32_le(r: &mut impl Read) -> Result<u32> {
 /// Compute data area size for provided fields and attribute layout.
 fn compute_data_len(attrs: &[PgAttrWire], fields: &[Field<'_>], hoff: usize) -> Result<usize> {
     if attrs.len() != fields.len() {
-        bail!("attrs/fields length mismatch: {} vs {}", attrs.len(), fields.len());
+        bail!(
+            "attrs/fields length mismatch: {} vs {}",
+            attrs.len(),
+            fields.len()
+        );
     }
     let mut off = hoff;
     for (a, f) in attrs.iter().zip(fields.iter()) {
@@ -165,7 +169,10 @@ fn compute_data_len(attrs: &[PgAttrWire], fields: &[Field<'_>], hoff: usize) -> 
             // For varlena, encode length prefix (u32 LE) followed by bytes
             (-1, Field::ByRef(bytes)) => off += 4 + bytes.len(),
             (len, Field::ByRef(bytes)) if len > 0 => off += bytes.len(),
-            _ => bail!("unsupported field/attlen combination for atttypid {}", a.atttypid),
+            _ => bail!(
+                "unsupported field/attlen combination for atttypid {}",
+                a.atttypid
+            ),
         }
     }
     Ok(off - hoff)
@@ -173,10 +180,18 @@ fn compute_data_len(attrs: &[PgAttrWire], fields: &[Field<'_>], hoff: usize) -> 
 
 /// Encode a tuple into protocol-specific wire format.
 /// Backend will read this and construct a MinimalTuple or HeapTuple in palloc'd memory.
-pub fn encode_wire_tuple(mut out: &mut impl std::io::Write, attrs: &[PgAttrWire], fields: &[Field<'_>]) -> Result<()> {
+pub fn encode_wire_tuple(
+    mut out: &mut impl std::io::Write,
+    attrs: &[PgAttrWire],
+    fields: &[Field<'_>],
+) -> Result<()> {
     let nattrs = u16::try_from(attrs.len())?;
     let has_nulls = fields.iter().any(|f| matches!(f, Field::Null));
-    let bitmap_bytes: usize = if has_nulls { (attrs.len() + 7) / 8 } else { 0 };
+    let bitmap_bytes: usize = if has_nulls {
+        attrs.len().div_ceil(8)
+    } else {
+        0
+    };
     // Header is 2 + 1 + 1 + 2 + 4 = 10 bytes; data hoff aligned to MAXALIGN(10 + bitmap)
     let hdr_bytes = 10usize;
     // PG MAXALIGN is 8 on most platforms; align header+bitmap to 8.
@@ -253,7 +268,7 @@ pub fn encode_wire_tuple(mut out: &mut impl std::io::Write, attrs: &[PgAttrWire]
 }
 
 /// Decode protocol-level wire tuple header and return slices into the bitmap and data.
-pub fn decode_wire_tuple<'a>(mut input: &'a [u8]) -> Result<(WireHeader, &'a [u8], &'a [u8])> {
+pub fn decode_wire_tuple(mut input: &[u8]) -> Result<(WireHeader, &[u8], &[u8])> {
     let nattrs = read_u16_le(&mut input)?;
     let mut flag = [0u8; 1];
     input.read_exact(&mut flag)?;

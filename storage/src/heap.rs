@@ -406,7 +406,7 @@ fn typed_null_for(atttypid: pg_sys::Oid) -> ScalarValue {
 
 // Generic, iterator-driven projection decoder (no projection materialization required).
 pub struct DecodedIter<'bytes, I: Iterator<Item = usize>> {
-    page_hdr: *const PageHeaderData,
+    _page_hdr: *const PageHeaderData,
     tuple: &'bytes [u8],
     attrs: &'bytes [PgAttrMeta],
     iter: I,
@@ -441,7 +441,7 @@ impl<'bytes, I: Iterator<Item = usize>> DecodedIter<'bytes, I> {
             core::ptr::null()
         };
         Ok(Self {
-            page_hdr,
+            _page_hdr: page_hdr,
             tuple,
             attrs,
             iter,
@@ -621,12 +621,10 @@ impl<'bytes, I: Iterator<Item = usize>> DecodedIter<'bytes, I> {
     }
 }
 
-impl<'bytes, I: Iterator<Item = usize>> Iterator for DecodedIter<'bytes, I> {
+impl<I: Iterator<Item = usize>> Iterator for DecodedIter<'_, I> {
     type Item = Result<ScalarValue>;
     fn next(&mut self) -> Option<Self::Item> {
-        let Some(att_idx) = self.iter.next() else {
-            return None;
-        };
+        let att_idx = self.iter.next()?;
         if let Some(err) = self.pending_err.take() {
             return Some(Err(err));
         }
@@ -636,6 +634,12 @@ impl<'bytes, I: Iterator<Item = usize>> Iterator for DecodedIter<'bytes, I> {
 
 /// Create a decoder over a custom iterator of attribute indices (projection),
 /// avoiding projection materialization.
+///
+/// # Safety
+/// - `page_hdr` must point to a valid page header corresponding to the `tuple` buffer.
+/// - `tuple` must contain a valid `HeapTupleHeaderData` and data area sized consistently with `attrs`.
+/// - `attrs` must match the table schema for decoding fixed/varlena attributes.
+/// - `indices` must yield in-range attribute positions.
 pub unsafe fn decode_tuple_project<'bytes, I: Iterator<Item = usize>>(
     page_hdr: *const PageHeaderData,
     tuple: &'bytes [u8],

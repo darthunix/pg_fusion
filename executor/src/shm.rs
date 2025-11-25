@@ -44,6 +44,10 @@ pub fn copy_vis(slot: usize, vis_len: usize) -> Vec<u8> {
 /// Borrow the heap page bytes from shared memory for the given connection and `slot`.
 /// Lifetime is 'static since the region lives for the process lifetime; caller
 /// must ensure the producer won't mutate the slot while reading.
+///
+/// # Safety
+/// - The shared memory region must remain valid for the duration of the borrow.
+/// - Callers must ensure exclusive access or external synchronization for the slot buffer.
 pub unsafe fn block_slice(conn_offset: usize, slot: usize) -> &'static [u8] {
     let (base, layout) = get();
     let per = layout.layout.size();
@@ -54,6 +58,10 @@ pub unsafe fn block_slice(conn_offset: usize, slot: usize) -> &'static [u8] {
 
 /// Borrow the visibility bitmap bytes from shared memory for the given `slot`.
 /// Lifetime is 'static; see notes in `block_slice`.
+///
+/// # Safety
+/// - The shared memory region must remain valid for the duration of the borrow.
+/// - Callers must not read beyond `vis_len` (clamped internally to capacity).
 pub unsafe fn vis_slice(conn_offset: usize, slot: usize, vis_len: usize) -> &'static [u8] {
     let (base, layout) = get();
     let per = layout.layout.size();
