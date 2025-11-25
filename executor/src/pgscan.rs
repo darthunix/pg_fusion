@@ -2,6 +2,7 @@ use std::any::Any;
 use std::collections::HashMap;
 use std::pin::Pin;
 use std::sync::{Arc, Mutex, MutexGuard};
+use std::sync::atomic::{AtomicU64, Ordering, AtomicU16};
 use std::task::{Context, Poll};
 
 use crate::shm;
@@ -13,7 +14,7 @@ use datafusion::arrow::array::{
 };
 use datafusion::arrow::datatypes::DataType as ArrowDataType;
 use datafusion::arrow::datatypes::SchemaRef;
-use datafusion::arrow::record_batch::RecordBatch;
+use datafusion::arrow::record_batch::{RecordBatch, RecordBatchOptions};
 use datafusion::common::Result as DFResult;
 use datafusion::error::DataFusionError;
 use datafusion::logical_expr::TableProviderFilterPushDown;
@@ -52,18 +53,25 @@ pub struct HeapBlock {
 pub struct ScanRegistry {
     inner: Mutex<HashMap<ScanId, Entry>>,
     conn_id: usize,
+    next_id: AtomicU64,
+    next_slot: AtomicU16,
 }
 
 #[derive(Debug)]
 struct Entry {
     sender: mpsc::Sender<HeapBlock>,
     receiver: Option<mpsc::Receiver<HeapBlock>>,
+    slot_id: u16,
 }
 
 impl ScanRegistry {
-    pub fn new() -> Self { Self { inner: Mutex::new(HashMap::new()), conn_id: 0 } }
+    pub fn new() -> Self {
+        Self { inner: Mutex::new(HashMap::new()), conn_id: 0, next_id: AtomicU64::new(1), next_slot: AtomicU16::new(0) }
+    }
 
-    pub fn with_conn(conn_id: usize) -> Self { Self { inner: Mutex::new(HashMap::new()), conn_id } }
+    pub fn with_conn(conn_id: usize) -> Self {
+        Self { inner: Mutex::new(HashMap::new()), conn_id, next_id: AtomicU64::new(1), next_slot: AtomicU16::new(0) }
+    }
 
     #[inline]
     fn lock(&self) -> MutexGuard<HashMap<ScanId, Entry>> {
@@ -77,7 +85,14 @@ impl ScanRegistry {
         map.reserve(additional);
     }
 
+    /// Allocate a unique scan identifier for this connection.
+    pub fn allocate_id(&self) -> ScanId {
+        self.next_id.fetch_add(1, Ordering::Relaxed)
+    }
+
     pub fn register(&self, scan_id: ScanId, capacity: usize) -> mpsc::Sender<HeapBlock> {
+        // Allocate alternating slot ids 0,1 for concurrent scans
+        let slot = self.next_slot.fetch_add(1, Ordering::Relaxed) % 2;
         let (tx, rx) = mpsc::channel(capacity);
         let mut map = self.lock();
         map.insert(
@@ -85,6 +100,7 @@ impl ScanRegistry {
             Entry {
                 sender: tx.clone(),
                 receiver: Some(rx),
+                slot_id: slot,
             },
         );
         tx
@@ -98,6 +114,12 @@ impl ScanRegistry {
     pub fn take_receiver(&self, scan_id: ScanId) -> Option<mpsc::Receiver<HeapBlock>> {
         let mut map = self.lock();
         map.get_mut(&scan_id).and_then(|e| e.receiver.take())
+    }
+
+    /// Get the assigned slot id for this scan
+    pub fn slot_for(&self, scan_id: ScanId) -> Option<u16> {
+        let map = self.lock();
+        map.get(&scan_id).map(|e| e.slot_id)
     }
 
     /// Close all channels and clear the registry.
@@ -122,15 +144,15 @@ impl ScanRegistry {
 #[derive(Debug)]
 pub struct PgTableProvider {
     schema: SchemaRef,
-    scan_id: ScanId,
+    table_oid: u32,
     registry: Arc<ScanRegistry>,
 }
 
 impl PgTableProvider {
-    pub fn new(scan_id: ScanId, schema: SchemaRef, registry: Arc<ScanRegistry>) -> Self {
+    pub fn new(table_oid: u32, schema: SchemaRef, registry: Arc<ScanRegistry>) -> Self {
         Self {
             schema,
-            scan_id,
+            table_oid,
             registry,
         }
     }
@@ -164,9 +186,26 @@ impl TableProvider for PgTableProvider {
         _filters: &[Expr],
         _limit: Option<usize>,
     ) -> DFResult<Arc<dyn ExecutionPlan>> {
-        let exec = PgScanExec::new(
-            self.scan_id,
-            Arc::clone(&self.schema),
+        // Respect requested projection; DataFusion expects the physical plan schema
+        // to match the projected logical input schema.
+        let proj_indices: Vec<usize> = match _projection {
+            Some(ix) => ix.clone(),
+            None => (0..self.schema.fields().len()).collect(),
+        };
+        let proj_fields: Vec<datafusion::arrow::datatypes::Field> = proj_indices
+            .iter()
+            .map(|&i| self.schema.field(i).clone())
+            .collect();
+        let proj_schema = Arc::new(datafusion::arrow::datatypes::Schema::new(proj_fields));
+
+        // Allocate a fresh, unique scan id for every scan instance (handles self-joins)
+        let scan_id = self.registry.allocate_id();
+        let exec = PgScanExec::with_projection(
+            scan_id,
+            self.table_oid,
+            Arc::clone(&self.schema), // full schema for decoding
+            proj_schema,               // physical output schema
+            proj_indices,
             Arc::clone(&self.registry),
         );
         Ok(Arc::new(exec))
@@ -175,31 +214,48 @@ impl TableProvider for PgTableProvider {
 
 #[derive(Debug)]
 pub struct PgScanExec {
-    schema: SchemaRef,
+    // Full table schema (all columns) used to compute attribute metadata for decoding
+    full_schema: SchemaRef,
+    // Projected schema exposed by this plan node
+    proj_schema: SchemaRef,
+    // Postgres table OID for this scan
+    table_oid: u32,
     scan_id: ScanId,
     registry: Arc<ScanRegistry>,
     props: PlanProperties,
-    attrs: Arc<Vec<PgAttrMeta>>,
+    // Attribute metadata for the full schema (decoder needs all columns to walk offsets)
+    attrs_full: Arc<Vec<PgAttrMeta>>,
+    // Indices of columns to project, in terms of full schema
+    proj_indices: Arc<Vec<usize>>,
 }
 
 impl PgScanExec {
-    pub fn new(scan_id: ScanId, schema: SchemaRef, registry: Arc<ScanRegistry>) -> Self {
-        let eq = EquivalenceProperties::new(schema.clone());
+    pub fn with_projection(
+        scan_id: ScanId,
+        table_oid: u32,
+        full_schema: SchemaRef,
+        proj_schema: SchemaRef,
+        proj_indices: Vec<usize>,
+        registry: Arc<ScanRegistry>,
+    ) -> Self {
+        // Execution plan schema must match the projected schema
+        let eq = EquivalenceProperties::new(proj_schema.clone());
         let props = PlanProperties::new(
             eq,
             Partitioning::UnknownPartitioning(1),
             EmissionType::Incremental,
-            Boundedness::Unbounded {
-                requires_infinite_memory: false,
-            },
+            Boundedness::Bounded,
         );
-        let attrs = Arc::new(attrs_from_schema(&schema));
+        let attrs_full = Arc::new(attrs_from_schema(&full_schema));
         Self {
-            schema,
+            full_schema,
+            proj_schema,
+            table_oid,
             scan_id,
             registry,
             props,
-            attrs,
+            attrs_full,
+            proj_indices: Arc::new(proj_indices),
         }
     }
 }
@@ -210,8 +266,8 @@ impl DisplayAs for PgScanExec {
             DisplayFormatType::Default => write!(f, "PgScanExec: scan_id={}", self.scan_id),
             DisplayFormatType::Verbose => write!(
                 f,
-                "PgScanExec: scan_id={}, schema={:?}",
-                self.scan_id, self.schema
+                "PgScanExec: scan_id={}, table_oid={}, proj_schema={:?}",
+                self.scan_id, self.table_oid, self.proj_schema
             ),
         }
     }
@@ -255,30 +311,41 @@ impl ExecutionPlan for PgScanExec {
         let rx = self.registry.take_receiver(self.scan_id);
         // Use connection id stored in registry to address per-connection slot buffers
         let conn_id = self.registry.conn_id();
-        let stream = PgScanStream::new(Arc::clone(&self.schema), Arc::clone(&self.attrs), rx, conn_id);
+        let stream = PgScanStream::new(
+            Arc::clone(&self.proj_schema),
+            Arc::clone(&self.attrs_full),
+            Arc::clone(&self.proj_indices),
+            rx,
+            conn_id,
+        );
         Ok(Box::pin(stream))
     }
 
     fn statistics(&self) -> DFResult<Statistics> {
-        Ok(Statistics::new_unknown(&self.schema))
+        Ok(Statistics::new_unknown(&self.proj_schema))
     }
 }
 
 pub struct PgScanStream {
-    schema: SchemaRef,
-    attrs: Arc<Vec<PgAttrMeta>>,
+    // Schema of output batches
+    proj_schema: SchemaRef,
+    // Full attribute metadata for decoding
+    attrs_full: Arc<Vec<PgAttrMeta>>,
+    // Projection indices into full schema
+    proj_indices: Arc<Vec<usize>>,
     rx: Option<mpsc::Receiver<HeapBlock>>,
     conn_id: usize,
 }
 
 impl PgScanStream {
     pub fn new(
-        schema: SchemaRef,
-        attrs: Arc<Vec<PgAttrMeta>>,
+        proj_schema: SchemaRef,
+        attrs_full: Arc<Vec<PgAttrMeta>>,
+        proj_indices: Arc<Vec<usize>>,
         rx: Option<mpsc::Receiver<HeapBlock>>,
         conn_id: usize,
     ) -> Self {
-        Self { schema, attrs, rx, conn_id }
+        Self { proj_schema, attrs_full, proj_indices, rx, conn_id }
     }
 }
 
@@ -301,19 +368,19 @@ impl Stream for PgScanStream {
                 };
 
                 // Prepare decoding metadata: attrs (precomputed once) and projection (all columns)
-                let total_cols = this.schema.fields().len();
+                let total_cols = this.proj_schema.fields().len();
 
                 // Create a HeapPage view and iterate tuples
                 let hp = unsafe { HeapPage::from_slice(page) };
                 let Ok(hp) = hp else {
                     // On error decoding page, return empty batch for resilience
-                    let batch = RecordBatch::new_empty(Arc::clone(&this.schema));
+                    let batch = RecordBatch::new_empty(Arc::clone(&this.proj_schema));
                     return Poll::Ready(Some(Ok(batch)));
                 };
 
                 // Prepare per-column builders
                 let col_count = total_cols;
-                let mut builders = make_builders(&this.schema, block.num_offsets as usize)
+                let mut builders = make_builders(&this.proj_schema, block.num_offsets as usize)
                     .map_err(|e| datafusion::error::DataFusionError::Execution(format!("{e}")))?;
                 // Use tuples_by_offset to iterate LP_NORMAL tuples in page order
                 let mut pairs: Vec<(u16, u16)> = Vec::new();
@@ -335,12 +402,19 @@ impl Stream for PgScanStream {
                     as *const pg_sys::PageHeaderData;
                 let mut decoded_rows = 0usize;
                 while let Some(tup) = it.next() {
-                    // Decode projected columns for tuple using iterator over all columns
-                    let iter =
-                        unsafe { decode_tuple_project(page_hdr, tup, &this.attrs, 0..total_cols) };
+                    // Decode projected columns for tuple using iterator over requested projection
+                    let iter = unsafe {
+                        decode_tuple_project(
+                            page_hdr,
+                            tup,
+                            &this.attrs_full,
+                            this.proj_indices.iter().copied(),
+                        )
+                    };
                     let Ok(mut iter) = iter else {
                         continue;
                     };
+                    // Iterate over projected columns in order
                     for col_idx in 0..total_cols {
                         match iter.next() {
                             Some(Ok(v)) => append_scalar(&mut builders[col_idx], v),
@@ -356,8 +430,15 @@ impl Stream for PgScanStream {
                 for b in builders.into_iter() {
                     arrs.push(finish_builder(b));
                 }
-                let rb = RecordBatch::try_new(Arc::clone(&this.schema), arrs)
-                    .map_err(|e| datafusion::error::DataFusionError::Execution(format!("{e}")))?;
+                let rb = if this.proj_schema.fields().is_empty() {
+                    // Special case: empty projection — use row_count to communicate the number of rows
+                    let opts = RecordBatchOptions::new().with_row_count(Some(decoded_rows));
+                    RecordBatch::try_new_with_options(Arc::clone(&this.proj_schema), vec![], &opts)
+                        .map_err(|e| datafusion::error::DataFusionError::Execution(format!("{e}")))?
+                } else {
+                    RecordBatch::try_new(Arc::clone(&this.proj_schema), arrs)
+                        .map_err(|e| datafusion::error::DataFusionError::Execution(format!("{e}")))?
+                };
                 tracing::trace!(
                     target = "executor::server",
                     rows = decoded_rows,
@@ -561,7 +642,7 @@ fn finish_builder(b: ColBuilder) -> ArrayRef {
 
 impl RecordBatchStream for PgScanStream {
     fn schema(&self) -> SchemaRef {
-        Arc::clone(&self.schema)
+        Arc::clone(&self.proj_schema)
     }
 }
 
@@ -589,7 +670,7 @@ where
     {
         if let Some(p) = node.as_any().downcast_ref::<PgScanExec>() {
             let id = p.scan_id;
-            let table_oid = id as u32; // current convention
+            let table_oid = p.table_oid;
             f(id, table_oid)?;
         }
         for child in node.children() {
