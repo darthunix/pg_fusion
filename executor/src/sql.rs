@@ -211,11 +211,10 @@ impl Catalog {
                 fields.push(field);
             }
             let schema = Arc::new(datafusion::arrow::datatypes::Schema::new(fields));
-            // Register PgTableProvider backed by ScanRegistry; use OID as scan_id for now.
-            let scan_id = oid as u64;
-            // Provider uses connection-local registry; injected later via Catalog
+            // Register PgTableProvider backed by ScanRegistry; allocate scan ids per-scan at runtime.
+            // Keep the table OID so executor can request heap blocks.
             let provider = Arc::new(PgTableProvider::new(
-                scan_id,
+                oid,
                 Arc::clone(&schema),
                 Arc::clone(&self.registry),
             ));
