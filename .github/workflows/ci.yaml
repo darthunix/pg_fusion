@@ -17,7 +17,7 @@ env:
   SCCACHE_SHA256: "7203a4dcb3a67f3a0272366d50ede22e5faa3e2a798deaa4d1ea377b51c0ab0c"
   SCCACHE_DIR: /home/runner/.cache/sccache
   SCCACHE_PREFIX: pg_fusion-rust-cache
-  RUST_TOOLCHAIN_VERSION: 1.85.0
+  RUST_TOOLCHAIN_VERSION: 1.89.0
   PGRX_VERSION: 0.16.0
 
 jobs:
