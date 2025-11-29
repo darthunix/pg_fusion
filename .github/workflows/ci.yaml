@@ -88,10 +88,20 @@ jobs:
       - name: Install cargo-llvm-cov for coverage report
         run: cargo install --locked cargo-llvm-cov@0.6.12
 
+      - name: Clippy pg_fusion (lib only, after pgrx)
+        run: |
+          # Lint the extension crate now that Postgres symbols and pgrx config are available.
+          # Limit to lib target to avoid linking test harness against PG server symbols.
+          cargo clippy -p pg_fusion --lib --features "pg${{ env.PG_MAJOR }}, pg_test" --no-default-features
+
       - name: Format and lint
         run: |
           cargo fmt --all -- --check
-          cargo clippy --all-targets --features "pg${{ env.PG_MAJOR }}, pg_test" --no-default-features
+          # Run clippy for non-extension crates to avoid linking against PG outside pgrx
+          cargo clippy --workspace \
+            --exclude pg_fusion \
+            --exclude pg_test \
+            --all-targets --no-default-features
 
 
       - name: Set up permissions for PostgreSQL
