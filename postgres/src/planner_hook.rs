@@ -35,7 +35,15 @@ extern "C-unwind" fn datafusion_planner_hook(
     boundparams: ParamListInfo,
 ) -> *mut PlannedStmt {
     if ENABLE_DATAFUSION.get() {
-        return df_planner(query_string, boundparams);
+        // Only intercept plain SELECT statements; let DML/DDL/ACL/utility go through standard planner
+        unsafe {
+            if !parse.is_null() {
+                if (*parse).commandType == CMD_SELECT {
+                    return df_planner(query_string, boundparams);
+                }
+            }
+        }
+        // Not a SELECT: fall through to previous/standard planner
     }
     unsafe {
         if let Some(prev_hook) = PREV_PLANNER_HOOK {
