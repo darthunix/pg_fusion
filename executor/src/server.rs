@@ -7,7 +7,7 @@ use crate::sql::Catalog;
 use anyhow::Error;
 use anyhow::{bail, Result};
 use common::FusionError;
-use datafusion::arrow::array::{Array, Int32Array, Int64Array, StringArray};
+use datafusion::arrow::array::{Array, Float32Array, Float64Array, Int32Array, Int64Array, StringArray};
 use datafusion::arrow::record_batch::RecordBatch;
 use datafusion::config::ConfigOptions;
 use datafusion::execution::SessionStateBuilder;
@@ -516,6 +516,22 @@ fn encode_and_write_rows(
                             .downcast_ref::<Int64Array>()
                             .expect("int64 array");
                         let v = a.value(row);
+                        fields.push(F::ByVal8(v.to_le_bytes()));
+                    }
+                    datafusion::arrow::datatypes::DataType::Float32 => {
+                        let v = array
+                            .as_any()
+                            .downcast_ref::<Float32Array>()
+                            .expect("float32 array")
+                            .value(row);
+                        fields.push(F::ByVal4(v.to_le_bytes()));
+                    }
+                    datafusion::arrow::datatypes::DataType::Float64 => {
+                        let v = array
+                            .as_any()
+                            .downcast_ref::<Float64Array>()
+                            .expect("float64 array")
+                            .value(row);
                         fields.push(F::ByVal8(v.to_le_bytes()));
                     }
                     datafusion::arrow::datatypes::DataType::Utf8 => {
