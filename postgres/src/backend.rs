@@ -426,7 +426,7 @@ unsafe extern "C-unwind" fn begin_df_scan(
         Ok(s) => s,
         Err(e) => error!("Failed to map shared connection: {}", e),
     };
-    pgrx::info!("begin_df_scan: requesting BeginScan (conn={})", id);
+    pgrx::debug1!("begin_df_scan: requesting BeginScan (conn={})", id);
     if let Err(err) = request_begin_scan(&mut shared.recv) {
         let _ = request_failure(&mut shared.recv);
         let _ = shared.signal_server();
@@ -488,7 +488,7 @@ unsafe extern "C-unwind" fn exec_df_scan(
     };
     EXEC_SCAN_STARTED.with(|started| {
         if !started.get() {
-            pgrx::info!("exec_df_scan: requesting ExecScan (conn={})", id);
+            pgrx::debug1!("exec_df_scan: requesting ExecScan (conn={})", id);
             if let Err(err) = request_exec_scan(&mut shared.recv) {
                 let _ = request_failure(&mut shared.recv);
                 let _ = shared.signal_server();
@@ -526,7 +526,7 @@ unsafe extern "C-unwind" fn exec_df_scan(
             }
             match ControlPacket::try_from(header.tag) {
                 Ok(ControlPacket::ExecReady) => {
-                    pgrx::info!("exec_df_scan: ExecReady received (conn={})", id);
+                    pgrx::debug1!("exec_df_scan: ExecReady received (conn={})", id);
                     EXEC_READY_SEEN.with(|seen| seen.set(true));
                     break;
                 }
@@ -603,7 +603,7 @@ fn process_pending_heap_request(shared: &mut ConnectionShared) {
                     if let Ok((scan_id, table_oid, slot_id)) =
                         read_heap_block_request(&mut shared.send)
                     {
-                        pgrx::info!(
+                        pgrx::debug1!(
                             "process_pending_heap_request: heap request received scan_id={} table_oid={} slot_id={}",
                             scan_id, table_oid, slot_id
                         );
@@ -617,7 +617,7 @@ fn process_pending_heap_request(shared: &mut ConnectionShared) {
                             *e = e.saturating_add(1);
                             cur
                         };
-                        pgrx::info!(
+                        pgrx::debug1!(
                             "process_pending_heap_request: computed blkno={} for scan_id={}",
                             blkno,
                             scan_id
@@ -647,7 +647,7 @@ fn process_pending_heap_request(shared: &mut ConnectionShared) {
                         } as u32;
                         if blkno >= nblocks {
                             // End of relation reached: send EOF for this scan
-                            pgrx::info!(
+                            pgrx::debug1!(
                                 "process_pending_heap_request: EOF scan_id={} slot_id={} (blkno {} >= nblocks {})",
                                 scan_id, slot_id, blkno, nblocks
                             );
@@ -714,7 +714,7 @@ fn process_pending_heap_request(shared: &mut ConnectionShared) {
                             }
                         }
                         // Publish to shared memory + notify executor
-                        pgrx::info!(
+                        pgrx::debug1!(
                             "process_pending_heap_request: publishing page scan_id={} slot_id={} table_oid={} blkno={} num_offsets={} vis_bytes={}",
                             scan_id, slot_id, table_oid, blkno, num_offsets, vis.len()
                         );
@@ -768,10 +768,10 @@ unsafe fn try_store_wire_tuple_from_result(
     let mut ring = LockFreeBuffer::from_layout(base, layout);
     let avail = ring.len();
     if avail == 0 {
-        pgrx::info!("result_ring: empty (conn={})", conn_id);
+    pgrx::debug1!("result_ring: empty (conn={})", conn_id);
         return None;
     }
-    pgrx::info!("result_ring: bytes available={} (conn={})", avail, conn_id);
+    pgrx::debug1!("result_ring: bytes available={} (conn={})", avail, conn_id);
     use std::io::Read;
     // Read fixed 4-byte little-endian row_len
     let row_len = match protocol::result::read_frame_len(&mut ring) {
@@ -785,10 +785,10 @@ unsafe fn try_store_wire_tuple_from_result(
             return None;
         }
     };
-    pgrx::info!("result_ring: frame_len={} (conn={})", row_len, conn_id);
+    pgrx::debug1!("result_ring: frame_len={} (conn={})", row_len, conn_id);
     if row_len == 0 {
         // EOF sentinel
-        pgrx::info!("result_ring: EOF sentinel (conn={})", conn_id);
+        pgrx::debug1!("result_ring: EOF sentinel (conn={})", conn_id);
         RESULT_RING_EOF.with(|f| f.set(true));
         return None;
     }
@@ -1018,7 +1018,7 @@ fn wait_latch(timeout: Option<Duration>) {
     check_for_interrupts!();
     if rc & WL_TIMEOUT as i32 != 0 {
         // Timeout is expected in non-blocking polling; do not raise ERROR.
-        pgrx::info!("wait_latch: timeout (non-fatal)");
+        pgrx::debug1!("wait_latch: timeout (non-fatal)");
     } else if rc & WL_POSTMASTER_DEATH as i32 != 0 {
         panic!("Postmaster is dead");
     }

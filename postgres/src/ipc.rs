@@ -76,9 +76,9 @@ impl ConnectionShared<'_> {
             self.flag.store(true, Ordering::Release);
             // Best-effort diagnostics
             if let Ok(id) = crate::ipc::connection_id() {
-                pgrx::info!("signal_server: flag set (conn={})", id);
+                pgrx::debug1!("signal_server: flag set (conn={})", id);
             } else {
-                pgrx::info!("signal_server: flag set (conn=?), pid unknown");
+                pgrx::debug1!("signal_server: flag set (conn=?), pid unknown");
             }
 
             // Best-effort: wait briefly for the worker to publish PID.
@@ -104,7 +104,7 @@ impl ConnectionShared<'_> {
                 return Err(std::io::Error::last_os_error().into());
             }
             if let Ok(id) = crate::ipc::connection_id() {
-                pgrx::info!("signal_server: SIGUSR1 sent (conn={} pid={})", id, pid);
+                pgrx::debug1!("signal_server: SIGUSR1 sent (conn={} pid={})", id, pid);
             }
             Ok(())
         }
@@ -142,8 +142,8 @@ pub(crate) fn connection_shared(id: u32) -> AnyResult<ConnectionShared<'static>>
     let client_pid_ref: &'static AtomicI32 = unsafe { &*client_ptr };
     let server_pid_ref: &'static AtomicI32 = crate::worker::server_pid_atomic();
 
-    // Diagnostics: log addresses once per call (cheap and helps correlate with worker)
-    pgrx::info!(
+    // Diagnostics: lower level to avoid noisy INFO in production
+    pgrx::debug1!(
         "connection_shared: id={} recv_base={:?} recv_buf={:?} send_base={:?}",
         id,
         recv_base,

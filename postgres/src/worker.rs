@@ -24,7 +24,7 @@ pub(crate) const RESULT_RING_CAP: usize = 64 * 1024; // bytes per-connection for
 
 #[pg_guard]
 pub(crate) unsafe extern "C-unwind" fn init_datafusion_worker() {
-    info!("Registering DataFusion background worker");
+    debug1!("Registering DataFusion background worker");
     BackgroundWorkerBuilder::new("datafusion")
         .set_function("worker_main")
         .set_library("pg_fusion")
@@ -50,7 +50,7 @@ pub unsafe extern "C-unwind" fn init_shmem() {
         if !found {
             std::ptr::write_bytes(base, 0, shared.layout.size());
         }
-        info!(
+        debug1!(
             "init_shmem: flags region ready: bytes={} count={} found={}",
             shared.layout.size(),
             num,
@@ -76,7 +76,7 @@ pub unsafe extern "C-unwind" fn init_shmem() {
                 unsafe { (*client_ptr).store(i32::MAX, Ordering::Relaxed) };
             }
         }
-        info!(
+        debug1!(
             "init_shmem: connections region ready: bytes_per_conn={} total_bytes={} recv_cap={} send_cap={} count={} found={}",
             layout.layout.size(), total, RECV_CAP, SEND_CAP, num, found
         );
@@ -98,7 +98,7 @@ pub unsafe extern "C-unwind" fn init_shmem() {
         }
         // Publish base and layout to executor module for in-process access
         executor::shm::set_slot_blocks(base, layout);
-        info!(
+        debug1!(
             "init_shmem: slot blocks ready: bytes_per_conn={} total_bytes={} slots_per_conn={} blocks_per_slot={} blksz={} count={} found={}",
             layout.layout.size(), total, SLOTS_PER_CONN, BLOCKS_PER_SLOT, blksz, num, found
         );
@@ -189,7 +189,7 @@ pub extern "C-unwind" fn worker_main(_arg: pg_sys::Datum) {
     let num = crate::max_backends() as usize;
     init_tracing_file_logger();
     let pid = unsafe { libc::getpid() };
-    info!(
+    debug1!(
         "worker_main: starting DataFusion worker pid={} max_backends={}",
         pid, num
     );
@@ -207,7 +207,7 @@ pub extern "C-unwind" fn worker_main(_arg: pg_sys::Datum) {
         slice::from_raw_parts(flags_ptr, num)
     };
     let state = Arc::new(executor::ipc::SharedState::new(flags_slice));
-    info!(
+    debug1!(
         "worker_main: SharedState ready (flags={})",
         flags_slice.len()
     );
@@ -224,7 +224,7 @@ pub extern "C-unwind" fn worker_main(_arg: pg_sys::Datum) {
         let pid_ptr = executor::layout::server_pid_ptr(base, layout);
         let pid = libc::getpid();
         (*pid_ptr).store(pid as i32, Ordering::Relaxed);
-        info!("worker_main: published server pid={}", pid);
+        debug1!("worker_main: published server pid={}", pid);
     }
 
     // Build runtime
@@ -233,7 +233,7 @@ pub extern "C-unwind" fn worker_main(_arg: pg_sys::Datum) {
         .enable_all()
         .build()
         .unwrap();
-    info!(
+    debug1!(
         "worker_main: tokio runtime built, threads={}",
         TOKIO_THREAD_NUMBER
     );
