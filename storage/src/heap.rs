@@ -287,6 +287,11 @@ fn decode_fixed_width(atttypid: pg_sys::Oid, bytes: &[u8]) -> Result<Option<Scal
 
     let v = match atttypid {
         x if x == BOOLOID => ScalarValue::Boolean(Some(bytes[0] != 0)),
+        // PostgreSQL internal single-byte "char" type (not BPCHAR)
+        x if x == CHAROID => {
+            let ch = bytes[0] as char;
+            ScalarValue::Utf8(Some(ch.to_string()))
+        }
         x if x == INT2OID => {
             let mut a = [0u8; 2];
             a.copy_from_slice(bytes);
@@ -296,6 +301,13 @@ fn decode_fixed_width(atttypid: pg_sys::Oid, bytes: &[u8]) -> Result<Option<Scal
             let mut a = [0u8; 4];
             a.copy_from_slice(bytes);
             ScalarValue::Int32(Some(i32::from_ne_bytes(a)))
+        }
+        // OID maps to Int32 for now (DataFusion UInt32 available but keep consistent with common integer use)
+        x if x == OIDOID => {
+            let mut a = [0u8; 4];
+            a.copy_from_slice(bytes);
+            let v = u32::from_ne_bytes(a) as i32;
+            ScalarValue::Int32(Some(v))
         }
         x if x == INT8OID => {
             let mut a = [0u8; 8];
@@ -358,6 +370,13 @@ fn decode_fixed_width(atttypid: pg_sys::Oid, bytes: &[u8]) -> Result<Option<Scal
                 },
             ))
         }
+        // name is fixed-length (NAMEDATALEN) with trailing NULs
+        x if x == NAMEOID => {
+            let end = bytes.iter().position(|&b| b == 0).unwrap_or(bytes.len());
+            let s = std::str::from_utf8(&bytes[..end])
+                .map_err(|e| anyhow::anyhow!("invalid utf8 in name: {}", e))?;
+            ScalarValue::Utf8(Some(s.to_string()))
+        }
         _ => return Ok(None),
     };
     Ok(Some(v))
@@ -388,12 +407,14 @@ fn typed_null_for(atttypid: pg_sys::Oid) -> ScalarValue {
     use pg_sys::*;
     match atttypid {
         x if x == BOOLOID => ScalarValue::Boolean(None),
+        x if x == CHAROID => ScalarValue::Utf8(None),
         x if x == INT2OID => ScalarValue::Int16(None),
         x if x == INT4OID => ScalarValue::Int32(None),
+        x if x == OIDOID => ScalarValue::Int32(None),
         x if x == INT8OID => ScalarValue::Int64(None),
         x if x == FLOAT4OID => ScalarValue::Float32(None),
         x if x == FLOAT8OID => ScalarValue::Float64(None),
-        x if x == TEXTOID || x == VARCHAROID || x == BPCHAROID => ScalarValue::Utf8(None),
+        x if x == TEXTOID || x == VARCHAROID || x == BPCHAROID || x == NAMEOID => ScalarValue::Utf8(None),
         x if x == DATEOID => ScalarValue::Date32(None),
         x if x == TIMEOID => ScalarValue::Time64Microsecond(None),
         x if x == TIMESTAMPOID || x == TIMESTAMPTZOID => {
