@@ -1,28 +1,46 @@
 # pg_fusion
 
-Currently, PostgreSQL operates a row-based engine built on the Volcano
-architecture. While this is a good solution for OLTP workloads, it is
-very slow for analytical processing. Modern OLAP engines leverage columnar
-data representation in memory to enable SIMD optimizations and take advantage
-of data locality in CPU caches.
+pg_fusion is a PostgreSQL extension that delegates query execution to an external Apache DataFusion runtime. The extension hooks PG planning/execution, streams heap pages via shared memory to the runtime, and streams back results as wire‑friendly MinimalTuple frames.
 
-Additionally, PostgreSQL operates on a process-based model, where each process
-executes a single thread. The issue with this approach is that these threads
-handle not only data processing but also I/O tasks: reading blocks from disk
-into a shared memory cache, and communicating with clients over the network.
-As a result, the operating system scheduler frequently removes threads from CPU
-cores and later reinstates them, which negatively impacts TLB efficiency.
+Why: PostgreSQL’s Volcano (row‑at‑a‑time) engine is great for OLTP but slow for OLAP. DataFusion provides a modern, vectorized execution engine in Rust. pg_fusion integrates it in‑process via a background worker and shared memory IPC.
 
-These limitations make historical analytics in PostgreSQL a slow and cumbersome
-process. In comparison, DataFusion processes queries an order of magnitude faster.
-This leads to the hypothesis that PostgreSQL users need a CPU-efficient engine
-capable of significantly accelerating most read-heavy queries on heap tables.
-This is the motivation behind the development of `pg_fusion`.
+## Architecture (high level)
 
-## How to run
+- Extension (pgrx) sits in the backend process and drives Parse/Bind/Optimize/Translate/Begin/Exec/End.
+- Executor (runtime) runs DataFusion; `PgTableProvider → PgScanExec → PgScanStream` scans heap pages from shared memory and produces Arrow RecordBatches.
+- Protocol defines control/data packets and a compact wire tuple format with explicit alignment.
 
-After installing `postgres`, you need to set up `rustup`, `cargo-pgrx` to build
-the extension.
+See: `ai/memory/architecture.md` and component notes in `ai/memory/components/`.
+
+## Repository layout
+
+- `postgres/` — pgrx extension (hooks, IPC, TupleTableSlot fill)
+- `executor/` — DataFusion runtime (planning/execution, SHM access, result encoding)
+- `protocol/` — shared packets and wire formats
+- `storage/` — heap page reader + zero‑allocation tuple decoder to DataFusion `ScalarValue`
+- `common/` — shared errors/types
+
+## Build & test
+
+Workspace targets Rust 1.89.
+
+Basics:
+
+```
+cargo check --workspace
+cargo test --workspace
+```
+
+Lint/format:
+
+```
+cargo fmt --all
+cargo clippy --all-targets --features "pg17, pg_test" --no-default-features
+```
+
+## pgrx quickstart (PG 17)
+
+Install and initialize pgrx:
 
 ```
 # install rustup
@@ -34,9 +52,37 @@ cargo install cargo-pgrx
 # configure pgrx
 cargo pgrx init --pg17 $(which pg_config)
 
-# append the extension to shared_preload_libraries in ~/.pgrx/data-17/postgresql.conf
+# enable extension in the dev cluster
 echo "shared_preload_libraries = 'pg_fusion'" >> ~/.pgrx/data-17/postgresql.conf
 
-# run cargo-pgrx to build and install the extension
+# run the dev cluster and build/install the extension
 cargo pgrx run
 ```
+
+Extension‑specific commands:
+
+```
+# build only the extension crate
+cargo build -p pg_fusion
+
+# run pgrx tests for storage’s pg_test
+cargo pgrx test pg17 -p pg_test
+```
+
+## Developer guidelines
+
+- Rust 2021; keep changes small and focused; surface structured errors (no panics in extension paths).
+- Before PR: `cargo fmt`, `cargo clippy -D warnings`, `cargo test --workspace`.
+- Commit style: `area: concise change` (e.g., `executor: fix buffer rollback`).
+
+## Memory bank for agents (RAG)
+
+We maintain a human‑readable “memory bank” for agents and humans under `/ai/memory` (Markdown + YAML frontmatter). Start with:
+
+- `/ai/memory/index.md` — how to read the bank
+- `/ai/memory/architecture.md` — overview
+- `/ai/memory/components/` — component facts
+- `/ai/memory/decisions/` — ADR‑lite decisions
+- `/ai/memory/invariants.md` — project invariants
+
+Agent workflow requirement: after you implement or change behavior, update the relevant files under `/ai/memory` (components, decisions, invariants, architecture) so future agents have accurate context.
