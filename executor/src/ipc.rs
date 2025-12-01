@@ -35,18 +35,22 @@ pub async fn signal_listener(state: Arc<SharedState<'_>>) {
             if state.flags[i].load(Ordering::Acquire) {
                 state.wakers[i].wake();
                 woke += 1;
-                tracing::trace!(
-                    target = "executor::ipc",
-                    conn_id = i,
-                    "signal_listener: woke socket"
-                );
+                if tracing::enabled!(target: "executor::ipc", tracing::Level::TRACE) {
+                    tracing::trace!(
+                        target = "executor::ipc",
+                        conn_id = i,
+                        "signal_listener: woke socket"
+                    );
+                }
             }
         }
         if woke == 0 {
-            tracing::trace!(
-                target = "executor::ipc",
-                "signal_listener: signal received but no flags set"
-            );
+            if tracing::enabled!(target: "executor::ipc", tracing::Level::TRACE) {
+                tracing::trace!(
+                    target = "executor::ipc",
+                    "signal_listener: signal received but no flags set"
+                );
+            }
         }
     }
 }
