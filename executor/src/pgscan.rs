@@ -404,20 +404,8 @@ impl Stream for PgScanStream {
                     .map_err(|e| datafusion::error::DataFusionError::Execution(format!("{e}")))?;
                 // Use tuples_by_offset to iterate LP_NORMAL tuples in page order
                 let mut pairs: Vec<(u16, u16)> = Vec::new();
-                // Pre-scan to populate pairs and log LP_NORMAL count
-                {
-                    let _ = hp.tuples_by_offset(None, std::ptr::null_mut(), &mut pairs);
-                }
-                let pairs_len = pairs.len();
-                // Create iterator borrowing the filled pairs slice
+                // Populate pairs once and create iterator borrowing the filled pairs slice
                 let it = hp.tuples_by_offset(None, std::ptr::null_mut(), &mut pairs);
-                tracing::trace!(
-                    target = "executor::server",
-                    blkno = block.blkno,
-                    num_offsets = block.num_offsets,
-                    lp_normal = pairs_len,
-                    "pgscan: tuples_by_offset summary"
-                );
                 let page_hdr = unsafe { &*(page.as_ptr() as *const pg_sys::PageHeaderData) }
                     as *const pg_sys::PageHeaderData;
                 let mut decoded_rows = 0usize;
@@ -462,12 +450,14 @@ impl Stream for PgScanStream {
                         datafusion::error::DataFusionError::Execution(format!("{e}"))
                     })?
                 };
-                tracing::trace!(
-                    target = "executor::server",
-                    rows = decoded_rows,
-                    blkno = block.blkno,
-                    "pgscan: decoded rows"
-                );
+                if tracing::enabled!(target: "executor::server", tracing::Level::TRACE) {
+                    tracing::trace!(
+                        target = "executor::server",
+                        rows = decoded_rows,
+                        blkno = block.blkno,
+                        "pgscan: decoded rows"
+                    );
+                }
                 Poll::Ready(Some(Ok(rb)))
             }
             Poll::Ready(None) => Poll::Ready(None),

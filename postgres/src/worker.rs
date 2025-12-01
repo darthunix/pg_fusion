@@ -191,7 +191,8 @@ pub extern "C-unwind" fn worker_main(_arg: pg_sys::Datum) {
     let pid = unsafe { libc::getpid() };
     debug1!(
         "worker_main: starting DataFusion worker pid={} max_backends={}",
-        pid, num
+        pid,
+        num
     );
 
     // Build SharedState from shared flags
@@ -375,10 +376,8 @@ fn init_tracing_file_logger() {
     let file_appender = tracing_appender::rolling::never(dir, file);
     let (nb, guard) = tracing_appender::non_blocking(file_appender);
 
-    let filter = tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| {
-        // Default: verbose for our crates; info elsewhere
-        tracing_subscriber::EnvFilter::new("info,pg_fusion=trace,executor=trace")
-    });
+    let filter = tracing_subscriber::EnvFilter::try_from_default_env()
+        .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info"));
 
     let subscriber = tracing_subscriber::fmt()
         .with_env_filter(filter)

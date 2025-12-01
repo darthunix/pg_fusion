@@ -768,7 +768,7 @@ unsafe fn try_store_wire_tuple_from_result(
     let mut ring = LockFreeBuffer::from_layout(base, layout);
     let avail = ring.len();
     if avail == 0 {
-    pgrx::debug1!("result_ring: empty (conn={})", conn_id);
+        pgrx::debug1!("result_ring: empty (conn={})", conn_id);
         return None;
     }
     pgrx::debug1!("result_ring: bytes available={} (conn={})", avail, conn_id);

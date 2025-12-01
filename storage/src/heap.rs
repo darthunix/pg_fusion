@@ -101,14 +101,35 @@ impl<'bytes> HeapPage<'bytes> {
         let mut cur =
             unsafe { self.data.as_ptr().add(size_of::<PageHeaderData>()) as *const ItemIdData };
         let end = unsafe { cur.add(cnt) };
+        // ItemIdData array is 4-byte aligned on PostgreSQL pages; prefer aligned load
         while cur < end {
-            let item = unsafe { ptr::read(cur) };
+            let raw: u32 = unsafe { ptr::read(cur as *const u32) };
             cur = unsafe { cur.add(1) };
-            if (item.lp_flags() as u32) != pg_sys::LP_NORMAL {
+
+            #[inline(always)]
+            fn unpack_itemid(raw: u32) -> (u16, u8, u16) {
+                if cfg!(target_endian = "little") {
+                    // [ len:15 ][ flags:2 ][ off:15 ] (low bits declared first in little-endian)
+                    let off = (raw & 0x7FFF) as u16;
+                    let flags = ((raw >> 15) & 0x03) as u8;
+                    let len = ((raw >> 17) & 0x7FFF) as u16;
+                    (off, flags, len)
+                } else {
+                    // In big-endian, the first-declared field occupies the high bits
+                    let off = ((raw >> 17) & 0x7FFF) as u16;
+                    let flags = ((raw >> 15) & 0x03) as u8;
+                    let len = (raw & 0x7FFF) as u16;
+                    (off, flags, len)
+                }
+            }
+
+            let (off_u16, flags_u8, len_u16) = unpack_itemid(raw);
+            if (flags_u8 as u32) != pg_sys::LP_NORMAL {
                 continue;
             }
-            let off = item.lp_off() as usize;
-            let len = item.lp_len() as usize;
+
+            let off = off_u16 as usize;
+            let len = len_u16 as usize;
             if len == 0 {
                 continue;
             }
@@ -123,7 +144,9 @@ impl<'bytes> HeapPage<'bytes> {
                 continue;
             }
             if let Some(f) = filter {
-                if !f(&item, ctx) {
+                // Pass a reference to the in-page ItemIdData when a filter is present
+                let item_ref: &ItemIdData = unsafe { &*cur.offset(-1) };
+                if !f(item_ref, ctx) {
                     continue;
                 }
             }
@@ -170,19 +193,34 @@ impl<'block> Iterator for TupleSliceIter<'block> {
 
     fn next(&mut self) -> Option<Self::Item> {
         while self.cur < self.end {
-            // Safety: constructed within `line_pointers`, `cur < end` and points to valid item
-            let item = unsafe { ptr::read(self.cur) };
+            // Aligned read of ItemIdData as u32
+            let raw: u32 = unsafe { ptr::read(self.cur as *const u32) };
             self.cur = unsafe { self.cur.add(1) };
 
+            #[inline(always)]
+            fn unpack_itemid(raw: u32) -> (u16, u8, u16) {
+                if cfg!(target_endian = "little") {
+                    let off = (raw & 0x7FFF) as u16;
+                    let flags = ((raw >> 15) & 0x03) as u8;
+                    let len = ((raw >> 17) & 0x7FFF) as u16;
+                    (off, flags, len)
+                } else {
+                    let off = ((raw >> 17) & 0x7FFF) as u16;
+                    let flags = ((raw >> 15) & 0x03) as u8;
+                    let len = (raw & 0x7FFF) as u16;
+                    (off, flags, len)
+                }
+            }
+
+            let (off_u16, flags_u8, len_u16) = unpack_itemid(raw);
             // Filter only live tuples
-            let flags = item.lp_flags() as u32;
-            if flags != pg_sys::LP_NORMAL {
+            if (flags_u8 as u32) != pg_sys::LP_NORMAL {
                 continue;
             }
 
             // Derive offset and length; validate within data region
-            let off = item.lp_off() as usize;
-            let len = item.lp_len() as usize;
+            let off = off_u16 as usize;
+            let len = len_u16 as usize;
 
             // basic sanity: nonzero length and within page bounds
             if len == 0 {
@@ -203,7 +241,8 @@ impl<'block> Iterator for TupleSliceIter<'block> {
 
             // User filter (if any)
             if let Some(f) = self.filter {
-                if !f(&item, self.ctx) {
+                let item_ref: &ItemIdData = unsafe { &*self.cur.offset(-1) };
+                if !f(item_ref, self.ctx) {
                     continue;
                 }
             }
@@ -279,55 +318,74 @@ fn align_up(off: usize, align_char: u8) -> usize {
     (off + mask) & !mask
 }
 
-#[inline]
+#[inline(always)]
 fn decode_fixed_width(atttypid: pg_sys::Oid, bytes: &[u8]) -> Result<Option<ScalarValue>> {
     use pg_sys::*;
     const UNIX_EPOCH_USEC_FROM_PG: i64 = 946_684_800_i64 * 1_000_000; // 1970-01-01 - 2000-01-01
     const UNIX_EPOCH_DAYS_FROM_PG: i32 = 10_957; // days between 1970-01-01 and 2000-01-01
 
     let v = match atttypid {
-        x if x == BOOLOID => ScalarValue::Boolean(Some(bytes[0] != 0)),
+        x if x == BOOLOID => ScalarValue::Boolean(Some(unsafe { *bytes.get_unchecked(0) } != 0)),
         // PostgreSQL internal single-byte "char" type (not BPCHAR)
         x if x == CHAROID => {
-            let ch = bytes[0] as char;
+            let ch = unsafe { *bytes.get_unchecked(0) } as char;
             ScalarValue::Utf8(Some(ch.to_string()))
         }
         x if x == INT2OID => {
-            let mut a = [0u8; 2];
-            a.copy_from_slice(bytes);
-            ScalarValue::Int16(Some(i16::from_ne_bytes(a)))
+            debug_assert_eq!(
+                (bytes.as_ptr() as usize) & (core::mem::align_of::<i16>() - 1),
+                0
+            );
+            let v = unsafe { core::ptr::read(bytes.as_ptr() as *const i16) };
+            ScalarValue::Int16(Some(v))
         }
         x if x == INT4OID => {
-            let mut a = [0u8; 4];
-            a.copy_from_slice(bytes);
-            ScalarValue::Int32(Some(i32::from_ne_bytes(a)))
+            debug_assert_eq!(
+                (bytes.as_ptr() as usize) & (core::mem::align_of::<i32>() - 1),
+                0
+            );
+            let v = unsafe { core::ptr::read(bytes.as_ptr() as *const i32) };
+            ScalarValue::Int32(Some(v))
         }
         // OID maps to Int32 for now (DataFusion UInt32 available but keep consistent with common integer use)
         x if x == OIDOID => {
-            let mut a = [0u8; 4];
-            a.copy_from_slice(bytes);
-            let v = u32::from_ne_bytes(a) as i32;
+            debug_assert_eq!(
+                (bytes.as_ptr() as usize) & (core::mem::align_of::<u32>() - 1),
+                0
+            );
+            let v = unsafe { core::ptr::read(bytes.as_ptr() as *const u32) } as i32;
             ScalarValue::Int32(Some(v))
         }
         x if x == INT8OID => {
-            let mut a = [0u8; 8];
-            a.copy_from_slice(bytes);
-            ScalarValue::Int64(Some(i64::from_ne_bytes(a)))
+            debug_assert_eq!(
+                (bytes.as_ptr() as usize) & (core::mem::align_of::<i64>() - 1),
+                0
+            );
+            let v = unsafe { core::ptr::read(bytes.as_ptr() as *const i64) };
+            ScalarValue::Int64(Some(v))
         }
         x if x == FLOAT4OID => {
-            let mut a = [0u8; 4];
-            a.copy_from_slice(bytes);
-            ScalarValue::Float32(Some(f32::from_ne_bytes(a)))
+            debug_assert_eq!(
+                (bytes.as_ptr() as usize) & (core::mem::align_of::<f32>() - 1),
+                0
+            );
+            let v = unsafe { core::ptr::read(bytes.as_ptr() as *const f32) };
+            ScalarValue::Float32(Some(v))
         }
         x if x == FLOAT8OID => {
-            let mut a = [0u8; 8];
-            a.copy_from_slice(bytes);
-            ScalarValue::Float64(Some(f64::from_ne_bytes(a)))
+            debug_assert_eq!(
+                (bytes.as_ptr() as usize) & (core::mem::align_of::<f64>() - 1),
+                0
+            );
+            let v = unsafe { core::ptr::read(bytes.as_ptr() as *const f64) };
+            ScalarValue::Float64(Some(v))
         }
         x if x == DATEOID => {
-            let mut a = [0u8; 4];
-            a.copy_from_slice(bytes);
-            let pg_days = i32::from_ne_bytes(a);
+            debug_assert_eq!(
+                (bytes.as_ptr() as usize) & (core::mem::align_of::<i32>() - 1),
+                0
+            );
+            let pg_days: i32 = unsafe { core::ptr::read(bytes.as_ptr() as *const i32) };
             // Preserve infinities as sentinels, otherwise convert from PG epoch (2000-01-01) to UNIX (1970-01-01)
             let unix_days = if pg_days == i32::MIN || pg_days == i32::MAX {
                 pg_days
@@ -337,30 +395,36 @@ fn decode_fixed_width(atttypid: pg_sys::Oid, bytes: &[u8]) -> Result<Option<Scal
             ScalarValue::Date32(Some(unix_days))
         }
         x if x == TIMEOID => {
-            let mut a = [0u8; 8];
-            a.copy_from_slice(bytes);
-            let usec = i64::from_ne_bytes(a);
+            debug_assert_eq!(
+                (bytes.as_ptr() as usize) & (core::mem::align_of::<i64>() - 1),
+                0
+            );
+            let usec: i64 = unsafe { core::ptr::read(bytes.as_ptr() as *const i64) };
             ScalarValue::Time64Microsecond(Some(usec))
         }
         x if x == TIMESTAMPOID || x == TIMESTAMPTZOID => {
-            let mut a = [0u8; 8];
-            a.copy_from_slice(bytes);
-            let pg_usec = i64::from_ne_bytes(a);
+            debug_assert_eq!(
+                (bytes.as_ptr() as usize) & (core::mem::align_of::<i64>() - 1),
+                0
+            );
+            let pg_usec: i64 = unsafe { core::ptr::read(bytes.as_ptr() as *const i64) };
             let unix_usec = pg_usec.saturating_add(UNIX_EPOCH_USEC_FROM_PG);
             ScalarValue::TimestampMicrosecond(Some(unix_usec), None)
         }
         x if x == INTERVALOID => {
             // struct Interval { TimeOffset time; int32 day; int32 month; }
             // time is microseconds
-            let mut t = [0u8; 8];
-            let mut d = [0u8; 4];
-            let mut m = [0u8; 4];
-            t.copy_from_slice(&bytes[0..8]);
-            d.copy_from_slice(&bytes[8..12]);
-            m.copy_from_slice(&bytes[12..16]);
-            let usec = i64::from_ne_bytes(t);
-            let day_count = i32::from_ne_bytes(d);
-            let month_count = i32::from_ne_bytes(m);
+            debug_assert_eq!(
+                (bytes.as_ptr() as usize) & (core::mem::align_of::<i64>() - 1),
+                0
+            );
+            let usec: i64 = unsafe { core::ptr::read(bytes.as_ptr() as *const i64) };
+            let day_ptr = unsafe { bytes.as_ptr().add(8) };
+            let month_ptr = unsafe { bytes.as_ptr().add(12) };
+            debug_assert_eq!((day_ptr as usize) & (core::mem::align_of::<i32>() - 1), 0);
+            debug_assert_eq!((month_ptr as usize) & (core::mem::align_of::<i32>() - 1), 0);
+            let day_count: i32 = unsafe { core::ptr::read(day_ptr as *const i32) };
+            let month_count: i32 = unsafe { core::ptr::read(month_ptr as *const i32) };
             let nanos = usec.saturating_mul(1000);
             ScalarValue::IntervalMonthDayNano(Some(
                 datafusion_common::arrow::array::types::IntervalMonthDayNano {
@@ -414,7 +478,9 @@ fn typed_null_for(atttypid: pg_sys::Oid) -> ScalarValue {
         x if x == INT8OID => ScalarValue::Int64(None),
         x if x == FLOAT4OID => ScalarValue::Float32(None),
         x if x == FLOAT8OID => ScalarValue::Float64(None),
-        x if x == TEXTOID || x == VARCHAROID || x == BPCHAROID || x == NAMEOID => ScalarValue::Utf8(None),
+        x if x == TEXTOID || x == VARCHAROID || x == BPCHAROID || x == NAMEOID => {
+            ScalarValue::Utf8(None)
+        }
         x if x == DATEOID => ScalarValue::Date32(None),
         x if x == TIMEOID => ScalarValue::Time64Microsecond(None),
         x if x == TIMESTAMPOID || x == TIMESTAMPTZOID => {
@@ -436,7 +502,6 @@ pub struct DecodedIter<'bytes, I: Iterator<Item = usize>> {
     hasnull: bool,
     bits_ptr: *const u8,
     hoff: usize,
-    pending_err: Option<anyhow::Error>,
 }
 
 impl<'bytes, I: Iterator<Item = usize>> DecodedIter<'bytes, I> {
@@ -471,7 +536,6 @@ impl<'bytes, I: Iterator<Item = usize>> DecodedIter<'bytes, I> {
             hasnull,
             bits_ptr,
             hoff,
-            pending_err: None,
         })
     }
 
@@ -525,6 +589,7 @@ impl<'bytes, I: Iterator<Item = usize>> DecodedIter<'bytes, I> {
         }
     }
 
+    #[inline(always)]
     unsafe fn decode_att(&mut self, att_idx: usize) -> Result<ScalarValue> {
         if att_idx < self.last_attno {
             self.last_attno = 0;
@@ -564,9 +629,8 @@ impl<'bytes, I: Iterator<Item = usize>> DecodedIter<'bytes, I> {
                         if self.off + 4 > self.tuple.len() {
                             bail!(FusionError::BufferTooSmall(self.tuple.len()));
                         }
-                        let hdr_u32 = u32::from_ne_bytes(
-                            self.tuple[self.off..self.off + 4].try_into().unwrap(),
-                        );
+                        let hdr_u32: u32 =
+                            ptr::read(self.tuple.as_ptr().add(self.off) as *const u32);
                         let total_len = Self::varlena_4b_total_len(hdr_u32);
                         if total_len < 4 || self.off + total_len > self.tuple.len() {
                             bail!(FusionError::BufferTooSmall(self.tuple.len()));
@@ -623,8 +687,7 @@ impl<'bytes, I: Iterator<Item = usize>> DecodedIter<'bytes, I> {
             if self.off + 4 > self.tuple.len() {
                 bail!(FusionError::BufferTooSmall(self.tuple.len()));
             }
-            let hdr_u32 =
-                u32::from_ne_bytes(self.tuple[self.off..self.off + 4].try_into().unwrap());
+            let hdr_u32: u32 = ptr::read(self.tuple.as_ptr().add(self.off) as *const u32);
             let total_len = Self::varlena_4b_total_len(hdr_u32);
             if total_len < 4 || self.off + total_len > self.tuple.len() {
                 bail!(FusionError::BufferTooSmall(self.tuple.len()));
@@ -644,11 +707,9 @@ impl<'bytes, I: Iterator<Item = usize>> DecodedIter<'bytes, I> {
 
 impl<I: Iterator<Item = usize>> Iterator for DecodedIter<'_, I> {
     type Item = Result<ScalarValue>;
+    #[inline(always)]
     fn next(&mut self) -> Option<Self::Item> {
         let att_idx = self.iter.next()?;
-        if let Some(err) = self.pending_err.take() {
-            return Some(Err(err));
-        }
         Some(unsafe { self.decode_att(att_idx) })
     }
 }
