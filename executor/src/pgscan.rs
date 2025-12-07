@@ -347,6 +347,7 @@ pub struct PgScanStream {
     proj_indices: Arc<Vec<usize>>,
     rx: Option<mpsc::Receiver<HeapBlock>>,
     conn_id: usize,
+    pairs: Vec<(u16, u16)>,
 }
 
 impl PgScanStream {
@@ -363,6 +364,7 @@ impl PgScanStream {
             proj_indices,
             rx,
             conn_id,
+            pairs: Vec::new(),
         }
     }
 }
@@ -392,9 +394,9 @@ impl Stream for PgScanStream {
 
                 // Create a HeapPage view and iterate tuples
                 let hp = unsafe { HeapPage::from_slice(page) };
+                let batch = RecordBatch::new_empty(Arc::clone(&this.proj_schema));
                 let Ok(hp) = hp else {
                     // On error decoding page, return empty batch for resilience
-                    let batch = RecordBatch::new_empty(Arc::clone(&this.proj_schema));
                     return Poll::Ready(Some(Ok(batch)));
                 };
 
@@ -402,35 +404,39 @@ impl Stream for PgScanStream {
                 let col_count = total_cols;
                 let mut builders = make_builders(&this.proj_schema, block.num_offsets as usize)
                     .map_err(|e| datafusion::error::DataFusionError::Execution(format!("{e}")))?;
-                // Use tuples_by_offset to iterate LP_NORMAL tuples in page order
-                let mut pairs: Vec<(u16, u16)> = Vec::new();
-                // Populate pairs once and create iterator borrowing the filled pairs slice
-                let it = hp.tuples_by_offset(None, std::ptr::null_mut(), &mut pairs);
+                // Take local clones of shared metadata to avoid borrowing `this` during tuple iteration
+                let proj_indices = Arc::clone(&this.proj_indices);
+                let attrs_full = Arc::clone(&this.attrs_full);
                 let page_hdr = unsafe { &*(page.as_ptr() as *const pg_sys::PageHeaderData) }
                     as *const pg_sys::PageHeaderData;
                 let mut decoded_rows = 0usize;
-                for tup in it {
-                    // Decode projected columns for tuple using iterator over requested projection
-                    let iter = unsafe {
-                        decode_tuple_project(
-                            page_hdr,
-                            tup,
-                            &this.attrs_full,
-                            this.proj_indices.iter().copied(),
-                        )
-                    };
-                    let Ok(mut iter) = iter else {
-                        continue;
-                    };
-                    // Iterate over projected columns in order
-                    for b in builders.iter_mut().take(total_cols) {
-                        match iter.next() {
-                            Some(Ok(v)) => append_scalar(b, v),
-                            Some(Err(_e)) => append_null(b),
-                            None => append_null(b),
+                // Limit the borrow of `this.pairs` to this inner scope to satisfy borrow checker
+                {
+                    // Populate pairs once and create iterator borrowing the filled pairs slice
+                    let it = hp.tuples_by_offset(None, std::ptr::null_mut(), &mut this.pairs);
+                    for tup in it {
+                        // Decode projected columns for tuple using iterator over requested projection
+                        let iter = unsafe {
+                            decode_tuple_project(
+                                page_hdr,
+                                tup,
+                                &attrs_full,
+                                proj_indices.iter().copied(),
+                            )
+                        };
+                        let Ok(mut iter) = iter else {
+                            continue;
+                        };
+                        // Iterate over projected columns in order
+                        for b in builders.iter_mut().take(total_cols) {
+                            match iter.next() {
+                                Some(Ok(v)) => append_scalar(b, v),
+                                Some(Err(_e)) => append_null(b),
+                                None => append_null(b),
+                            }
                         }
+                        decoded_rows += 1;
                     }
-                    decoded_rows += 1;
                 }
 
                 // Build Arrow arrays and RecordBatch
