@@ -39,3 +39,11 @@ In short: a PostgreSQL (pgrx) extension intercepts planning/execution and delega
 - Executor (`executor/`): DataFusion planning/execution, heap requests, decode/encode results, backpressure.
 - Protocol: stable binary formats/messages.
 - Storage: precise heap/attribute decoder (zero‑copy where possible).
+
+## Result Path Status
+
+- Column layout: backend sends `ColumnLayout` with `PgAttrWire { atttypid, typmod, attlen, attalign, attbyval, nullable }` during planning; executor caches it.
+- Wire tuples: executor encodes rows using `protocol::tuple::encode_wire_tuple` (header + optional null bitmap + aligned data area; byval in host‑endian; varlena as length-prefixed bytes, no TOAST/compression).
+- Result ring: executor writes length‑prefixed wire tuples to the per‑connection lock‑free result ring and nudges backend (SIGUSR1).
+- Backend assembly: backend reads frames, decodes wire header, reconstructs `Datum[]/isnull[]` by `attlen/attalign/attbyval`, forms `MinimalTuple` via `heap_form_minimal_tuple`, and stores into `TupleTableSlot`.
+- Visibility: heap page visibility bitmap is carried out‑of‑band in SHM; currently parsed but not applied in `PgScanStream` (planned follow‑up).
