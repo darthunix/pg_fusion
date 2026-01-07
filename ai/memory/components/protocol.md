@@ -2,24 +2,14 @@
 id: comp-protocol-0001
 type: fact
 scope: protocol
-tags: ["wire", "tuple", "ipc", "msgpack"]
-updated_at: "2025-11-29"
-importance: 0.85
+tags: ["ipc", "control", "data", "tuple", "bitmap"]
+updated_at: "2026-01-07"
+importance: 0.7
 ---
 
 # Component: Protocol
 
-## Control Packets
-
-- Parse/Metadata/Bind/Optimize/Translate/BeginScan/ExecScan/EndScan/Explain/Failure/ExecReady.
-
-## Data Packets
-
-- Heap: meta with (scan_id, slot_id, table_oid, blkno, num_offsets, vis_len); page/bitmap bytes reside in SHM.
-- Results: `result::write_frame(u32_len + payload)`; payload is a “WireMinimalTuple”:
-  - Header (nattrs, flags, hoff, bitmap_bytes, data_bytes), null bitmap (LSB‑first), aligned attributes.
-
-## Supported Types
-
-- boolean, int2/4/8, float4/8, utf8, date, time64(us), timestamp(us), interval month‑day‑nano.
-- Alignment and attlen must match `PgAttrWire`.
+- Control: `Parse/Metadata/Bind/Optimize/Translate/Explain/BeginScan/ExecScan/EndScan/ExecReady/ColumnLayout`.
+- Data: `Heap` (requests + metadata for SHM page + vis bitmap `vis_len`), `Eof` per‑scan (u64 scan_id).
+- Column layout: `PgAttrWire { atttypid, typmod, attlen, attalign, attbyval, nullable }` to drive result encoding.
+- Tuples: `encode_wire_tuple` + `decode_wire_tuple` with header, null bitmap, and aligned data area.

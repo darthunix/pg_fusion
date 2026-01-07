@@ -1,26 +1,15 @@
 ---
 id: comp-postgres-0001
 type: fact
-scope: postgres
-tags: ["pgrx", "executor", "TupleTableSlot", "heap", "ipc"]
-updated_at: "2025-11-29"
-importance: 0.8
+scope: backend
+tags: ["pgrx", "customscan", "heap", "shm", "result"]
+updated_at: "2026-01-07"
+importance: 0.7
 ---
 
-# Component: Postgres (pgrx Extension)
+# Component: PostgreSQL Extension (Backend)
 
-## Responsibilities
-
-- Drives lifecycle: Parse/Metadata/Bind/Optimize/Translate/BeginScan/ExecScan/EndScan.
-- Reads heap blocks and publishes them into SHM slots + sends metadata (scan_id/slot_id/vis_len).
-- Reads the result ring, decodes wire MinimalTuple frames, and fills a `TupleTableSlot`.
-
-## Safety
-
-- No panics; errors via `FusionError`.
-- Minimize work outside PostgreSQL’s safe APIs; always unlock/release buffers/locks.
-
-## Known Limitations
-
-- MVCC visibility is simplified (all visible) — TODO: proper XMIN/XMAX/hints checks.
-- SIGUSR1 requires a valid client PID; unsupported on non‑Unix.
+- Planning: builds `TargetEntry` list and sends `ColumnLayout` for executor encoding.
+- Scan lifecycle: `BeginScan` registers channels; `ExecScan` waits `ExecReady`, loops reading result ring and serving heap requests; `EndScan` closes.
+- Heap path: reads `request_heap_block`, copies page + vis bitmap to SHM, sends metadata; on end, sends per‑scan `Eof`.
+- Result path: reads frames from result ring, decodes wire tuple, assembles `MinimalTuple` via `heap_form_minimal_tuple`, and stores into `TupleTableSlot`.
