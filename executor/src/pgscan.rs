@@ -5,7 +5,7 @@ use std::sync::atomic::{AtomicU16, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::task::{Context, Poll};
 
-use crate::shm;
+// use crate::shm;
 use async_trait::async_trait;
 use datafusion::arrow::array::{
     ArrayRef, BooleanBuilder, Date32Builder, Float32Builder, Float64Builder, Int16Builder,
@@ -32,12 +32,12 @@ use datafusion_execution::TaskContext;
 use datafusion_physical_expr::EquivalenceProperties;
 use futures::Stream;
 use pgrx_pg_sys as pg_sys;
-use storage::heap::{decode_tuple_project, HeapPage, LpFilter, PgAttrMeta};
+use storage::heap::{decode_tuple_project, HeapPage, PgAttrMeta};
 use tokio::sync::mpsc;
 
 pub type ScanId = u64;
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 pub struct HeapBlock {
     pub scan_id: ScanId,
     pub slot_id: u16,
@@ -45,6 +45,8 @@ pub struct HeapBlock {
     pub blkno: u32,
     pub num_offsets: u16,
     pub vis_len: u16,
+    pub page: Vec<u8>,
+    pub vis: Vec<u8>,
     // Note: page bytes and visibility bitmap reside in shared memory,
     // addressed by `slot_id` with `vis_len` bytes for visibility bitmap.
 }
@@ -321,14 +323,11 @@ impl ExecutionPlan for PgScanExec {
         _ctx: Arc<TaskContext>,
     ) -> DFResult<SendableRecordBatchStream> {
         let rx = self.registry.take_receiver(self.scan_id);
-        // Use connection id stored in registry to address per-connection slot buffers
-        let conn_id = self.registry.conn_id();
         let stream = PgScanStream::new(
             Arc::clone(&self.proj_schema),
             Arc::clone(&self.attrs_full),
             Arc::clone(&self.proj_indices),
             rx,
-            conn_id,
         );
         Ok(Box::pin(stream))
     }
@@ -346,8 +345,6 @@ pub struct PgScanStream {
     // Projection indices into full schema
     proj_indices: Arc<Vec<usize>>,
     rx: Option<mpsc::Receiver<HeapBlock>>,
-    conn_id: usize,
-    pairs: Vec<(u16, u16)>,
 }
 
 impl PgScanStream {
@@ -356,15 +353,12 @@ impl PgScanStream {
         attrs_full: Arc<Vec<PgAttrMeta>>,
         proj_indices: Arc<Vec<usize>>,
         rx: Option<mpsc::Receiver<HeapBlock>>,
-        conn_id: usize,
     ) -> Self {
         Self {
             proj_schema,
             attrs_full,
             proj_indices,
             rx,
-            conn_id,
-            pairs: Vec::new(),
         }
     }
 }
@@ -379,30 +373,26 @@ impl Stream for PgScanStream {
         };
         match rx.poll_recv(cx) {
             Poll::Ready(Some(block)) => {
-                // Borrow page and (optional) visibility bitmap from shared memory (no copy)
-                let page = unsafe { shm::block_slice(this.conn_id, block.slot_id as usize) };
-                let vis_opt = if block.vis_len > 0 {
-                    Some(unsafe {
-                        shm::vis_slice(this.conn_id, block.slot_id as usize, block.vis_len as usize)
-                    })
-                } else {
-                    None
-                };
+                // Take ownership of copied page and visibility bitmap from the block (provided at receipt time)
+                let num_offsets = block.num_offsets;
+                let vis_len = block.vis_len;
+                let page = block.page;
+                let vis_buf = if vis_len > 0 { Some(block.vis) } else { None };
 
                 // Prepare decoding metadata: attrs (precomputed once) and projection (all columns)
                 let total_cols = this.proj_schema.fields().len();
 
                 // Create a HeapPage view and iterate tuples (optionally applying visibility bitmap)
-                let hp = unsafe { HeapPage::from_slice(page) };
+                let hp = unsafe { HeapPage::from_slice(&page) };
                 let batch = RecordBatch::new_empty(Arc::clone(&this.proj_schema));
-                let Ok(hp) = hp else {
+                let Ok(_hp) = hp else {
                     // On error decoding page, return empty batch for resilience
                     return Poll::Ready(Some(Ok(batch)));
                 };
 
                 // Prepare per-column builders
                 let col_count = total_cols;
-                let mut builders = make_builders(&this.proj_schema, block.num_offsets as usize)
+                let mut builders = make_builders(&this.proj_schema, num_offsets as usize)
                     .map_err(|e| datafusion::error::DataFusionError::Execution(format!("{e}")))?;
                 // Take local clones of shared metadata to avoid borrowing `this` during tuple iteration
                 let proj_indices = Arc::clone(&this.proj_indices);
@@ -410,85 +400,66 @@ impl Stream for PgScanStream {
                 let page_hdr = unsafe { &*(page.as_ptr() as *const pg_sys::PageHeaderData) }
                     as *const pg_sys::PageHeaderData;
                 let mut decoded_rows = 0usize;
-                // Limit the borrow of `this.pairs` to this inner scope to satisfy borrow checker
+                // Iterate line pointers by index to align with backend visibility bitmap semantics
                 {
-                    // Build optional visibility filter context
-                    #[repr(C)]
-                    struct VisCtx {
-                        start: *const pg_sys::ItemIdData,
-                        vis_ptr: *const u8,
-                        vis_len: usize,
-                        num_offsets: usize,
-                    }
-                    fn vis_filter(item: &pg_sys::ItemIdData, ctx: *mut std::ffi::c_void) -> bool {
-                        // Safety: ctx points to a valid VisCtx for the duration of iteration
-                        let c = unsafe { &*(ctx as *const VisCtx) };
-                        // Compute 1-based index of this line pointer within the array
-                        let idx0 =
-                            unsafe { (item as *const pg_sys::ItemIdData).offset_from(c.start) };
-                        if idx0 < 0 {
-                            return false;
-                        }
-                        let idx = (idx0 as usize) + 1; // 1-based
-                        if idx == 0 || idx > c.num_offsets {
-                            return false;
-                        }
-                        // Bounds-check bitmap access
-                        let byte_idx = (idx - 1) / 8;
-                        if byte_idx >= c.vis_len {
-                            return false;
-                        }
-                        let bit = 1u8 << (((idx - 1) % 8) as u8);
-                        let byte = unsafe { *c.vis_ptr.add(byte_idx) };
-                        (byte & bit) != 0
-                    }
-
-                    // Compute pointer to the first ItemIdData (line pointer array base)
-                    let start_ptr = unsafe {
-                        (page
-                            .as_ptr()
-                            .add(core::mem::size_of::<pg_sys::PageHeaderData>()))
-                            as *const pg_sys::ItemIdData
-                    };
-
-                    if let Some(vis) = vis_opt {
-                        // Visibility-aware iteration
-                        let mut ctx = VisCtx {
-                            start: start_ptr,
-                            vis_ptr: vis.as_ptr(),
-                            vis_len: vis.len(),
-                            num_offsets: block.num_offsets as usize,
-                        };
-                        let it = hp.tuples_by_offset(
-                            Some(vis_filter as LpFilter),
-                            (&mut ctx) as *mut _ as *mut std::ffi::c_void,
-                            &mut this.pairs,
-                        );
-                        for tup in it {
-                            let iter = unsafe {
-                                decode_tuple_project(
-                                    page_hdr,
-                                    tup,
-                                    &attrs_full,
-                                    proj_indices.iter().copied(),
-                                )
-                            };
-                            let Ok(mut iter) = iter else {
-                                continue;
-                            };
-                            for b in builders.iter_mut().take(total_cols) {
-                                match iter.next() {
-                                    Some(Ok(v)) => append_scalar(b, v),
-                                    Some(Err(_e)) => append_null(b),
-                                    None => append_null(b),
+                    let hdr = unsafe { &*(page.as_ptr() as *const pg_sys::PageHeaderData) };
+                    let header_sz = core::mem::size_of::<pg_sys::PageHeaderData>();
+                    let lower = hdr.pd_lower as usize;
+                    let upper = hdr.pd_upper as usize;
+                    let special = hdr.pd_special as usize;
+                    let special_limit = core::cmp::min(special, page.len());
+                    if lower >= header_sz {
+                        let cnt = (lower - header_sz) / core::mem::size_of::<pg_sys::ItemIdData>();
+                        for pos in 1..=cnt {
+                            // Apply visibility (if present) by 1-based LP index
+                            if let Some(ref vis) = vis_buf {
+                                let byte = (pos - 1) / 8;
+                                if byte >= vis.len() {
+                                    continue;
+                                }
+                                let bit = 1u8 << (((pos - 1) % 8) as u8);
+                                if (vis[byte] & bit) == 0 {
+                                    continue;
                                 }
                             }
-                            decoded_rows += 1;
-                        }
-                    } else {
-                        // No visibility bitmap: iterate all tuples
-                        let it = hp.tuples_by_offset(None, std::ptr::null_mut(), &mut this.pairs);
-                        for tup in it {
+                            // Read raw ItemIdData as u32 and unpack (off, flags, len)
+                            let raw_ptr = unsafe {
+                                page.as_ptr().add(
+                                    header_sz
+                                        + (pos - 1) * core::mem::size_of::<pg_sys::ItemIdData>(),
+                                )
+                            } as *const u32;
+                            let raw: u32 = unsafe { core::ptr::read(raw_ptr) };
+                            let (off_u16, flags_u8, len_u16) = if cfg!(target_endian = "little") {
+                                let off = (raw & 0x7FFF) as u16;
+                                let flags = ((raw >> 15) & 0x03) as u8;
+                                let len = ((raw >> 17) & 0x7FFF) as u16;
+                                (off, flags, len)
+                            } else {
+                                let off = ((raw >> 17) & 0x7FFF) as u16;
+                                let flags = ((raw >> 15) & 0x03) as u8;
+                                let len = (raw & 0x7FFF) as u16;
+                                (off, flags, len)
+                            };
+                            if (flags_u8 as u32) != pg_sys::LP_NORMAL {
+                                continue;
+                            }
+                            let off = off_u16 as usize;
+                            let len = len_u16 as usize;
+                            if len == 0 {
+                                continue;
+                            }
+                            if off < upper {
+                                continue;
+                            }
+                            let end_off = match off.checked_add(len) {
+                                Some(v) => v,
+                                None => continue,
+                            };
+                            if end_off > special_limit {
+                                continue;
+                            }
+                            let tup = &page[off..end_off];
                             let iter = unsafe {
                                 decode_tuple_project(
                                     page_hdr,
@@ -503,7 +474,7 @@ impl Stream for PgScanStream {
                             for b in builders.iter_mut().take(total_cols) {
                                 match iter.next() {
                                     Some(Ok(v)) => append_scalar(b, v),
-                                    Some(Err(_e)) => append_null(b),
+                                    Some(Err(_)) => append_null(b),
                                     None => append_null(b),
                                 }
                             }

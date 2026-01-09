@@ -260,6 +260,17 @@ impl<'bytes> Connection<'bytes> {
                         );
                     }
                     if let Some(tx) = storage.registry.sender(meta.scan_id as u64) {
+                        // Copy page and vis now to avoid race with producer overwriting the slot
+                        let page = crate::shm::copy_block_conn(self.id, meta.slot_id as usize);
+                        let vis = if vis_len > 0 {
+                            crate::shm::copy_vis_conn(
+                                self.id,
+                                meta.slot_id as usize,
+                                vis_len as usize,
+                            )
+                        } else {
+                            Vec::new()
+                        };
                         let block = crate::pgscan::HeapBlock {
                             scan_id: meta.scan_id as u64,
                             slot_id: meta.slot_id,
@@ -267,6 +278,8 @@ impl<'bytes> Connection<'bytes> {
                             blkno: meta.blkno,
                             num_offsets: meta.num_offsets,
                             vis_len,
+                            page,
+                            vis,
                         };
                         // Best-effort send; if the channel is full, await until space is available
                         if let Err(e) = tx.send(block).await {

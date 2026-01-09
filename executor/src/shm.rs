@@ -33,10 +33,30 @@ pub fn copy_block(slot: usize) -> Vec<u8> {
     unsafe { std::slice::from_raw_parts(ptr, len) }.to_vec()
 }
 
+/// Copy heap page bytes for the given connection and slot into an owned Vec.
+pub fn copy_block_conn(conn_offset: usize, slot: usize) -> Vec<u8> {
+    let (base, layout) = get();
+    let per = layout.layout.size();
+    let conn_base = unsafe { base.add(conn_offset * per) };
+    let ptr = unsafe { slot_ptr_calc(conn_base, layout, slot, 0) };
+    let len = layout.block_len;
+    unsafe { std::slice::from_raw_parts(ptr, len) }.to_vec()
+}
+
 /// Copy the visibility bitmap bytes from shared memory for the given `slot` into an owned Vec.
 pub fn copy_vis(slot: usize, vis_len: usize) -> Vec<u8> {
     let (base, layout) = get();
     let ptr = unsafe { vis_ptr_calc(base, layout, slot, 0) };
+    let len = vis_len.min(layout.vis_bytes_per_block);
+    unsafe { std::slice::from_raw_parts(ptr, len) }.to_vec()
+}
+
+/// Copy visibility bitmap bytes for the given connection and slot into an owned Vec.
+pub fn copy_vis_conn(conn_offset: usize, slot: usize, vis_len: usize) -> Vec<u8> {
+    let (base, layout) = get();
+    let per = layout.layout.size();
+    let conn_base = unsafe { base.add(conn_offset * per) };
+    let ptr = unsafe { vis_ptr_calc(conn_base, layout, slot, 0) };
     let len = vis_len.min(layout.vis_bytes_per_block);
     unsafe { std::slice::from_raw_parts(ptr, len) }.to_vec()
 }
