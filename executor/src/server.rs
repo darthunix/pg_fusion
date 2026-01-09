@@ -298,15 +298,13 @@ impl<'bytes> Connection<'bytes> {
                                 meta.scan_id
                             );
                         }
-                    } else {
-                        if tracing::enabled!(target: "pg_fusion::server", tracing::Level::TRACE) {
-                            trace!(
-                                target = "pg_fusion::server",
-                                scan_id = meta.scan_id,
-                                "received heap block for unknown scan_id; dropping"
-                            );
-                        }
-                        // Drop the payload (already consumed above)
+                    } else if tracing::enabled!(target: "pg_fusion::server", tracing::Level::TRACE)
+                    {
+                        trace!(
+                            target = "pg_fusion::server",
+                            scan_id = meta.scan_id,
+                            "received heap block for unknown scan_id; dropping"
+                        );
                     }
                     return Ok(());
                 }

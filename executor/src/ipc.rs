@@ -44,13 +44,11 @@ pub async fn signal_listener(state: Arc<SharedState<'_>>) {
                 }
             }
         }
-        if woke == 0 {
-            if tracing::enabled!(target: "executor::ipc", tracing::Level::TRACE) {
-                tracing::trace!(
-                    target = "executor::ipc",
-                    "signal_listener: signal received but no flags set"
-                );
-            }
+        if woke == 0 && tracing::enabled!(target: "executor::ipc", tracing::Level::TRACE) {
+            tracing::trace!(
+                target = "executor::ipc",
+                "signal_listener: signal received but no flags set"
+            );
         }
     }
 }
@@ -122,15 +120,15 @@ mod tests {
     use super::*;
     use crate::buffer::LockFreeBuffer;
     use crate::layout::lockfree_buffer_layout;
-    use std::cell::UnsafeCell;
+    // no extra imports
     use std::time::Duration;
     use tokio::task;
     use tokio::time::timeout;
 
     #[tokio::test]
     async fn test_signal_before_poll() -> Result<()> {
-        let flags = [AtomicBool::new(true)];
-        let state = Arc::new(SharedState::new(&flags));
+        let flags = Box::leak(Box::new([AtomicBool::new(true); 1]));
+        let state = Arc::new(SharedState::new(flags));
 
         // Allocate buffer via BufferLayout on the heap
         let layout = lockfree_buffer_layout(13).unwrap();
@@ -151,8 +149,8 @@ mod tests {
     #[tokio::test]
     async fn test_signal_after_poll() -> Result<()> {
         // Prepare shared state with one flag
-        let flags = [AtomicBool::new(false)];
-        let state = Arc::new(SharedState::new(&flags));
+        let flags = Box::leak(Box::new([AtomicBool::new(false); 1]));
+        let state = Arc::new(SharedState::new(flags));
 
         // Allocate an aligned buffer region using the layout helper
         let layout = lockfree_buffer_layout(13).unwrap();
@@ -174,7 +172,7 @@ mod tests {
             state.wakers[0].wake();
 
             // Future should succeed.
-            timeout(Duration::from_secs(1), handle).await??;
+            let _ = timeout(Duration::from_secs(1), handle).await??;
 
             // Free memory after the future is done
             std::alloc::dealloc(base, layout.layout);

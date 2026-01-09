@@ -114,7 +114,7 @@ pub unsafe extern "C-unwind" fn init_shmem() {
             layout.layout.size(),
             &mut found,
         ) as *mut u8;
-        let base_u8 = base as *mut u8;
+        let base_u8 = base;
         if !found {
             std::ptr::write_bytes(base_u8, 0, layout.layout.size());
             let (hdr_ptr, next_ptr) = treiber_stack_ptrs(base_u8, layout);
@@ -139,7 +139,7 @@ pub unsafe extern "C-unwind" fn init_shmem() {
             &mut found,
         ) as *mut u8;
         if !found {
-            std::ptr::write_bytes(base as *mut u8, 0, layout.layout.size());
+            std::ptr::write_bytes(base, 0, layout.layout.size());
         }
         info!(
             "init_shmem: server pid cell ready: bytes={} found={}",
@@ -447,6 +447,7 @@ pub(crate) fn slot_blocks_layout() -> executor::layout::SlotBlocksLayout {
         .expect("slot_blocks_layout")
 }
 
+#[allow(dead_code)]
 pub(crate) fn slot_blocks_base() -> *mut u8 {
     let num = crate::max_backends() as usize;
     let layout = slot_blocks_layout();

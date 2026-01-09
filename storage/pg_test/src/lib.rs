@@ -679,8 +679,7 @@ mod tests {
                 .as_slice((*tdesc.as_ptr()).natts as _);
             assert!(attrs.len() >= 2);
             let mut wires: Vec<PgAttrWire> = Vec::with_capacity(2);
-            for i in 0..2 {
-                let a = &attrs[i];
+            for a in attrs.iter().take(2) {
                 let oid = a.atttypid;
                 let tuple = pg_sys::SearchSysCache1(TYPEOID as i32, pg_sys::ObjectIdGetDatum(oid));
                 assert!(!tuple.is_null());

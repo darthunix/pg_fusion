@@ -728,28 +728,19 @@ fn process_pending_heap_request(shared: &mut ConnectionShared) {
                             }
                             // Check ItemId flags (LP_NORMAL) by unpacking the 32-bit representation
                             let raw: u32 = unsafe { std::ptr::read(itemid as *const u32) };
-                            #[inline(always)]
-                            fn unpack_flags(raw: u32) -> u8 {
-                                if cfg!(target_endian = "little") {
-                                    ((raw >> 15) & 0x03) as u8
-                                } else {
-                                    ((raw >> 15) & 0x03) as u8
-                                }
-                            }
-                            let flags_u8 = unpack_flags(raw);
+                            let flags_u8 = ((raw >> 15) & 0x03) as u8;
                             if (flags_u8 as u32) != pg_sys::LP_NORMAL {
                                 continue;
                             }
                             // Build HeapTuple for visibility check
-                            let hdr_ptr = unsafe {
-                                pg_sys::PageGetItem(page_ptr as pg_sys::Page, itemid)
-                                    as *mut pg_sys::HeapTupleHeaderData
-                            };
+                            let hdr_ptr =
+                                unsafe { pg_sys::PageGetItem(page_ptr as pg_sys::Page, itemid) }
+                                    as *mut pg_sys::HeapTupleHeaderData;
                             if hdr_ptr.is_null() {
                                 continue;
                             }
                             let mut htup: pg_sys::HeapTupleData = unsafe { std::mem::zeroed() };
-                            htup.t_data = hdr_ptr as *mut pg_sys::HeapTupleHeaderData;
+                            htup.t_data = hdr_ptr;
                             // Set table OID to satisfy visibility checks that assert non-InvalidOid
                             htup.t_tableOid = pg_sys::Oid::from(table_oid);
                             // Fill TID (block number and position)
@@ -766,14 +757,13 @@ fn process_pending_heap_request(shared: &mut ConnectionShared) {
                             let is_visible = if snapshot.is_null() {
                                 true
                             } else {
-                                let v = unsafe {
+                                unsafe {
                                     pg_sys::HeapTupleSatisfiesVisibility(
                                         &mut htup as *mut pg_sys::HeapTupleData,
                                         snapshot,
                                         buf,
                                     )
-                                };
-                                v
+                                }
                             };
                             if is_visible {
                                 let idx0 = off - 1;
@@ -782,7 +772,7 @@ fn process_pending_heap_request(shared: &mut ConnectionShared) {
                                     let bit = 1u8 << ((idx0 % 8) as u8);
                                     unsafe {
                                         let p = vis_ptr.add(byte);
-                                        *p = (*p) | bit;
+                                        *p |= bit;
                                     }
                                 }
                             }
@@ -819,11 +809,11 @@ fn process_pending_heap_request(shared: &mut ConnectionShared) {
 }
 
 thread_local! {
-    static RESULT_RING_EOF: Cell<bool> = Cell::new(false);
-    static EXEC_SCAN_STARTED: Cell<bool> = Cell::new(false);
-    static EXEC_READY_SEEN: Cell<bool> = Cell::new(false);
-    static HEAP_EOF_SENT: Cell<bool> = Cell::new(false);
-    static EMPTY_SPINS: Cell<u32> = Cell::new(0);
+    static RESULT_RING_EOF: Cell<bool> = const { Cell::new(false) };
+    static EXEC_SCAN_STARTED: Cell<bool> = const { Cell::new(false) };
+    static EXEC_READY_SEEN: Cell<bool> = const { Cell::new(false) };
+    static HEAP_EOF_SENT: Cell<bool> = const { Cell::new(false) };
+    static EMPTY_SPINS: Cell<u32> = const { Cell::new(0) };
 }
 
 /// Read one row from the result ring and populate `tupslot`.
@@ -1141,6 +1131,7 @@ fn type_to_oid(dtype: &DataType) -> AnyResult<pg_sys::Oid> {
 /// Write the visibility bitmap bytes for a given `slot_id` into the per-connection
 /// shared memory area reserved for that slot, returning the number of bytes written
 /// (clamped to the reserved capacity for a single block's bitmap).
+#[allow(dead_code)]
 fn shm_write_visibility(slot_id: u16, src: &[u8]) -> AnyResult<u16> {
     let conn = connection_id()? as usize;
     let base = slot_blocks_base_for(conn);
@@ -1172,6 +1163,7 @@ fn shm_write_heap_block(slot_id: u16, page: &[u8]) -> AnyResult<u32> {
 
 /// Publish heap visibility metadata for a page: copy the bitmap to shared memory and
 /// send a lightweight `DataPacket::Heap` metadata packet to the executor.
+#[allow(dead_code)]
 fn publish_heap_visibility(
     shared: &mut ConnectionShared,
     scan_id: u64,
@@ -1198,6 +1190,8 @@ fn publish_heap_visibility(
 
 /// Publish a full heap page: copy page bytes and its visibility bitmap into shared memory,
 /// then send a metadata packet to the executor indicating `vis_len` and other identifiers.
+#[allow(dead_code)]
+#[allow(clippy::too_many_arguments)]
 fn publish_heap_page(
     shared: &mut ConnectionShared,
     scan_id: u64,
