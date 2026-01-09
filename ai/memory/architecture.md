@@ -30,7 +30,7 @@ In short: a PostgreSQL (pgrx) extension intercepts planning/execution and delega
 
 - Executor requests heap blocks (scan_id, table_oid, slot_id).
 - Backend reads blocks, copies into SHM slots, sends metadata + visibility bitmap length.
-- `PgScanStream` reads pages from SHM, decodes tuples via `storage::heap`, builds Arrow RecordBatches.
+- `PgScanStream` reads pages from SHM, applies per-page visibility bitmap to skip invisible LPs, decodes tuples via `storage::heap`, builds Arrow RecordBatches.
 - Results are encoded to wire MinimalTuple and written to the result ring; backend reads frames and fills `TupleTableSlot`.
 
 ## Responsibilities
@@ -46,4 +46,4 @@ In short: a PostgreSQL (pgrx) extension intercepts planning/execution and delega
 - Wire tuples: executor encodes rows using `protocol::tuple::encode_wire_tuple` (header + optional null bitmap + aligned data area; byval in host‑endian; varlena as length-prefixed bytes, no TOAST/compression).
 - Result ring: executor writes length‑prefixed wire tuples to the per‑connection lock‑free result ring and nudges backend (SIGUSR1).
 - Backend assembly: backend reads frames, decodes wire header, reconstructs `Datum[]/isnull[]` by `attlen/attalign/attbyval`, forms `MinimalTuple` via `heap_form_minimal_tuple`, and stores into `TupleTableSlot`.
-- Visibility: heap page visibility bitmap is carried out‑of‑band in SHM; currently parsed but not applied in `PgScanStream` (planned follow‑up).
+- Visibility: heap page visibility bitmap is carried out‑of‑band in SHM and applied in `PgScanStream` to filter invisible tuples. Backend computes bitmap via `HeapTupleSatisfiesVisibility` against the active snapshot.

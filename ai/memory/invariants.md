@@ -29,3 +29,13 @@ importance: 0.95
 5) Heap decoder treats varlena carefully
 
 - Inline text is OK; projected compressed/external varlena → error; non‑projected → safely skip.
+
+6) No heap allocations on hot SHM paths
+
+- Backend fills per‑page visibility bitmap directly into SHM buffers (no intermediate Vec copies).
+- Executor borrows SHM slices (page/bitmap) without cloning; clamp lengths to layout capacities.
+
+7) Aligned ring buffers and atomics
+
+- All lock‑free ring buffers (`LockFreeBuffer`) must be constructed from regions allocated with `executor::layout::lockfree_buffer_layout` (or wrappers) to guarantee alignment for `AtomicU32` head/tail words.
+- Do not construct buffers on arbitrary `[u8]`; if unavoidable (tests), ensure proper allocation via `Layout` or guard with `debug_assert!` on alignment in debug builds.
