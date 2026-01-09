@@ -886,22 +886,36 @@ unsafe fn try_store_wire_tuple_from_result(
 #[pg_guard]
 #[no_mangle]
 unsafe extern "C-unwind" fn end_df_scan(_node: *mut CustomScanState) {
-    // Notify executor to close data/control flow associated with the scan
-    let id = match connection_id() {
-        Ok(v) => v,
-        Err(e) => error!("Failed to acquire connection id: {}", e),
-    };
-    let mut shared = match connection_shared(id) {
-        Ok(s) => s,
-        Err(e) => error!("Failed to map shared connection: {}", e),
-    };
-    if let Err(err) = request_end_scan(&mut shared.recv) {
-        let _ = request_failure(&mut shared.recv);
-        let _ = shared.signal_server();
-        error!("Failed to request end scan: {}", err);
-    }
-    if let Err(err) = shared.signal_server() {
-        error!("Failed to signal server: {}", err);
+    // Only notify executor to end a scan if execution actually started.
+    // EXPLAIN (without ANALYZE) should not drive the scan FSM; avoid sending EndScan.
+    let mut should_end = false;
+    EXEC_SCAN_STARTED.with(|started| {
+        if started.get() {
+            should_end = true;
+        }
+    });
+    EXEC_READY_SEEN.with(|ready| {
+        if ready.get() {
+            should_end = true;
+        }
+    });
+    if should_end {
+        let id = match connection_id() {
+            Ok(v) => v,
+            Err(e) => error!("Failed to acquire connection id: {}", e),
+        };
+        let mut shared = match connection_shared(id) {
+            Ok(s) => s,
+            Err(e) => error!("Failed to map shared connection: {}", e),
+        };
+        if let Err(err) = request_end_scan(&mut shared.recv) {
+            let _ = request_failure(&mut shared.recv);
+            let _ = shared.signal_server();
+            error!("Failed to request end scan: {}", err);
+        }
+        if let Err(err) = shared.signal_server() {
+            error!("Failed to signal server: {}", err);
+        }
     }
 }
 
