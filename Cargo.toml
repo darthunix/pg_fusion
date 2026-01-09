@@ -9,6 +9,15 @@ members = [
 ]
 resolver = "2"
 
+[profile.dev]
+panic = "unwind"
+
+[profile.release]
+panic = "unwind"
+opt-level = 3
+lto = "fat"
+codegen-units = 1
+
 [workspace.dependencies]
 pgrx-pg-sys = "0.16"
 pgrx = "0.16"
