@@ -2,8 +2,8 @@
 id: arch-overview-0001
 type: fact
 scope: repo
-tags: ["architecture", "datafusion", "pgrx", "shared-memory", "ipc"]
-updated_at: "2025-11-29"
+tags: ["architecture", "datafusion", "pgrx", "shared-memory", "ipc", "visibility"]
+updated_at: "2026-01-09"
 importance: 0.8
 ---
 
@@ -30,7 +30,7 @@ In short: a PostgreSQL (pgrx) extension intercepts planning/execution and delega
 
 - Executor requests heap blocks (scan_id, table_oid, slot_id).
 - Backend reads blocks, copies into SHM slots, sends metadata + visibility bitmap length.
-- `PgScanStream` reads pages from SHM, applies per-page visibility bitmap to skip invisible LPs, decodes tuples via `storage::heap`, builds Arrow RecordBatches.
+- `PgScanStream` copies the page and visibility bitmap out of SHM on receipt (to avoid slot reuse races), applies the per-page visibility bitmap to skip invisible LPs, decodes tuples via `storage::heap`, and builds Arrow RecordBatches.
 - Results are encoded to wire MinimalTuple and written to the result ring; backend reads frames and fills `TupleTableSlot`.
 
 ## Responsibilities
