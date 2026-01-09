@@ -2,8 +2,8 @@
 id: inv-project-0001
 type: invariant
 scope: project
-tags: ["safety", "pgrx", "errors", "ipc", "datafusion"]
-updated_at: "2025-11-29"
+tags: ["safety", "pgrx", "errors", "ipc", "datafusion", "visibility"]
+updated_at: "2026-01-09"
 importance: 0.95
 ---
 
@@ -33,7 +33,8 @@ importance: 0.95
 6) No heap allocations on hot SHM paths
 
 - Backend fills per‑page visibility bitmap directly into SHM buffers (no intermediate Vec copies).
-- Executor borrows SHM slices (page/bitmap) without cloning; clamp lengths to layout capacities.
+- Executor must copy page and bitmap out of SHM immediately upon receipt of metadata to avoid slot reuse races; do not borrow SHM slices during decode.
+- Clamp all SHM-derived lengths to layout capacities.
 
 7) Aligned ring buffers and atomics
 
