@@ -24,12 +24,3 @@ protocol = { path = "../../protocol", version = "25.0" }
 
 [dev-dependencies]
 pgrx-tests = { workspace = true }
-
-[profile.dev]
-panic = "unwind"
-
-[profile.release]
-panic = "unwind"
-opt-level = 3
-lto = "fat"
-codegen-units = 1
