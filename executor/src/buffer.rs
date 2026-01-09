@@ -63,6 +63,12 @@ impl Read for LockFreeBuffer<'_> {
 impl<'bytes> LockFreeBuffer<'bytes> {
     pub fn new(mem: &'bytes mut [u8]) -> Self {
         assert!(mem.len() >= 8, "Buffer too small");
+        // Ensure 4-byte alignment for atomic u32 head/tail words (debug only)
+        debug_assert!(
+            (mem.as_ptr() as usize) % core::mem::align_of::<AtomicU32>() == 0,
+            "Buffer base must be {}-byte aligned",
+            core::mem::align_of::<AtomicU32>()
+        );
 
         let head_ptr = mem.as_ptr() as *const AtomicU32;
         let tail_ptr = unsafe { mem.as_ptr().add(4) } as *const AtomicU32;
@@ -220,83 +226,91 @@ mod tests {
 
     #[test]
     fn test_lock_free_buffer() {
-        let mut bytes = vec![0u8; 8 + 13];
-        let mut buffer = LockFreeBuffer::new(&mut bytes);
+        // Allocate aligned memory region for buffer via layout helper
+        let layout = crate::layout::lockfree_buffer_layout(13).expect("layout");
+        unsafe {
+            let base = std::alloc::alloc(layout.layout);
+            assert!(!base.is_null());
+            std::ptr::write_bytes(base, 0, layout.layout.size());
+            let mut buffer = LockFreeBuffer::from_layout(base, layout);
 
-        assert_eq!(buffer.len(), 0);
-        assert_eq!(buffer.capacity(), 13);
-        assert!(buffer.is_empty());
+            assert_eq!(buffer.len(), 0);
+            assert_eq!(buffer.capacity(), 13);
+            assert!(buffer.is_empty());
 
-        // Test pushing data into the buffer.
-        buffer.push(b"Hello, ").unwrap();
-        buffer.push(b"world").unwrap();
-        assert_eq!(buffer.len(), 12);
-        // Test there is no more space in the buffer.
-        assert!(buffer.push(b"1").is_err());
+            // Test pushing data into the buffer.
+            buffer.push(b"Hello, ").unwrap();
+            buffer.push(b"world").unwrap();
+            assert_eq!(buffer.len(), 12);
+            // Test there is no more space in the buffer.
+            assert!(buffer.push(b"1").is_err());
 
-        // Test peeking data from the buffer.
-        let mut out = vec![0u8; 5];
-        let bytes_read = buffer.peek(&mut out);
-        assert_eq!(bytes_read, 5);
-        assert_eq!(&out[..bytes_read], b"Hello");
-        assert_eq!(buffer.len(), 12);
+            // Test peeking data from the buffer.
+            let mut out = vec![0u8; 5];
+            let bytes_read = buffer.peek(&mut out);
+            assert_eq!(bytes_read, 5);
+            assert_eq!(&out[..bytes_read], b"Hello");
+            assert_eq!(buffer.len(), 12);
 
-        // Test popping data from the buffer.
-        let mut out = vec![0u8; 5];
-        let bytes_read = buffer.pop(&mut out);
-        assert_eq!(bytes_read, 5);
-        assert_eq!(&out[..bytes_read], b"Hello");
-        assert_eq!(buffer.len(), 7);
-        assert!(!buffer.is_empty());
-        let bytes_read = buffer.pop(&mut out);
-        assert_eq!(bytes_read, 5);
-        assert_eq!(&out[..bytes_read], b", wor");
-        assert_eq!(buffer.len(), 2);
-        let bytes_read = buffer.pop(&mut out);
-        assert_eq!(bytes_read, 2);
-        assert_eq!(&out[..bytes_read], b"ld");
-        assert!(buffer.is_empty());
-        let bytes_read = buffer.pop(&mut out);
-        assert_eq!(bytes_read, 0);
+            // Test popping data from the buffer.
+            let mut out = vec![0u8; 5];
+            let bytes_read = buffer.pop(&mut out);
+            assert_eq!(bytes_read, 5);
+            assert_eq!(&out[..bytes_read], b"Hello");
+            assert_eq!(buffer.len(), 7);
+            assert!(!buffer.is_empty());
+            let bytes_read = buffer.pop(&mut out);
+            assert_eq!(bytes_read, 5);
+            assert_eq!(&out[..bytes_read], b", wor");
+            assert_eq!(buffer.len(), 2);
+            let bytes_read = buffer.pop(&mut out);
+            assert_eq!(bytes_read, 2);
+            assert_eq!(&out[..bytes_read], b"ld");
+            assert!(buffer.is_empty());
+            let bytes_read = buffer.pop(&mut out);
+            assert_eq!(bytes_read, 0);
 
-        let bytes_read = buffer.peek(&mut out);
-        assert_eq!(bytes_read, 0);
+            let bytes_read = buffer.peek(&mut out);
+            assert_eq!(bytes_read, 0);
 
-        // Test wrapping around the buffer.
-        buffer.push(b"123456789012").unwrap();
-        assert_eq!(buffer.len(), 12);
-        let mut out = vec![0u8; 10];
-        let bytes_read = buffer.pop(&mut out);
-        assert_eq!(bytes_read, 10);
-        assert_eq!(&out[..bytes_read], b"1234567890");
-        assert_eq!(buffer.len(), 2);
-        buffer.push(b"3456").unwrap();
-        assert_eq!(buffer.len(), 6);
-        let bytes_read = buffer.pop(&mut out);
-        assert_eq!(bytes_read, 6);
-        assert_eq!(&out[..bytes_read], b"123456");
-        assert_eq!(buffer.len(), 0);
+            // Test wrapping around the buffer.
+            buffer.push(b"123456789012").unwrap();
+            assert_eq!(buffer.len(), 12);
+            let mut out = vec![0u8; 10];
+            let bytes_read = buffer.pop(&mut out);
+            assert_eq!(bytes_read, 10);
+            assert_eq!(&out[..bytes_read], b"1234567890");
+            assert_eq!(buffer.len(), 2);
+            buffer.push(b"3456").unwrap();
+            assert_eq!(buffer.len(), 6);
+            let bytes_read = buffer.pop(&mut out);
+            assert_eq!(bytes_read, 6);
+            assert_eq!(&out[..bytes_read], b"123456");
+            assert_eq!(buffer.len(), 0);
 
-        // Test writing data to the buffer.
-        let len = buffer.write(b"Hello, world").unwrap();
-        assert_eq!(len, b"Hello, world".len());
-        assert_eq!(buffer.len(), 0);
-        // Replace "World" with "Peace".
-        buffer.rollback();
-        buffer.write_all(b"Peace").unwrap();
-        // Replace "w" with "W".
-        buffer.fast_forward(2).unwrap();
-        buffer.write_all(b"W").unwrap();
-        // Replace "," with "!".
-        buffer.rewind(3).unwrap();
-        buffer.write_all(b"!").unwrap();
-        // Go to the end of the message.
-        buffer.fast_forward(6).unwrap();
-        buffer.flush().unwrap();
-        assert_eq!(buffer.len(), 12);
-        let mut out = vec![0u8; 12];
-        let bytes_read = buffer.pop(&mut out);
-        assert_eq!(bytes_read, 12);
-        assert_eq!(&out[..bytes_read], b"Peace! World");
+            // Test writing data to the buffer.
+            let len = buffer.write(b"Hello, world").unwrap();
+            assert_eq!(len, b"Hello, world".len());
+            assert_eq!(buffer.len(), 0);
+            // Replace "World" with "Peace".
+            buffer.rollback();
+            buffer.write_all(b"Peace").unwrap();
+            // Replace "w" with "W".
+            buffer.fast_forward(2).unwrap();
+            buffer.write_all(b"W").unwrap();
+            // Replace "," with "!".
+            buffer.rewind(3).unwrap();
+            buffer.write_all(b"!").unwrap();
+            // Go to the end of the message.
+            buffer.fast_forward(6).unwrap();
+            buffer.flush().unwrap();
+            assert_eq!(buffer.len(), 12);
+            let mut out = vec![0u8; 12];
+            let bytes_read = buffer.pop(&mut out);
+            assert_eq!(bytes_read, 12);
+            assert_eq!(&out[..bytes_read], b"Peace! World");
+            // Free memory
+            std::alloc::dealloc(base, layout.layout);
+        }
     }
 }
