@@ -125,3 +125,5 @@ pub(crate) fn max_backends() -> u32 {
     #[cfg(any(test, feature = "pg_test"))]
     10
 }
+
+// tests live in storage/pg_test per project policy

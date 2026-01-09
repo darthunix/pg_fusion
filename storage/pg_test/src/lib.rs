@@ -344,6 +344,44 @@ mod tests {
     }
 
     #[pg_test]
+    fn pg_heap_visibility_via_select() {
+        // Skip test if pg_fusion is not preloaded (worker/SHM not available)
+        let spl: Option<&str> = Spi::get_one("SHOW shared_preload_libraries").unwrap();
+        if let Some(v) = spl {
+            if !v.contains("pg_fusion") {
+                pgrx::warning!("skipping pg_heap_visibility_via_select: pg_fusion not in shared_preload_libraries");
+                return;
+            }
+        }
+
+        // Prepare data set
+        Spi::run("DROP TABLE IF EXISTS public.heap_vis_t").unwrap();
+        Spi::run("CREATE TABLE public.heap_vis_t (id int, payload text)").unwrap();
+        let nrows = 60i32;
+        Spi::run(&format!(
+            "INSERT INTO public.heap_vis_t SELECT g, repeat('x', 5) FROM generate_series(1, {}) g",
+            nrows
+        ))
+        .unwrap();
+        Spi::run("DELETE FROM public.heap_vis_t WHERE id % 2 = 0").unwrap();
+
+        // Baseline via core executor
+        Spi::run("SET pg_fusion.enable = off").unwrap();
+        let expected: i64 = Spi::get_one("SELECT count(*) FROM public.heap_vis_t")
+            .unwrap()
+            .unwrap();
+
+        // Now via pg_fusion (hooked SELECT path)
+        Spi::run("SET pg_fusion.enable = on").unwrap();
+        // Add a trivial predicate to make sure we go through our CustomScan
+        let got: i64 = Spi::get_one("SELECT count(*) FROM public.heap_vis_t WHERE id >= 0")
+            .unwrap()
+            .unwrap();
+
+        assert_eq!(got, expected);
+    }
+
+    #[pg_test]
     fn heap_decode_date_extremes() {
         Spi::run("DROP TABLE IF EXISTS public.heap_decode_date_t").unwrap();
         Spi::run(

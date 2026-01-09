@@ -701,33 +701,105 @@ fn process_pending_heap_request(shared: &mut ConnectionShared) {
                                 / std::mem::size_of::<pg_sys::ItemIdData>();
                             u16::try_from(cnt).unwrap_or(u16::MAX)
                         };
-                        // Prepare visibility bitmap with all tuples visible
+                        // Prepare visibility bitmap using MVCC visibility against the active snapshot
                         let bytes = (num_offsets as usize).div_ceil(8);
-                        let mut vis = vec![0xFFu8; bytes];
-                        if num_offsets > 0 {
-                            let rem = (num_offsets as usize) % 8;
-                            if rem != 0 {
-                                let mask = (1u8 << rem) - 1;
-                                if let Some(last) = vis.last_mut() {
-                                    *last = mask;
+                        // Obtain SHM visibility buffer and zero it (avoid heap allocation)
+                        let conn = connection_id().unwrap_or_default() as usize;
+                        let base = slot_blocks_base_for(conn);
+                        let layout = slot_blocks_layout();
+                        let vis_ptr =
+                            unsafe { slot_block_vis_ptr(base, layout, slot_id as usize, 0) };
+                        let cap = layout.vis_bytes_per_block;
+                        let vis_len = std::cmp::min(bytes, cap);
+                        unsafe { std::ptr::write_bytes(vis_ptr, 0u8, vis_len) };
+                        // Snapshot to use for visibility checks; if none, treat all as visible
+                        let snapshot = unsafe { pg_sys::GetActiveSnapshot() };
+                        // Iterate 1-based offsets up to num_offsets
+                        for off in 1..=num_offsets as usize {
+                            // Fetch line pointer; skip non-normal entries
+                            let itemid = unsafe {
+                                pg_sys::PageGetItemId(
+                                    page_ptr as pg_sys::Page,
+                                    off as pg_sys::OffsetNumber,
+                                )
+                            };
+                            if itemid.is_null() {
+                                continue;
+                            }
+                            // Check ItemId flags (LP_NORMAL) by unpacking the 32-bit representation
+                            let raw: u32 = unsafe { std::ptr::read(itemid as *const u32) };
+                            #[inline(always)]
+                            fn unpack_flags(raw: u32) -> u8 {
+                                if cfg!(target_endian = "little") {
+                                    ((raw >> 15) & 0x03) as u8
+                                } else {
+                                    ((raw >> 15) & 0x03) as u8
+                                }
+                            }
+                            let flags_u8 = unpack_flags(raw);
+                            if (flags_u8 as u32) != pg_sys::LP_NORMAL {
+                                continue;
+                            }
+                            // Build HeapTuple for visibility check
+                            let hdr_ptr = unsafe {
+                                pg_sys::PageGetItem(page_ptr as pg_sys::Page, itemid)
+                                    as *mut pg_sys::HeapTupleHeaderData
+                            };
+                            if hdr_ptr.is_null() {
+                                continue;
+                            }
+                            let mut htup: pg_sys::HeapTupleData = unsafe { std::mem::zeroed() };
+                            htup.t_data = hdr_ptr as *mut pg_sys::HeapTupleHeaderData;
+                            // Set table OID to satisfy visibility checks that assert non-InvalidOid
+                            htup.t_tableOid = pg_sys::Oid::from(table_oid);
+                            // Fill TID (block number and position)
+                            unsafe {
+                                pg_sys::ItemPointerSetBlockNumber(
+                                    &mut htup.t_self,
+                                    blkno as pg_sys::BlockNumber,
+                                );
+                                pg_sys::ItemPointerSetOffsetNumber(
+                                    &mut htup.t_self,
+                                    off as pg_sys::OffsetNumber,
+                                );
+                            }
+                            let is_visible = if snapshot.is_null() {
+                                true
+                            } else {
+                                let v = unsafe {
+                                    pg_sys::HeapTupleSatisfiesVisibility(
+                                        &mut htup as *mut pg_sys::HeapTupleData,
+                                        snapshot,
+                                        buf,
+                                    )
+                                };
+                                v
+                            };
+                            if is_visible {
+                                let idx0 = off - 1;
+                                let byte = idx0 / 8;
+                                if byte < vis_len {
+                                    let bit = 1u8 << ((idx0 % 8) as u8);
+                                    unsafe {
+                                        let p = vis_ptr.add(byte);
+                                        *p = (*p) | bit;
+                                    }
                                 }
                             }
                         }
-                        // Publish to shared memory + notify executor
-                        pgrx::debug1!(
-                            "process_pending_heap_request: publishing page scan_id={} slot_id={} table_oid={} blkno={} num_offsets={} vis_bytes={}",
-                            scan_id, slot_id, table_oid, blkno, num_offsets, vis.len()
-                        );
-                        let _ = publish_heap_page(
-                            shared,
+                        // Publish page bytes and the computed visibility bitmap already stored in SHM, then notify executor
+                        let _ = shm_write_heap_block(slot_id, page);
+                        // Send lightweight metadata indicating the SHM bitmap length
+                        let _ = prepare_heap_block_meta_shm(
+                            &mut shared.recv,
                             scan_id,
                             slot_id,
                             table_oid,
                             blkno,
                             num_offsets,
-                            page,
-                            &vis,
+                            vis_len as u16,
                         );
+                        let _ = shared.signal_server();
                         // Unlock and release buffer; close relation
                         unsafe {
                             pg_sys::UnlockReleaseBuffer(buf);
@@ -1172,4 +1244,3 @@ fn oid_to_encoded_type(oid: pg_sys::Oid) -> Option<EncodedType> {
         _ => None,
     }
 }
-
