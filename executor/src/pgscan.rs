@@ -32,7 +32,7 @@ use datafusion_execution::TaskContext;
 use datafusion_physical_expr::EquivalenceProperties;
 use futures::Stream;
 use pgrx_pg_sys as pg_sys;
-use storage::heap::{decode_tuple_project, HeapPage, PgAttrMeta};
+use storage::heap::{decode_tuple_project, HeapPage, LpFilter, PgAttrMeta};
 use tokio::sync::mpsc;
 
 pub type ScanId = u64;
@@ -381,7 +381,7 @@ impl Stream for PgScanStream {
             Poll::Ready(Some(block)) => {
                 // Borrow page and (optional) visibility bitmap from shared memory (no copy)
                 let page = unsafe { shm::block_slice(this.conn_id, block.slot_id as usize) };
-                let _vis = if block.vis_len > 0 {
+                let vis_opt = if block.vis_len > 0 {
                     Some(unsafe {
                         shm::vis_slice(this.conn_id, block.slot_id as usize, block.vis_len as usize)
                     })
@@ -392,7 +392,7 @@ impl Stream for PgScanStream {
                 // Prepare decoding metadata: attrs (precomputed once) and projection (all columns)
                 let total_cols = this.proj_schema.fields().len();
 
-                // Create a HeapPage view and iterate tuples
+                // Create a HeapPage view and iterate tuples (optionally applying visibility bitmap)
                 let hp = unsafe { HeapPage::from_slice(page) };
                 let batch = RecordBatch::new_empty(Arc::clone(&this.proj_schema));
                 let Ok(hp) = hp else {
@@ -412,30 +412,103 @@ impl Stream for PgScanStream {
                 let mut decoded_rows = 0usize;
                 // Limit the borrow of `this.pairs` to this inner scope to satisfy borrow checker
                 {
-                    // Populate pairs once and create iterator borrowing the filled pairs slice
-                    let it = hp.tuples_by_offset(None, std::ptr::null_mut(), &mut this.pairs);
-                    for tup in it {
-                        // Decode projected columns for tuple using iterator over requested projection
-                        let iter = unsafe {
-                            decode_tuple_project(
-                                page_hdr,
-                                tup,
-                                &attrs_full,
-                                proj_indices.iter().copied(),
-                            )
-                        };
-                        let Ok(mut iter) = iter else {
-                            continue;
-                        };
-                        // Iterate over projected columns in order
-                        for b in builders.iter_mut().take(total_cols) {
-                            match iter.next() {
-                                Some(Ok(v)) => append_scalar(b, v),
-                                Some(Err(_e)) => append_null(b),
-                                None => append_null(b),
-                            }
+                    // Build optional visibility filter context
+                    #[repr(C)]
+                    struct VisCtx {
+                        start: *const pg_sys::ItemIdData,
+                        vis_ptr: *const u8,
+                        vis_len: usize,
+                        num_offsets: usize,
+                    }
+                    fn vis_filter(item: &pg_sys::ItemIdData, ctx: *mut std::ffi::c_void) -> bool {
+                        // Safety: ctx points to a valid VisCtx for the duration of iteration
+                        let c = unsafe { &*(ctx as *const VisCtx) };
+                        // Compute 1-based index of this line pointer within the array
+                        let idx0 =
+                            unsafe { (item as *const pg_sys::ItemIdData).offset_from(c.start) };
+                        if idx0 < 0 {
+                            return false;
                         }
-                        decoded_rows += 1;
+                        let idx = (idx0 as usize) + 1; // 1-based
+                        if idx == 0 || idx > c.num_offsets {
+                            return false;
+                        }
+                        // Bounds-check bitmap access
+                        let byte_idx = (idx - 1) / 8;
+                        if byte_idx >= c.vis_len {
+                            return false;
+                        }
+                        let bit = 1u8 << (((idx - 1) % 8) as u8);
+                        let byte = unsafe { *c.vis_ptr.add(byte_idx) };
+                        (byte & bit) != 0
+                    }
+
+                    // Compute pointer to the first ItemIdData (line pointer array base)
+                    let start_ptr = unsafe {
+                        (page
+                            .as_ptr()
+                            .add(core::mem::size_of::<pg_sys::PageHeaderData>()))
+                            as *const pg_sys::ItemIdData
+                    };
+
+                    if let Some(vis) = vis_opt {
+                        // Visibility-aware iteration
+                        let mut ctx = VisCtx {
+                            start: start_ptr,
+                            vis_ptr: vis.as_ptr(),
+                            vis_len: vis.len(),
+                            num_offsets: block.num_offsets as usize,
+                        };
+                        let it = hp.tuples_by_offset(
+                            Some(vis_filter as LpFilter),
+                            (&mut ctx) as *mut _ as *mut std::ffi::c_void,
+                            &mut this.pairs,
+                        );
+                        for tup in it {
+                            let iter = unsafe {
+                                decode_tuple_project(
+                                    page_hdr,
+                                    tup,
+                                    &attrs_full,
+                                    proj_indices.iter().copied(),
+                                )
+                            };
+                            let Ok(mut iter) = iter else {
+                                continue;
+                            };
+                            for b in builders.iter_mut().take(total_cols) {
+                                match iter.next() {
+                                    Some(Ok(v)) => append_scalar(b, v),
+                                    Some(Err(_e)) => append_null(b),
+                                    None => append_null(b),
+                                }
+                            }
+                            decoded_rows += 1;
+                        }
+                    } else {
+                        // No visibility bitmap: iterate all tuples
+                        let it = hp.tuples_by_offset(None, std::ptr::null_mut(), &mut this.pairs);
+                        for tup in it {
+                            let iter = unsafe {
+                                decode_tuple_project(
+                                    page_hdr,
+                                    tup,
+                                    &attrs_full,
+                                    proj_indices.iter().copied(),
+                                )
+                            };
+                            let Ok(mut iter) = iter else {
+                                continue;
+                            };
+                            for b in builders.iter_mut().take(total_cols) {
+                                match iter.next() {
+                                    Some(Ok(v)) => append_scalar(b, v),
+                                    Some(Err(_e)) => append_null(b),
+                                    None => append_null(b),
+                                }
+                            }
+                            decoded_rows += 1;
+                        }
                     }
                 }
 
