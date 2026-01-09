@@ -11,5 +11,5 @@ importance: 0.7
 
 - Planning/exec: DataFusion with single partition; `PgTableProvider -> PgScanExec -> PgScanStream`.
 - Scans: per‑connection `ScanRegistry` with bounded channels; issues `request_heap_block` and pipelines next on receipt.
-- Heap: borrows page/bitmap from SHM; decodes tuples via `storage::heap::decode_tuple_project` using iterator projection; builds Arrow batches.
+- Heap: borrows page/bitmap from SHM; applies visibility bitmap (LSB‑first, 1‑based LP indices) to filter tuples; decodes via `storage::heap::decode_tuple_project` using iterator projection; builds Arrow batches.
 - Results: encodes each row via `encode_wire_tuple` and writes to per‑connection result ring; signals backend.
