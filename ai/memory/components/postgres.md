@@ -18,3 +18,6 @@ Notes
 - For LP state, avoid non‑portable macros; unpack `ItemIdData` flags from the raw 32‑bit value and compare to `LP_NORMAL`.
 - Fill `HeapTupleData.t_self` and set `t_tableOid` before visibility check to satisfy assertions in PG17.
 - Avoid sending `EndScan` during `EXPLAIN` (no ANALYZE); gate by whether execution started.
+
+Opportunities
+- If `PD_ALL_VISIBLE` flag is set in `PageHeader`, we can skip per‑tuple MVCC checks and mark all offsets visible when building the bitmap.
