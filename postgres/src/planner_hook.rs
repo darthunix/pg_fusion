@@ -37,10 +37,8 @@ extern "C-unwind" fn datafusion_planner_hook(
     if ENABLE_DATAFUSION.get() {
         // Only intercept plain SELECT statements; let DML/DDL/ACL/utility go through standard planner
         unsafe {
-            if !parse.is_null() {
-                if (*parse).commandType == CMD_SELECT {
-                    return df_planner(query_string, boundparams);
-                }
+            if !parse.is_null() && (*parse).commandType == CMD_SELECT {
+                return df_planner(query_string, boundparams);
             }
         }
         // Not a SELECT: fall through to previous/standard planner
@@ -62,33 +60,32 @@ extern "C-unwind" fn df_planner(pattern: *const c_char, params: ParamListInfo) -
     let cscan = pack_args(pattern, params);
 
     let stmt_ptr = unsafe { palloc0(size_of::<PlannedStmt>()) as *mut PlannedStmt };
-    let mut stmt = PlannedStmt::default();
-    stmt.type_ = NodeTag::T_PlannedStmt;
-    stmt.commandType = CMD_SELECT;
-    stmt.queryId = fasthash::murmur2::hash64_with_seed(bytes, seed);
-    stmt.hasReturning = false;
-    stmt.hasModifyingCTE = false;
-    stmt.canSetTag = false;
-    stmt.transientPlan = false;
-    stmt.dependsOnRole = false;
-    stmt.parallelModeNeeded = false;
-    stmt.planTree = cscan as *mut Plan;
-    stmt.rtable = null_mut();
-    stmt.permInfos = null_mut();
-    stmt.resultRelations = null_mut();
-    stmt.subplans = null_mut();
-    stmt.rewindPlanIDs = null_mut();
-    stmt.rowMarks = null_mut();
-    stmt.relationOids = null_mut();
-    stmt.invalItems = null_mut();
-    stmt.paramExecTypes = null_mut();
-    stmt.utilityStmt = null_mut();
-    stmt.stmt_location = -1;
-    stmt.stmt_len = 0;
-    unsafe {
-        std::ptr::write(stmt_ptr, stmt);
-    }
-
+    let stmt = PlannedStmt {
+        type_: NodeTag::T_PlannedStmt,
+        commandType: CMD_SELECT,
+        queryId: fasthash::murmur2::hash64_with_seed(bytes, seed),
+        hasReturning: false,
+        hasModifyingCTE: false,
+        canSetTag: false,
+        transientPlan: false,
+        dependsOnRole: false,
+        parallelModeNeeded: false,
+        planTree: cscan as *mut Plan,
+        rtable: null_mut(),
+        permInfos: null_mut(),
+        resultRelations: null_mut(),
+        subplans: null_mut(),
+        rewindPlanIDs: null_mut(),
+        rowMarks: null_mut(),
+        relationOids: null_mut(),
+        invalItems: null_mut(),
+        paramExecTypes: null_mut(),
+        utilityStmt: null_mut(),
+        stmt_location: -1,
+        stmt_len: 0,
+        ..Default::default()
+    };
+    unsafe { std::ptr::write(stmt_ptr, stmt) };
     stmt_ptr
 }
 
