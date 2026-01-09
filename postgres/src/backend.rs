@@ -732,18 +732,9 @@ fn process_pending_heap_request(shared: &mut ConnectionShared) {
                             if (flags_u8 as u32) != pg_sys::LP_NORMAL {
                                 continue;
                             }
-                            // Build HeapTuple for visibility check
-                            let hdr_ptr =
-                                unsafe { pg_sys::PageGetItem(page_ptr as pg_sys::Page, itemid) }
-                                    as *mut pg_sys::HeapTupleHeaderData;
-                            if hdr_ptr.is_null() {
-                                continue;
-                            }
+                            // Build TID and perform HOT-chain visibility search within the buffer
                             let mut htup: pg_sys::HeapTupleData = unsafe { std::mem::zeroed() };
-                            htup.t_data = hdr_ptr;
-                            // Set table OID to satisfy visibility checks that assert non-InvalidOid
                             htup.t_tableOid = pg_sys::Oid::from(table_oid);
-                            // Fill TID (block number and position)
                             unsafe {
                                 pg_sys::ItemPointerSetBlockNumber(
                                     &mut htup.t_self,
@@ -757,16 +748,25 @@ fn process_pending_heap_request(shared: &mut ConnectionShared) {
                             let is_visible = if snapshot.is_null() {
                                 true
                             } else {
+                                let mut all_dead: bool = false;
                                 unsafe {
-                                    pg_sys::HeapTupleSatisfiesVisibility(
-                                        &mut htup as *mut pg_sys::HeapTupleData,
-                                        snapshot,
-                                        buf,
+                                    pg_sys::heap_hot_search_buffer(
+                                        &mut htup.t_self,                        // in/out TID
+                                        rel,                                     // relation
+                                        buf,                                     // buffer
+                                        snapshot,                                // snapshot
+                                        &mut htup as *mut pg_sys::HeapTupleData, // out tuple
+                                        &mut all_dead as *mut bool,              // all-dead flag
+                                        true,                                    // first_call
                                     )
                                 }
                             };
                             if is_visible {
-                                let idx0 = off - 1;
+                                // Mark the actual visible member of a HOT chain
+                                let vis_off: usize =
+                                    unsafe { pg_sys::ItemPointerGetOffsetNumber(&htup.t_self) }
+                                        as usize;
+                                let idx0 = vis_off.saturating_sub(1);
                                 let byte = idx0 / 8;
                                 if byte < vis_len {
                                     let bit = 1u8 << ((idx0 % 8) as u8);
