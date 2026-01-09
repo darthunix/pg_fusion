@@ -127,20 +127,6 @@ mod tests {
     use tokio::task;
     use tokio::time::timeout;
 
-    struct Memory {
-        bytes: UnsafeCell<[u8; 8 + 13]>,
-        flags: UnsafeCell<[AtomicBool; 1]>,
-    }
-    impl Memory {
-        const fn new() -> Self {
-            Self {
-                flags: UnsafeCell::new([AtomicBool::new(false); 1]),
-                bytes: UnsafeCell::new([0; 8 + 13]),
-            }
-        }
-    }
-    unsafe impl Sync for Memory {}
-
     #[tokio::test]
     async fn test_signal_before_poll() -> Result<()> {
         let flags = [AtomicBool::new(true)];
@@ -164,26 +150,35 @@ mod tests {
 
     #[tokio::test]
     async fn test_signal_after_poll() -> Result<()> {
-        static BUFFER: Memory = Memory::new();
+        // Prepare shared state with one flag
+        let flags = [AtomicBool::new(false)];
+        let state = Arc::new(SharedState::new(&flags));
 
-        let state = Arc::new(SharedState::new(unsafe { &*BUFFER.flags.get() }));
-        let buffer = LockFreeBuffer::new(unsafe { &mut *BUFFER.bytes.get() });
-        let socket = Socket::new(0, Arc::clone(&state), buffer);
-
-        let handle = task::spawn(socket);
-
-        // Wait for socket to register its waker.
-        tokio::time::sleep(Duration::from_millis(100)).await;
-
-        // Set the flag.
+        // Allocate an aligned buffer region using the layout helper
+        let layout = lockfree_buffer_layout(13).unwrap();
         unsafe {
-            (&mut *BUFFER.flags.get())[0].store(true, Ordering::Release);
-        }
-        // Manually wake the waker.
-        state.wakers[0].wake();
+            let base = std::alloc::alloc(layout.layout);
+            assert!(!base.is_null());
+            std::ptr::write_bytes(base, 0, layout.layout.size());
 
-        // Future should succeed.
-        timeout(Duration::from_secs(1), handle).await???;
+            let buffer = LockFreeBuffer::from_layout(base, layout);
+            let socket = Socket::new(0, Arc::clone(&state), buffer);
+
+            let handle = task::spawn(socket);
+
+            // Wait for socket to register its waker.
+            tokio::time::sleep(Duration::from_millis(100)).await;
+
+            // Set the flag and wake
+            flags[0].store(true, Ordering::Release);
+            state.wakers[0].wake();
+
+            // Future should succeed.
+            timeout(Duration::from_secs(1), handle).await??;
+
+            // Free memory after the future is done
+            std::alloc::dealloc(base, layout.layout);
+        }
         Ok(())
     }
 }
