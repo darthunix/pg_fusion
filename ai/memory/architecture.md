@@ -2,8 +2,8 @@
 id: arch-overview-0001
 type: fact
 scope: repo
-tags: ["architecture", "datafusion", "pgrx", "shared-memory", "ipc", "visibility"]
-updated_at: "2026-01-09"
+tags: ["architecture", "datafusion", "pgrx", "shared-memory", "ipc", "visibility", "utility_hook"]
+updated_at: "2026-01-10"
 importance: 0.8
 ---
 
@@ -21,6 +21,7 @@ In short: a PostgreSQL (pgrx) extension intercepts planning/execution and delega
 
 ## Control Path
 
+0. Utility gating: `ProcessUtility` hook guards CTAS/SELECT INTO (`CreateTableAsStmt`) by setting a thread‑local flag; planner hook respects the flag and skips the inner SELECT.
 1. Parse → Metadata → Compile (logical plan)
 2. Bind (Columns) → Optimize → Translate (physical plan)
 3. BeginScan (register channels/slots) → ExecScan (start) → ExecReady

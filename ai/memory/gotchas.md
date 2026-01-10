@@ -2,8 +2,8 @@
 id: gotchas-0001
 type: gotcha
 scope: repo
-tags: ["joins", "partitions", "varlena", "signals", "shm"]
-updated_at: "2026-01-09"
+tags: ["joins", "partitions", "varlena", "signals", "shm", "utility_hook"]
+updated_at: "2026-01-10"
 importance: 0.7
 ---
 
@@ -17,6 +17,10 @@ importance: 0.7
 ## Executor borrow patterns
 
 - Historical: we previously cached tuple `(off,len)` pairs in `PgScanStream` and scoped the iterator to avoid borrow conflicts. After the slot-race fix we iterate LPs by index over the owned page buffer; if reintroducing cached pairs, keep borrows tightly scoped and avoid holding `&mut self` while borrowing internal buffers.
+
+## Planner vs CTAS/SELECT INTO
+
+- Не полагайтесь на поля `Query` для распознавания CTAS/SELECT INTO в pgrx (PG17): используйте `ProcessUtility` hook для `CreateTableAsStmt` и thread‑local guard, чтобы planner hook не перехватывал внутренний SELECT.
 
 ## Testing & snapshots
 
