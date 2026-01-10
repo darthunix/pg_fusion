@@ -989,14 +989,17 @@ mod tests {
     const PID_SIZE: usize = size_of::<AtomicI32>();
     const CONN_BYTES: usize = (BUF_META + PAYLOAD_SIZE) * 2 + PID_SIZE;
 
+    #[repr(align(8))]
+    struct AlignedConn([u8; CONN_BYTES]);
+
     struct ConnMemory {
-        conn: UnsafeCell<[u8; CONN_BYTES]>,
+        conn: UnsafeCell<AlignedConn>,
         flags: UnsafeCell<[AtomicBool; 1]>,
     }
     impl ConnMemory {
         const fn new() -> Self {
             Self {
-                conn: UnsafeCell::new([0; CONN_BYTES]),
+                conn: UnsafeCell::new(AlignedConn([0; CONN_BYTES])),
                 flags: UnsafeCell::new([AtomicBool::new(false); 1]),
             }
         }
@@ -1063,7 +1066,7 @@ mod tests {
 
         // Derive recv/send buffers from the connection layout.
         let layout = connection_layout(PAYLOAD_SIZE, PAYLOAD_SIZE).expect("layout");
-        let base = unsafe { (*BYTES.conn.get()).as_mut_ptr() };
+        let base = unsafe { (*BYTES.conn.get()).0.as_mut_ptr() };
         let (recv_base, send_base, _pid_ptr) = unsafe { connection_ptrs(base, layout) };
 
         let socket = unsafe {
@@ -1128,7 +1131,7 @@ mod tests {
         let state = Arc::new(SharedState::new(unsafe { &*BYTES.flags.get() }));
 
         let layout = connection_layout(PAYLOAD_SIZE, PAYLOAD_SIZE).expect("layout");
-        let base = unsafe { (*BYTES.conn.get()).as_mut_ptr() };
+        let base = unsafe { (*BYTES.conn.get()).0.as_mut_ptr() };
         let (recv_base, send_base, _pid_ptr) = unsafe { connection_ptrs(base, layout) };
 
         let socket = unsafe {
@@ -1258,7 +1261,7 @@ mod tests {
         let state = Arc::new(SharedState::new(unsafe { &*BYTES.flags.get() }));
 
         let layout = connection_layout(PAYLOAD_SIZE, PAYLOAD_SIZE).expect("layout");
-        let base = unsafe { (*BYTES.conn.get()).as_mut_ptr() };
+        let base = unsafe { (*BYTES.conn.get()).0.as_mut_ptr() };
         let (recv_base, send_base, _pid_ptr) = unsafe { connection_ptrs(base, layout) };
 
         let socket = unsafe {
