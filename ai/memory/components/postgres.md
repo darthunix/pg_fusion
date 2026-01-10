@@ -2,8 +2,8 @@
 id: comp-postgres-0001
 type: fact
 scope: backend
-tags: ["pgrx", "customscan", "heap", "shm", "result", "visibility"]
-updated_at: "2026-01-09"
+tags: ["pgrx", "customscan", "heap", "shm", "result", "visibility", "utility_hook"]
+updated_at: "2026-01-10"
 importance: 0.7
 ---
 
@@ -18,6 +18,7 @@ Notes
 - For LP state, avoid non‑portable macros; unpack `ItemIdData` flags from the raw 32‑bit value and compare to `LP_NORMAL`.
 - Fill `HeapTupleData.t_self` and set `t_tableOid` before visibility check to satisfy assertions in PG17.
 - Avoid sending `EndScan` during `EXPLAIN` (no ANALYZE); gate by whether execution started.
+- CTAS/SELECT INTO: handled by a `ProcessUtility` hook that detects `CreateTableAsStmt` and sets a thread‑local guard; the planner hook checks this guard and skips intercepting the inner SELECT. Do not rely on `Query` fields like `intoClause` or `canSetTag`.
 
 Opportunities
 - If `PD_ALL_VISIBLE` flag is set in `PageHeader`, we can skip per‑tuple MVCC checks and mark all offsets visible when building the bitmap.

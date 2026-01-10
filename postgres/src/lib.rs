@@ -7,6 +7,7 @@ use worker::init_datafusion_worker;
 mod backend;
 mod ipc;
 mod planner_hook;
+mod utility_hook;
 mod worker;
 
 pgrx::pg_module_magic!();
@@ -24,6 +25,7 @@ pub unsafe extern "C-unwind" fn _PG_init() {
     init_datafusion_worker();
     backend::init_datafusion_methods();
     planner_hook::init_datafusion_planner_hook();
+    utility_hook::init_datafusion_utility_hook();
 }
 
 fn init_seed() {

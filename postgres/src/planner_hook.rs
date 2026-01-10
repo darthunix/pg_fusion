@@ -10,6 +10,7 @@ use std::mem::size_of;
 use std::ptr::null_mut;
 
 use crate::backend::scan_methods;
+use crate::utility_hook::skip_df_planner;
 use crate::{ENABLE_DATAFUSION, SEED};
 
 static mut PREV_PLANNER_HOOK: planner_hook_type = None;
@@ -34,14 +35,14 @@ extern "C-unwind" fn datafusion_planner_hook(
     cursoroptions: c_int,
     boundparams: ParamListInfo,
 ) -> *mut PlannedStmt {
-    if ENABLE_DATAFUSION.get() {
-        // Only intercept plain SELECT statements; let DML/DDL/ACL/utility go through standard planner
+    if ENABLE_DATAFUSION.get() && !skip_df_planner() {
+        // Only intercept plain SELECT statements; skip CTAS/SELECT INTO and modifying CTEs.
         unsafe {
-            if !parse.is_null() && (*parse).commandType == CMD_SELECT {
+            if !parse.is_null() && (*parse).commandType == CMD_SELECT && !(*parse).hasModifyingCTE {
                 return df_planner(query_string, boundparams);
             }
         }
-        // Not a SELECT: fall through to previous/standard planner
+        // Otherwise fall through to previous/standard planner
     }
     unsafe {
         if let Some(prev_hook) = PREV_PLANNER_HOOK {
