@@ -926,17 +926,25 @@ fn start_data_flow(conn: &mut Connection, storage: &mut Storage) -> Result<TaskR
     protocol::exec::prepare_exec_ready(&mut conn.send_buffer)?;
     // No demo row: result rows will be written by the execution task
     // Kick off initial heap block requests for each scan using per-scan assigned slot
+    // Maintain a small prefetch window so executor has data ready when polling.
+    const PREFETCH_WINDOW: usize = 2; // conservative: 2 in-flight per scan
     if let Some(phys) = storage.physical_plan.as_ref() {
         let registry = Arc::clone(&storage.registry);
         let _ = for_each_scan::<_, Error>(phys, |id, table_oid| {
             let slot = registry.slot_for(id).unwrap_or(0);
-            trace!(
-                scan_id = id,
-                table_oid,
-                slot_id = slot,
-                "start_data_flow: initial heap request"
-            );
-            request_heap_block(&mut conn.send_buffer, id, table_oid, slot)?;
+            for n in 0..PREFETCH_WINDOW {
+                if tracing::enabled!(target: "executor::server", tracing::Level::TRACE) {
+                    tracing::trace!(
+                        target = "executor::server",
+                        scan_id = id,
+                        table_oid,
+                        slot_id = slot,
+                        prefetch = n,
+                        "start_data_flow: initial heap request"
+                    );
+                }
+                request_heap_block(&mut conn.send_buffer, id, table_oid, slot)?;
+            }
             Ok(())
         });
     }

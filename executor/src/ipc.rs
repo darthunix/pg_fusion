@@ -44,11 +44,13 @@ pub async fn signal_listener(state: Arc<SharedState<'_>>) {
                 }
             }
         }
-        if woke == 0 && tracing::enabled!(target: "executor::ipc", tracing::Level::TRACE) {
-            tracing::trace!(
-                target = "executor::ipc",
-                "signal_listener: signal received but no flags set"
-            );
+        if woke == 0 {
+            if tracing::enabled!(target: "executor::ipc", tracing::Level::TRACE) {
+                tracing::trace!(
+                    target = "executor::ipc",
+                    "signal_listener: signal received but no flags set"
+                );
+            }
         }
     }
 }

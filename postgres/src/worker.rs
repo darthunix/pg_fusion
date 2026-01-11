@@ -176,9 +176,13 @@ pub unsafe extern "C-unwind" fn init_shmem() {
 fn signal_client(conn: &Connection, id: usize) {
     // Notify client process; ignore errors (e.g., invalid pid)
     if let Err(e) = conn.signal_client() {
-        tracing::trace!(connection_id = id, error = %e, "signal_client failed (ignored)");
+        if tracing::enabled!(tracing::Level::TRACE) {
+            tracing::trace!(connection_id = id, error = %e, "signal_client failed (ignored)");
+        }
     } else {
-        tracing::trace!(connection_id = id, "client signaled");
+        if tracing::enabled!(tracing::Level::TRACE) {
+            tracing::trace!(connection_id = id, "client signaled");
+        }
     }
 }
 
@@ -267,12 +271,14 @@ pub extern "C-unwind" fn worker_main(_arg: pg_sys::Datum) {
             let conn_base = unsafe { base.add(id * layout.layout.size()) };
             let (recv_base, send_base, client_ptr) =
                 unsafe { executor::layout::connection_ptrs(conn_base, layout) };
-            tracing::trace!(
-                connection_id = id,
-                recv_base = ?recv_base,
-                send_base = ?send_base,
-                "worker_main: connection bases"
-            );
+            if tracing::enabled!(tracing::Level::TRACE) {
+                tracing::trace!(
+                    connection_id = id,
+                    recv_base = ?recv_base,
+                    send_base = ?send_base,
+                    "worker_main: connection bases"
+                );
+            }
             let socket = unsafe {
                 executor::ipc::Socket::from_layout_with_state(
                     id,
@@ -304,20 +310,28 @@ pub extern "C-unwind" fn worker_main(_arg: pg_sys::Datum) {
             conn.set_result_buffer(res_buf);
 
             tokio::spawn(async move {
-                tracing::trace!(connection_id = id, "connection task started");
+                if tracing::enabled!(tracing::Level::TRACE) {
+                    tracing::trace!(connection_id = id, "connection task started");
+                }
                 let mut storage = Storage::default();
                 // Ensure registry knows this connection id for SHM addressing
                 storage.set_registry_conn(id);
                 loop {
                     let res = match conn.poll().await {
                         Ok(_) => {
-                            tracing::trace!(connection_id = id, "processing message");
+                            if tracing::enabled!(tracing::Level::TRACE) {
+                                tracing::trace!(connection_id = id, "processing message");
+                            }
                             conn.process_message(&mut storage).await
                         }
                         Err(e) => Err(e),
                     };
                     match res {
-                        Ok(()) => tracing::trace!(connection_id = id, "message processed"),
+                        Ok(()) => {
+                            if tracing::enabled!(tracing::Level::TRACE) {
+                                tracing::trace!(connection_id = id, "message processed");
+                            }
+                        }
                         Err(err) => {
                             let ferr = match err.downcast::<common::FusionError>() {
                                 Ok(f) => f,
