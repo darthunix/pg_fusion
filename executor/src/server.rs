@@ -172,7 +172,13 @@ impl<'bytes> Connection<'bytes> {
         self.server_pid.load(Ordering::Relaxed)
     }
 
+    /// Bytes currently queued in the send ring for the backend to read.
+    pub fn pending_send_len(&self) -> usize {
+        self.send_buffer.len()
+    }
+
     pub async fn process_message(&mut self, storage: &mut Storage) -> Result<()> {
+        let _t0 = std::time::Instant::now();
         // Guard against spurious wakeups where no bytes are available yet.
         let pending = self.recv_socket.buffer.len();
         if pending < 6 {
@@ -195,6 +201,7 @@ impl<'bytes> Connection<'bytes> {
             length = header.length,
             recv_unread = self.recv_socket.buffer.len(),
             send_unread = self.send_buffer.len(),
+            elapsed_us = _t0.elapsed().as_micros() as u64,
             "process_message: header received"
             );
         }
@@ -271,24 +278,25 @@ impl<'bytes> Connection<'bytes> {
                         } else {
                             Vec::new()
                         };
-                        let block = crate::pgscan::HeapBlock {
-                            scan_id: meta.scan_id as u64,
-                            slot_id: meta.slot_id,
-                            table_oid: meta.table_oid,
-                            blkno: meta.blkno,
-                            num_offsets: meta.num_offsets,
-                            vis_len,
-                            page,
-                            vis,
-                        };
                         // Best-effort send; if the channel is full, await until space is available
-                        if let Err(e) = tx.send(block).await {
-                            tracing::warn!(
-                                target = "pg_fusion::server",
-                                "failed to enqueue heap block for scan {}: {e}",
-                                meta.scan_id
-                            );
-                        }
+                let block = crate::pgscan::HeapBlock {
+                    scan_id: meta.scan_id as u64,
+                    slot_id: meta.slot_id,
+                    table_oid: meta.table_oid,
+                    blkno: meta.blkno,
+                    num_offsets: meta.num_offsets,
+                    vis_len,
+                    page,
+                    vis,
+                    recv_ts: std::time::Instant::now(),
+                };
+                if let Err(e) = tx.send(block).await {
+                    tracing::warn!(
+                        target = "pg_fusion::server",
+                        "failed to enqueue heap block for scan {}: {e}",
+                        meta.scan_id
+                    );
+                }
                         // Request the next heap block for this scan using the same slot
                         if tracing::enabled!(target: "executor::server", tracing::Level::TRACE) {
                             trace!(
@@ -339,6 +347,19 @@ impl<'bytes> Connection<'bytes> {
             }
         }
         let mut packet = ControlPacket::try_from(header.tag)?;
+        // Do not flush send_buffer here; backend is the reader for responses
+        // Guard against spurious EndScan (e.g., after EXPLAIN) when no PhysicalPlan is active
+        if packet == ControlPacket::EndScan {
+            if storage.state.state() != &crate::fsm::ExecutorState::PhysicalPlan {
+                if tracing::enabled!(target: "executor::server", tracing::Level::TRACE) {
+                    tracing::trace!(
+                        target = "executor::server",
+                        "process_message: ignoring EndScan outside PhysicalPlan state"
+                    );
+                }
+                return Ok(());
+            }
+        }
         let mut skip_metadata = false;
         loop {
             let action = storage.state.consume(&packet)?;
@@ -425,6 +446,7 @@ impl<'bytes> Connection<'bytes> {
                             "process_message: Action::Flush (reset state)"
                         );
                     }
+                    // Do not flush send_buffer here; only backend should move read head
                     storage.flush();
                     return Ok(());
                 }
@@ -571,6 +593,7 @@ impl<'bytes> Connection<'bytes> {
                 target = "executor::server",
                 send_unread = self.send_buffer.len(),
                 client_pid = self.client_pid.load(Ordering::Relaxed),
+                elapsed_us = _t0.elapsed().as_micros() as u64,
                 "process_message: response buffered, ready to signal client"
             );
         }
@@ -845,6 +868,7 @@ fn start_data_flow(conn: &mut Connection, storage: &mut Storage) -> Result<TaskR
             "start_data_flow: spawning execution task"
         );
     }
+    let t0 = std::time::Instant::now();
     let handle = tokio::spawn(async move {
         // Execute all output partitions and merge them into the single result ring
         let mut ring = crate::shm::result_ring_writer_for(conn_id);
@@ -917,22 +941,34 @@ fn start_data_flow(conn: &mut Connection, storage: &mut Storage) -> Result<TaskR
     });
     storage.exec_task = Some(handle);
     // Send a tiny ack to the backend indicating execution is ready
-    if tracing::enabled!(target: "executor::server", tracing::Level::TRACE) {
-        trace!(
-            target = "executor::server",
-            "start_data_flow: sending ExecReady to backend"
-        );
-    }
+        if tracing::enabled!(target: "executor::server", tracing::Level::TRACE) {
+            let us = t0.elapsed().as_micros() as u64;
+            trace!(
+                target = "executor::server",
+                elapsed_us = us,
+                "start_data_flow: sending ExecReady to backend"
+            );
+        }
     protocol::exec::prepare_exec_ready(&mut conn.send_buffer)?;
+    // Immediately notify backend to observe ExecReady without waiting for prefetch signals
+    let _ = conn.signal_client();
     // No demo row: result rows will be written by the execution task
     // Kick off initial heap block requests for each scan using per-scan assigned slot
     // Maintain a small prefetch window so executor has data ready when polling.
-    const PREFETCH_WINDOW: usize = 2; // conservative: 2 in-flight per scan
+    fn prefetch_window() -> usize {
+        if let Ok(s) = std::env::var("PG_FUSION_PREFETCH") {
+            if let Ok(n) = s.parse::<usize>() {
+                return n.max(1);
+            }
+        }
+        4
+    }
+    let prefetch = prefetch_window();
     if let Some(phys) = storage.physical_plan.as_ref() {
         let registry = Arc::clone(&storage.registry);
         let _ = for_each_scan::<_, Error>(phys, |id, table_oid| {
             let slot = registry.slot_for(id).unwrap_or(0);
-            for n in 0..PREFETCH_WINDOW {
+            for n in 0..prefetch {
                 if tracing::enabled!(target: "executor::server", tracing::Level::TRACE) {
                     tracing::trace!(
                         target = "executor::server",
@@ -944,6 +980,7 @@ fn start_data_flow(conn: &mut Connection, storage: &mut Storage) -> Result<TaskR
                     );
                 }
                 request_heap_block(&mut conn.send_buffer, id, table_oid, slot)?;
+                let _ = conn.signal_client();
             }
             Ok(())
         });

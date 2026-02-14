@@ -13,8 +13,19 @@ use std::sync::OnceLock;
 use tokio::runtime::Builder;
 use tokio::signal::unix::{signal as unix_signal, SignalKind};
 
-// FIXME: This should be configurable.
-const TOKIO_THREAD_NUMBER: usize = 1;
+// Tokio worker thread count: PG_FUSION_TOKIO_THREADS or default to min(4, available cores)
+fn tokio_thread_number() -> usize {
+    if let Ok(s) = std::env::var("PG_FUSION_TOKIO_THREADS") {
+        if let Ok(n) = s.parse::<usize>() {
+            return n.max(1);
+        }
+    }
+    std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(1)
+        .min(4)
+        .max(1)
+}
 pub(crate) const RECV_CAP: usize = 8192;
 pub(crate) const SEND_CAP: usize = 8192;
 // Heap block buffer configuration per connection
@@ -174,15 +185,24 @@ pub unsafe extern "C-unwind" fn init_shmem() {
 }
 
 fn signal_client(conn: &Connection, id: usize) {
+    // Only signal when there is actually data queued for the backend to read.
+    let pending = conn.pending_send_len();
+    if pending == 0 {
+        if tracing::enabled!(tracing::Level::TRACE) {
+            tracing::trace!(
+                connection_id = id,
+                "signal_client: skipped (no bytes queued)"
+            );
+        }
+        return;
+    }
     // Notify client process; ignore errors (e.g., invalid pid)
     if let Err(e) = conn.signal_client() {
         if tracing::enabled!(tracing::Level::TRACE) {
             tracing::trace!(connection_id = id, error = %e, "signal_client failed (ignored)");
         }
-    } else {
-        if tracing::enabled!(tracing::Level::TRACE) {
-            tracing::trace!(connection_id = id, "client signaled");
-        }
+    } else if tracing::enabled!(tracing::Level::TRACE) {
+        tracing::trace!(connection_id = id, queued = pending, "client signaled");
     }
 }
 
@@ -233,15 +253,13 @@ pub extern "C-unwind" fn worker_main(_arg: pg_sys::Datum) {
     }
 
     // Build runtime
+    let threads = tokio_thread_number();
     let rt = Builder::new_multi_thread()
-        .worker_threads(TOKIO_THREAD_NUMBER)
+        .worker_threads(threads)
         .enable_all()
         .build()
         .unwrap();
-    debug1!(
-        "worker_main: tokio runtime built, threads={}",
-        TOKIO_THREAD_NUMBER
-    );
+    debug1!("worker_main: tokio runtime built, threads={}", threads);
 
     // Build connections from shared memory and run tasks
     rt.block_on(async move {
