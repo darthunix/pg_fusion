@@ -2,8 +2,8 @@
 id: gotchas-0001
 type: gotcha
 scope: repo
-tags: ["joins", "partitions", "varlena", "signals", "shm", "utility_hook"]
-updated_at: "2026-01-10"
+tags: ["joins", "partitions", "varlena", "signals", "shm", "utility_hook", "performance"]
+updated_at: "2026-02-14"
 importance: 0.7
 ---
 
@@ -31,3 +31,12 @@ importance: 0.7
 
 - Misaligned pointer deref can panic when interpreting `[u8]` as `AtomicU32` head/tail in ring buffers. Always allocate via `lockfree_buffer_layout` + `std::alloc::alloc(layout.layout)` and construct with `LockFreeBuffer::from_layout`.
 - In tests, avoid static byte arrays for buffers; CI environments may place them at misaligned addresses. A `debug_assert!` on alignment in `LockFreeBuffer::new` helps catch misuse in debug builds.
+
+## Scan performance (see dec-0009)
+
+- SIGUSR1 per page: worker and backend exchange signals for every heap page. On macOS each `kill(SIGUSR1)` costs ~5-20 us. With 1000 pages this is 2000+ signals. Batch messages and signal once per batch.
+- One message per wake: both worker loop (`worker.rs`) and backend loop (`exec_df_scan`) process a single message/request per wakeup cycle. Drain all available messages before signaling back.
+- `wait_latch(1ms)`: backend falls into 1ms sleep when result ring is empty after 128-spin. This adds up to seconds on large scans. Replace with latch-only wait (no timeout) + proper nudge signals.
+- `relation_open`/`relation_close` per page: `process_pending_heap_request` opens and closes the relation for every heap block. Cache the open relation for the scan lifetime.
+- Result ring 64KB: fills quickly with wide rows; execution task blocks waiting for backend to drain. Consider 256-512 KB and batch reading on backend side.
+- Full Arrow round-trip for SELECT *: heap tuple -> ScalarValue -> Arrow -> wire tuple -> MinimalTuple is ~6 transformation steps vs native PG's 1 step. Batch pages into larger RecordBatches to amortize overhead.
