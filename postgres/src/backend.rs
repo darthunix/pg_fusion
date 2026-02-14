@@ -33,12 +33,13 @@ use rmp::encode::{write_array_len, write_bool, write_str, write_u32, write_u8};
 use smallvec::SmallVec;
 use smol_str::format_smolstr;
 use std::cell::Cell;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::ffi::c_char;
 use std::ffi::CStr;
 use std::os::raw::c_void;
 use std::sync::{LazyLock, Mutex};
 use std::time::Duration;
+use std::time::Instant;
 
 fn handle_metadata(send: &mut LockFreeBuffer, recv: &mut LockFreeBuffer) -> AnyResult<()> {
     let schema_table_lookup = |schema: &[u8], table: &[u8]| -> AnyResult<u32> {
@@ -181,6 +182,29 @@ unsafe extern "C-unwind" fn create_df_scan_state(cscan: *mut pg_sys::CustomScan)
     // Ensure server can signal us
     shared.set_client_pid(unsafe { libc::getpid() } as i32);
 
+    // Flush any stale bytes in the incoming ring before starting a new planning handshake
+    // to avoid misaligned frames from a previous query.
+    let mut flushed = 0usize;
+    if shared.send.len() > 0 {
+        use std::io::Read;
+        loop {
+            let avail = shared.send.len();
+            if avail == 0 {
+                break;
+            }
+            let mut buf = [0u8; 512];
+            let take = avail.min(buf.len());
+            match Read::read(&mut shared.send, &mut buf[..take]) {
+                Ok(n) if n > 0 => flushed += n,
+                _ => break,
+            }
+        }
+        pgrx::debug1!(
+            "handshake: flushed stale bytes before Parse (flushed={})",
+            flushed
+        );
+    }
+
     // Fast-fail when worker is not running (PID not published yet)
     if shared.server_pid() <= 0 {
         error!(
@@ -204,20 +228,55 @@ unsafe extern "C-unwind" fn create_df_scan_state(cscan: *mut pg_sys::CustomScan)
     }
 
     // Process server responses until Columns received
+    let mut drain_remaining: usize = 0;
     loop {
-        // Wait to be signaled by server
-        wait_latch(None);
-        if shared.send.len() == 0 {
+        // If we are in the middle of draining an unexpected DataPacket payload, drain incrementally
+        if drain_remaining > 0 {
+            let avail = shared.send.len();
+            if avail == 0 {
+                wait_latch(Some(Duration::from_millis(1)));
+            } else {
+                use std::io::Read;
+                let to_drain = drain_remaining.min(avail);
+                let mut left = to_drain;
+                while left > 0 {
+                    let mut buf = [0u8; 256];
+                    let take = left.min(buf.len());
+                    match Read::read(&mut shared.send, &mut buf[..take]) {
+                        Ok(n) if n > 0 => {
+                            left -= n;
+                            drain_remaining -= n;
+                        }
+                        _ => break,
+                    }
+                }
+            }
+            // Try another loop iteration; either we finished draining or will continue
             continue;
+        }
+        // If a full header is already buffered, parse it immediately; otherwise wait briefly.
+        let cur_len = shared.send.len();
+        if cur_len < 6 {
+            wait_latch(Some(Duration::from_millis(1)));
+            let cur_len2 = shared.send.len();
+            if cur_len2 < 6 {
+                continue;
+            }
         }
         let header = match consume_header(&mut shared.send) {
             Ok(h) => h,
-            Err(err) => {
-                let _ = request_failure(&mut shared.recv);
-                let _ = shared.signal_server();
-                error!("Failed to consume header: {}", err)
+            Err(_err) => {
+                // Partial frame observed; retry next wake without failing the query
+                pgrx::debug1!("handshake: partial header (len={})", shared.send.len());
+                continue;
             }
         };
+        pgrx::debug1!(
+            "handshake: parsed header tag={} dir={:?} recv_unread={}",
+            header.tag,
+            header.direction,
+            shared.send.len()
+        );
         if header.direction != Direction::ToClient {
             continue;
         }
@@ -228,10 +287,12 @@ unsafe extern "C-unwind" fn create_df_scan_state(cscan: *mut pg_sys::CustomScan)
                 Err(err) => error!("Double error: {}", err),
             },
             Err(_) if DataPacket::try_from(header.tag).is_ok() => {
-                // Not expected during planning; ignore.
+                // Not expected during planning; begin draining payload incrementally to realign the stream.
+                drain_remaining = header.length as usize;
                 continue;
             }
             Ok(ControlPacket::Metadata) => {
+                pgrx::debug1!("handshake: got Metadata");
                 if let Err(err) = handle_metadata(&mut shared.send, &mut shared.recv) {
                     let _ = request_failure(&mut shared.recv);
                     let _ = shared.signal_server();
@@ -242,6 +303,7 @@ unsafe extern "C-unwind" fn create_df_scan_state(cscan: *mut pg_sys::CustomScan)
                 }
             }
             Ok(ControlPacket::Bind) => {
+                pgrx::debug1!("handshake: got Bind");
                 // For now, send empty params (queries without params)
                 if let Err(err) = prepare_params(&mut shared.recv, || {
                     (
@@ -258,6 +320,7 @@ unsafe extern "C-unwind" fn create_df_scan_state(cscan: *mut pg_sys::CustomScan)
                 }
             }
             Ok(ControlPacket::Columns) => {
+                pgrx::debug1!("handshake: got Columns, consuming");
                 // We'll build a Postgres TargetEntry list for the scan's output
                 // and assign it to custom_scan_tlist after consumption.
                 let mut tlist: *mut List = std::ptr::null_mut();
@@ -341,6 +404,7 @@ unsafe extern "C-unwind" fn create_df_scan_state(cscan: *mut pg_sys::CustomScan)
                 if let Err(err) = shared.signal_server() {
                     error!("Failed to signal server: {}", err);
                 }
+                pgrx::debug1!("handshake: Columns processed and ColumnLayout sent");
                 break;
             }
 
@@ -360,6 +424,10 @@ unsafe extern "C-unwind" fn create_df_scan_state(cscan: *mut pg_sys::CustomScan)
             | Ok(ControlPacket::EndScan)
             | Ok(ControlPacket::ExecReady) => {
                 // Ignore execution-time control messages during planning
+                pgrx::debug1!(
+                    "handshake: ignoring execution-time packet tag={}",
+                    header.tag
+                );
                 continue;
             }
             Ok(ControlPacket::ColumnLayout) => continue,
@@ -508,17 +576,48 @@ unsafe extern "C-unwind" fn exec_df_scan(
         }
     });
     if need_wait {
+        let mut drain_remaining: usize = 0;
         loop {
-            wait_latch(None);
-            if shared.send.len() == 0 {
+            if drain_remaining > 0 {
+                let avail = shared.send.len();
+                if avail == 0 {
+                    wait_latch(Some(Duration::from_millis(1)));
+                } else {
+                    use std::io::Read;
+                    let to_drain = drain_remaining.min(avail);
+                    let mut left = to_drain;
+                    while left > 0 {
+                        let mut buf = [0u8; 256];
+                        let take = left.min(buf.len());
+                        match Read::read(&mut shared.send, &mut buf[..take]) {
+                            Ok(n) if n > 0 => {
+                                left -= n;
+                                drain_remaining -= n;
+                            }
+                            _ => break,
+                        }
+                    }
+                }
+                // Continue draining until complete
                 continue;
+            }
+            let cur = shared.send.len();
+            if cur < 6 {
+                pgrx::debug1!("exec_df_scan: waiting ExecReady (len={})", cur);
+                wait_latch(Some(Duration::from_millis(1)));
+                if shared.send.len() < 6 {
+                    continue;
+                }
             }
             let header = match consume_header(&mut shared.send) {
                 Ok(h) => h,
-                Err(err) => {
-                    let _ = request_failure(&mut shared.recv);
-                    let _ = shared.signal_server();
-                    error!("Failed to consume header: {}", err)
+                Err(_err) => {
+                    pgrx::debug1!(
+                        "exec_df_scan: partial header while waiting ExecReady (len={})",
+                        shared.send.len()
+                    );
+                    // Transient decode mismatch (partial frame); retry on next wake
+                    continue;
                 }
             };
             if header.direction != Direction::ToClient {
@@ -535,6 +634,8 @@ unsafe extern "C-unwind" fn exec_df_scan(
                     Err(err) => error!("Double error: {}", err),
                 },
                 Err(_) if DataPacket::try_from(header.tag).is_ok() => {
+                    // Begin draining unexpected data payload incrementally
+                    drain_remaining = header.length as usize;
                     continue;
                 }
                 _ => continue,
@@ -554,6 +655,21 @@ unsafe extern "C-unwind" fn exec_df_scan(
             EMPTY_SPINS.with(|f| f.set(0));
             return slot;
         }
+        // Brief spin to catch just-written frames without sleeping
+        let mut spun = false;
+        for _ in 0..128 {
+            let base = result_ring_base_for(match connection_id() { Ok(v) => v as usize, Err(_) => 0 });
+            let layout = result_ring_layout();
+            let ring = LockFreeBuffer::from_layout(base, layout);
+            if ring.len() > 0 {
+                spun = true;
+                break;
+            }
+            std::hint::spin_loop();
+        }
+        if spun {
+            continue;
+        }
         // If EOF sentinel was seen, terminate scan
         if RESULT_RING_EOF.with(|f| f.get()) {
             RESULT_RING_EOF.with(|f| f.set(false));
@@ -568,8 +684,8 @@ unsafe extern "C-unwind" fn exec_df_scan(
                 EMPTY_SPINS.with(|spins| {
                     let cur = spins.get().saturating_add(1);
                     spins.set(cur);
-                    if cur > 200 {
-                        // ~10s with 50ms waits
+                    if cur > 5000 {
+                        // ~5s with 1ms waits
                         bail = true;
                     }
                 });
@@ -582,8 +698,8 @@ unsafe extern "C-unwind" fn exec_df_scan(
             EMPTY_SPINS.with(|f| f.set(0));
             return std::ptr::null_mut();
         }
-        // Otherwise, wait to be signaled and retry
-        wait_latch(Some(Duration::from_millis(50)));
+        // Otherwise, wait to be signaled and retry (short 1ms guard)
+        wait_latch(Some(Duration::from_millis(1)));
     }
 }
 
@@ -603,6 +719,17 @@ fn process_pending_heap_request(shared: &mut ConnectionShared) {
                     if let Ok((scan_id, table_oid, slot_id)) =
                         read_heap_block_request(&mut shared.send)
                     {
+                        let t0 = Instant::now();
+                        // If EOF was already sent for this scan_id, ignore further heap requests
+                        if let Ok(done) = COMPLETED.lock() {
+                            if done.contains(&scan_id) {
+                                pgrx::debug1!(
+                                    "process_pending_heap_request: ignoring request for completed scan_id={}",
+                                    scan_id
+                                );
+                                return;
+                            }
+                        }
                         pgrx::debug1!(
                             "process_pending_heap_request: heap request received scan_id={} table_oid={} slot_id={}",
                             scan_id, table_oid, slot_id
@@ -610,6 +737,8 @@ fn process_pending_heap_request(shared: &mut ConnectionShared) {
                         // Determine next block number for this scan
                         static PROGRESS: LazyLock<Mutex<HashMap<u64, u32>>> =
                             LazyLock::new(|| Mutex::new(HashMap::new()));
+                        static COMPLETED: LazyLock<Mutex<HashSet<u64>>> =
+                            LazyLock::new(|| Mutex::new(HashSet::new()));
                         let blkno = {
                             let mut map = PROGRESS.lock().unwrap();
                             let e = map.entry(scan_id).or_insert(0);
@@ -657,6 +786,10 @@ fn process_pending_heap_request(shared: &mut ConnectionShared) {
                             {
                                 let mut map = PROGRESS.lock().unwrap();
                                 map.remove(&scan_id);
+                            }
+                            {
+                                let mut done = COMPLETED.lock().unwrap();
+                                done.insert(scan_id);
                             }
                             HEAP_EOF_SENT.with(|f| f.set(true));
                             unsafe {
@@ -790,6 +923,13 @@ fn process_pending_heap_request(shared: &mut ConnectionShared) {
                             vis_len as u16,
                         );
                         let _ = shared.signal_server();
+                        let us = t0.elapsed().as_micros() as u64;
+                        pgrx::debug1!(
+                            "process_pending_heap_request: served blkno={} scan_id={} in {} us",
+                            blkno,
+                            scan_id,
+                            us
+                        );
                         // Unlock and release buffer; close relation
                         unsafe {
                             pg_sys::UnlockReleaseBuffer(buf);
@@ -814,6 +954,8 @@ thread_local! {
     static EXEC_READY_SEEN: Cell<bool> = const { Cell::new(false) };
     static HEAP_EOF_SENT: Cell<bool> = const { Cell::new(false) };
     static EMPTY_SPINS: Cell<u32> = const { Cell::new(0) };
+    static HANDSHAKE_T0: std::cell::RefCell<Option<Instant>> = const { std::cell::RefCell::new(None) };
+    static EXECREADY_T0: std::cell::RefCell<Option<Instant>> = const { std::cell::RefCell::new(None) };
 }
 
 /// Read one row from the result ring and populate `tupslot`.
@@ -1018,16 +1160,15 @@ unsafe extern "C-unwind" fn explain_df_scan(
 
     // Wait for the explain response
     loop {
-        wait_latch(None);
-        if shared.send.len() == 0 {
+        wait_latch(Some(Duration::from_millis(1)));
+        if shared.send.len() < 6 {
             continue;
         }
         let header = match consume_header(&mut shared.send) {
             Ok(h) => h,
-            Err(err) => {
-                let _ = request_failure(&mut shared.recv);
-                let _ = shared.signal_server();
-                error!("Failed to consume header: {}", err)
+            Err(_err) => {
+                // Partial frame or transient mismatch; retry next wake
+                continue;
             }
         };
         if header.direction != Direction::ToClient {

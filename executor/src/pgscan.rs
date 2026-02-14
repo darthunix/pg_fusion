@@ -34,6 +34,7 @@ use futures::Stream;
 use pgrx_pg_sys as pg_sys;
 use storage::heap::{decode_tuple_project, HeapPage, PgAttrMeta};
 use tokio::sync::mpsc;
+use std::time::Instant;
 
 pub type ScanId = u64;
 
@@ -47,6 +48,7 @@ pub struct HeapBlock {
     pub vis_len: u16,
     pub page: Vec<u8>,
     pub vis: Vec<u8>,
+    pub recv_ts: Instant,
     // Note: page bytes and visibility bitmap reside in shared memory,
     // addressed by `slot_id` with `vis_len` bytes for visibility bitmap.
 }
@@ -501,10 +503,12 @@ impl Stream for PgScanStream {
                     })?
                 };
                 if tracing::enabled!(target: "executor::server", tracing::Level::TRACE) {
+                    let elapsed_us = block.recv_ts.elapsed().as_micros() as u64;
                     tracing::trace!(
                         target = "executor::server",
                         rows = decoded_rows,
                         blkno = block.blkno,
+                        elapsed_us = elapsed_us,
                         "pgscan: decoded rows"
                     );
                 }
