@@ -1,0 +1,35 @@
+run=run2 (interactive query timing)
+query_time_on_ms=1158.564
+sum_off=45000150000
+sum_on=45000178125
+
+phase_parse_to_exec_ready_us=107344
+phase_exec_ready_to_first_meta_us=1279
+phase_scan_first_served_to_heap_eof_us=1029000
+phase_heap_eof_to_ring_eof_us=2000
+
+scan_breakdown_us:
+  backend_serve_total=498291
+  worker_decode_total=126304
+  residual_control_plane=404405
+
+scan_breakdown_pct_of_scan:
+  backend_serve=48.4%
+  worker_decode=12.3%
+  residual_control_plane=39.3%
+
+signals_and_cadence:
+  backend_signal_server_count=4040
+  worker_signal_client_count=4037
+  worker_batch_processed_eq_1=4029_of_4035
+  worker_meta_cadence_avg_us=254.86
+  worker_cadence_minus_decode_avg_us=223.53
+  backend_serve_avg_us=123.58
+  inferred_nonserve_nondecode_per_page_us~=99.95
+
+wait_latch_timeouts:
+  total=90
+  pre_exec_req=49
+  exec_req_to_ready=35
+  scan_window=5
+  eof_to_ring_eof=1

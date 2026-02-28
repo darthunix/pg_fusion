@@ -1,0 +1,18 @@
+[32m[1m       Using[0m[39m [37m[1mCliArgument("pg17")[0m[39m and `pg_config` from [36m/Users/darthunix/.pgrx/17.7/pgrx-install/bin/pg_config[39m
+[32m[1m    Building[0m[39m extension with features [36mpg17[39m
+[32m[1m     Running[0m[39m command [36m"/Users/darthunix/.rustup/toolchains/1.86.0-x86_64-apple-darwin/bin/cargo" "build" "--lib" "--package" "pg_fusion" "--release" "--features" "pg17" "--no-default-features" "--message-format=json-render-diagnostics"[39m
+   Compiling executor v25.0.0 (/Users/darthunix/git/pg_fusion/executor)
+   Compiling pg_fusion v24.0.0 (/Users/darthunix/git/pg_fusion/postgres)
+    Finished `release` profile [optimized] target(s) in 57.34s
+[32m[1m  Installing[0m[39m extension
+[32m[1m     Copying[0m[39m control file to [36m/Users/darthunix/.pgrx/17.7/pgrx-install/share/postgresql/extension/pg_fusion.control[39m
+[32m[1m     Copying[0m[39m shared library to [36m/Users/darthunix/.pgrx/17.7/pgrx-install/lib/postgresql/pg_fusion.dylib[39m
+[32m[1m  Discovered[0m[39m [36m[1m0[0m[39m SQL entities: [36m[1m0[0m[39m schemas ([36m[1m0[0m[39m unique), [36m[1m0[0m[39m functions, [36m[1m0[0m[39m types, [36m[1m0[0m[39m enums, [36m[1m0[0m[39m sqls, [36m[1m0[0m[39m ords, [36m[1m0[0m[39m hashes, [36m[1m0[0m[39m aggregates, [36m[1m0[0m[39m triggers
+[32m[1m  Rebuilding[0m[39m [36mpgrx_embed[39m, in debug mode, for SQL generation with features [36mpg17[39m
+   Compiling executor v25.0.0 (/Users/darthunix/git/pg_fusion/executor)
+   Compiling pg_fusion v24.0.0 (/Users/darthunix/git/pg_fusion/postgres)
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 13.61s
+[32m[1m     Writing[0m[39m SQL entities to /Users/darthunix/.pgrx/17.7/pgrx-install/share/postgresql/extension/pg_fusion--24.0.0.sql
+[32m[1m    Finished[0m[39m installing pg_fusion
+[32m[1m    Starting[0m[39m Postgres v17 on port [36m[1m28817[0m[39m
+[36m[1m    Re-using[0m[39m existing database pg_fusion

@@ -1,0 +1,16 @@
+exec_req_us=46546575000
+exec_ready_us=46546620000
+first_served_us=46546620000
+heap_eof_us=46547649000
+ring_eof_us=46547651000
+wait_timeouts_total=90
+timeouts_pre_exec_req=49
+timeouts_req_to_ready=35
+timeouts_ready_to_first_served=0
+timeouts_scan_window=5
+timeouts_heap_eof_to_ring_eof=1
+timeouts_other=0
+exec_req_to_ready_us=45000
+exec_ready_to_first_served_us=0
+first_served_to_heap_eof_us=1029000
+heap_eof_to_ring_eof_us=2000

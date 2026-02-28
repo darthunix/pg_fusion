@@ -202,6 +202,11 @@ impl<'bytes> Connection<'bytes> {
         self.send_buffer.len()
     }
 
+    /// Bytes currently queued in the recv ring from the backend.
+    pub fn pending_recv_len(&self) -> usize {
+        self.recv_socket.buffer.len()
+    }
+
     pub async fn process_message(&mut self, storage: &mut Storage) -> Result<()> {
         self.sync_probe_epoch();
         let _t0 = std::time::Instant::now();
@@ -1027,14 +1032,14 @@ fn start_data_flow(conn: &mut Connection, storage: &mut Storage) -> Result<TaskR
     });
     storage.exec_task = Some(handle);
     // Send a tiny ack to the backend indicating execution is ready
-        if tracing::enabled!(target: "executor::server", tracing::Level::TRACE) {
-            let us = t0.elapsed().as_micros() as u64;
-            trace!(
-                target = "executor::server",
-                elapsed_us = us,
-                "start_data_flow: sending ExecReady to backend"
-            );
-        }
+    if tracing::enabled!(target: "executor::server", tracing::Level::TRACE) {
+        let us = t0.elapsed().as_micros() as u64;
+        trace!(
+            target = "executor::server",
+            elapsed_us = us,
+            "start_data_flow: sending ExecReady to backend"
+        );
+    }
     protocol::exec::prepare_exec_ready(&mut conn.send_buffer)?;
     // Immediately notify backend to observe ExecReady without waiting for prefetch signals
     let _ = conn.signal_client();
@@ -1066,10 +1071,11 @@ fn start_data_flow(conn: &mut Connection, storage: &mut Storage) -> Result<TaskR
                     );
                 }
                 request_heap_block(&mut conn.send_buffer, id, table_oid, slot)?;
-                let _ = conn.signal_client();
             }
             Ok(())
         });
+        // Signal the client once after all prefetch requests are queued
+        let _ = conn.signal_client();
     }
     Ok(TaskResult::Noop)
 }

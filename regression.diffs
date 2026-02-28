@@ -1,0 +1,16 @@
+diff -U3 /Users/darthunix/git/pg_fusion/postgres/regress/expected/test_setup.out /Users/darthunix/git/pg_fusion/results/test_setup.out
+--- /Users/darthunix/git/pg_fusion/postgres/regress/expected/test_setup.out	2026-01-10 13:28:13.639199638 +0700
++++ /Users/darthunix/git/pg_fusion/results/test_setup.out	2026-01-10 14:06:20.380090051 +0700
+@@ -202,10 +202,12 @@
+     RETURNS bool
+     AS :'regresslib', 'binary_coercible'
+     LANGUAGE C STRICT STABLE PARALLEL SAFE;
++ERROR:  could not access file "/Users/darthunix/.pgrx/17.7/pgrx-install/lib/postgresql/regress.dylib": No such file or directory
+ CREATE FUNCTION ttdummy ()
+     RETURNS trigger
+     AS :'regresslib'
+     LANGUAGE C;
++ERROR:  could not access file "/Users/darthunix/.pgrx/17.7/pgrx-install/lib/postgresql/regress.dylib": No such file or directory
+ -- Use hand-rolled hash functions and operator classes to get predictable
+ -- result on different machines.  The hash function for int4 simply returns
+ -- the sum of the values passed to it and the one for text returns the length
