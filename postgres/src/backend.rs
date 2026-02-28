@@ -1,4 +1,4 @@
-use crate::ipc::{connection_id, connection_shared, ConnectionShared};
+use crate::ipc::{connection_id, connection_shared, current_connection_id, ConnectionShared};
 use crate::worker::{result_ring_base_for, result_ring_layout};
 use crate::worker::{slot_blocks_base_for, slot_blocks_layout};
 use anyhow::Result as AnyResult;
@@ -7,6 +7,7 @@ use datafusion::arrow::datatypes::DataType;
 use executor::buffer::LockFreeBuffer;
 use executor::layout::{slot_block_ptr, slot_block_vis_ptr};
 use libc::c_long;
+use pgrx::pg_sys::AsPgCStr;
 use pgrx::pg_sys::SysCacheIdentifier::TYPEOID;
 use pgrx::pg_sys::{
     self, error, palloc0, CustomExecMethods, CustomScanMethods, CustomScanState, InvalidOid, List,
@@ -127,6 +128,113 @@ fn handle_metadata(send: &mut LockFreeBuffer, recv: &mut LockFreeBuffer) -> AnyR
         table_serialize,
     )?;
     Ok(())
+}
+
+fn probe_metrics_for_conn(conn_id: usize) -> Option<&'static executor::telemetry::ConnTelemetry> {
+    if !executor::telemetry::probe_enabled() {
+        return None;
+    }
+    if let Some(metrics) = executor::telemetry::try_conn_telemetry(conn_id) {
+        return Some(metrics);
+    }
+    let num = crate::max_backends() as usize;
+    let layout = executor::telemetry::telemetry_layout(num).ok()?;
+    let mut _found = false;
+    let base = unsafe {
+        pg_sys::ShmemInitStruct(
+            "pg_fusion:telemetry".as_pg_cstr(),
+            layout.layout.size(),
+            &mut _found,
+        ) as *mut u8
+    };
+    executor::telemetry::set_telemetry(base, num);
+    executor::telemetry::try_conn_telemetry(conn_id)
+}
+
+fn probe_metrics_current() -> Option<&'static executor::telemetry::ConnTelemetry> {
+    current_connection_id().and_then(|id| probe_metrics_for_conn(id as usize))
+}
+
+fn reset_probe_metrics_for_current_conn() {
+    if !executor::telemetry::probe_enabled() {
+        return;
+    }
+    let conn_id = match connection_id() {
+        Ok(v) => v as usize,
+        Err(_) => return,
+    };
+    if let Some(metrics) = probe_metrics_for_conn(conn_id) {
+        let epoch = metrics.reset_for_new_epoch();
+        PROBE_EPOCH.with(|cell| cell.set(epoch));
+        LAST_WORKER_REQUEST_SEQ.with(|cell| cell.set(0));
+        LAST_RESULT_SIGNAL_SEQ.with(|cell| cell.set(0));
+    }
+}
+
+fn log_probe_summary(reason: &str) {
+    if !executor::telemetry::probe_enabled() {
+        return;
+    }
+    let conn_id = match current_connection_id() {
+        Some(v) => v as usize,
+        None => return,
+    };
+    let Some(metrics) = probe_metrics_for_conn(conn_id) else {
+        return;
+    };
+    let s = metrics.snapshot();
+    pgrx::warning!(
+        "pg_fusion_probe summary conn={} reason={} epoch={} backend_wait_ms={:.3} backend_wait_count={} backend_wait_timeouts={} backend_heap_serve_ms={:.3} backend_heap_serve_count={} backend_result_read_ms={:.3} backend_result_read_count={}",
+        conn_id,
+        reason,
+        s.epoch,
+        executor::telemetry::ProbeSnapshot::total_ms(s.backend_wait_ns),
+        s.backend_wait_count,
+        s.backend_wait_timeout_count,
+        executor::telemetry::ProbeSnapshot::total_ms(s.backend_heap_serve_ns),
+        s.backend_heap_serve_count,
+        executor::telemetry::ProbeSnapshot::total_ms(s.backend_result_read_ns),
+        s.backend_result_read_count,
+    );
+    pgrx::warning!(
+        "pg_fusion_probe transport conn={} backend_to_worker_page_ms={:.3} backend_to_worker_page_count={} backend_to_worker_page_avg_us={:.3} worker_to_backend_req_ms={:.3} worker_to_backend_req_count={} worker_to_backend_req_avg_us={:.3} worker_to_backend_result_ms={:.3} worker_to_backend_result_count={} worker_to_backend_result_avg_us={:.3}",
+        conn_id,
+        executor::telemetry::ProbeSnapshot::total_ms(s.backend_to_worker_page_ns),
+        s.backend_to_worker_page_count,
+        executor::telemetry::ProbeSnapshot::avg_us(
+            s.backend_to_worker_page_ns,
+            s.backend_to_worker_page_count,
+        ),
+        executor::telemetry::ProbeSnapshot::total_ms(s.worker_to_backend_req_ns),
+        s.worker_to_backend_req_count,
+        executor::telemetry::ProbeSnapshot::avg_us(
+            s.worker_to_backend_req_ns,
+            s.worker_to_backend_req_count,
+        ),
+        executor::telemetry::ProbeSnapshot::total_ms(s.worker_to_backend_result_ns),
+        s.worker_to_backend_result_count,
+        executor::telemetry::ProbeSnapshot::avg_us(
+            s.worker_to_backend_result_ns,
+            s.worker_to_backend_result_count,
+        ),
+    );
+    pgrx::warning!(
+        "pg_fusion_probe worker conn={} worker_poll_wait_ms={:.3} worker_poll_wait_count={} worker_heap_msg_ms={:.3} worker_heap_msg_count={} worker_heap_copy_ms={:.3} worker_heap_tx_send_ms={:.3} worker_request_next_ms={:.3} worker_pgscan_wait_ms={:.3} worker_pgscan_wait_count={} worker_pgscan_decode_ms={:.3} worker_pgscan_decode_count={} worker_result_write_ms={:.3} worker_result_write_count={}",
+        conn_id,
+        executor::telemetry::ProbeSnapshot::total_ms(s.worker_poll_wait_ns),
+        s.worker_poll_wait_count,
+        executor::telemetry::ProbeSnapshot::total_ms(s.worker_heap_msg_ns),
+        s.worker_heap_msg_count,
+        executor::telemetry::ProbeSnapshot::total_ms(s.worker_heap_copy_ns),
+        executor::telemetry::ProbeSnapshot::total_ms(s.worker_heap_tx_send_ns),
+        executor::telemetry::ProbeSnapshot::total_ms(s.worker_request_next_ns),
+        executor::telemetry::ProbeSnapshot::total_ms(s.worker_pgscan_wait_ns),
+        s.worker_pgscan_wait_count,
+        executor::telemetry::ProbeSnapshot::total_ms(s.worker_pgscan_decode_ns),
+        s.worker_pgscan_decode_count,
+        executor::telemetry::ProbeSnapshot::total_ms(s.worker_result_write_ns),
+        s.worker_result_write_count,
+    );
 }
 
 thread_local! {
@@ -460,6 +568,9 @@ unsafe extern "C-unwind" fn begin_df_scan(
     RESULT_RING_EOF.with(|f| f.set(false));
     HEAP_EOF_SENT.with(|f| f.set(false));
     EMPTY_SPINS.with(|f| f.set(0));
+    PROBE_EPOCH.with(|f| f.set(0));
+    LAST_WORKER_REQUEST_SEQ.with(|f| f.set(0));
+    LAST_RESULT_SIGNAL_SEQ.with(|f| f.set(0));
     // Initialize ScanTupleSlot as a MinimalTuple slot with a TupleDesc
     unsafe {
         // Derive TupleDesc from the CustomScan's target list
@@ -556,6 +667,7 @@ unsafe extern "C-unwind" fn exec_df_scan(
     };
     EXEC_SCAN_STARTED.with(|started| {
         if !started.get() {
+            reset_probe_metrics_for_current_conn();
             pgrx::debug1!("exec_df_scan: requesting ExecScan (conn={})", id);
             if let Err(err) = request_exec_scan(&mut shared.recv) {
                 let _ = request_failure(&mut shared.recv);
@@ -658,7 +770,10 @@ unsafe extern "C-unwind" fn exec_df_scan(
         // Brief spin to catch just-written frames without sleeping
         let mut spun = false;
         for _ in 0..128 {
-            let base = result_ring_base_for(match connection_id() { Ok(v) => v as usize, Err(_) => 0 });
+            let base = result_ring_base_for(match connection_id() {
+                Ok(v) => v as usize,
+                Err(_) => 0,
+            });
             let layout = result_ring_layout();
             let ring = LockFreeBuffer::from_layout(base, layout);
             if ring.len() > 0 {
@@ -672,6 +787,7 @@ unsafe extern "C-unwind" fn exec_df_scan(
         }
         // If EOF sentinel was seen, terminate scan
         if RESULT_RING_EOF.with(|f| f.get()) {
+            log_probe_summary("result_eof");
             RESULT_RING_EOF.with(|f| f.set(false));
             HEAP_EOF_SENT.with(|f| f.set(false));
             EMPTY_SPINS.with(|f| f.set(0));
@@ -693,6 +809,7 @@ unsafe extern "C-unwind" fn exec_df_scan(
         });
         if bail {
             pgrx::warning!("result_ring: bailout after EOF (no frames observed)");
+            log_probe_summary("result_bailout");
             RESULT_RING_EOF.with(|f| f.set(false));
             HEAP_EOF_SENT.with(|f| f.set(false));
             EMPTY_SPINS.with(|f| f.set(0));
@@ -719,7 +836,17 @@ fn process_pending_heap_request(shared: &mut ConnectionShared) {
                     if let Ok((scan_id, table_oid, slot_id)) =
                         read_heap_block_request(&mut shared.send)
                     {
+                        if let Some(metrics) = probe_metrics_current() {
+                            let now_ns = executor::telemetry::monotonic_now_ns();
+                            LAST_WORKER_REQUEST_SEQ.with(|last_seen| {
+                                let mut seq = last_seen.get();
+                                metrics.observe_worker_heap_request(&mut seq, now_ns);
+                                last_seen.set(seq);
+                            });
+                        }
                         let t0 = Instant::now();
+                        let serve_t0_ns = executor::telemetry::probe_enabled()
+                            .then(executor::telemetry::monotonic_now_ns);
                         // If EOF was already sent for this scan_id, ignore further heap requests
                         if let Ok(done) = COMPLETED.lock() {
                             if done.contains(&scan_id) {
@@ -922,7 +1049,20 @@ fn process_pending_heap_request(shared: &mut ConnectionShared) {
                             num_offsets,
                             vis_len as u16,
                         );
+                        if let (true, Some(metrics)) = (
+                            executor::telemetry::probe_enabled(),
+                            probe_metrics_current(),
+                        ) {
+                            metrics.publish_backend_page(executor::telemetry::monotonic_now_ns());
+                        }
                         let _ = shared.signal_server();
+                        if let (Some(serve_t0_ns), Some(metrics)) =
+                            (serve_t0_ns, probe_metrics_current())
+                        {
+                            metrics.record_backend_heap_serve(
+                                executor::telemetry::monotonic_now_ns().saturating_sub(serve_t0_ns),
+                            );
+                        }
                         let us = t0.elapsed().as_micros() as u64;
                         pgrx::debug1!(
                             "process_pending_heap_request: served blkno={} scan_id={} in {} us",
@@ -954,6 +1094,9 @@ thread_local! {
     static EXEC_READY_SEEN: Cell<bool> = const { Cell::new(false) };
     static HEAP_EOF_SENT: Cell<bool> = const { Cell::new(false) };
     static EMPTY_SPINS: Cell<u32> = const { Cell::new(0) };
+    static PROBE_EPOCH: Cell<u64> = const { Cell::new(0) };
+    static LAST_WORKER_REQUEST_SEQ: Cell<u64> = const { Cell::new(0) };
+    static LAST_RESULT_SIGNAL_SEQ: Cell<u64> = const { Cell::new(0) };
     static HANDSHAKE_T0: std::cell::RefCell<Option<Instant>> = const { std::cell::RefCell::new(None) };
     static EXECREADY_T0: std::cell::RefCell<Option<Instant>> = const { std::cell::RefCell::new(None) };
 }
@@ -967,6 +1110,7 @@ unsafe fn try_store_wire_tuple_from_result(
         Ok(v) => v as usize,
         Err(_) => 0,
     };
+    let probe_metrics = probe_metrics_for_conn(conn_id);
     let base = result_ring_base_for(conn_id);
     let layout = result_ring_layout();
     let mut ring = LockFreeBuffer::from_layout(base, layout);
@@ -975,6 +1119,16 @@ unsafe fn try_store_wire_tuple_from_result(
         pgrx::debug1!("result_ring: empty (conn={})", conn_id);
         return None;
     }
+    if let Some(metrics) = probe_metrics {
+        let now_ns = executor::telemetry::monotonic_now_ns();
+        LAST_RESULT_SIGNAL_SEQ.with(|last_seen| {
+            let mut seq = last_seen.get();
+            metrics.observe_worker_result_signal(&mut seq, now_ns);
+            last_seen.set(seq);
+        });
+    }
+    let read_t0_ns =
+        executor::telemetry::probe_enabled().then(executor::telemetry::monotonic_now_ns);
     pgrx::debug1!("result_ring: bytes available={} (conn={})", avail, conn_id);
     use std::io::Read;
     // Read fixed 4-byte little-endian row_len
@@ -986,6 +1140,11 @@ unsafe fn try_store_wire_tuple_from_result(
                 e,
                 conn_id
             );
+            if let (Some(read_t0_ns), Some(metrics)) = (read_t0_ns, probe_metrics) {
+                metrics.record_backend_result_read(
+                    executor::telemetry::monotonic_now_ns().saturating_sub(read_t0_ns),
+                );
+            }
             return None;
         }
     };
@@ -994,6 +1153,11 @@ unsafe fn try_store_wire_tuple_from_result(
         // EOF sentinel
         pgrx::debug1!("result_ring: EOF sentinel (conn={})", conn_id);
         RESULT_RING_EOF.with(|f| f.set(true));
+        if let (Some(read_t0_ns), Some(metrics)) = (read_t0_ns, probe_metrics) {
+            metrics.record_backend_result_read(
+                executor::telemetry::monotonic_now_ns().saturating_sub(read_t0_ns),
+            );
+        }
         return None;
     }
     // Read payload into buffer
@@ -1003,12 +1167,22 @@ unsafe fn try_store_wire_tuple_from_result(
             "result_ring: failed to read frame payload (len={})",
             row_len
         );
+        if let (Some(read_t0_ns), Some(metrics)) = (read_t0_ns, probe_metrics) {
+            metrics.record_backend_result_read(
+                executor::telemetry::monotonic_now_ns().saturating_sub(read_t0_ns),
+            );
+        }
         return None;
     }
     let (hdr, bitmap, data) = match decode_wire_tuple(&buf) {
         Ok(v) => v,
         Err(e) => {
             pgrx::warning!("result_ring: decode error: {}", e);
+            if let (Some(read_t0_ns), Some(metrics)) = (read_t0_ns, probe_metrics) {
+                metrics.record_backend_result_read(
+                    executor::telemetry::monotonic_now_ns().saturating_sub(read_t0_ns),
+                );
+            }
             return None;
         }
     };
@@ -1084,6 +1258,11 @@ unsafe fn try_store_wire_tuple_from_result(
     // Form MinimalTuple and store in slot
     let mtup = pg_sys::heap_form_minimal_tuple(tdesc, values.as_mut_ptr(), nulls.as_mut_ptr());
     pg_sys::ExecStoreMinimalTuple(mtup, scanslot, false);
+    if let (Some(read_t0_ns), Some(metrics)) = (read_t0_ns, probe_metrics) {
+        metrics.record_backend_result_read(
+            executor::telemetry::monotonic_now_ns().saturating_sub(read_t0_ns),
+        );
+    }
     Some(scanslot)
 }
 
@@ -1211,6 +1390,11 @@ unsafe extern "C-unwind" fn explain_df_scan(
 }
 
 fn wait_latch(timeout: Option<Duration>) {
+    let wait_t0 = if executor::telemetry::probe_enabled() && current_connection_id().is_some() {
+        Some(executor::telemetry::monotonic_now_ns())
+    } else {
+        None
+    };
     // In PostgreSQL, WaitLatch timeout -1 means wait forever, 0 means do not wait.
     // For None we want to block until signaled, not to return immediately.
     let timeout_ms: c_long = timeout
@@ -1233,6 +1417,12 @@ fn wait_latch(timeout: Option<Duration>) {
         rc
     };
     check_for_interrupts!();
+    if let (Some(wait_t0), Some(metrics)) = (wait_t0, probe_metrics_current()) {
+        metrics.record_backend_wait(
+            executor::telemetry::monotonic_now_ns().saturating_sub(wait_t0),
+            rc & WL_TIMEOUT as i32 != 0,
+        );
+    }
     if rc & WL_TIMEOUT as i32 != 0 {
         // Timeout is expected in non-blocking polling; do not raise ERROR.
         pgrx::debug1!("wait_latch: timeout (non-fatal)");

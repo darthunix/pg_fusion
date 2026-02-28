@@ -106,12 +106,18 @@ unsafe extern "C-unwind" fn pg_fusion_shmem_request_hook() {
         executor::layout::result_ring_layout(worker::RESULT_RING_CAP).expect("result_ring_layout");
     let result_ring_sz = result_ring_layout.layout.size() * num;
 
+    let telemetry_sz = executor::telemetry::telemetry_layout(num)
+        .expect("telemetry_layout")
+        .layout
+        .size();
+
     let total = flags_sz
         .saturating_add(conns_sz)
         .saturating_add(stack_sz)
         .saturating_add(pid_sz)
         .saturating_add(slot_blocks_sz)
-        .saturating_add(result_ring_sz);
+        .saturating_add(result_ring_sz)
+        .saturating_add(telemetry_sz);
 
     pgrx::pg_sys::RequestAddinShmemSpace(total);
 }

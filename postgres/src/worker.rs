@@ -193,6 +193,27 @@ pub unsafe extern "C-unwind" fn init_shmem() {
             found
         );
     }
+
+    // Per-connection probe telemetry.
+    {
+        let layout = executor::telemetry::telemetry_layout(num).expect("telemetry_layout");
+        let mut found = false;
+        let base = pgrx::pg_sys::ShmemInitStruct(
+            "pg_fusion:telemetry".as_pg_cstr(),
+            layout.layout.size(),
+            &mut found,
+        ) as *mut u8;
+        if !found {
+            std::ptr::write_bytes(base, 0, layout.layout.size());
+        }
+        executor::telemetry::set_telemetry(base, num);
+        info!(
+            "init_shmem: telemetry ready: total_bytes={} count={} found={}",
+            layout.layout.size(),
+            num,
+            found
+        );
+    }
 }
 
 fn signal_client(conn: &Connection, id: usize) {
