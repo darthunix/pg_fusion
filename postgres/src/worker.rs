@@ -7,7 +7,7 @@ use std::fs;
 use std::path::Path;
 use std::ptr;
 use std::slice;
-use std::sync::atomic::{AtomicBool, AtomicI32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI32, AtomicPtr, Ordering};
 use std::sync::Arc;
 use std::sync::OnceLock;
 use tokio::runtime::Builder;
@@ -32,6 +32,13 @@ pub(crate) const SEND_CAP: usize = 8192;
 pub(crate) const SLOTS_PER_CONN: usize = 2; // two logical slots per connection
 pub(crate) const BLOCKS_PER_SLOT: usize = 2; // double buffering inside each slot
 pub(crate) const RESULT_RING_CAP: usize = 64 * 1024; // bytes per-connection for result rows
+
+// These SHMEM lookups are on hot paths in the backend, so cache the base pointers
+// and layouts per process after the first successful lookup.
+static SLOT_BLOCKS_BASE: AtomicPtr<u8> = AtomicPtr::new(ptr::null_mut());
+static SLOT_BLOCKS_LAYOUT_CACHE: OnceLock<executor::layout::SlotBlocksLayout> = OnceLock::new();
+static RESULT_RING_BASE: AtomicPtr<u8> = AtomicPtr::new(ptr::null_mut());
+static RESULT_RING_LAYOUT_CACHE: OnceLock<executor::layout::BufferLayout> = OnceLock::new();
 
 #[pg_guard]
 pub(crate) unsafe extern "C-unwind" fn init_datafusion_worker() {
@@ -109,6 +116,8 @@ pub unsafe extern "C-unwind" fn init_shmem() {
         }
         // Publish base and layout to executor module for in-process access
         executor::shm::set_slot_blocks(base, layout);
+        SLOT_BLOCKS_BASE.store(base, Ordering::Release);
+        let _ = SLOT_BLOCKS_LAYOUT_CACHE.set(layout);
         debug1!(
             "init_shmem: slot blocks ready: bytes_per_conn={} total_bytes={} slots_per_conn={} blocks_per_slot={} blksz={} count={} found={}",
             layout.layout.size(), total, SLOTS_PER_CONN, BLOCKS_PER_SLOT, blksz, num, found
@@ -173,6 +182,8 @@ pub unsafe extern "C-unwind" fn init_shmem() {
         }
         // Publish base and layout to executor module
         executor::shm::set_result_ring(base, layout);
+        RESULT_RING_BASE.store(base, Ordering::Release);
+        let _ = RESULT_RING_LAYOUT_CACHE.set(layout);
         info!(
             "init_shmem: result ring ready: bytes_per_conn={} total_bytes={} cap={} count={} found={}",
             layout.layout.size(),
@@ -474,36 +485,43 @@ pub(crate) fn connections_base() -> *mut u8 {
 }
 
 pub(crate) fn slot_blocks_layout() -> executor::layout::SlotBlocksLayout {
-    let blksz = pgrx::pg_sys::BLCKSZ as usize;
-    executor::layout::slot_blocks_layout(SLOTS_PER_CONN, blksz, BLOCKS_PER_SLOT)
-        .expect("slot_blocks_layout")
+    *SLOT_BLOCKS_LAYOUT_CACHE.get_or_init(|| {
+        let blksz = pgrx::pg_sys::BLCKSZ as usize;
+        executor::layout::slot_blocks_layout(SLOTS_PER_CONN, blksz, BLOCKS_PER_SLOT)
+            .expect("slot_blocks_layout")
+    })
 }
 
-#[allow(dead_code)]
-pub(crate) fn slot_blocks_base() -> *mut u8 {
+fn slot_blocks_region_base() -> *mut u8 {
+    let base = SLOT_BLOCKS_BASE.load(Ordering::Acquire);
+    if !base.is_null() {
+        return base;
+    }
+
     let num = crate::max_backends() as usize;
     let layout = slot_blocks_layout();
     let mut found = false;
-    unsafe {
+    let base = unsafe {
         pgrx::pg_sys::ShmemInitStruct(
             "pg_fusion:slot_blocks".as_pg_cstr(),
             layout.layout.size() * num,
             &mut found,
         ) as *mut u8
-    }
+    };
+    SLOT_BLOCKS_BASE.store(base, Ordering::Release);
+    base
+}
+
+#[allow(dead_code)]
+pub(crate) fn slot_blocks_base() -> *mut u8 {
+    slot_blocks_region_base()
 }
 
 /// Return the base pointer for the slot blocks region of a specific connection id.
 pub(crate) fn slot_blocks_base_for(conn_id: usize) -> *mut u8 {
     unsafe {
         let layout = slot_blocks_layout();
-        let num = crate::max_backends() as usize;
-        let mut found = false;
-        let base = pgrx::pg_sys::ShmemInitStruct(
-            "pg_fusion:slot_blocks".as_pg_cstr(),
-            layout.layout.size() * num,
-            &mut found,
-        ) as *mut u8;
+        let base = slot_blocks_region_base();
         base.add(conn_id * layout.layout.size())
     }
 }
@@ -523,19 +541,35 @@ pub(crate) fn server_pid_atomic() -> &'static AtomicI32 {
 }
 
 pub(crate) fn result_ring_layout() -> executor::layout::BufferLayout {
-    executor::layout::result_ring_layout(RESULT_RING_CAP).expect("result ring layout")
+    *RESULT_RING_LAYOUT_CACHE.get_or_init(|| {
+        executor::layout::result_ring_layout(RESULT_RING_CAP).expect("result ring layout")
+    })
+}
+
+fn result_ring_region_base() -> *mut u8 {
+    let base = RESULT_RING_BASE.load(Ordering::Acquire);
+    if !base.is_null() {
+        return base;
+    }
+
+    let layout = result_ring_layout();
+    let num = crate::max_backends() as usize;
+    let mut found = false;
+    let base = unsafe {
+        pgrx::pg_sys::ShmemInitStruct(
+            "pg_fusion:result_ring".as_pg_cstr(),
+            layout.layout.size() * num,
+            &mut found,
+        ) as *mut u8
+    };
+    RESULT_RING_BASE.store(base, Ordering::Release);
+    base
 }
 
 pub(crate) fn result_ring_base_for(conn_id: usize) -> *mut u8 {
     unsafe {
         let layout = result_ring_layout();
-        let num = crate::max_backends() as usize;
-        let mut found = false;
-        let base = pgrx::pg_sys::ShmemInitStruct(
-            "pg_fusion:result_ring".as_pg_cstr(),
-            layout.layout.size() * num,
-            &mut found,
-        ) as *mut u8;
+        let base = result_ring_region_base();
         base.add(conn_id * layout.layout.size())
     }
 }
