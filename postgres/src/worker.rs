@@ -367,32 +367,45 @@ pub extern "C-unwind" fn worker_main(_arg: pg_sys::Datum) {
                 // Ensure registry knows this connection id for SHM addressing
                 storage.set_registry_conn(id);
                 loop {
-                    let res = match conn.poll().await {
-                        Ok(_) => {
-                            if tracing::enabled!(tracing::Level::TRACE) {
-                                tracing::trace!(connection_id = id, "processing message");
-                            }
-                            conn.process_message(&mut storage).await
+                    // Wait until data is available (or flag is already set).
+                    if let Err(e) = conn.poll().await {
+                        tracing::error!(connection_id = id, error = %e, "poll error");
+                        continue;
+                    }
+                    // Drain all available messages before signaling the client
+                    // once.  This reduces SIGUSR1 round-trips from one-per-message
+                    // to one-per-batch, which is the single biggest IPC win.
+                    let mut processed = 0usize;
+                    loop {
+                        // A protocol header is at least 6 bytes; stop when
+                        // there is not enough data for a complete header.
+                        if conn.pending_recv_len() < 6 {
+                            break;
                         }
-                        Err(e) => Err(e),
-                    };
-                    match res {
-                        Ok(()) => {
-                            if tracing::enabled!(tracing::Level::TRACE) {
-                                tracing::trace!(connection_id = id, "message processed");
+                        match conn.process_message(&mut storage).await {
+                            Ok(()) => {
+                                processed += 1;
                             }
-                        }
-                        Err(err) => {
-                            let ferr = match err.downcast::<common::FusionError>() {
-                                Ok(f) => f,
-                                Err(e) => common::FusionError::Other(e),
-                            };
-                            tracing::error!(connection_id = id, error = %ferr, "processing error");
-                            storage.flush();
-                            conn.handle_error(ferr);
-                            signal_client(&conn, id);
+                            Err(err) => {
+                                let ferr = match err.downcast::<common::FusionError>() {
+                                    Ok(f) => f,
+                                    Err(e) => common::FusionError::Other(e),
+                                };
+                                tracing::error!(connection_id = id, error = %ferr, "processing error");
+                                storage.flush();
+                                conn.handle_error(ferr);
+                                break;
+                            }
                         }
                     }
+                    if tracing::enabled!(tracing::Level::TRACE) {
+                        tracing::trace!(
+                            connection_id = id,
+                            processed,
+                            "batch drained, signaling client"
+                        );
+                    }
+                    // Single signal after the entire batch is processed.
                     signal_client(&conn, id);
                 }
             });

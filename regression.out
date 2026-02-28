@@ -1,0 +1,6 @@
+# using postmaster on /Users/darthunix/.pgrx, port 28817
+not ok 1     - test_setup                                670 ms
+1..1
+# 1 of 1 tests failed.
+# The differences that caused some tests to fail can be viewed in the file "/Users/darthunix/git/pg_fusion/regression.diffs".
+# A copy of the test summary that you see above is saved in the file "/Users/darthunix/git/pg_fusion/regression.out".

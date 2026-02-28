@@ -1,0 +1,25 @@
+SET
+SET
+SET
+SET
+CREATE EXTENSION
+DO
+DO
+ANALYZE
+ rows_cnt | rel_size 
+----------+----------
+   300000 | 32 MB
+(1 row)
+
+SET
+   sum_off   
+-------------
+ 45000150000
+(1 row)
+
+SET
+   sum_on    
+-------------
+ 45000161250
+(1 row)
+

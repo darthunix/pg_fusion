@@ -1,0 +1,11 @@
+run_at_utc=2026-02-26T05:55:xxZ
+command=PG_FUSION_PREFETCH=6 PG_FUSION_TOKIO_THREADS=4 PG_FUSION_LOG=/Users/darthunix/git/pg_fusion/results/pg_fusion_worker_run2.log RUST_LOG=debug,pg_fusion=trace,executor=trace cargo pgrx run pg17 -p pg_fusion --release
+query_table=public.bench_scan_small
+rows_cnt=300000
+rel_size=32MB
+sum_off=45000150000
+time_off_ms=43.210
+sum_on=45000178125
+time_on_ms=1158.564
+slowdown_x=26.81
+note=sum_on differs from sum_off
