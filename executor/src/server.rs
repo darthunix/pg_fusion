@@ -73,6 +73,8 @@ pub struct Connection<'bytes> {
     result_buffer: Option<LockFreeBuffer<'bytes>>,
     client_pid: &'bytes AtomicI32,
     server_pid: &'bytes AtomicI32,
+    telemetry_epoch: u64,
+    last_backend_publish_seq: u64,
 }
 
 impl<'bytes> Connection<'bytes> {
@@ -90,10 +92,26 @@ impl<'bytes> Connection<'bytes> {
             result_buffer: None,
             client_pid,
             server_pid,
+            telemetry_epoch: 0,
+            last_backend_publish_seq: 0,
+        }
+    }
+
+    #[inline]
+    fn sync_probe_epoch(&mut self) {
+        if !crate::telemetry::probe_enabled() {
+            return;
+        }
+        let metrics = crate::telemetry::conn_telemetry(self.id);
+        let epoch = metrics.epoch.load(Ordering::Acquire);
+        if epoch != 0 && epoch != self.telemetry_epoch {
+            self.telemetry_epoch = epoch;
+            self.last_backend_publish_seq = 0;
         }
     }
 
     pub async fn poll(&mut self) -> Result<()> {
+        self.sync_probe_epoch();
         let pending = self.recv_socket.buffer.len();
         if pending > 0 {
             if tracing::enabled!(target: "executor::server", tracing::Level::TRACE) {
@@ -105,6 +123,7 @@ impl<'bytes> Connection<'bytes> {
             }
             return Ok(());
         }
+        let wait_t0 = crate::telemetry::probe_enabled().then(crate::telemetry::monotonic_now_ns);
         if tracing::enabled!(target: "executor::server", tracing::Level::TRACE) {
             trace!(
                 target = "executor::server",
@@ -112,6 +131,12 @@ impl<'bytes> Connection<'bytes> {
             );
         }
         (&mut self.recv_socket).await?;
+        if let Some(wait_t0) = wait_t0 {
+            let metrics = crate::telemetry::conn_telemetry(self.id);
+            metrics.record_worker_poll_wait(
+                crate::telemetry::monotonic_now_ns().saturating_sub(wait_t0),
+            );
+        }
         if tracing::enabled!(target: "executor::server", tracing::Level::TRACE) {
             trace!(
                 target = "executor::server",
@@ -178,6 +203,7 @@ impl<'bytes> Connection<'bytes> {
     }
 
     pub async fn process_message(&mut self, storage: &mut Storage) -> Result<()> {
+        self.sync_probe_epoch();
         let _t0 = std::time::Instant::now();
         // Guard against spurious wakeups where no bytes are available yet.
         let pending = self.recv_socket.buffer.len();
@@ -232,6 +258,15 @@ impl<'bytes> Connection<'bytes> {
         if is_data_tag(header.tag) {
             match DataPacket::try_from(header.tag) {
                 Ok(DataPacket::Heap) => {
+                    let heap_msg_t0 =
+                        crate::telemetry::probe_enabled().then(crate::telemetry::monotonic_now_ns);
+                    if let Some(now_ns) = heap_msg_t0 {
+                        let metrics = crate::telemetry::conn_telemetry(self.id);
+                        metrics.observe_backend_page_publish(
+                            &mut self.last_backend_publish_seq,
+                            now_ns,
+                        );
+                    }
                     // Read metadata; we expect the visibility bitmap to be stored in shared memory.
                     let meta =
                         read_heap_block_bitmap_meta(&mut self.recv_socket.buffer, header.length)?;
@@ -267,6 +302,8 @@ impl<'bytes> Connection<'bytes> {
                         );
                     }
                     if let Some(tx) = storage.registry.sender(meta.scan_id as u64) {
+                        let copy_t0 = crate::telemetry::probe_enabled()
+                            .then(crate::telemetry::monotonic_now_ns);
                         // Copy page and vis now to avoid race with producer overwriting the slot
                         let page = crate::shm::copy_block_conn(self.id, meta.slot_id as usize);
                         let vis = if vis_len > 0 {
@@ -278,25 +315,39 @@ impl<'bytes> Connection<'bytes> {
                         } else {
                             Vec::new()
                         };
+                        if let Some(copy_t0) = copy_t0 {
+                            let metrics = crate::telemetry::conn_telemetry(self.id);
+                            metrics.record_worker_heap_copy(
+                                crate::telemetry::monotonic_now_ns().saturating_sub(copy_t0),
+                            );
+                        }
                         // Best-effort send; if the channel is full, await until space is available
-                let block = crate::pgscan::HeapBlock {
-                    scan_id: meta.scan_id as u64,
-                    slot_id: meta.slot_id,
-                    table_oid: meta.table_oid,
-                    blkno: meta.blkno,
-                    num_offsets: meta.num_offsets,
-                    vis_len,
-                    page,
-                    vis,
-                    recv_ts: std::time::Instant::now(),
-                };
-                if let Err(e) = tx.send(block).await {
-                    tracing::warn!(
-                        target = "pg_fusion::server",
-                        "failed to enqueue heap block for scan {}: {e}",
-                        meta.scan_id
-                    );
-                }
+                        let block = crate::pgscan::HeapBlock {
+                            scan_id: meta.scan_id as u64,
+                            slot_id: meta.slot_id,
+                            table_oid: meta.table_oid,
+                            blkno: meta.blkno,
+                            num_offsets: meta.num_offsets,
+                            vis_len,
+                            page,
+                            vis,
+                            recv_ts: std::time::Instant::now(),
+                        };
+                        let tx_send_t0 = crate::telemetry::probe_enabled()
+                            .then(crate::telemetry::monotonic_now_ns);
+                        if let Err(e) = tx.send(block).await {
+                            tracing::warn!(
+                                target = "pg_fusion::server",
+                                "failed to enqueue heap block for scan {}: {e}",
+                                meta.scan_id
+                            );
+                        }
+                        if let Some(tx_send_t0) = tx_send_t0 {
+                            let metrics = crate::telemetry::conn_telemetry(self.id);
+                            metrics.record_worker_heap_tx_send(
+                                crate::telemetry::monotonic_now_ns().saturating_sub(tx_send_t0),
+                            );
+                        }
                         // Request the next heap block for this scan using the same slot
                         if tracing::enabled!(target: "executor::server", tracing::Level::TRACE) {
                             trace!(
@@ -307,17 +358,28 @@ impl<'bytes> Connection<'bytes> {
                                 "requesting next heap block"
                             );
                         }
-                        if let Err(e) = request_heap_block(
+                        let req_t0 = crate::telemetry::probe_enabled()
+                            .then(crate::telemetry::monotonic_now_ns);
+                        let req_res = request_heap_block(
                             &mut self.send_buffer,
                             meta.scan_id,
                             meta.table_oid,
                             meta.slot_id,
-                        ) {
+                        );
+                        if let Err(ref e) = req_res {
                             tracing::error!(
                                 target = "pg_fusion::server",
                                 "failed to request next heap block for scan {}: {e}",
                                 meta.scan_id
                             );
+                        }
+                        if let Some(req_t0) = req_t0 {
+                            let metrics = crate::telemetry::conn_telemetry(self.id);
+                            let done_ns = crate::telemetry::monotonic_now_ns();
+                            metrics.record_worker_request_next(done_ns.saturating_sub(req_t0));
+                            if req_res.is_ok() {
+                                metrics.publish_worker_heap_request(done_ns);
+                            }
                         }
                     } else if tracing::enabled!(target: "pg_fusion::server", tracing::Level::TRACE)
                     {
@@ -325,6 +387,12 @@ impl<'bytes> Connection<'bytes> {
                             target = "pg_fusion::server",
                             scan_id = meta.scan_id,
                             "received heap block for unknown scan_id; dropping"
+                        );
+                    }
+                    if let Some(heap_msg_t0) = heap_msg_t0 {
+                        let metrics = crate::telemetry::conn_telemetry(self.id);
+                        metrics.record_worker_heap_msg(
+                            crate::telemetry::monotonic_now_ns().saturating_sub(heap_msg_t0),
                         );
                     }
                     return Ok(());
@@ -872,6 +940,8 @@ fn start_data_flow(conn: &mut Connection, storage: &mut Storage) -> Result<TaskR
     let handle = tokio::spawn(async move {
         // Execute all output partitions and merge them into the single result ring
         let mut ring = crate::shm::result_ring_writer_for(conn_id);
+        let probe_metrics =
+            crate::telemetry::probe_enabled().then(|| crate::telemetry::conn_telemetry(conn_id));
         let part_count = plan.output_partitioning().partition_count();
         if tracing::enabled!(target: "executor::server", tracing::Level::TRACE) {
             tracing::trace!(
@@ -896,7 +966,15 @@ fn start_data_flow(conn: &mut Connection, storage: &mut Storage) -> Result<TaskR
                                 if pg_attrs.is_empty() {
                                     continue;
                                 }
+                                let write_t0 = crate::telemetry::probe_enabled()
+                                    .then(crate::telemetry::monotonic_now_ns);
                                 let wrote = encode_and_write_rows(&batch, &pg_attrs, &mut ring);
+                                if let (Some(write_t0), Some(metrics)) = (write_t0, probe_metrics) {
+                                    metrics.record_worker_result_write(
+                                        crate::telemetry::monotonic_now_ns()
+                                            .saturating_sub(write_t0),
+                                    );
+                                }
                                 if tracing::enabled!(target: "executor::server", tracing::Level::TRACE)
                                 {
                                     tracing::trace!(
@@ -908,6 +986,11 @@ fn start_data_flow(conn: &mut Connection, storage: &mut Storage) -> Result<TaskR
                                     );
                                 }
                                 if wrote > 0 {
+                                    if let Some(metrics) = probe_metrics {
+                                        metrics.publish_worker_result_signal(
+                                            crate::telemetry::monotonic_now_ns(),
+                                        );
+                                    }
                                     let pid = client_pid_val;
                                     if pid > 0 && pid != i32::MAX {
                                         unsafe { libc::kill(pid as libc::pid_t, libc::SIGUSR1) };
@@ -933,6 +1016,9 @@ fn start_data_flow(conn: &mut Connection, storage: &mut Storage) -> Result<TaskR
         }
         // Write EOF sentinel row to result ring to unblock backend
         let _ = protocol::result::write_eof(&mut ring);
+        if let Some(metrics) = probe_metrics {
+            metrics.publish_worker_result_signal(crate::telemetry::monotonic_now_ns());
+        }
         // Nudge the backend in case it is waiting on latch
         let pid = client_pid_val;
         if pid > 0 && pid != i32::MAX {

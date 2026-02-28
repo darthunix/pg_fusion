@@ -9,3 +9,4 @@ pub mod server;
 pub mod shm;
 pub mod sql;
 pub mod stack;
+pub mod telemetry;

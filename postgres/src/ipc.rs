@@ -47,6 +47,11 @@ pub(crate) fn connection_id() -> AnyResult<u32> {
     Ok(CONNECTION_HANDLE.get().unwrap().id())
 }
 
+#[inline]
+pub(crate) fn current_connection_id() -> Option<u32> {
+    CONNECTION_HANDLE.get().map(ConnectionHandle::id)
+}
+
 pub(crate) struct ConnectionShared<'a> {
     pub flag: &'a AtomicBool,
     pub recv: LockFreeBuffer<'a>,

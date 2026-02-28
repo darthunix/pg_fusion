@@ -32,9 +32,9 @@ use datafusion_execution::TaskContext;
 use datafusion_physical_expr::EquivalenceProperties;
 use futures::Stream;
 use pgrx_pg_sys as pg_sys;
+use std::time::Instant;
 use storage::heap::{decode_tuple_project, HeapPage, PgAttrMeta};
 use tokio::sync::mpsc;
-use std::time::Instant;
 
 pub type ScanId = u64;
 
@@ -329,6 +329,7 @@ impl ExecutionPlan for PgScanExec {
             Arc::clone(&self.proj_schema),
             Arc::clone(&self.attrs_full),
             Arc::clone(&self.proj_indices),
+            self.registry.conn_id(),
             rx,
         );
         Ok(Box::pin(stream))
@@ -346,6 +347,8 @@ pub struct PgScanStream {
     attrs_full: Arc<Vec<PgAttrMeta>>,
     // Projection indices into full schema
     proj_indices: Arc<Vec<usize>>,
+    conn_id: usize,
+    pending_wait_start_ns: Option<u64>,
     rx: Option<mpsc::Receiver<HeapBlock>>,
 }
 
@@ -354,12 +357,15 @@ impl PgScanStream {
         proj_schema: SchemaRef,
         attrs_full: Arc<Vec<PgAttrMeta>>,
         proj_indices: Arc<Vec<usize>>,
+        conn_id: usize,
         rx: Option<mpsc::Receiver<HeapBlock>>,
     ) -> Self {
         Self {
             proj_schema,
             attrs_full,
             proj_indices,
+            conn_id,
+            pending_wait_start_ns: None,
             rx,
         }
     }
@@ -375,6 +381,16 @@ impl Stream for PgScanStream {
         };
         match rx.poll_recv(cx) {
             Poll::Ready(Some(block)) => {
+                if let Some(wait_t0) = this.pending_wait_start_ns.take() {
+                    if crate::telemetry::probe_enabled() {
+                        let metrics = crate::telemetry::conn_telemetry(this.conn_id);
+                        metrics.record_worker_pgscan_wait(
+                            crate::telemetry::monotonic_now_ns().saturating_sub(wait_t0),
+                        );
+                    }
+                }
+                let decode_t0 =
+                    crate::telemetry::probe_enabled().then(crate::telemetry::monotonic_now_ns);
                 // Take ownership of copied page and visibility bitmap from the block (provided at receipt time)
                 let num_offsets = block.num_offsets;
                 let vis_len = block.vis_len;
@@ -389,6 +405,12 @@ impl Stream for PgScanStream {
                 let batch = RecordBatch::new_empty(Arc::clone(&this.proj_schema));
                 let Ok(_hp) = hp else {
                     // On error decoding page, return empty batch for resilience
+                    if let Some(decode_t0) = decode_t0 {
+                        let metrics = crate::telemetry::conn_telemetry(this.conn_id);
+                        metrics.record_worker_pgscan_decode(
+                            crate::telemetry::monotonic_now_ns().saturating_sub(decode_t0),
+                        );
+                    }
                     return Poll::Ready(Some(Ok(batch)));
                 };
 
@@ -512,10 +534,24 @@ impl Stream for PgScanStream {
                         "pgscan: decoded rows"
                     );
                 }
+                if let Some(decode_t0) = decode_t0 {
+                    let metrics = crate::telemetry::conn_telemetry(this.conn_id);
+                    metrics.record_worker_pgscan_decode(
+                        crate::telemetry::monotonic_now_ns().saturating_sub(decode_t0),
+                    );
+                }
                 Poll::Ready(Some(Ok(rb)))
             }
-            Poll::Ready(None) => Poll::Ready(None),
-            Poll::Pending => Poll::Pending,
+            Poll::Ready(None) => {
+                this.pending_wait_start_ns = None;
+                Poll::Ready(None)
+            }
+            Poll::Pending => {
+                if crate::telemetry::probe_enabled() && this.pending_wait_start_ns.is_none() {
+                    this.pending_wait_start_ns = Some(crate::telemetry::monotonic_now_ns());
+                }
+                Poll::Pending
+            }
         }
     }
 }
