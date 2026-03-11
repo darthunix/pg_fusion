@@ -209,10 +209,8 @@ impl<'bytes> Connection<'bytes> {
 
     pub async fn process_message(&mut self, storage: &mut Storage) -> Result<()> {
         self.sync_probe_epoch();
-        let _t0 = std::time::Instant::now();
-        // Guard against spurious wakeups where no bytes are available yet.
-        let pending = self.recv_socket.buffer.len();
-        if pending < 6 {
+        let t0 = std::time::Instant::now();
+        if self.recv_socket.buffer.len() < 6 {
             // Header is at least 6 bytes (3 fixints + u16)
             if tracing::enabled!(target: "executor::server", tracing::Level::TRACE) {
                 trace!(
@@ -222,20 +220,22 @@ impl<'bytes> Connection<'bytes> {
             }
             return Ok(());
         }
+
         let header = consume_header(&mut self.recv_socket.buffer)?;
         if tracing::enabled!(target: "executor::server", tracing::Level::DEBUG) {
             debug!(
-            target = "executor::server",
-            direction = ?header.direction,
-            tag = header.tag,
-            flag = ?header.flag,
-            length = header.length,
-            recv_unread = self.recv_socket.buffer.len(),
-            send_unread = self.send_buffer.len(),
-            elapsed_us = _t0.elapsed().as_micros() as u64,
-            "process_message: header received"
+                target = "executor::server",
+                direction = ?header.direction,
+                tag = header.tag,
+                flag = ?header.flag,
+                length = header.length,
+                recv_unread = self.recv_socket.buffer.len(),
+                send_unread = self.send_buffer.len(),
+                elapsed_us = t0.elapsed().as_micros() as u64,
+                "process_message: header received"
             );
         }
+
         if header.direction == Direction::ToClient {
             if tracing::enabled!(target: "executor::server", tracing::Level::TRACE) {
                 trace!(
@@ -245,196 +245,258 @@ impl<'bytes> Connection<'bytes> {
             }
             return Ok(());
         }
-        // Column layout arrives during planning/prepare; store it for later encoding use.
-        if header.tag == ControlPacket::ColumnLayout as u8 {
-            let attrs = consume_column_layout(&mut self.recv_socket.buffer)?;
-            let len = attrs.len();
+
+        if self.handle_column_layout_packet(storage, header.tag)? {
+            return Ok(());
+        }
+
+        if self
+            .handle_data_packet(storage, header.tag, header.length)
+            .await?
+        {
+            return Ok(());
+        }
+
+        let packet = ControlPacket::try_from(header.tag)?;
+        if !self.handle_control_packet(storage, packet).await? {
+            return Ok(());
+        }
+
+        if tracing::enabled!(target: "executor::server", tracing::Level::DEBUG) {
+            debug!(
+                target = "executor::server",
+                send_unread = self.send_buffer.len(),
+                client_pid = self.client_pid.load(Ordering::Relaxed),
+                elapsed_us = t0.elapsed().as_micros() as u64,
+                "process_message: response buffered, ready to signal client"
+            );
+        }
+        Ok(())
+    }
+
+    #[inline]
+    fn handle_column_layout_packet(&mut self, storage: &mut Storage, tag: u8) -> Result<bool> {
+        if tag != ControlPacket::ColumnLayout as u8 {
+            return Ok(false);
+        }
+        let attrs = consume_column_layout(&mut self.recv_socket.buffer)?;
+        if tracing::enabled!(target: "executor::server", tracing::Level::TRACE) {
+            tracing::trace!(
+                target = "executor::server",
+                pg_attrs = attrs.len(),
+                "column layout received"
+            );
+        }
+        storage.pg_attrs = Some(attrs);
+        Ok(true)
+    }
+
+    async fn handle_data_packet(
+        &mut self,
+        storage: &mut Storage,
+        tag: u8,
+        payload_len: u16,
+    ) -> Result<bool> {
+        if !is_data_tag(tag) {
+            return Ok(false);
+        }
+        match DataPacket::try_from(tag) {
+            Ok(DataPacket::Heap) => self.handle_heap_data_packet(storage, payload_len).await?,
+            Ok(DataPacket::Eof) => self.handle_eof_data_packet(storage)?,
+            _ => {
+                if tracing::enabled!(target: "executor::server", tracing::Level::TRACE) {
+                    trace!(
+                        target = "executor::server",
+                        "process_message: unrecognized data packet, ignoring"
+                    );
+                }
+            }
+        }
+        Ok(true)
+    }
+
+    #[inline]
+    fn handle_eof_data_packet(&mut self, storage: &mut Storage) -> Result<()> {
+        // Per-scan EOF notification
+        let scan_id = read_u64_msgpack(&mut self.recv_socket.buffer)?;
+        storage.registry.close(scan_id);
+        Ok(())
+    }
+
+    #[inline]
+    fn drain_legacy_bitmap_inline(&mut self, mut remaining: usize) -> Result<()> {
+        // If payload included inline bitmap bytes (legacy), drain them without allocation.
+        while remaining > 0 {
+            let mut buf = [0u8; 256];
+            let chunk = remaining.min(buf.len());
+            std::io::Read::read_exact(&mut self.recv_socket.buffer, &mut buf[..chunk])?;
+            remaining -= chunk;
+        }
+        Ok(())
+    }
+
+    async fn handle_heap_data_packet(
+        &mut self,
+        storage: &mut Storage,
+        payload_len: u16,
+    ) -> Result<()> {
+        let heap_msg_t0 =
+            crate::telemetry::probe_enabled().then(crate::telemetry::monotonic_now_ns);
+        if let Some(now_ns) = heap_msg_t0 {
+            let metrics = crate::telemetry::conn_telemetry(self.id);
+            metrics.observe_backend_page_publish(&mut self.last_backend_publish_seq, now_ns);
+        }
+
+        // Read metadata; visibility bitmap is stored in shared memory.
+        let meta = read_heap_block_bitmap_meta(&mut self.recv_socket.buffer, payload_len)?;
+        if tracing::enabled!(target: "executor::server", tracing::Level::TRACE) {
+            trace!(
+                target = "executor::server",
+                scan_id = meta.scan_id,
+                slot_id = meta.slot_id,
+                table_oid = meta.table_oid,
+                blkno = meta.blkno,
+                num_offsets = meta.num_offsets,
+                bitmap_inline_len = meta.bitmap_len,
+                "heap bitmap meta received"
+            );
+        }
+
+        self.drain_legacy_bitmap_inline(meta.bitmap_len as usize)?;
+
+        // Trailing u16 carries the visibility bitmap length in shared memory.
+        let vis_len = read_u16_msgpack(&mut self.recv_socket.buffer)?;
+        if tracing::enabled!(target: "executor::server", tracing::Level::TRACE) {
+            trace!(
+                target = "executor::server",
+                scan_id = meta.scan_id,
+                slot_id = meta.slot_id,
+                vis_len,
+                "heap bitmap vis_len (shm) received"
+            );
+        }
+
+        if let Some(tx) = storage.registry.sender(meta.scan_id) {
+            let copy_t0 =
+                crate::telemetry::probe_enabled().then(crate::telemetry::monotonic_now_ns);
+            // Copy page and vis now to avoid race with producer overwriting the slot.
+            let page = crate::shm::copy_block_conn(self.id, meta.slot_id as usize);
+            let vis = if vis_len > 0 {
+                crate::shm::copy_vis_conn(self.id, meta.slot_id as usize, vis_len as usize)
+            } else {
+                Vec::new()
+            };
+            if let Some(copy_t0) = copy_t0 {
+                let metrics = crate::telemetry::conn_telemetry(self.id);
+                metrics.record_worker_heap_copy(
+                    crate::telemetry::monotonic_now_ns().saturating_sub(copy_t0),
+                );
+            }
+
+            let block = HeapPageBlock {
+                blkno: meta.blkno,
+                num_offsets: meta.num_offsets,
+                vis_len,
+                page,
+                vis,
+                recv_ts: std::time::Instant::now(),
+            };
+
+            let tx_send_t0 =
+                crate::telemetry::probe_enabled().then(crate::telemetry::monotonic_now_ns);
+            // Best-effort send; if the channel is full, await until space is available.
+            if let Err(e) = tx.send(block).await {
+                tracing::warn!(
+                    target = "pg_fusion::server",
+                    "failed to enqueue heap block for scan {}: {e}",
+                    meta.scan_id
+                );
+            }
+            if let Some(tx_send_t0) = tx_send_t0 {
+                let metrics = crate::telemetry::conn_telemetry(self.id);
+                metrics.record_worker_heap_tx_send(
+                    crate::telemetry::monotonic_now_ns().saturating_sub(tx_send_t0),
+                );
+            }
+
+            // Request the next heap block for this scan using the same slot.
+            if tracing::enabled!(target: "executor::server", tracing::Level::TRACE) {
+                trace!(
+                    target = "executor::server",
+                    scan_id = meta.scan_id,
+                    table_oid = meta.table_oid,
+                    slot_id = meta.slot_id,
+                    "requesting next heap block"
+                );
+            }
+            let req_t0 = crate::telemetry::probe_enabled().then(crate::telemetry::monotonic_now_ns);
+            let req_res = request_heap_block(
+                &mut self.send_buffer,
+                meta.scan_id,
+                meta.table_oid,
+                meta.slot_id,
+            );
+            if let Err(ref e) = req_res {
+                tracing::error!(
+                    target = "pg_fusion::server",
+                    "failed to request next heap block for scan {}: {e}",
+                    meta.scan_id
+                );
+            }
+            if let Some(req_t0) = req_t0 {
+                let metrics = crate::telemetry::conn_telemetry(self.id);
+                let done_ns = crate::telemetry::monotonic_now_ns();
+                metrics.record_worker_request_next(done_ns.saturating_sub(req_t0));
+                if req_res.is_ok() {
+                    metrics.publish_worker_heap_request(done_ns);
+                }
+            }
+        } else if tracing::enabled!(target: "pg_fusion::server", tracing::Level::TRACE) {
+            trace!(
+                target = "pg_fusion::server",
+                scan_id = meta.scan_id,
+                "received heap block for unknown scan_id; dropping"
+            );
+        }
+
+        if let Some(heap_msg_t0) = heap_msg_t0 {
+            let metrics = crate::telemetry::conn_telemetry(self.id);
+            metrics.record_worker_heap_msg(
+                crate::telemetry::monotonic_now_ns().saturating_sub(heap_msg_t0),
+            );
+        }
+        Ok(())
+    }
+
+    async fn handle_control_packet(
+        &mut self,
+        storage: &mut Storage,
+        mut packet: ControlPacket,
+    ) -> Result<bool> {
+        // Do not flush send_buffer here; backend is the reader for responses.
+        // Guard against spurious EndScan (e.g., after EXPLAIN) when no PhysicalPlan is active.
+        if packet == ControlPacket::EndScan
+            && storage.state.state() != &crate::fsm::ExecutorState::PhysicalPlan
+        {
             if tracing::enabled!(target: "executor::server", tracing::Level::TRACE) {
                 tracing::trace!(
                     target = "executor::server",
-                    pg_attrs = len,
-                    "column layout received"
+                    "process_message: ignoring EndScan outside PhysicalPlan state"
                 );
             }
-            storage.pg_attrs = Some(attrs);
-            return Ok(());
+            return Ok(false);
         }
-        // Data packets are handled out-of-band: push heap blocks into registry channels.
-        if is_data_tag(header.tag) {
-            match DataPacket::try_from(header.tag) {
-                Ok(DataPacket::Heap) => {
-                    let heap_msg_t0 =
-                        crate::telemetry::probe_enabled().then(crate::telemetry::monotonic_now_ns);
-                    if let Some(now_ns) = heap_msg_t0 {
-                        let metrics = crate::telemetry::conn_telemetry(self.id);
-                        metrics.observe_backend_page_publish(
-                            &mut self.last_backend_publish_seq,
-                            now_ns,
-                        );
-                    }
-                    // Read metadata; we expect the visibility bitmap to be stored in shared memory.
-                    let meta =
-                        read_heap_block_bitmap_meta(&mut self.recv_socket.buffer, header.length)?;
-                    if tracing::enabled!(target: "executor::server", tracing::Level::TRACE) {
-                        trace!(
-                            target = "executor::server",
-                            scan_id = meta.scan_id,
-                            slot_id = meta.slot_id,
-                            table_oid = meta.table_oid,
-                            blkno = meta.blkno,
-                            num_offsets = meta.num_offsets,
-                            bitmap_inline_len = meta.bitmap_len,
-                            "heap bitmap meta received"
-                        );
-                    }
-                    // If payload included inline bitmap bytes (legacy), drain them without allocation.
-                    let mut remaining = meta.bitmap_len as usize;
-                    while remaining > 0 {
-                        let mut buf = [0u8; 256];
-                        let chunk = remaining.min(buf.len());
-                        std::io::Read::read_exact(&mut self.recv_socket.buffer, &mut buf[..chunk])?;
-                        remaining -= chunk;
-                    }
-                    // Trailing u16 carries the visibility bitmap length in shared memory
-                    let vis_len = read_u16_msgpack(&mut self.recv_socket.buffer)?;
-                    if tracing::enabled!(target: "executor::server", tracing::Level::TRACE) {
-                        trace!(
-                            target = "executor::server",
-                            scan_id = meta.scan_id,
-                            slot_id = meta.slot_id,
-                            vis_len,
-                            "heap bitmap vis_len (shm) received"
-                        );
-                    }
-                    if let Some(tx) = storage.registry.sender(meta.scan_id as u64) {
-                        let copy_t0 = crate::telemetry::probe_enabled()
-                            .then(crate::telemetry::monotonic_now_ns);
-                        // Copy page and vis now to avoid race with producer overwriting the slot
-                        let page = crate::shm::copy_block_conn(self.id, meta.slot_id as usize);
-                        let vis = if vis_len > 0 {
-                            crate::shm::copy_vis_conn(
-                                self.id,
-                                meta.slot_id as usize,
-                                vis_len as usize,
-                            )
-                        } else {
-                            Vec::new()
-                        };
-                        if let Some(copy_t0) = copy_t0 {
-                            let metrics = crate::telemetry::conn_telemetry(self.id);
-                            metrics.record_worker_heap_copy(
-                                crate::telemetry::monotonic_now_ns().saturating_sub(copy_t0),
-                            );
-                        }
-                        // Best-effort send; if the channel is full, await until space is available
-                        let block = HeapPageBlock {
-                            blkno: meta.blkno,
-                            num_offsets: meta.num_offsets,
-                            vis_len,
-                            page,
-                            vis,
-                            recv_ts: std::time::Instant::now(),
-                        };
-                        let tx_send_t0 = crate::telemetry::probe_enabled()
-                            .then(crate::telemetry::monotonic_now_ns);
-                        if let Err(e) = tx.send(block).await {
-                            tracing::warn!(
-                                target = "pg_fusion::server",
-                                "failed to enqueue heap block for scan {}: {e}",
-                                meta.scan_id
-                            );
-                        }
-                        if let Some(tx_send_t0) = tx_send_t0 {
-                            let metrics = crate::telemetry::conn_telemetry(self.id);
-                            metrics.record_worker_heap_tx_send(
-                                crate::telemetry::monotonic_now_ns().saturating_sub(tx_send_t0),
-                            );
-                        }
-                        // Request the next heap block for this scan using the same slot
-                        if tracing::enabled!(target: "executor::server", tracing::Level::TRACE) {
-                            trace!(
-                                target = "executor::server",
-                                scan_id = meta.scan_id,
-                                table_oid = meta.table_oid,
-                                slot_id = meta.slot_id,
-                                "requesting next heap block"
-                            );
-                        }
-                        let req_t0 = crate::telemetry::probe_enabled()
-                            .then(crate::telemetry::monotonic_now_ns);
-                        let req_res = request_heap_block(
-                            &mut self.send_buffer,
-                            meta.scan_id,
-                            meta.table_oid,
-                            meta.slot_id,
-                        );
-                        if let Err(ref e) = req_res {
-                            tracing::error!(
-                                target = "pg_fusion::server",
-                                "failed to request next heap block for scan {}: {e}",
-                                meta.scan_id
-                            );
-                        }
-                        if let Some(req_t0) = req_t0 {
-                            let metrics = crate::telemetry::conn_telemetry(self.id);
-                            let done_ns = crate::telemetry::monotonic_now_ns();
-                            metrics.record_worker_request_next(done_ns.saturating_sub(req_t0));
-                            if req_res.is_ok() {
-                                metrics.publish_worker_heap_request(done_ns);
-                            }
-                        }
-                    } else if tracing::enabled!(target: "pg_fusion::server", tracing::Level::TRACE)
-                    {
-                        trace!(
-                            target = "pg_fusion::server",
-                            scan_id = meta.scan_id,
-                            "received heap block for unknown scan_id; dropping"
-                        );
-                    }
-                    if let Some(heap_msg_t0) = heap_msg_t0 {
-                        let metrics = crate::telemetry::conn_telemetry(self.id);
-                        metrics.record_worker_heap_msg(
-                            crate::telemetry::monotonic_now_ns().saturating_sub(heap_msg_t0),
-                        );
-                    }
-                    return Ok(());
-                }
-                Ok(DataPacket::Eof) => {
-                    // Per-scan EOF notification
-                    let scan_id = read_u64_msgpack(&mut self.recv_socket.buffer)?;
-                    storage.registry.close(scan_id as u64);
-                    return Ok(());
-                }
-                _ => {
-                    if tracing::enabled!(target: "executor::server", tracing::Level::TRACE) {
-                        trace!(
-                            target = "executor::server",
-                            "process_message: unrecognized data packet, ignoring"
-                        );
-                    }
-                    return Ok(());
-                }
-            }
-        }
-        let mut packet = ControlPacket::try_from(header.tag)?;
-        // Do not flush send_buffer here; backend is the reader for responses
-        // Guard against spurious EndScan (e.g., after EXPLAIN) when no PhysicalPlan is active
-        if packet == ControlPacket::EndScan {
-            if storage.state.state() != &crate::fsm::ExecutorState::PhysicalPlan {
-                if tracing::enabled!(target: "executor::server", tracing::Level::TRACE) {
-                    tracing::trace!(
-                        target = "executor::server",
-                        "process_message: ignoring EndScan outside PhysicalPlan state"
-                    );
-                }
-                return Ok(());
-            }
-        }
+
         let mut skip_metadata = false;
         loop {
             let action = storage.state.consume(&packet)?;
             if tracing::enabled!(target: "executor::server", tracing::Level::TRACE) {
-                trace!(target = "executor::server", current_packet = ?packet, action = ?action, "process_message: state consumed");
+                trace!(
+                    target = "executor::server",
+                    current_packet = ?packet,
+                    action = ?action,
+                    "process_message: state consumed"
+                );
             }
             let result = match action {
                 Some(Action::Bind) => {
@@ -516,14 +578,18 @@ impl<'bytes> Connection<'bytes> {
                             "process_message: Action::Flush (reset state)"
                         );
                     }
-                    // Do not flush send_buffer here; only backend should move read head
+                    // Do not flush send_buffer here; only backend should move read head.
                     storage.flush();
-                    return Ok(());
+                    return Ok(false);
                 }
                 Some(Action::Parse) => {
                     let query = read_query(&mut self.recv_socket.buffer)?;
                     if tracing::enabled!(target: "executor::server", tracing::Level::TRACE) {
-                        trace!(target = "executor::server", query = %query, "process_message: Action::Parse");
+                        trace!(
+                            target = "executor::server",
+                            query = %query,
+                            "process_message: Action::Parse"
+                        );
                     }
                     parse(query.into())
                 }
@@ -636,7 +702,7 @@ impl<'bytes> Connection<'bytes> {
                     }
                 }
                 TaskResult::Noop => {
-                    // Intentionally no-op (e.g., heap packet consumed elsewhere)
+                    // Intentionally no-op (e.g., heap packet consumed elsewhere).
                 }
                 TaskResult::Parsing((stmt, tables)) => {
                     storage.statement = Some(stmt);
@@ -645,7 +711,9 @@ impl<'bytes> Connection<'bytes> {
                         // Let's move connection to the next state.
                         skip_metadata = true;
                         packet = ControlPacket::Metadata;
-                        trace!("process_message: no tables, skipping metadata, forcing ControlPacket::Metadata");
+                        trace!(
+                            "process_message: no tables, skipping metadata, forcing ControlPacket::Metadata"
+                        );
                         continue;
                     } else {
                         trace!(
@@ -658,16 +726,7 @@ impl<'bytes> Connection<'bytes> {
             }
             break;
         }
-        if tracing::enabled!(target: "executor::server", tracing::Level::DEBUG) {
-            debug!(
-                target = "executor::server",
-                send_unread = self.send_buffer.len(),
-                client_pid = self.client_pid.load(Ordering::Relaxed),
-                elapsed_us = _t0.elapsed().as_micros() as u64,
-                "process_message: response buffered, ready to signal client"
-            );
-        }
-        Ok(())
+        Ok(true)
     }
 
     pub fn handle_error(&mut self, error: FusionError) {
