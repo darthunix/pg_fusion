@@ -26,11 +26,12 @@ tracing = { version = "0.1" }
 protocol = { path = "../protocol", version = "25.0" }
 common = { path = "../common", version = "25.0" }
 async-trait = "0.1"
-datafusion-catalog = "44.0"
-datafusion-physical-expr = "44.0.0"
-datafusion-execution = "44.0.0"
+datafusion-catalog = { workspace = true }
+datafusion-physical-expr = { workspace = true }
+datafusion-execution = { workspace = true }
 storage = { path = "../storage", version = "25.0" }
-pgrx-pg-sys = { version = "0.16.0", package = "pgrx-pg-sys" }
+pgrx-pg-sys = { workspace = true }
+scan = { path = "../scan", version = "25.0" }
 
 [dev-dependencies]
 bitflags = "2"

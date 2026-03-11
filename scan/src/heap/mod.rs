@@ -35,23 +35,58 @@ use tokio::sync::mpsc;
 type HeapScanId = u64;
 
 #[derive(Debug, Clone)]
-pub(crate) struct HeapPageBlock {
-    pub(crate) blkno: u32,
-    pub(crate) num_offsets: u16,
-    pub(crate) vis_len: u16,
-    pub(crate) page: Vec<u8>,
-    pub(crate) vis: Vec<u8>,
-    pub(crate) recv_ts: Instant,
+pub struct HeapPageBlock {
+    pub blkno: u32,
+    pub num_offsets: u16,
+    pub vis_len: u16,
+    pub page: Vec<u8>,
+    pub vis: Vec<u8>,
+    pub recv_ts: Instant,
     // Note: page bytes and visibility bitmap reside in shared memory,
     // addressed by `slot_id` with `vis_len` bytes for visibility bitmap.
 }
 
 #[derive(Debug, Default)]
-pub(crate) struct HeapScanRegistry {
+pub struct HeapScanRegistry {
     inner: Mutex<HashMap<HeapScanId, Entry>>,
     conn_id: usize,
     next_id: AtomicU64,
     next_slot: AtomicU16,
+}
+
+#[derive(Clone, Copy, Debug)]
+pub struct HeapScanTelemetryHooks {
+    pub enabled: fn() -> bool,
+    pub now_ns: fn() -> u64,
+    pub record_wait: fn(conn_id: usize, delta_ns: u64),
+    pub record_decode: fn(conn_id: usize, delta_ns: u64),
+}
+
+fn telemetry_disabled() -> bool {
+    false
+}
+
+fn telemetry_now_zero() -> u64 {
+    0
+}
+
+fn telemetry_noop(_: usize, _: u64) {}
+
+impl HeapScanTelemetryHooks {
+    pub const fn disabled() -> Self {
+        Self {
+            enabled: telemetry_disabled,
+            now_ns: telemetry_now_zero,
+            record_wait: telemetry_noop,
+            record_decode: telemetry_noop,
+        }
+    }
+}
+
+impl Default for HeapScanTelemetryHooks {
+    fn default() -> Self {
+        Self::disabled()
+    }
 }
 
 #[derive(Debug)]
@@ -62,17 +97,11 @@ struct Entry {
 }
 
 impl HeapScanRegistry {
-    #[cfg(test)]
-    pub(crate) fn new() -> Self {
-        Self {
-            inner: Mutex::new(HashMap::new()),
-            conn_id: 0,
-            next_id: AtomicU64::new(1),
-            next_slot: AtomicU16::new(0),
-        }
+    pub fn new() -> Self {
+        Self::with_conn(0)
     }
 
-    pub(crate) fn with_conn(conn_id: usize) -> Self {
+    pub fn with_conn(conn_id: usize) -> Self {
         Self {
             inner: Mutex::new(HashMap::new()),
             conn_id,
@@ -88,21 +117,17 @@ impl HeapScanRegistry {
     }
 
     /// Reserve space for at least `additional` more scan entries.
-    pub(crate) fn reserve(&self, additional: usize) {
+    pub fn reserve(&self, additional: usize) {
         let mut map = self.lock();
         map.reserve(additional);
     }
 
     /// Allocate a unique scan identifier for this connection.
-    pub(crate) fn allocate_id(&self) -> HeapScanId {
+    pub fn allocate_id(&self) -> HeapScanId {
         self.next_id.fetch_add(1, Ordering::Relaxed)
     }
 
-    pub(crate) fn register(
-        &self,
-        scan_id: HeapScanId,
-        capacity: usize,
-    ) -> mpsc::Sender<HeapPageBlock> {
+    pub fn register(&self, scan_id: HeapScanId, capacity: usize) -> mpsc::Sender<HeapPageBlock> {
         // Allocate alternating slot ids 0,1 for concurrent scans
         let slot = self.next_slot.fetch_add(1, Ordering::Relaxed) % 2;
         let (tx, rx) = mpsc::channel(capacity);
@@ -118,33 +143,30 @@ impl HeapScanRegistry {
         tx
     }
 
-    pub(crate) fn sender(&self, scan_id: HeapScanId) -> Option<mpsc::Sender<HeapPageBlock>> {
+    pub fn sender(&self, scan_id: HeapScanId) -> Option<mpsc::Sender<HeapPageBlock>> {
         let map = self.lock();
         map.get(&scan_id).map(|e| e.sender.clone())
     }
 
-    pub(crate) fn take_receiver(
-        &self,
-        scan_id: HeapScanId,
-    ) -> Option<mpsc::Receiver<HeapPageBlock>> {
+    pub fn take_receiver(&self, scan_id: HeapScanId) -> Option<mpsc::Receiver<HeapPageBlock>> {
         let mut map = self.lock();
         map.get_mut(&scan_id).and_then(|e| e.receiver.take())
     }
 
     /// Get the assigned slot id for this scan
-    pub(crate) fn slot_for(&self, scan_id: HeapScanId) -> Option<u16> {
+    pub fn slot_for(&self, scan_id: HeapScanId) -> Option<u16> {
         let map = self.lock();
         map.get(&scan_id).map(|e| e.slot_id)
     }
 
     /// Close a single scan by dropping its sender; receiver will eventually see EOF.
-    pub(crate) fn close(&self, scan_id: HeapScanId) {
+    pub fn close(&self, scan_id: HeapScanId) {
         let mut map = self.lock();
         let _ = map.remove(&scan_id);
     }
 
     #[inline]
-    pub(crate) fn conn_id(&self) -> usize {
+    pub fn conn_id(&self) -> usize {
         self.conn_id
     }
 }
@@ -152,18 +174,34 @@ impl HeapScanRegistry {
 // No global registry; registries are per-connection and owned by the server Storage.
 
 #[derive(Debug)]
-pub(crate) struct HeapScanProvider {
+pub struct HeapScanProvider {
     schema: SchemaRef,
     table_oid: u32,
     registry: Arc<HeapScanRegistry>,
+    telemetry: HeapScanTelemetryHooks,
 }
 
 impl HeapScanProvider {
-    pub(crate) fn new(table_oid: u32, schema: SchemaRef, registry: Arc<HeapScanRegistry>) -> Self {
+    pub fn new(table_oid: u32, schema: SchemaRef, registry: Arc<HeapScanRegistry>) -> Self {
         Self {
             schema,
             table_oid,
             registry,
+            telemetry: HeapScanTelemetryHooks::default(),
+        }
+    }
+
+    pub fn with_telemetry(
+        table_oid: u32,
+        schema: SchemaRef,
+        registry: Arc<HeapScanRegistry>,
+        telemetry: HeapScanTelemetryHooks,
+    ) -> Self {
+        Self {
+            schema,
+            table_oid,
+            registry,
+            telemetry,
         }
     }
 }
@@ -198,15 +236,25 @@ impl TableProvider for HeapScanProvider {
     ) -> DFResult<Arc<dyn ExecutionPlan>> {
         // Respect requested projection; DataFusion expects the physical plan schema
         // to match the projected logical input schema.
-        let proj_indices: Vec<usize> = match _projection {
-            Some(ix) => ix.clone(),
-            None => (0..self.schema.fields().len()).collect(),
+        //
+        // For identity/full projection we reuse the full schema and skip
+        // allocating projection indices.
+        let is_identity_projection = _projection.is_none_or(|ix| {
+            ix.len() == self.schema.fields().len() && ix.iter().copied().eq(0..ix.len())
+        });
+        let (proj_schema, proj_indices) = if is_identity_projection {
+            (Arc::clone(&self.schema), None)
+        } else {
+            let proj_indices = _projection.cloned().unwrap_or_default();
+            let proj_fields: Vec<datafusion::arrow::datatypes::Field> = proj_indices
+                .iter()
+                .map(|&i| self.schema.field(i).clone())
+                .collect();
+            (
+                Arc::new(datafusion::arrow::datatypes::Schema::new(proj_fields)),
+                Some(proj_indices),
+            )
         };
-        let proj_fields: Vec<datafusion::arrow::datatypes::Field> = proj_indices
-            .iter()
-            .map(|&i| self.schema.field(i).clone())
-            .collect();
-        let proj_schema = Arc::new(datafusion::arrow::datatypes::Schema::new(proj_fields));
 
         // Allocate a fresh, unique scan id for every scan instance (handles self-joins)
         let scan_id = self.registry.allocate_id();
@@ -217,6 +265,7 @@ impl TableProvider for HeapScanProvider {
             proj_schema,              // physical output schema
             proj_indices,
             Arc::clone(&self.registry),
+            self.telemetry,
         );
         Ok(Arc::new(exec))
     }
@@ -235,8 +284,10 @@ struct HeapScanExec {
     props: PlanProperties,
     // Attribute metadata for the full schema (decoder needs all columns to walk offsets)
     attrs_full: Arc<Vec<PgAttrMeta>>,
-    // Indices of columns to project, in terms of full schema
-    proj_indices: Arc<Vec<usize>>,
+    // Indices of columns to project, in terms of full schema.
+    // `None` means identity/full projection.
+    proj_indices: Option<Arc<[usize]>>,
+    telemetry: HeapScanTelemetryHooks,
 }
 
 impl HeapScanExec {
@@ -245,8 +296,9 @@ impl HeapScanExec {
         table_oid: u32,
         full_schema: SchemaRef,
         proj_schema: SchemaRef,
-        proj_indices: Vec<usize>,
+        proj_indices: Option<Vec<usize>>,
         registry: Arc<HeapScanRegistry>,
+        telemetry: HeapScanTelemetryHooks,
     ) -> Self {
         // Execution plan schema must match the projected schema
         let eq = EquivalenceProperties::new(proj_schema.clone());
@@ -265,7 +317,8 @@ impl HeapScanExec {
             registry,
             props,
             attrs_full,
-            proj_indices: Arc::new(proj_indices),
+            proj_indices: proj_indices.map(Arc::from),
+            telemetry,
         }
     }
 }
@@ -322,8 +375,9 @@ impl ExecutionPlan for HeapScanExec {
         let stream = HeapScanStream::new(
             Arc::clone(&self.proj_schema),
             Arc::clone(&self.attrs_full),
-            Arc::clone(&self.proj_indices),
+            self.proj_indices.as_ref().map(Arc::clone),
             self.registry.conn_id(),
+            self.telemetry,
             rx,
         );
         Ok(Box::pin(stream))
@@ -339,9 +393,10 @@ struct HeapScanStream {
     proj_schema: SchemaRef,
     // Full attribute metadata for decoding
     attrs_full: Arc<Vec<PgAttrMeta>>,
-    // Projection indices into full schema
-    proj_indices: Arc<Vec<usize>>,
+    // Projection indices into full schema. `None` means identity/full projection.
+    proj_indices: Option<Arc<[usize]>>,
     conn_id: usize,
+    telemetry: HeapScanTelemetryHooks,
     pending_wait_start_ns: Option<u64>,
     rx: Option<mpsc::Receiver<HeapPageBlock>>,
 }
@@ -350,8 +405,9 @@ impl HeapScanStream {
     fn new(
         proj_schema: SchemaRef,
         attrs_full: Arc<Vec<PgAttrMeta>>,
-        proj_indices: Arc<Vec<usize>>,
+        proj_indices: Option<Arc<[usize]>>,
         conn_id: usize,
+        telemetry: HeapScanTelemetryHooks,
         rx: Option<mpsc::Receiver<HeapPageBlock>>,
     ) -> Self {
         Self {
@@ -359,6 +415,7 @@ impl HeapScanStream {
             attrs_full,
             proj_indices,
             conn_id,
+            telemetry,
             pending_wait_start_ns: None,
             rx,
         }
@@ -376,27 +433,26 @@ impl Stream for HeapScanStream {
         match rx.poll_recv(cx) {
             Poll::Ready(Some(block)) => {
                 if let Some(wait_t0) = this.pending_wait_start_ns.take() {
-                    if crate::telemetry::probe_enabled() {
-                        let metrics = crate::telemetry::conn_telemetry(this.conn_id);
-                        metrics.record_worker_heap_scan_wait(
-                            crate::telemetry::monotonic_now_ns().saturating_sub(wait_t0),
+                    if (this.telemetry.enabled)() {
+                        (this.telemetry.record_wait)(
+                            this.conn_id,
+                            (this.telemetry.now_ns)().saturating_sub(wait_t0),
                         );
                     }
                 }
-                let decode_t0 =
-                    crate::telemetry::probe_enabled().then(crate::telemetry::monotonic_now_ns);
+                let decode_t0 = (this.telemetry.enabled)().then(|| (this.telemetry.now_ns)());
                 let decoded = match decode_block_to_batch(
                     &block,
                     &this.proj_schema,
                     this.attrs_full.as_ref(),
-                    this.proj_indices.as_ref(),
+                    this.proj_indices.as_deref(),
                 ) {
                     Ok(v) => v,
                     Err(e) => {
                         if let Some(decode_t0) = decode_t0 {
-                            let metrics = crate::telemetry::conn_telemetry(this.conn_id);
-                            metrics.record_worker_heap_scan_decode(
-                                crate::telemetry::monotonic_now_ns().saturating_sub(decode_t0),
+                            (this.telemetry.record_decode)(
+                                this.conn_id,
+                                (this.telemetry.now_ns)().saturating_sub(decode_t0),
                             );
                         }
                         return Poll::Ready(Some(Err(e)));
@@ -413,9 +469,9 @@ impl Stream for HeapScanStream {
                     );
                 }
                 if let Some(decode_t0) = decode_t0 {
-                    let metrics = crate::telemetry::conn_telemetry(this.conn_id);
-                    metrics.record_worker_heap_scan_decode(
-                        crate::telemetry::monotonic_now_ns().saturating_sub(decode_t0),
+                    (this.telemetry.record_decode)(
+                        this.conn_id,
+                        (this.telemetry.now_ns)().saturating_sub(decode_t0),
                     );
                 }
                 Poll::Ready(Some(Ok(decoded.batch)))
@@ -425,8 +481,8 @@ impl Stream for HeapScanStream {
                 Poll::Ready(None)
             }
             Poll::Pending => {
-                if crate::telemetry::probe_enabled() && this.pending_wait_start_ns.is_none() {
-                    this.pending_wait_start_ns = Some(crate::telemetry::monotonic_now_ns());
+                if (this.telemetry.enabled)() && this.pending_wait_start_ns.is_none() {
+                    this.pending_wait_start_ns = Some((this.telemetry.now_ns)());
                 }
                 Poll::Pending
             }
@@ -440,7 +496,21 @@ impl RecordBatchStream for HeapScanStream {
     }
 }
 
-pub(crate) fn count_heap_scans(plan: &Arc<dyn ExecutionPlan>) -> usize {
+pub fn heap_attrs_from_schema(schema: &SchemaRef) -> Vec<PgAttrMeta> {
+    attrs_from_schema(schema)
+}
+
+pub fn decode_heap_page_block(
+    block: &HeapPageBlock,
+    proj_schema: &SchemaRef,
+    attrs_full: &[PgAttrMeta],
+    proj_indices: Option<&[usize]>,
+) -> DFResult<(RecordBatch, usize)> {
+    let out = decode_block_to_batch(block, proj_schema, attrs_full, proj_indices)?;
+    Ok((out.batch, out.decoded_rows))
+}
+
+pub fn count_heap_scans(plan: &Arc<dyn ExecutionPlan>) -> usize {
     fn visit(node: &Arc<dyn ExecutionPlan>) -> usize {
         let mut n = 0usize;
         if node.as_any().downcast_ref::<HeapScanExec>().is_some() {
@@ -454,7 +524,7 @@ pub(crate) fn count_heap_scans(plan: &Arc<dyn ExecutionPlan>) -> usize {
     visit(plan)
 }
 
-pub(crate) fn for_each_heap_scan<F, E>(plan: &Arc<dyn ExecutionPlan>, mut f: F) -> Result<(), E>
+pub fn for_each_heap_scan<F, E>(plan: &Arc<dyn ExecutionPlan>, mut f: F) -> Result<(), E>
 where
     F: FnMut(HeapScanId, u32) -> Result<(), E>,
 {

@@ -2,7 +2,6 @@ use crate::buffer::LockFreeBuffer;
 use crate::fsm::executor::StateMachine;
 use crate::fsm::Action;
 use crate::ipc::Socket;
-use crate::scan::{count_heap_scans, for_each_heap_scan, HeapScanRegistry};
 use crate::sql::Catalog;
 use anyhow::Error;
 use anyhow::{bail, Result};
@@ -32,6 +31,7 @@ use protocol::tuple::{consume_column_layout, PgAttrWire};
 use protocol::Tape;
 use protocol::{consume_header, is_data_tag, ControlPacket, DataPacket, Direction};
 use rmp::decode::{read_u16 as read_u16_msgpack, read_u64 as read_u64_msgpack};
+use scan::{count_heap_scans, for_each_heap_scan, HeapPageBlock, HeapScanRegistry};
 use smol_str::{format_smolstr, SmolStr};
 use std::sync::atomic::{AtomicI32, Ordering};
 use std::sync::Arc;
@@ -62,7 +62,7 @@ impl Storage {
     }
 
     pub fn set_registry_conn(&mut self, conn_id: usize) {
-        self.registry = Arc::new(crate::scan::HeapScanRegistry::with_conn(conn_id));
+        self.registry = Arc::new(HeapScanRegistry::with_conn(conn_id));
     }
 }
 
@@ -327,7 +327,7 @@ impl<'bytes> Connection<'bytes> {
                             );
                         }
                         // Best-effort send; if the channel is full, await until space is available
-                        let block = crate::scan::HeapPageBlock {
+                        let block = HeapPageBlock {
                             blkno: meta.blkno,
                             num_offsets: meta.num_offsets,
                             vis_len,

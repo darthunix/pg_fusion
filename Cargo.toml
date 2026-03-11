@@ -1,6 +1,7 @@
 [workspace]
 members = [
   "executor",
+  "scan",
   "postgres",
   "protocol",
   "common",
@@ -25,3 +26,6 @@ pgrx-tests = "0.16"
 datafusion-common = "44.0"
 datafusion = "44.0"
 datafusion-sql = "44.0"
+datafusion-catalog = "44.0"
+datafusion-physical-expr = "44.0"
+datafusion-execution = "44.0"
