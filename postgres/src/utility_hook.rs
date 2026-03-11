@@ -12,7 +12,7 @@ thread_local! {
     static SKIP_DF_PLANNER_GUARD: Cell<bool> = const { Cell::new(false) };
 }
 
-pub fn skip_df_planner() -> bool {
+pub(crate) fn skip_df_planner() -> bool {
     SKIP_DF_PLANNER_GUARD.with(|f| f.get())
 }
 

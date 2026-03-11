@@ -1459,24 +1459,6 @@ fn type_to_oid(dtype: &DataType) -> AnyResult<pg_sys::Oid> {
     Ok(oid)
 }
 
-/// Write the visibility bitmap bytes for a given `slot_id` into the per-connection
-/// shared memory area reserved for that slot, returning the number of bytes written
-/// (clamped to the reserved capacity for a single block's bitmap).
-#[allow(dead_code)]
-fn shm_write_visibility(slot_id: u16, src: &[u8]) -> AnyResult<u16> {
-    let conn = connection_id()? as usize;
-    let base = slot_blocks_base_for(conn);
-    let layout = slot_blocks_layout();
-    // For now use block index 0; double-buffering can rotate indices later.
-    let vis_ptr = unsafe { slot_block_vis_ptr(base, layout, slot_id as usize, 0) };
-    let cap = layout.vis_bytes_per_block;
-    let n = std::cmp::min(cap, src.len());
-    unsafe {
-        std::ptr::copy_nonoverlapping(src.as_ptr(), vis_ptr, n);
-    }
-    Ok(u16::try_from(n).unwrap_or(u16::MAX))
-}
-
 /// Copy a heap page into the shared memory buffer for the given `slot_id`.
 /// Returns the number of bytes copied (clamped to `layout.block_len`).
 fn shm_write_heap_block(slot_id: u16, page: &[u8]) -> AnyResult<u32> {
@@ -1490,51 +1472,6 @@ fn shm_write_heap_block(slot_id: u16, page: &[u8]) -> AnyResult<u32> {
         std::ptr::copy_nonoverlapping(page.as_ptr(), dst, n);
     }
     Ok(u32::try_from(n).unwrap_or(layout.block_len as u32))
-}
-
-/// Publish heap visibility metadata for a page: copy the bitmap to shared memory and
-/// send a lightweight `DataPacket::Heap` metadata packet to the executor.
-#[allow(dead_code)]
-fn publish_heap_visibility(
-    shared: &mut ConnectionShared,
-    scan_id: u64,
-    slot_id: u16,
-    table_oid: u32,
-    blkno: u32,
-    num_offsets: u16,
-    vis: &[u8],
-) -> AnyResult<()> {
-    let vis_len = shm_write_visibility(slot_id, vis)?;
-    prepare_heap_block_meta_shm(
-        &mut shared.recv,
-        scan_id,
-        slot_id,
-        table_oid,
-        blkno,
-        num_offsets,
-        vis_len,
-    )?;
-    // Notify the executor that a data packet is available
-    let _ = shared.signal_server();
-    Ok(())
-}
-
-/// Publish a full heap page: copy page bytes and its visibility bitmap into shared memory,
-/// then send a metadata packet to the executor indicating `vis_len` and other identifiers.
-#[allow(dead_code)]
-#[allow(clippy::too_many_arguments)]
-fn publish_heap_page(
-    shared: &mut ConnectionShared,
-    scan_id: u64,
-    slot_id: u16,
-    table_oid: u32,
-    blkno: u32,
-    num_offsets: u16,
-    page: &[u8],
-    vis: &[u8],
-) -> AnyResult<()> {
-    let _ = shm_write_heap_block(slot_id, page)?;
-    publish_heap_visibility(shared, scan_id, slot_id, table_oid, blkno, num_offsets, vis)
 }
 
 #[inline]

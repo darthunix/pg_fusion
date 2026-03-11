@@ -546,11 +546,6 @@ fn slot_blocks_region_base() -> *mut u8 {
     base
 }
 
-#[allow(dead_code)]
-pub(crate) fn slot_blocks_base() -> *mut u8 {
-    slot_blocks_region_base()
-}
-
 /// Return the base pointer for the slot blocks region of a specific connection id.
 pub(crate) fn slot_blocks_base_for(conn_id: usize) -> *mut u8 {
     unsafe {
