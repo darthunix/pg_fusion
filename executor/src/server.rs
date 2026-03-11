@@ -26,7 +26,7 @@ use protocol::columns::prepare_columns;
 use protocol::explain::prepare_explain;
 use protocol::failure::prepare_error;
 use protocol::heap::read_heap_block_bitmap_meta;
-use protocol::heap::request_heap_block;
+use protocol::heap::request_heap_block_unflushed;
 use protocol::metadata::prepare_table_refs;
 use protocol::parse::read_query;
 use protocol::tuple::{consume_column_layout, PgAttrWire};
@@ -334,10 +334,7 @@ impl<'bytes> Connection<'bytes> {
             }
             let _ = runtime.scheduler.mark_scan_eof(scan_id);
         }
-        let dispatched = dispatch_heap_requests(self, storage, usize::MAX)?;
-        if dispatched > 0 {
-            let _ = self.signal_client();
-        }
+        let _ = dispatch_heap_requests(self, storage, usize::MAX)?;
         Ok(())
     }
 
@@ -470,10 +467,7 @@ impl<'bytes> Connection<'bytes> {
             }
         }
         if should_dispatch {
-            let dispatched = dispatch_heap_requests(self, storage, usize::MAX)?;
-            if dispatched > 0 {
-                let _ = self.signal_client();
-            }
+            let _ = dispatch_heap_requests(self, storage, usize::MAX)?;
         }
 
         if let Some(heap_msg_t0) = heap_msg_t0 {
@@ -1023,7 +1017,7 @@ fn dispatch_heap_requests(
             block_idx = req.credit.block_idx,
             "dispatching heap request"
         );
-        request_heap_block(
+        request_heap_block_unflushed(
             &mut conn.send_buffer,
             req.scan_id,
             req.table_oid,
@@ -1031,6 +1025,8 @@ fn dispatch_heap_requests(
             req.credit.block_idx,
         )?;
     }
+    std::io::Write::flush(&mut conn.send_buffer)?;
+    let _ = conn.signal_client();
 
     if let Some(req_t0) = req_t0 {
         let metrics = crate::telemetry::conn_telemetry(conn.id);
@@ -1204,17 +1200,18 @@ fn start_data_flow(conn: &mut Connection, storage: &mut Storage) -> Result<TaskR
         "start_data_flow: sending ExecReady to backend"
     );
     protocol::exec::prepare_exec_ready(&mut conn.send_buffer)?;
-    // Immediately notify backend to observe ExecReady without waiting for prefetch signals
-    let _ = conn.signal_client();
     // Schedule initial heap page requests according to credit budget.
     let dispatched = dispatch_heap_requests(conn, storage, usize::MAX)?;
+    // Notify backend once for ExecReady (and requests if any were queued).
+    if dispatched == 0 {
+        let _ = conn.signal_client();
+    }
     if dispatched > 0 {
         log_trace!(
             EXECUTOR_TARGET,
             dispatched,
             "start_data_flow: initial heap requests queued"
         );
-        let _ = conn.signal_client();
     }
     Ok(TaskResult::Noop)
 }

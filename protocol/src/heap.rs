@@ -12,7 +12,7 @@ use std::io::{Read, Write};
 /// - u32: table OID
 /// - u16: slot id in shared memory where BLCKSZ bytes must be written
 /// - u16: block index within the slot (for double-buffering)
-pub fn request_heap_block(
+pub fn request_heap_block_unflushed(
     stream: &mut impl Write,
     scan_id: u64,
     table_oid: u32,
@@ -30,6 +30,17 @@ pub fn request_heap_block(
     write_u32(stream, table_oid)?;
     write_u16(stream, slot_id)?;
     write_u16(stream, block_idx)?;
+    Ok(())
+}
+
+pub fn request_heap_block(
+    stream: &mut impl Write,
+    scan_id: u64,
+    table_oid: u32,
+    slot_id: u16,
+    block_idx: u16,
+) -> Result<()> {
+    request_heap_block_unflushed(stream, scan_id, table_oid, slot_id, block_idx)?;
     stream.flush()?;
     Ok(())
 }
