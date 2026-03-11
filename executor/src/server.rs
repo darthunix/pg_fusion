@@ -2,6 +2,7 @@ use crate::buffer::LockFreeBuffer;
 use crate::fsm::executor::StateMachine;
 use crate::fsm::Action;
 use crate::ipc::Socket;
+use crate::logging::{log_debug, log_error, log_trace, log_warn};
 use crate::sql::Catalog;
 use anyhow::Error;
 use anyhow::{bail, Result};
@@ -36,7 +37,9 @@ use smol_str::{format_smolstr, SmolStr};
 use std::sync::atomic::{AtomicI32, Ordering};
 use std::sync::Arc;
 use tokio::task::JoinHandle;
-use tracing::{debug, trace};
+
+const EXECUTOR_TARGET: &str = "executor::server";
+const FUSION_TARGET: &str = "pg_fusion::server";
 
 #[derive(Default)]
 pub struct Storage {
@@ -114,22 +117,15 @@ impl<'bytes> Connection<'bytes> {
         self.sync_probe_epoch();
         let pending = self.recv_socket.buffer.len();
         if pending > 0 {
-            if tracing::enabled!(target: "executor::server", tracing::Level::TRACE) {
-                trace!(
-                    target = "executor::server",
-                    "poll: data already available: {} bytes",
-                    pending
-                );
-            }
+            log_trace!(
+                EXECUTOR_TARGET,
+                "poll: data already available: {} bytes",
+                pending
+            );
             return Ok(());
         }
         let wait_t0 = crate::telemetry::probe_enabled().then(crate::telemetry::monotonic_now_ns);
-        if tracing::enabled!(target: "executor::server", tracing::Level::TRACE) {
-            trace!(
-                target = "executor::server",
-                "poll: waiting for socket signal"
-            );
-        }
+        log_trace!(EXECUTOR_TARGET, "poll: waiting for socket signal");
         (&mut self.recv_socket).await?;
         if let Some(wait_t0) = wait_t0 {
             let metrics = crate::telemetry::conn_telemetry(self.id);
@@ -137,13 +133,11 @@ impl<'bytes> Connection<'bytes> {
                 crate::telemetry::monotonic_now_ns().saturating_sub(wait_t0),
             );
         }
-        if tracing::enabled!(target: "executor::server", tracing::Level::TRACE) {
-            trace!(
-                target = "executor::server",
-                "poll: socket signaled (data available: {} bytes)",
-                self.recv_socket.buffer.len()
-            );
-        }
+        log_trace!(
+            EXECUTOR_TARGET,
+            "poll: socket signaled (data available: {} bytes)",
+            self.recv_socket.buffer.len()
+        );
         Ok(())
     }
 
@@ -153,13 +147,11 @@ impl<'bytes> Connection<'bytes> {
         #[cfg(unix)]
         {
             let pid = self.client_pid.load(Ordering::Relaxed);
-            if tracing::enabled!(target: "executor::server", tracing::Level::TRACE) {
-                trace!(
-                    target = "executor::server",
-                    client_pid = pid,
-                    "signal_client: about to send SIGUSR1"
-                );
-            }
+            log_trace!(
+                EXECUTOR_TARGET,
+                client_pid = pid,
+                "signal_client: about to send SIGUSR1"
+            );
             if pid <= 0 || pid == i32::MAX {
                 bail!(FusionError::FailedTo(
                     "send SIGUSR1".into(),
@@ -174,13 +166,11 @@ impl<'bytes> Connection<'bytes> {
                     format_smolstr!("{err}")
                 ));
             }
-            if tracing::enabled!(target: "executor::server", tracing::Level::TRACE) {
-                trace!(
-                    target = "executor::server",
-                    client_pid = pid,
-                    "signal_client: SIGUSR1 sent"
-                );
-            }
+            log_trace!(
+                EXECUTOR_TARGET,
+                client_pid = pid,
+                "signal_client: SIGUSR1 sent"
+            );
             Ok(())
         }
         #[cfg(not(unix))]
@@ -212,37 +202,30 @@ impl<'bytes> Connection<'bytes> {
         let t0 = std::time::Instant::now();
         if self.recv_socket.buffer.len() < 6 {
             // Header is at least 6 bytes (3 fixints + u16)
-            if tracing::enabled!(target: "executor::server", tracing::Level::TRACE) {
-                trace!(
-                    target = "executor::server",
-                    "process_message: woke but no header bytes available"
-                );
-            }
+            log_trace!(
+                EXECUTOR_TARGET,
+                "process_message: woke but no header bytes available"
+            );
             return Ok(());
         }
 
         let header = consume_header(&mut self.recv_socket.buffer)?;
-        if tracing::enabled!(target: "executor::server", tracing::Level::DEBUG) {
-            debug!(
-                target = "executor::server",
-                direction = ?header.direction,
-                tag = header.tag,
-                flag = ?header.flag,
-                length = header.length,
-                recv_unread = self.recv_socket.buffer.len(),
-                send_unread = self.send_buffer.len(),
-                elapsed_us = t0.elapsed().as_micros() as u64,
-                "process_message: header received"
-            );
-        }
+        log_debug!(EXECUTOR_TARGET,
+            direction = ?header.direction,
+            tag = header.tag,
+            flag = ?header.flag,
+            length = header.length,
+            recv_unread = self.recv_socket.buffer.len(),
+            send_unread = self.send_buffer.len(),
+            elapsed_us = t0.elapsed().as_micros() as u64,
+            "process_message: header received"
+        );
 
         if header.direction == Direction::ToClient {
-            if tracing::enabled!(target: "executor::server", tracing::Level::TRACE) {
-                trace!(
-                    target = "executor::server",
-                    "process_message: header direction ToClient, ignoring"
-                );
-            }
+            log_trace!(
+                EXECUTOR_TARGET,
+                "process_message: header direction ToClient, ignoring"
+            );
             return Ok(());
         }
 
@@ -262,15 +245,13 @@ impl<'bytes> Connection<'bytes> {
             return Ok(());
         }
 
-        if tracing::enabled!(target: "executor::server", tracing::Level::DEBUG) {
-            debug!(
-                target = "executor::server",
-                send_unread = self.send_buffer.len(),
-                client_pid = self.client_pid.load(Ordering::Relaxed),
-                elapsed_us = t0.elapsed().as_micros() as u64,
-                "process_message: response buffered, ready to signal client"
-            );
-        }
+        log_debug!(
+            EXECUTOR_TARGET,
+            send_unread = self.send_buffer.len(),
+            client_pid = self.client_pid.load(Ordering::Relaxed),
+            elapsed_us = t0.elapsed().as_micros() as u64,
+            "process_message: response buffered, ready to signal client"
+        );
         Ok(())
     }
 
@@ -280,13 +261,11 @@ impl<'bytes> Connection<'bytes> {
             return Ok(false);
         }
         let attrs = consume_column_layout(&mut self.recv_socket.buffer)?;
-        if tracing::enabled!(target: "executor::server", tracing::Level::TRACE) {
-            tracing::trace!(
-                target = "executor::server",
-                pg_attrs = attrs.len(),
-                "column layout received"
-            );
-        }
+        log_trace!(
+            EXECUTOR_TARGET,
+            pg_attrs = attrs.len(),
+            "column layout received"
+        );
         storage.pg_attrs = Some(attrs);
         Ok(true)
     }
@@ -304,12 +283,10 @@ impl<'bytes> Connection<'bytes> {
             Ok(DataPacket::Heap) => self.handle_heap_data_packet(storage, payload_len).await?,
             Ok(DataPacket::Eof) => self.handle_eof_data_packet(storage)?,
             _ => {
-                if tracing::enabled!(target: "executor::server", tracing::Level::TRACE) {
-                    trace!(
-                        target = "executor::server",
-                        "process_message: unrecognized data packet, ignoring"
-                    );
-                }
+                log_trace!(
+                    EXECUTOR_TARGET,
+                    "process_message: unrecognized data packet, ignoring"
+                );
             }
         }
         Ok(true)
@@ -349,32 +326,28 @@ impl<'bytes> Connection<'bytes> {
 
         // Read metadata; visibility bitmap is stored in shared memory.
         let meta = read_heap_block_bitmap_meta(&mut self.recv_socket.buffer, payload_len)?;
-        if tracing::enabled!(target: "executor::server", tracing::Level::TRACE) {
-            trace!(
-                target = "executor::server",
-                scan_id = meta.scan_id,
-                slot_id = meta.slot_id,
-                table_oid = meta.table_oid,
-                blkno = meta.blkno,
-                num_offsets = meta.num_offsets,
-                bitmap_inline_len = meta.bitmap_len,
-                "heap bitmap meta received"
-            );
-        }
+        log_trace!(
+            EXECUTOR_TARGET,
+            scan_id = meta.scan_id,
+            slot_id = meta.slot_id,
+            table_oid = meta.table_oid,
+            blkno = meta.blkno,
+            num_offsets = meta.num_offsets,
+            bitmap_inline_len = meta.bitmap_len,
+            "heap bitmap meta received"
+        );
 
         self.drain_legacy_bitmap_inline(meta.bitmap_len as usize)?;
 
         // Trailing u16 carries the visibility bitmap length in shared memory.
         let vis_len = read_u16_msgpack(&mut self.recv_socket.buffer)?;
-        if tracing::enabled!(target: "executor::server", tracing::Level::TRACE) {
-            trace!(
-                target = "executor::server",
-                scan_id = meta.scan_id,
-                slot_id = meta.slot_id,
-                vis_len,
-                "heap bitmap vis_len (shm) received"
-            );
-        }
+        log_trace!(
+            EXECUTOR_TARGET,
+            scan_id = meta.scan_id,
+            slot_id = meta.slot_id,
+            vis_len,
+            "heap bitmap vis_len (shm) received"
+        );
 
         if let Some(tx) = storage.registry.sender(meta.scan_id) {
             let copy_t0 =
@@ -406,8 +379,8 @@ impl<'bytes> Connection<'bytes> {
                 crate::telemetry::probe_enabled().then(crate::telemetry::monotonic_now_ns);
             // Best-effort send; if the channel is full, await until space is available.
             if let Err(e) = tx.send(block).await {
-                tracing::warn!(
-                    target = "pg_fusion::server",
+                log_warn!(
+                    FUSION_TARGET,
                     "failed to enqueue heap block for scan {}: {e}",
                     meta.scan_id
                 );
@@ -420,15 +393,13 @@ impl<'bytes> Connection<'bytes> {
             }
 
             // Request the next heap block for this scan using the same slot.
-            if tracing::enabled!(target: "executor::server", tracing::Level::TRACE) {
-                trace!(
-                    target = "executor::server",
-                    scan_id = meta.scan_id,
-                    table_oid = meta.table_oid,
-                    slot_id = meta.slot_id,
-                    "requesting next heap block"
-                );
-            }
+            log_trace!(
+                EXECUTOR_TARGET,
+                scan_id = meta.scan_id,
+                table_oid = meta.table_oid,
+                slot_id = meta.slot_id,
+                "requesting next heap block"
+            );
             let req_t0 = crate::telemetry::probe_enabled().then(crate::telemetry::monotonic_now_ns);
             let req_res = request_heap_block(
                 &mut self.send_buffer,
@@ -437,8 +408,8 @@ impl<'bytes> Connection<'bytes> {
                 meta.slot_id,
             );
             if let Err(ref e) = req_res {
-                tracing::error!(
-                    target = "pg_fusion::server",
+                log_error!(
+                    FUSION_TARGET,
                     "failed to request next heap block for scan {}: {e}",
                     meta.scan_id
                 );
@@ -451,9 +422,9 @@ impl<'bytes> Connection<'bytes> {
                     metrics.publish_worker_heap_request(done_ns);
                 }
             }
-        } else if tracing::enabled!(target: "pg_fusion::server", tracing::Level::TRACE) {
-            trace!(
-                target = "pg_fusion::server",
+        } else {
+            log_trace!(
+                FUSION_TARGET,
                 scan_id = meta.scan_id,
                 "received heap block for unknown scan_id; dropping"
             );
@@ -478,12 +449,10 @@ impl<'bytes> Connection<'bytes> {
         if packet == ControlPacket::EndScan
             && storage.state.state() != &crate::fsm::ExecutorState::PhysicalPlan
         {
-            if tracing::enabled!(target: "executor::server", tracing::Level::TRACE) {
-                tracing::trace!(
-                    target = "executor::server",
-                    "process_message: ignoring EndScan outside PhysicalPlan state"
-                );
-            }
+            log_trace!(
+                EXECUTOR_TARGET,
+                "process_message: ignoring EndScan outside PhysicalPlan state"
+            );
             return Ok(false);
         }
 
@@ -494,14 +463,11 @@ impl<'bytes> Connection<'bytes> {
         let mut skip_metadata = false;
         loop {
             let action = ctx.storage.state.consume(&packet)?;
-            if tracing::enabled!(target: "executor::server", tracing::Level::TRACE) {
-                trace!(
-                    target = "executor::server",
-                    current_packet = ?packet,
-                    action = ?action,
-                    "process_message: state consumed"
-                );
-            }
+            log_trace!(EXECUTOR_TARGET,
+                current_packet = ?packet,
+                action = ?action,
+                "process_message: state consumed"
+            );
             let exec_outcome = ctx.execute_action(action, skip_metadata).await?;
             if matches!(exec_outcome, ActionExecOutcome::ReturnFalse) {
                 return Ok(false);
@@ -522,7 +488,7 @@ impl<'bytes> Connection<'bytes> {
         self.recv_socket.buffer.flush_read();
         let error_message = format_smolstr!("{error}");
         if let Err(e) = prepare_error(&mut self.send_buffer, &error_message) {
-            tracing::error!(target = "pg_fusion::server", error = %e, "Failed to prepare error response");
+            log_error!(FUSION_TARGET, error = %e, "Failed to prepare error response");
         }
     }
 }
@@ -555,12 +521,10 @@ impl<'a, 'bytes> ControlPacketCtx<'a, 'bytes> {
             Some(Action::Explain) => self.action_explain()?,
             Some(Action::Optimize) => self.action_optimize()?,
             Some(Action::Flush) => {
-                if tracing::enabled!(target: "executor::server", tracing::Level::TRACE) {
-                    trace!(
-                        target = "executor::server",
-                        "process_message: Action::Flush (reset state)"
-                    );
-                }
+                log_trace!(
+                    EXECUTOR_TARGET,
+                    "process_message: Action::Flush (reset state)"
+                );
                 // Do not flush send_buffer here; only backend should move read head.
                 self.storage.flush();
                 return Ok(ActionExecOutcome::ReturnFalse);
@@ -590,63 +554,53 @@ impl<'a, 'bytes> ControlPacketCtx<'a, 'bytes> {
         match result {
             TaskResult::Bind(plan) => {
                 prepare_columns(&mut self.conn.send_buffer, plan.schema().fields())?;
-                if tracing::enabled!(target: "executor::server", tracing::Level::TRACE) {
-                    trace!(
-                        columns = plan.schema().fields().len(),
-                        "process_message: prepared columns for Bind"
-                    );
-                }
+                log_trace!(
+                    EXECUTOR_TARGET,
+                    columns = plan.schema().fields().len(),
+                    "process_message: prepared columns for Bind"
+                );
                 self.storage.logical_plan = Some(plan);
                 // Immediately schedule an Optimize pass for the next loop iteration.
                 *packet = ControlPacket::Optimize;
-                if tracing::enabled!(target: "executor::server", tracing::Level::TRACE) {
-                    trace!(
-                        target = "executor::server",
-                        "process_message: scheduling Optimize after Bind"
-                    );
-                }
+                log_trace!(
+                    EXECUTOR_TARGET,
+                    "process_message: scheduling Optimize after Bind"
+                );
                 Ok(ControlLoopStep::Continue)
             }
             TaskResult::Compilation(plan) => {
                 self.storage.logical_plan = Some(plan);
                 request_params(&mut self.conn.send_buffer)?;
-                if tracing::enabled!(target: "executor::server", tracing::Level::TRACE) {
-                    trace!(
-                        target = "executor::server",
-                        "process_message: requested params after Compilation"
-                    );
-                }
+                log_trace!(
+                    EXECUTOR_TARGET,
+                    "process_message: requested params after Compilation"
+                );
                 Ok(ControlLoopStep::Break)
             }
             TaskResult::Optimized(plan) => {
                 self.storage.logical_plan = Some(plan);
                 *packet = ControlPacket::Translate;
-                if tracing::enabled!(target: "executor::server", tracing::Level::TRACE) {
-                    trace!(
-                        target = "executor::server",
-                        "process_message: scheduling Translate after Optimize"
-                    );
-                }
+                log_trace!(
+                    EXECUTOR_TARGET,
+                    "process_message: scheduling Translate after Optimize"
+                );
                 Ok(ControlLoopStep::Continue)
             }
             TaskResult::Translated(phys) => {
                 self.storage.physical_plan = phys;
-                if tracing::enabled!(target: "executor::server", tracing::Level::TRACE) {
-                    trace!(
-                        target = "executor::server",
-                        "process_message: transitioned to PhysicalPlan (built physical plan)"
-                    );
-                }
+                log_trace!(
+                    EXECUTOR_TARGET,
+                    "process_message: transitioned to PhysicalPlan (built physical plan)"
+                );
                 Ok(ControlLoopStep::Break)
             }
             TaskResult::Explain(explain) => {
                 prepare_explain(&mut self.conn.send_buffer, explain.as_str())?;
-                if tracing::enabled!(target: "executor::server", tracing::Level::TRACE) {
-                    trace!(
-                        explain_len = explain.len(),
-                        "process_message: prepared Explain"
-                    );
-                }
+                log_trace!(
+                    EXECUTOR_TARGET,
+                    explain_len = explain.len(),
+                    "process_message: prepared Explain"
+                );
                 Ok(ControlLoopStep::Break)
             }
             TaskResult::Noop => Ok(ControlLoopStep::Break),
@@ -657,12 +611,13 @@ impl<'a, 'bytes> ControlPacketCtx<'a, 'bytes> {
                     // Let's move connection to the next state.
                     *skip_metadata = true;
                     *packet = ControlPacket::Metadata;
-                    trace!(
+                    log_trace!(EXECUTOR_TARGET,
                         "process_message: no tables, skipping metadata, forcing ControlPacket::Metadata"
                     );
                     Ok(ControlLoopStep::Continue)
                 } else {
-                    trace!(
+                    log_trace!(
+                        EXECUTOR_TARGET,
                         tables = tables.len(),
                         "process_message: preparing table refs"
                     );
@@ -682,13 +637,11 @@ impl<'a, 'bytes> ControlPacketCtx<'a, 'bytes> {
             ));
         };
         let params = read_params(&mut self.conn.recv_socket.buffer)?;
-        if tracing::enabled!(target: "executor::server", tracing::Level::TRACE) {
-            trace!(
-                target = "executor::server",
-                "process_message: Action::Bind with {} params",
-                params.len()
-            );
-        }
+        log_trace!(
+            EXECUTOR_TARGET,
+            "process_message: Action::Bind with {} params",
+            params.len()
+        );
         bind(plan, params)
     }
 
@@ -708,24 +661,18 @@ impl<'a, 'bytes> ControlPacketCtx<'a, 'bytes> {
                 Arc::clone(&self.storage.registry),
             )?
         };
-        if tracing::enabled!(target: "executor::server", tracing::Level::TRACE) {
-            trace!(
-                skip_metadata,
-                "process_message: Action::Compile (catalog {}loaded)",
-                if skip_metadata { "not " } else { "" }
-            );
-        }
+        log_trace!(
+            EXECUTOR_TARGET,
+            skip_metadata,
+            "process_message: Action::Compile (catalog {}loaded)",
+            if skip_metadata { "not " } else { "" }
+        );
         compile(stmt, &catalog)
     }
 
     #[inline]
     fn action_explain(&mut self) -> Result<TaskResult> {
-        if tracing::enabled!(target: "executor::server", tracing::Level::TRACE) {
-            trace!(
-                target = "executor::server",
-                "process_message: Action::Explain"
-            );
-        }
+        log_trace!(EXECUTOR_TARGET, "process_message: Action::Explain");
         if let Some(phys) = self.storage.physical_plan.as_ref() {
             explain_physical(phys)
         } else {
@@ -744,25 +691,17 @@ impl<'a, 'bytes> ControlPacketCtx<'a, 'bytes> {
                 "while processing optimize message".into(),
             ));
         };
-        if tracing::enabled!(target: "executor::server", tracing::Level::TRACE) {
-            trace!(
-                target = "executor::server",
-                "process_message: Action::Optimize"
-            );
-        }
+        log_trace!(EXECUTOR_TARGET, "process_message: Action::Optimize");
         optimize(plan)
     }
 
     #[inline]
     fn action_parse(&mut self) -> Result<TaskResult> {
         let query = read_query(&mut self.conn.recv_socket.buffer)?;
-        if tracing::enabled!(target: "executor::server", tracing::Level::TRACE) {
-            trace!(
-                target = "executor::server",
-                query = %query,
-                "process_message: Action::Parse"
-            );
-        }
+        log_trace!(EXECUTOR_TARGET,
+            query = %query,
+            "process_message: Action::Parse"
+        );
         parse(query.into())
     }
 
@@ -774,45 +713,25 @@ impl<'a, 'bytes> ControlPacketCtx<'a, 'bytes> {
                 "while processing translate message".into(),
             ));
         };
-        if tracing::enabled!(target: "executor::server", tracing::Level::TRACE) {
-            trace!(
-                target = "executor::server",
-                "process_message: Action::Translate"
-            );
-        }
+        log_trace!(EXECUTOR_TARGET, "process_message: Action::Translate");
         translate(plan).await
     }
 
     #[inline]
     fn action_open_data_flow(&mut self) -> Result<TaskResult> {
-        if tracing::enabled!(target: "executor::server", tracing::Level::TRACE) {
-            trace!(
-                target = "executor::server",
-                "process_message: Action::OpenDataFlow"
-            );
-        }
+        log_trace!(EXECUTOR_TARGET, "process_message: Action::OpenDataFlow");
         open_data_flow(self.conn, self.storage)
     }
 
     #[inline]
     fn action_start_data_flow(&mut self) -> Result<TaskResult> {
-        if tracing::enabled!(target: "executor::server", tracing::Level::TRACE) {
-            trace!(
-                target = "executor::server",
-                "process_message: Action::StartDataFlow"
-            );
-        }
+        log_trace!(EXECUTOR_TARGET, "process_message: Action::StartDataFlow");
         start_data_flow(self.conn, self.storage)
     }
 
     #[inline]
     fn action_end_data_flow(&mut self) -> Result<TaskResult> {
-        if tracing::enabled!(target: "executor::server", tracing::Level::TRACE) {
-            trace!(
-                target = "executor::server",
-                "process_message: Action::EndDataFlow"
-            );
-        }
+        log_trace!(EXECUTOR_TARGET, "process_message: Action::EndDataFlow");
         end_data_flow(self.storage)
     }
 }
@@ -829,15 +748,13 @@ fn encode_and_write_rows(
     let rows = batch.num_rows();
     let cols = std::cmp::min(batch.num_columns(), attrs.len());
     if cols == 0 || rows == 0 {
-        if tracing::enabled!(target: "executor::server", tracing::Level::TRACE) {
-            tracing::trace!(
-                target = "executor::server",
-                rows,
-                cols,
-                attrs = attrs.len(),
-                "execution: empty batch or no attrs; skipping write"
-            );
-        }
+        log_trace!(
+            EXECUTOR_TARGET,
+            rows,
+            cols,
+            attrs = attrs.len(),
+            "execution: empty batch or no attrs; skipping write"
+        );
         return 0;
     }
     // Working buffers reused across rows to minimize allocations
@@ -970,7 +887,10 @@ async fn translate(plan: LogicalPlan) -> Result<TaskResult> {
         Err(e) => {
             // Propagate the actual physical planning error so the backend can report it
             // instead of failing later during OpenDataFlow.
-            tracing::warn!("translate: failed to build physical plan: {e}");
+            log_warn!(
+                EXECUTOR_TARGET,
+                "translate: failed to build physical plan: {e}"
+            );
             anyhow::bail!(FusionError::FailedTo(
                 "build physical plan".into(),
                 format_smolstr!("{e}")
@@ -1012,24 +932,20 @@ fn open_data_flow(_conn: &mut Connection, storage: &mut Storage) -> Result<TaskR
     let phys = storage.physical_plan.as_ref().expect("checked above");
     // Reserve capacity to avoid HashMap reallocation while registering
     let scan_count = count_heap_scans(phys);
-    if tracing::enabled!(target: "executor::server", tracing::Level::TRACE) {
-        trace!(
-            target = "executor::server",
-            scan_count,
-            "open_data_flow: reserving scan registry capacity"
-        );
-    }
+    log_trace!(
+        EXECUTOR_TARGET,
+        scan_count,
+        "open_data_flow: reserving scan registry capacity"
+    );
     storage.registry.reserve(scan_count);
     // Register channels per scan in the connection-local registry; no response payload
     let _ = for_each_heap_scan::<_, Error>(phys, |id, table_oid| {
-        if tracing::enabled!(target: "executor::server", tracing::Level::TRACE) {
-            trace!(
-                target = "executor::server",
-                scan_id = id,
-                table_oid,
-                "open_data_flow: registering scan channel"
-            );
-        }
+        log_trace!(
+            EXECUTOR_TARGET,
+            scan_id = id,
+            table_oid,
+            "open_data_flow: registering scan channel"
+        );
         let _ = storage.registry.register(id, 16);
         Ok(())
     });
@@ -1045,21 +961,20 @@ fn start_data_flow(conn: &mut Connection, storage: &mut Storage) -> Result<TaskR
     }
     // If a task is already running, don't start another
     if storage.exec_task.is_some() {
-        if tracing::enabled!(target: "executor::server", tracing::Level::TRACE) {
-            trace!("start_data_flow: execution already running, skipping");
-        }
+        log_trace!(
+            EXECUTOR_TARGET,
+            "start_data_flow: execution already running, skipping"
+        );
         return Ok(TaskResult::Noop);
     }
 
     let plan = Arc::clone(storage.physical_plan.as_ref().expect("checked above"));
     let pg_attrs = storage.pg_attrs.clone().unwrap_or_default();
-    if tracing::enabled!(target: "executor::server", tracing::Level::TRACE) {
-        tracing::trace!(
-            target = "executor::server",
-            pg_attrs = pg_attrs.len(),
-            "start_data_flow: attrs snapshot"
-        );
-    }
+    log_trace!(
+        EXECUTOR_TARGET,
+        pg_attrs = pg_attrs.len(),
+        "start_data_flow: attrs snapshot"
+    );
     // Build a fresh TaskContext for execution (single partition)
     let mut opts = ConfigOptions::default();
     opts.execution.target_partitions = 1;
@@ -1068,13 +983,11 @@ fn start_data_flow(conn: &mut Connection, storage: &mut Storage) -> Result<TaskR
 
     let conn_id = conn.id;
     let client_pid_val = conn.client_pid.load(std::sync::atomic::Ordering::Relaxed); // snapshot pid
-    if tracing::enabled!(target: "executor::server", tracing::Level::TRACE) {
-        trace!(
-            target = "executor::server",
-            conn_id,
-            "start_data_flow: spawning execution task"
-        );
-    }
+    log_trace!(
+        EXECUTOR_TARGET,
+        conn_id,
+        "start_data_flow: spawning execution task"
+    );
     let t0 = std::time::Instant::now();
     let handle = tokio::spawn(async move {
         // Execute all output partitions and merge them into the single result ring
@@ -1082,21 +995,19 @@ fn start_data_flow(conn: &mut Connection, storage: &mut Storage) -> Result<TaskR
         let probe_metrics =
             crate::telemetry::probe_enabled().then(|| crate::telemetry::conn_telemetry(conn_id));
         let part_count = plan.output_partitioning().partition_count();
-        if tracing::enabled!(target: "executor::server", tracing::Level::TRACE) {
-            tracing::trace!(
-                target = "executor::server",
-                partitions = part_count,
-                "execution: determined output partitions"
-            );
-        }
+        log_trace!(
+            EXECUTOR_TARGET,
+            partitions = part_count,
+            "execution: determined output partitions"
+        );
         for part in 0..part_count {
             match plan.execute(part, Arc::clone(&ctx)) {
                 Ok(mut stream) => {
                     while let Some(res) = stream.next().await {
                         match res {
                             Err(e) => {
-                                tracing::error!(
-                                    target = "pg_fusion::server",
+                                log_error!(
+                                    FUSION_TARGET,
                                     "execution stream error (part {part}): {e}"
                                 );
                                 break;
@@ -1114,16 +1025,13 @@ fn start_data_flow(conn: &mut Connection, storage: &mut Storage) -> Result<TaskR
                                             .saturating_sub(write_t0),
                                     );
                                 }
-                                if tracing::enabled!(target: "executor::server", tracing::Level::TRACE)
-                                {
-                                    tracing::trace!(
-                                        target = "executor::server",
-                                        rows = wrote,
-                                        cols = batch.num_columns(),
-                                        partition = part,
-                                        "execution: batch encoded and written"
-                                    );
-                                }
+                                log_trace!(
+                                    EXECUTOR_TARGET,
+                                    rows = wrote,
+                                    cols = batch.num_columns(),
+                                    partition = part,
+                                    "execution: batch encoded and written"
+                                );
                                 if wrote > 0 {
                                     if let Some(metrics) = probe_metrics {
                                         metrics.publish_worker_result_signal(
@@ -1140,19 +1048,14 @@ fn start_data_flow(conn: &mut Connection, storage: &mut Storage) -> Result<TaskR
                     }
                 }
                 Err(e) => {
-                    tracing::error!(
-                        target = "pg_fusion::server",
-                        "failed to start partition {part}: {e}"
-                    );
+                    log_error!(FUSION_TARGET, "failed to start partition {part}: {e}");
                 }
             }
         }
-        if tracing::enabled!(target: "pg_fusion::server", tracing::Level::TRACE) {
-            tracing::trace!(
-                target = "pg_fusion::server",
-                "execution streams completed for all partitions"
-            );
-        }
+        log_trace!(
+            FUSION_TARGET,
+            "execution streams completed for all partitions"
+        );
         // Write EOF sentinel row to result ring to unblock backend
         let _ = protocol::result::write_eof(&mut ring);
         if let Some(metrics) = probe_metrics {
@@ -1166,14 +1069,11 @@ fn start_data_flow(conn: &mut Connection, storage: &mut Storage) -> Result<TaskR
     });
     storage.exec_task = Some(handle);
     // Send a tiny ack to the backend indicating execution is ready
-    if tracing::enabled!(target: "executor::server", tracing::Level::TRACE) {
-        let us = t0.elapsed().as_micros() as u64;
-        trace!(
-            target = "executor::server",
-            elapsed_us = us,
-            "start_data_flow: sending ExecReady to backend"
-        );
-    }
+    log_trace!(
+        EXECUTOR_TARGET,
+        elapsed_us = t0.elapsed().as_micros() as u64,
+        "start_data_flow: sending ExecReady to backend"
+    );
     protocol::exec::prepare_exec_ready(&mut conn.send_buffer)?;
     // Immediately notify backend to observe ExecReady without waiting for prefetch signals
     let _ = conn.signal_client();
@@ -1194,16 +1094,14 @@ fn start_data_flow(conn: &mut Connection, storage: &mut Storage) -> Result<TaskR
         let _ = for_each_heap_scan::<_, Error>(phys, |id, table_oid| {
             let slot = registry.slot_for(id).unwrap_or(0);
             for n in 0..prefetch {
-                if tracing::enabled!(target: "executor::server", tracing::Level::TRACE) {
-                    tracing::trace!(
-                        target = "executor::server",
-                        scan_id = id,
-                        table_oid,
-                        slot_id = slot,
-                        prefetch = n,
-                        "start_data_flow: initial heap request"
-                    );
-                }
+                log_trace!(
+                    EXECUTOR_TARGET,
+                    scan_id = id,
+                    table_oid,
+                    slot_id = slot,
+                    prefetch = n,
+                    "start_data_flow: initial heap request"
+                );
                 request_heap_block(&mut conn.send_buffer, id, table_oid, slot)?;
             }
             Ok(())
