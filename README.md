@@ -7,7 +7,7 @@ Why: PostgreSQL’s Volcano (row‑at‑a‑time) engine is great for OLTP but s
 ## Architecture (high level)
 
 - Extension (pgrx) sits in the backend process and drives Parse/Bind/Optimize/Translate/Begin/Exec/End.
-- Executor (runtime) runs DataFusion; `PgTableProvider → PgScanExec → PgScanStream` scans heap pages from shared memory and produces Arrow RecordBatches.
+- Executor (runtime) runs DataFusion; `HeapScanProvider → HeapScanExec → HeapScanStream` scans heap pages from shared memory and produces Arrow RecordBatches.
 - Protocol defines control/data packets and a compact wire tuple format with explicit alignment.
 
 See: `ai/memory/architecture.md` and component notes in `ai/memory/components/`.

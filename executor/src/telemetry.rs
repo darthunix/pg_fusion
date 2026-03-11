@@ -50,10 +50,10 @@ pub struct ConnTelemetry {
     pub worker_heap_request_ns: AtomicU64,
     pub worker_to_backend_req_count: AtomicU64,
     pub worker_to_backend_req_ns: AtomicU64,
-    pub worker_pgscan_wait_count: AtomicU64,
-    pub worker_pgscan_wait_ns: AtomicU64,
-    pub worker_pgscan_decode_count: AtomicU64,
-    pub worker_pgscan_decode_ns: AtomicU64,
+    pub worker_heap_scan_wait_count: AtomicU64,
+    pub worker_heap_scan_wait_ns: AtomicU64,
+    pub worker_heap_scan_decode_count: AtomicU64,
+    pub worker_heap_scan_decode_ns: AtomicU64,
     pub worker_result_write_count: AtomicU64,
     pub worker_result_write_ns: AtomicU64,
     pub worker_result_signal_seq: AtomicU64,
@@ -95,10 +95,10 @@ impl ConnTelemetry {
         Self::clear_counter(&self.worker_heap_request_ns);
         Self::clear_counter(&self.worker_to_backend_req_count);
         Self::clear_counter(&self.worker_to_backend_req_ns);
-        Self::clear_counter(&self.worker_pgscan_wait_count);
-        Self::clear_counter(&self.worker_pgscan_wait_ns);
-        Self::clear_counter(&self.worker_pgscan_decode_count);
-        Self::clear_counter(&self.worker_pgscan_decode_ns);
+        Self::clear_counter(&self.worker_heap_scan_wait_count);
+        Self::clear_counter(&self.worker_heap_scan_wait_ns);
+        Self::clear_counter(&self.worker_heap_scan_decode_count);
+        Self::clear_counter(&self.worker_heap_scan_decode_ns);
         Self::clear_counter(&self.worker_result_write_count);
         Self::clear_counter(&self.worker_result_write_ns);
         Self::clear_counter(&self.worker_result_signal_seq);
@@ -245,19 +245,19 @@ impl ConnTelemetry {
     }
 
     #[inline]
-    pub fn record_worker_pgscan_wait(&self, delta_ns: u64) {
+    pub fn record_worker_heap_scan_wait(&self, delta_ns: u64) {
         Self::record_pair(
-            &self.worker_pgscan_wait_count,
-            &self.worker_pgscan_wait_ns,
+            &self.worker_heap_scan_wait_count,
+            &self.worker_heap_scan_wait_ns,
             delta_ns,
         );
     }
 
     #[inline]
-    pub fn record_worker_pgscan_decode(&self, delta_ns: u64) {
+    pub fn record_worker_heap_scan_decode(&self, delta_ns: u64) {
         Self::record_pair(
-            &self.worker_pgscan_decode_count,
-            &self.worker_pgscan_decode_ns,
+            &self.worker_heap_scan_decode_count,
+            &self.worker_heap_scan_decode_ns,
             delta_ns,
         );
     }
@@ -324,10 +324,12 @@ impl ConnTelemetry {
             worker_request_next_ns: self.worker_request_next_ns.load(Ordering::Relaxed),
             worker_to_backend_req_count: self.worker_to_backend_req_count.load(Ordering::Relaxed),
             worker_to_backend_req_ns: self.worker_to_backend_req_ns.load(Ordering::Relaxed),
-            worker_pgscan_wait_count: self.worker_pgscan_wait_count.load(Ordering::Relaxed),
-            worker_pgscan_wait_ns: self.worker_pgscan_wait_ns.load(Ordering::Relaxed),
-            worker_pgscan_decode_count: self.worker_pgscan_decode_count.load(Ordering::Relaxed),
-            worker_pgscan_decode_ns: self.worker_pgscan_decode_ns.load(Ordering::Relaxed),
+            worker_heap_scan_wait_count: self.worker_heap_scan_wait_count.load(Ordering::Relaxed),
+            worker_heap_scan_wait_ns: self.worker_heap_scan_wait_ns.load(Ordering::Relaxed),
+            worker_heap_scan_decode_count: self
+                .worker_heap_scan_decode_count
+                .load(Ordering::Relaxed),
+            worker_heap_scan_decode_ns: self.worker_heap_scan_decode_ns.load(Ordering::Relaxed),
             worker_result_write_count: self.worker_result_write_count.load(Ordering::Relaxed),
             worker_result_write_ns: self.worker_result_write_ns.load(Ordering::Relaxed),
             worker_to_backend_result_count: self
@@ -362,10 +364,10 @@ pub struct ProbeSnapshot {
     pub worker_request_next_ns: u64,
     pub worker_to_backend_req_count: u64,
     pub worker_to_backend_req_ns: u64,
-    pub worker_pgscan_wait_count: u64,
-    pub worker_pgscan_wait_ns: u64,
-    pub worker_pgscan_decode_count: u64,
-    pub worker_pgscan_decode_ns: u64,
+    pub worker_heap_scan_wait_count: u64,
+    pub worker_heap_scan_wait_ns: u64,
+    pub worker_heap_scan_decode_count: u64,
+    pub worker_heap_scan_decode_ns: u64,
     pub worker_result_write_count: u64,
     pub worker_result_write_ns: u64,
     pub worker_to_backend_result_count: u64,

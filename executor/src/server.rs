@@ -2,7 +2,7 @@ use crate::buffer::LockFreeBuffer;
 use crate::fsm::executor::StateMachine;
 use crate::fsm::Action;
 use crate::ipc::Socket;
-use crate::pgscan::{count_scans, for_each_scan, ScanRegistry};
+use crate::scan::{count_heap_scans, for_each_heap_scan, HeapScanRegistry};
 use crate::sql::Catalog;
 use anyhow::Error;
 use anyhow::{bail, Result};
@@ -44,7 +44,7 @@ pub struct Storage {
     statement: Option<Statement>,
     logical_plan: Option<LogicalPlan>,
     physical_plan: Option<Arc<dyn ExecutionPlan>>,
-    registry: Arc<ScanRegistry>,
+    registry: Arc<HeapScanRegistry>,
     exec_task: Option<JoinHandle<()>>,
     pg_attrs: Option<Vec<PgAttrWire>>,
 }
@@ -62,7 +62,7 @@ impl Storage {
     }
 
     pub fn set_registry_conn(&mut self, conn_id: usize) {
-        self.registry = Arc::new(crate::pgscan::ScanRegistry::with_conn(conn_id));
+        self.registry = Arc::new(crate::scan::HeapScanRegistry::with_conn(conn_id));
     }
 }
 
@@ -327,10 +327,7 @@ impl<'bytes> Connection<'bytes> {
                             );
                         }
                         // Best-effort send; if the channel is full, await until space is available
-                        let block = crate::pgscan::HeapBlock {
-                            scan_id: meta.scan_id as u64,
-                            slot_id: meta.slot_id,
-                            table_oid: meta.table_oid,
+                        let block = crate::scan::HeapPageBlock {
                             blkno: meta.blkno,
                             num_offsets: meta.num_offsets,
                             vis_len,
@@ -877,7 +874,7 @@ fn open_data_flow(_conn: &mut Connection, storage: &mut Storage) -> Result<TaskR
     }
     let phys = storage.physical_plan.as_ref().expect("checked above");
     // Reserve capacity to avoid HashMap reallocation while registering
-    let scan_count = count_scans(phys);
+    let scan_count = count_heap_scans(phys);
     if tracing::enabled!(target: "executor::server", tracing::Level::TRACE) {
         trace!(
             target = "executor::server",
@@ -887,7 +884,7 @@ fn open_data_flow(_conn: &mut Connection, storage: &mut Storage) -> Result<TaskR
     }
     storage.registry.reserve(scan_count);
     // Register channels per scan in the connection-local registry; no response payload
-    let _ = for_each_scan::<_, Error>(phys, |id, table_oid| {
+    let _ = for_each_heap_scan::<_, Error>(phys, |id, table_oid| {
         if tracing::enabled!(target: "executor::server", tracing::Level::TRACE) {
             trace!(
                 target = "executor::server",
@@ -1057,7 +1054,7 @@ fn start_data_flow(conn: &mut Connection, storage: &mut Storage) -> Result<TaskR
     let prefetch = prefetch_window();
     if let Some(phys) = storage.physical_plan.as_ref() {
         let registry = Arc::clone(&storage.registry);
-        let _ = for_each_scan::<_, Error>(phys, |id, table_oid| {
+        let _ = for_each_heap_scan::<_, Error>(phys, |id, table_oid| {
             let slot = registry.slot_for(id).unwrap_or(0);
             for n in 0..prefetch {
                 if tracing::enabled!(target: "executor::server", tracing::Level::TRACE) {
@@ -1220,7 +1217,7 @@ mod tests {
         static CLIENT_PID: AtomicI32 = AtomicI32::new(0);
         let mut conn = Connection::new(0, socket, send_buffer, &SERVER_PID, &CLIENT_PID);
         let storage = Storage {
-            registry: Arc::new(ScanRegistry::new()),
+            registry: Arc::new(HeapScanRegistry::new()),
             ..Default::default()
         };
         tokio::spawn(async move {
@@ -1249,9 +1246,10 @@ mod tests {
             let Ok(TaskResult::Parsing((stmt, _))) = parse(sql.into()) else {
                 unreachable!();
             };
-            let Ok(TaskResult::Compilation(plan)) =
-                compile(stmt, &Catalog::with_registry(Arc::new(ScanRegistry::new())))
-            else {
+            let Ok(TaskResult::Compilation(plan)) = compile(
+                stmt,
+                &Catalog::with_registry(Arc::new(HeapScanRegistry::new())),
+            ) else {
                 unreachable!();
             };
             assert_eq!(storage.logical_plan, Some(plan));
@@ -1285,7 +1283,7 @@ mod tests {
         static CLIENT_PID: AtomicI32 = AtomicI32::new(0);
         let mut conn = Connection::new(0, socket, send_buffer, &SERVER_PID, &CLIENT_PID);
         let storage = Storage {
-            registry: Arc::new(ScanRegistry::new()),
+            registry: Arc::new(HeapScanRegistry::new()),
             ..Default::default()
         };
         tokio::spawn(async move {
@@ -1415,7 +1413,7 @@ mod tests {
         static CLIENT_PID: AtomicI32 = AtomicI32::new(0);
         let mut conn = Connection::new(0, socket, send_buffer, &SERVER_PID, &CLIENT_PID);
         let storage = Storage {
-            registry: Arc::new(ScanRegistry::new()),
+            registry: Arc::new(HeapScanRegistry::new()),
             ..Default::default()
         };
         tokio::spawn(async move {
@@ -1477,7 +1475,7 @@ mod tests {
             // Verify a receiver was registered for the scan with table_oid 42
             let mut scan_id_opt: Option<u64> = None;
             if let Some(phys) = storage.physical_plan.as_ref() {
-                let _ = for_each_scan::<_, anyhow::Error>(phys, |id, table_oid| {
+                let _ = for_each_heap_scan::<_, anyhow::Error>(phys, |id, table_oid| {
                     if table_oid == 42 {
                         scan_id_opt = Some(id);
                     }

@@ -219,7 +219,7 @@ fn log_probe_summary(reason: &str) {
         ),
     );
     pgrx::warning!(
-        "pg_fusion_probe worker conn={} worker_poll_wait_ms={:.3} worker_poll_wait_count={} worker_heap_msg_ms={:.3} worker_heap_msg_count={} worker_heap_copy_ms={:.3} worker_heap_tx_send_ms={:.3} worker_request_next_ms={:.3} worker_pgscan_wait_ms={:.3} worker_pgscan_wait_count={} worker_pgscan_decode_ms={:.3} worker_pgscan_decode_count={} worker_result_write_ms={:.3} worker_result_write_count={}",
+        "pg_fusion_probe worker conn={} worker_poll_wait_ms={:.3} worker_poll_wait_count={} worker_heap_msg_ms={:.3} worker_heap_msg_count={} worker_heap_copy_ms={:.3} worker_heap_tx_send_ms={:.3} worker_request_next_ms={:.3} worker_heap_scan_wait_ms={:.3} worker_heap_scan_wait_count={} worker_heap_scan_decode_ms={:.3} worker_heap_scan_decode_count={} worker_result_write_ms={:.3} worker_result_write_count={}",
         conn_id,
         executor::telemetry::ProbeSnapshot::total_ms(s.worker_poll_wait_ns),
         s.worker_poll_wait_count,
@@ -228,10 +228,10 @@ fn log_probe_summary(reason: &str) {
         executor::telemetry::ProbeSnapshot::total_ms(s.worker_heap_copy_ns),
         executor::telemetry::ProbeSnapshot::total_ms(s.worker_heap_tx_send_ns),
         executor::telemetry::ProbeSnapshot::total_ms(s.worker_request_next_ns),
-        executor::telemetry::ProbeSnapshot::total_ms(s.worker_pgscan_wait_ns),
-        s.worker_pgscan_wait_count,
-        executor::telemetry::ProbeSnapshot::total_ms(s.worker_pgscan_decode_ns),
-        s.worker_pgscan_decode_count,
+        executor::telemetry::ProbeSnapshot::total_ms(s.worker_heap_scan_wait_ns),
+        s.worker_heap_scan_wait_count,
+        executor::telemetry::ProbeSnapshot::total_ms(s.worker_heap_scan_decode_ns),
+        s.worker_heap_scan_decode_count,
         executor::telemetry::ProbeSnapshot::total_ms(s.worker_result_write_ns),
         s.worker_result_write_count,
     );
