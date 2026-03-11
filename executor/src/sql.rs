@@ -1,4 +1,4 @@
-use crate::pgscan::{PgTableProvider, ScanRegistry};
+use crate::scan::{HeapScanProvider, HeapScanRegistry};
 use ahash::AHashMap;
 use anyhow::Result;
 use datafusion::arrow::datatypes::{DataType, SchemaRef};
@@ -80,14 +80,14 @@ impl Builtin {
     }
 }
 
-pub struct Catalog {
+pub(crate) struct Catalog {
     builtin: Arc<Builtin>,
     tables: AHashMap<TableReference, Arc<dyn TableSource>>,
-    registry: Arc<ScanRegistry>,
+    registry: Arc<HeapScanRegistry>,
 }
 
 impl Catalog {
-    pub fn with_registry(registry: Arc<ScanRegistry>) -> Self {
+    pub(crate) fn with_registry(registry: Arc<HeapScanRegistry>) -> Self {
         Self {
             builtin: Arc::clone(&*BUILDIN),
             tables: AHashMap::new(),
@@ -95,7 +95,10 @@ impl Catalog {
         }
     }
 
-    pub fn from_stream(stream: &mut impl Read, registry: Arc<ScanRegistry>) -> Result<Self> {
+    pub(crate) fn from_stream(
+        stream: &mut impl Read,
+        registry: Arc<HeapScanRegistry>,
+    ) -> Result<Self> {
         // Temporarily create a placeholder to pass registry into provider construction
         let mut catalog = Self {
             builtin: Arc::clone(&*BUILDIN),
@@ -211,9 +214,9 @@ impl Catalog {
                 fields.push(field);
             }
             let schema = Arc::new(datafusion::arrow::datatypes::Schema::new(fields));
-            // Register PgTableProvider backed by ScanRegistry; allocate scan ids per-scan at runtime.
+            // Register HeapScanProvider backed by HeapScanRegistry; allocate scan ids per-scan at runtime.
             // Keep the table OID so executor can request heap blocks.
-            let provider = Arc::new(PgTableProvider::new(
+            let provider = Arc::new(HeapScanProvider::new(
                 oid,
                 Arc::clone(&schema),
                 Arc::clone(&self.registry),
