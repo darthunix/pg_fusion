@@ -62,17 +62,17 @@ pub(crate) struct ConnectionShared<'a> {
 
 impl ConnectionShared<'_> {
     #[inline]
-    pub fn server_pid(&self) -> i32 {
+    pub(crate) fn server_pid(&self) -> i32 {
         self.server_pid.load(Ordering::Relaxed)
     }
 
     #[inline]
-    pub fn set_client_pid(&self, pid: i32) {
+    pub(crate) fn set_client_pid(&self, pid: i32) {
         self.client_pid.store(pid, Ordering::Relaxed)
     }
 
     /// Send SIGUSR1 to the server process.
-    pub fn signal_server(&self) -> AnyResult<()> {
+    pub(crate) fn signal_server(&self) -> AnyResult<()> {
         #[cfg(unix)]
         {
             // Mark this connection as ready in shared memory so the server's

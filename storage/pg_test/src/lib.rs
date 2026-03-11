@@ -1,4 +1,5 @@
-use pgrx::prelude::*;
+#[cfg(any(test, feature = "pg_test"))]
+use pgrx::pg_schema;
 
 ::pgrx::pg_module_magic!();
 
