@@ -257,6 +257,26 @@ impl BudgetScheduler {
         Ok(())
     }
 
+    /// Release any one leased credit that belongs to `scan_id`.
+    /// Useful for EOF paths where response metadata does not include the slot.
+    pub fn release_one_for_scan(
+        &mut self,
+        scan_id: ScanId,
+    ) -> Result<Option<CreditCell>, ReleaseError> {
+        if !self.scans.contains_key(&scan_id) {
+            return Err(ReleaseError::UnknownScan { scan_id });
+        }
+        let credit = self
+            .leased_credits
+            .iter()
+            .find_map(|(credit, owner)| (*owner == scan_id).then_some(*credit));
+        let Some(credit) = credit else {
+            return Ok(None);
+        };
+        self.release(scan_id, credit)?;
+        Ok(Some(credit))
+    }
+
     pub fn stats(&self) -> BudgetStats {
         BudgetStats {
             scans: self.scans.len(),
@@ -439,5 +459,20 @@ mod tests {
                 },
             }]
         );
+    }
+
+    #[test]
+    fn release_one_for_scan_reclaims_eof_credit() {
+        let mut sched = BudgetScheduler::with_slot_blocks(2, 1, cfg(1, 8));
+        sched.register_scan(1, 10).expect("register scan");
+        let req = sched.dispatch(2);
+        assert_eq!(req.len(), 2);
+        assert_eq!(sched.scan_inflight(1), Some(2));
+
+        let reclaimed = sched
+            .release_one_for_scan(1)
+            .expect("release one for scan should succeed");
+        assert!(reclaimed.is_some());
+        assert_eq!(sched.scan_inflight(1), Some(1));
     }
 }
