@@ -17,7 +17,9 @@ fn test_request_and_read_block_request_lockfree() {
     let scan_id = 1001u64;
     let table_oid = 42u32;
     let slot_id = 7u16;
-    request_heap_block(&mut buf, scan_id, table_oid, slot_id).expect("request_heap_block");
+    let block_idx = 1u16;
+    request_heap_block(&mut buf, scan_id, table_oid, slot_id, block_idx)
+        .expect("request_heap_block");
 
     let header = consume_header(&mut buf).expect("header");
     assert_eq!(header.direction, Direction::ToClient);
@@ -25,13 +27,17 @@ fn test_request_and_read_block_request_lockfree() {
     assert_eq!(header.flag, Flag::Last);
     assert_eq!(
         header.length as usize,
-        core::mem::size_of::<u64>() + core::mem::size_of::<u32>() + core::mem::size_of::<u16>()
+        core::mem::size_of::<u64>()
+            + core::mem::size_of::<u32>()
+            + core::mem::size_of::<u16>()
+            + core::mem::size_of::<u16>()
     );
 
-    let (sid, t, s) = read_heap_block_request(&mut buf).expect("read request");
+    let (sid, t, s, b) = read_heap_block_request(&mut buf).expect("read request");
     assert_eq!(sid, scan_id);
     assert_eq!(t, table_oid);
     assert_eq!(s, slot_id);
+    assert_eq!(b, block_idx);
 
     unsafe { std::alloc::dealloc(base, layout.layout) };
 }
@@ -45,6 +51,7 @@ fn test_prepare_and_read_block_bitmap_lockfree() {
 
     let scan_id = 55u64;
     let slot_id = 3u16;
+    let block_idx = 1u16;
     let table_oid = 777u32;
     let blkno = 1234u32;
     let num_offsets = 17u16; // 17 offsets -> bitmap length 3 bytes
@@ -66,6 +73,7 @@ fn test_prepare_and_read_block_bitmap_lockfree() {
         &mut buf,
         scan_id,
         slot_id,
+        block_idx,
         table_oid,
         blkno,
         num_offsets,
@@ -80,6 +88,7 @@ fn test_prepare_and_read_block_bitmap_lockfree() {
 
     let meta = read_heap_block_bitmap_meta(&mut buf, header.length).expect("bitmap meta");
     assert_eq!(meta.slot_id, slot_id);
+    assert_eq!(meta.block_idx, block_idx);
     assert_eq!(meta.scan_id, scan_id);
     assert_eq!(meta.table_oid, table_oid);
     assert_eq!(meta.blkno, blkno);

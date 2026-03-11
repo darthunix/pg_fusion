@@ -374,6 +374,7 @@ impl<'bytes> Connection<'bytes> {
             table_oid = meta.table_oid,
             blkno = meta.blkno,
             num_offsets = meta.num_offsets,
+            block_idx = meta.block_idx,
             bitmap_inline_len = meta.bitmap_len,
             "heap bitmap meta received"
         );
@@ -386,6 +387,7 @@ impl<'bytes> Connection<'bytes> {
             EXECUTOR_TARGET,
             scan_id = meta.scan_id,
             slot_id = meta.slot_id,
+            block_idx = meta.block_idx,
             vis_len,
             "heap bitmap vis_len (shm) received"
         );
@@ -394,9 +396,18 @@ impl<'bytes> Connection<'bytes> {
             let copy_t0 =
                 crate::telemetry::probe_enabled().then(crate::telemetry::monotonic_now_ns);
             // Copy page and vis now to avoid race with producer overwriting the slot.
-            let page = crate::shm::copy_block_conn(self.id, meta.slot_id as usize);
+            let page = crate::shm::copy_block_conn(
+                self.id,
+                meta.slot_id as usize,
+                meta.block_idx as usize,
+            );
             let vis = if vis_len > 0 {
-                crate::shm::copy_vis_conn(self.id, meta.slot_id as usize, vis_len as usize)
+                crate::shm::copy_vis_conn(
+                    self.id,
+                    meta.slot_id as usize,
+                    meta.block_idx as usize,
+                    vis_len as usize,
+                )
             } else {
                 Vec::new()
             };
@@ -442,7 +453,7 @@ impl<'bytes> Connection<'bytes> {
 
         let credit = CreditCell {
             slot_id: meta.slot_id,
-            block_idx: 0,
+            block_idx: meta.block_idx,
         };
         let mut should_dispatch = false;
         if let Some(runtime) = storage.scan_budget.as_mut() {
@@ -967,15 +978,12 @@ fn env_usize(name: &str, default: usize) -> usize {
 }
 
 fn build_scan_budget_runtime() -> ScanBudgetRuntime {
-    let slot_count = crate::shm::try_slot_blocks_layout()
-        .map(|layout| layout.slot_count)
-        .unwrap_or(2)
-        .max(1);
+    let (slot_count, blocks_per_slot) = crate::shm::try_slot_blocks_layout()
+        .map(|layout| (layout.slot_count, layout.blocks_per_slot))
+        .unwrap_or((2, 1));
     let scheduler = BudgetScheduler::with_slot_blocks(
-        slot_count,
-        // Protocol currently addresses only slot_id in heap requests.
-        // block_idx support will be wired later in the protocol.
-        1,
+        slot_count.max(1),
+        blocks_per_slot.max(1),
         SchedulerConfig {
             quantum: env_usize("PG_FUSION_HEAP_QUANTUM", 1),
             max_inflight_per_scan: env_usize("PG_FUSION_HEAP_MAX_INFLIGHT_PER_SCAN", 4),
@@ -1020,6 +1028,7 @@ fn dispatch_heap_requests(
             req.scan_id,
             req.table_oid,
             req.credit.slot_id,
+            req.credit.block_idx,
         )?;
     }
 
