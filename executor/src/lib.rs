@@ -1,3 +1,4 @@
+pub mod budget;
 pub mod buffer;
 pub mod fsm;
 pub mod ipc;
