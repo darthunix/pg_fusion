@@ -42,6 +42,34 @@ use tokio::task::JoinHandle;
 const EXECUTOR_TARGET: &str = "executor::server";
 const FUSION_TARGET: &str = "pg_fusion::server";
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct HeapFlowConfig {
+    pub quantum: usize,
+    pub max_inflight_per_scan: usize,
+    pub dispatch_batch: usize,
+}
+
+impl HeapFlowConfig {
+    #[inline]
+    pub fn normalized(self) -> Self {
+        Self {
+            quantum: self.quantum.max(1),
+            max_inflight_per_scan: self.max_inflight_per_scan.max(1),
+            dispatch_batch: self.dispatch_batch.max(1),
+        }
+    }
+}
+
+impl Default for HeapFlowConfig {
+    fn default() -> Self {
+        Self {
+            quantum: 1,
+            max_inflight_per_scan: 4,
+            dispatch_batch: 8,
+        }
+    }
+}
+
 #[derive(Debug)]
 struct ScanBudgetRuntime {
     scheduler: BudgetScheduler,
@@ -57,6 +85,7 @@ pub struct Storage {
     registry: Arc<HeapScanRegistry>,
     exec_task: Option<JoinHandle<()>>,
     pg_attrs: Option<Vec<PgAttrWire>>,
+    heap_flow: HeapFlowConfig,
     scan_budget: Option<ScanBudgetRuntime>,
 }
 
@@ -64,16 +93,22 @@ impl Storage {
     pub fn flush(&mut self) {
         // Preserve the registry across flushes
         let registry = Arc::clone(&self.registry);
+        let heap_flow = self.heap_flow;
         // Abort any running execution task to avoid leaks
         if let Some(handle) = self.exec_task.take() {
             handle.abort();
         }
         *self = Self::default();
         self.registry = registry;
+        self.heap_flow = heap_flow;
     }
 
     pub fn set_registry_conn(&mut self, conn_id: usize) {
         self.registry = Arc::new(HeapScanRegistry::with_conn(conn_id));
+    }
+
+    pub fn set_heap_flow_config(&mut self, config: HeapFlowConfig) {
+        self.heap_flow = config.normalized();
     }
 }
 
@@ -962,16 +997,8 @@ fn parse(query: SmolStr) -> Result<TaskResult> {
     Ok(TaskResult::Parsing((stmt, tables)))
 }
 
-fn env_usize(name: &str, default: usize) -> usize {
-    if let Ok(s) = std::env::var(name) {
-        if let Ok(n) = s.parse::<usize>() {
-            return n.max(1);
-        }
-    }
-    default.max(1)
-}
-
-fn build_scan_budget_runtime() -> ScanBudgetRuntime {
+fn build_scan_budget_runtime(config: HeapFlowConfig) -> ScanBudgetRuntime {
+    let config = config.normalized();
     let (slot_count, blocks_per_slot) = crate::shm::try_slot_blocks_layout()
         .map(|layout| (layout.slot_count, layout.blocks_per_slot))
         .unwrap_or((2, 1));
@@ -979,13 +1006,13 @@ fn build_scan_budget_runtime() -> ScanBudgetRuntime {
         slot_count.max(1),
         blocks_per_slot.max(1),
         SchedulerConfig {
-            quantum: env_usize("PG_FUSION_HEAP_QUANTUM", 1),
-            max_inflight_per_scan: env_usize("PG_FUSION_HEAP_MAX_INFLIGHT_PER_SCAN", 4),
+            quantum: config.quantum,
+            max_inflight_per_scan: config.max_inflight_per_scan,
         },
     );
     ScanBudgetRuntime {
         scheduler,
-        dispatch_batch: env_usize("PG_FUSION_HEAP_DISPATCH_BATCH", 8),
+        dispatch_batch: config.dispatch_batch,
     }
 }
 
@@ -1053,7 +1080,7 @@ fn open_data_flow(_conn: &mut Connection, storage: &mut Storage) -> Result<TaskR
         "open_data_flow: reserving scan registry capacity"
     );
     storage.registry.reserve(scan_count);
-    let mut budget = build_scan_budget_runtime();
+    let mut budget = build_scan_budget_runtime(storage.heap_flow);
     // Register channels per scan in the connection-local registry; no response payload
     let _ = for_each_heap_scan::<_, Error>(phys, |id, table_oid| {
         log_trace!(

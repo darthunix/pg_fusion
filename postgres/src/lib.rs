@@ -13,6 +13,15 @@ mod worker;
 pgrx::pg_module_magic!();
 
 pub(crate) static ENABLE_DATAFUSION: GucSetting<bool> = GucSetting::<bool>::new(false);
+pub(crate) static TOKIO_THREADS: GucSetting<i32> = GucSetting::<i32>::new(0);
+pub(crate) static HEAP_QUANTUM: GucSetting<i32> = GucSetting::<i32>::new(1);
+pub(crate) static HEAP_MAX_INFLIGHT_PER_SCAN: GucSetting<i32> = GucSetting::<i32>::new(4);
+pub(crate) static HEAP_DISPATCH_BATCH: GucSetting<i32> = GucSetting::<i32>::new(8);
+pub(crate) static HEAP_REQUEST_BATCH: GucSetting<i32> = GucSetting::<i32>::new(8);
+pub(crate) static EXECUTOR_LOG_PATH: GucSetting<Option<std::ffi::CString>> =
+    GucSetting::<Option<std::ffi::CString>>::new(Some(c"/tmp/pg_fusion_worker.log"));
+pub(crate) static EXECUTOR_LOG_FILTER: GucSetting<Option<std::ffi::CString>> =
+    GucSetting::<Option<std::ffi::CString>>::new(Some(c"info"));
 pub(crate) static mut SEED: Option<u64> = None;
 
 #[pg_guard]
@@ -43,6 +52,127 @@ fn init_gucs() {
         GucContext::Userset,
         GucFlags::default(),
     );
+
+    GucRegistry::define_int_guc(
+        c"pg_fusion.tokio_threads",
+        c"Executor Tokio worker threads",
+        c"Tokio worker thread count for the DataFusion background worker (0 = auto)",
+        &TOKIO_THREADS,
+        0,
+        i32::MAX,
+        GucContext::Postmaster,
+        GucFlags::default(),
+    );
+
+    GucRegistry::define_int_guc(
+        c"pg_fusion.heap_quantum",
+        c"Per-scan budget quantum",
+        c"Weighted-fair scheduler quantum for heap scan credit dispatch",
+        &HEAP_QUANTUM,
+        1,
+        i32::MAX,
+        GucContext::Postmaster,
+        GucFlags::default(),
+    );
+
+    GucRegistry::define_int_guc(
+        c"pg_fusion.heap_max_inflight_per_scan",
+        c"Max in-flight heap requests per scan",
+        c"Upper bound on concurrently leased heap page credits per logical heap scan",
+        &HEAP_MAX_INFLIGHT_PER_SCAN,
+        1,
+        i32::MAX,
+        GucContext::Postmaster,
+        GucFlags::default(),
+    );
+
+    GucRegistry::define_int_guc(
+        c"pg_fusion.heap_dispatch_batch",
+        c"Heap request dispatch batch size",
+        c"Maximum number of heap block requests the worker dispatches in one scheduling cycle",
+        &HEAP_DISPATCH_BATCH,
+        1,
+        i32::MAX,
+        GucContext::Postmaster,
+        GucFlags::default(),
+    );
+
+    GucRegistry::define_int_guc(
+        c"pg_fusion.heap_request_batch",
+        c"Heap request service batch size",
+        c"Maximum number of pending heap block requests a backend serves per poll iteration",
+        &HEAP_REQUEST_BATCH,
+        1,
+        i32::MAX,
+        GucContext::Postmaster,
+        GucFlags::default(),
+    );
+
+    GucRegistry::define_string_guc(
+        c"pg_fusion.executor_log_path",
+        c"Executor log file path",
+        c"Absolute path to background worker log file",
+        &EXECUTOR_LOG_PATH,
+        GucContext::Postmaster,
+        GucFlags::default(),
+    );
+
+    GucRegistry::define_string_guc(
+        c"pg_fusion.executor_log_filter",
+        c"Executor tracing filter",
+        c"Tracing filter expression used by background worker subscriber",
+        &EXECUTOR_LOG_FILTER,
+        GucContext::Postmaster,
+        GucFlags::default(),
+    );
+}
+
+#[inline]
+pub(crate) fn tokio_threads() -> Option<usize> {
+    let v = TOKIO_THREADS.get();
+    if v <= 0 {
+        None
+    } else {
+        Some(v as usize)
+    }
+}
+
+#[inline]
+pub(crate) fn heap_quantum() -> usize {
+    HEAP_QUANTUM.get().max(1) as usize
+}
+
+#[inline]
+pub(crate) fn heap_max_inflight_per_scan() -> usize {
+    HEAP_MAX_INFLIGHT_PER_SCAN.get().max(1) as usize
+}
+
+#[inline]
+pub(crate) fn heap_dispatch_batch() -> usize {
+    HEAP_DISPATCH_BATCH.get().max(1) as usize
+}
+
+#[inline]
+pub(crate) fn heap_request_batch() -> usize {
+    HEAP_REQUEST_BATCH.get().max(1) as usize
+}
+
+#[inline]
+pub(crate) fn executor_log_path() -> String {
+    EXECUTOR_LOG_PATH
+        .get()
+        .and_then(|v| v.into_string().ok())
+        .filter(|v| !v.trim().is_empty())
+        .unwrap_or_else(|| "/tmp/pg_fusion_worker.log".to_string())
+}
+
+#[inline]
+pub(crate) fn executor_log_filter() -> String {
+    EXECUTOR_LOG_FILTER
+        .get()
+        .and_then(|v| v.into_string().ok())
+        .filter(|v| !v.trim().is_empty())
+        .unwrap_or_else(|| "info".to_string())
 }
 
 fn mark_guc_prefix_reserved(guc_prefix: &str) {
