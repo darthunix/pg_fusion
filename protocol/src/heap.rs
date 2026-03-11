@@ -11,32 +11,36 @@ use std::io::{Read, Write};
 /// Payload layout:
 /// - u32: table OID
 /// - u16: slot id in shared memory where BLCKSZ bytes must be written
+/// - u16: block index within the slot (for double-buffering)
 pub fn request_heap_block(
     stream: &mut impl Write,
     scan_id: u64,
     table_oid: u32,
     slot_id: u16,
+    block_idx: u16,
 ) -> Result<()> {
     let header = Header {
         direction: Direction::ToClient,
         tag: DataPacket::Heap as u8,
         flag: Flag::Last,
-        length: (size_of::<u64>() + size_of::<u32>() + size_of::<u16>()) as u16,
+        length: (size_of::<u64>() + size_of::<u32>() + size_of::<u16>() + size_of::<u16>()) as u16,
     };
     write_header(stream, &header)?;
     write_u64(stream, scan_id)?;
     write_u32(stream, table_oid)?;
     write_u16(stream, slot_id)?;
+    write_u16(stream, block_idx)?;
     stream.flush()?;
     Ok(())
 }
 
 /// Consume a heap page request on the backend.
-pub fn read_heap_block_request(stream: &mut impl Read) -> Result<(u64, u32, u16)> {
+pub fn read_heap_block_request(stream: &mut impl Read) -> Result<(u64, u32, u16, u16)> {
     let scan_id = read_u64(stream)?;
     let table_oid = read_u32(stream)?;
     let slot_id = read_u16(stream)?;
-    Ok((scan_id, table_oid, slot_id))
+    let block_idx = read_u16(stream)?;
+    Ok((scan_id, table_oid, slot_id, block_idx))
 }
 
 /// Response with visibility bitmap for the copied heap page.
@@ -46,6 +50,7 @@ pub fn read_heap_block_request(stream: &mut impl Read) -> Result<(u64, u32, u16)
 ///
 /// Payload layout:
 /// - u16: slot id (echo)
+/// - u16: block index (echo)
 /// - u32: table OID (echo)
 /// - u32: block number
 /// - u16: number of meaningful offsets on the page (`num_offsets`),
@@ -59,6 +64,7 @@ pub fn prepare_heap_block_bitmap<PosIter>(
     stream: &mut impl Tape,
     scan_id: u64,
     slot_id: u16,
+    block_idx: u16,
     table_oid: u32,
     blkno: u32,
     // Number of meaningful ItemId slots on the page (1..=num_offsets).
@@ -73,6 +79,7 @@ where
     write_header(stream, &Header::default())?;
     let len_init = stream.uncommitted_len();
     write_u16(stream, slot_id)?;
+    write_u16(stream, block_idx)?;
     write_u64(stream, scan_id)?;
     write_u32(stream, table_oid)?;
     write_u32(stream, blkno)?;
@@ -138,6 +145,7 @@ where
 pub struct HeapBitmapMeta {
     pub scan_id: u64,
     pub slot_id: u16,
+    pub block_idx: u16,
     pub table_oid: u32,
     pub blkno: u32,
     pub num_offsets: u16,
@@ -152,18 +160,21 @@ pub fn read_heap_block_bitmap_meta(
     payload_len: u16,
 ) -> Result<HeapBitmapMeta> {
     let slot_id = read_u16(stream)?;
+    let block_idx = read_u16(stream)?;
     let scan_id = read_u64(stream)?;
     let table_oid = read_u32(stream)?;
     let blkno = read_u32(stream)?;
     let num_offsets = read_u16(stream)?;
     // Payload layout with MessagePack integer encoding sizes:
-    // slot_id (u16 -> 3) + scan_id (u64 -> 9) + table_oid (u32 -> 5) + blkno (u32 -> 5)
+    // slot_id (u16 -> 3) + block_idx (u16 -> 3) + scan_id (u64 -> 9)
+    // + table_oid (u32 -> 5) + blkno (u32 -> 5)
     // + num_offsets (u16 -> 3) + trailing bitmap_len (u16 -> 3)
-    let fixed = 3 + 9 + 5 + 5 + 3 + 3; // = 28 bytes
+    let fixed = 3 + 3 + 9 + 5 + 5 + 3 + 3; // = 31 bytes
     let bitmap_len = payload_len.saturating_sub(fixed);
     Ok(HeapBitmapMeta {
         scan_id,
         slot_id,
+        block_idx,
         table_oid,
         blkno,
         num_offsets,
@@ -247,6 +258,7 @@ pub fn heap_bitmap_positions<R: Read + ?Sized>(
 /// Sent by the backend (client) to the executor (server).
 /// Payload layout:
 /// - u16: slot id
+/// - u16: block index
 /// - u64: scan id
 /// - u32: table oid
 /// - u32: block number
@@ -256,6 +268,7 @@ pub fn prepare_heap_block_meta_shm(
     stream: &mut impl Tape,
     scan_id: u64,
     slot_id: u16,
+    block_idx: u16,
     table_oid: u32,
     blkno: u32,
     num_offsets: u16,
@@ -265,6 +278,7 @@ pub fn prepare_heap_block_meta_shm(
     write_header(stream, &Header::default())?;
     let len_init = stream.uncommitted_len();
     write_u16(stream, slot_id)?;
+    write_u16(stream, block_idx)?;
     write_u64(stream, scan_id)?;
     write_u32(stream, table_oid)?;
     write_u32(stream, blkno)?;

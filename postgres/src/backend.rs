@@ -760,8 +760,8 @@ unsafe extern "C-unwind" fn exec_df_scan(
         return std::ptr::null_mut();
     }
     loop {
-        // Make progress on any pending heap block request.
-        process_pending_heap_request(&mut shared);
+        // Make progress on pending heap block requests in a small batch.
+        process_pending_heap_requests(&mut shared, heap_request_batch());
         // Try to fetch a row from result ring
         if let Some(slot) = unsafe { try_store_wire_tuple_from_result(_node) } {
             EMPTY_SPINS.with(|f| f.set(0));
@@ -820,272 +820,291 @@ unsafe extern "C-unwind" fn exec_df_scan(
     }
 }
 
-/// Try to process at most one pending heap page request from the executor.
-/// Non-blocking and best-effort: silently returns if no applicable message is queued.
-fn process_pending_heap_request(shared: &mut ConnectionShared) {
-    if shared.send.len() == 0 {
-        return;
-    }
-    if let Ok(header) = consume_header(&mut shared.send) {
-        if header.direction != Direction::ToClient {
-            return;
+#[inline]
+fn heap_request_batch() -> usize {
+    if let Ok(s) = std::env::var("PG_FUSION_HEAP_REQUEST_BATCH") {
+        if let Ok(n) = s.parse::<usize>() {
+            return n.max(1);
         }
-        if let Ok(dp) = DataPacket::try_from(header.tag) {
-            match dp {
-                DataPacket::Heap => {
-                    if let Ok((scan_id, table_oid, slot_id)) =
-                        read_heap_block_request(&mut shared.send)
-                    {
-                        if let Some(metrics) = probe_metrics_current() {
-                            let now_ns = executor::telemetry::monotonic_now_ns();
-                            LAST_WORKER_REQUEST_SEQ.with(|last_seen| {
-                                let mut seq = last_seen.get();
-                                metrics.observe_worker_heap_request(&mut seq, now_ns);
-                                last_seen.set(seq);
-                            });
-                        }
-                        let t0 = Instant::now();
-                        let serve_t0_ns = executor::telemetry::probe_enabled()
-                            .then(executor::telemetry::monotonic_now_ns);
-                        // If EOF was already sent for this scan_id, ignore further heap requests
-                        if let Ok(done) = COMPLETED.lock() {
-                            if done.contains(&scan_id) {
-                                pgrx::debug1!(
-                                    "process_pending_heap_request: ignoring request for completed scan_id={}",
-                                    scan_id
-                                );
-                                return;
-                            }
-                        }
+    }
+    8
+}
+
+fn drain_frame_payload(send: &mut LockFreeBuffer, mut remaining: usize) {
+    let mut buf = [0u8; 256];
+    while remaining > 0 {
+        let chunk = remaining.min(buf.len());
+        if std::io::Read::read_exact(send, &mut buf[..chunk]).is_err() {
+            break;
+        }
+        remaining -= chunk;
+    }
+}
+
+/// Process up to `max_requests` pending heap page requests from the executor.
+/// Non-blocking and best-effort.
+fn process_pending_heap_requests(shared: &mut ConnectionShared, max_requests: usize) -> usize {
+    if shared.send.len() == 0 || max_requests == 0 {
+        return 0;
+    }
+
+    static PROGRESS: LazyLock<Mutex<HashMap<u64, u32>>> =
+        LazyLock::new(|| Mutex::new(HashMap::new()));
+    static COMPLETED: LazyLock<Mutex<HashSet<u64>>> = LazyLock::new(|| Mutex::new(HashSet::new()));
+
+    let mut handled = 0usize;
+    let mut should_signal = false;
+
+    while handled < max_requests && shared.send.len() > 0 {
+        let Ok(header) = consume_header(&mut shared.send) else {
+            break;
+        };
+        if header.direction != Direction::ToClient {
+            drain_frame_payload(&mut shared.send, header.length as usize);
+            continue;
+        }
+        let Ok(dp) = DataPacket::try_from(header.tag) else {
+            drain_frame_payload(&mut shared.send, header.length as usize);
+            continue;
+        };
+        match dp {
+            DataPacket::Heap => {
+                let Ok((scan_id, table_oid, slot_id, block_idx)) =
+                    read_heap_block_request(&mut shared.send)
+                else {
+                    break;
+                };
+                handled += 1;
+
+                if let Some(metrics) = probe_metrics_current() {
+                    let now_ns = executor::telemetry::monotonic_now_ns();
+                    LAST_WORKER_REQUEST_SEQ.with(|last_seen| {
+                        let mut seq = last_seen.get();
+                        metrics.observe_worker_heap_request(&mut seq, now_ns);
+                        last_seen.set(seq);
+                    });
+                }
+                let t0 = Instant::now();
+                let serve_t0_ns = executor::telemetry::probe_enabled()
+                    .then(executor::telemetry::monotonic_now_ns);
+
+                // If EOF was already sent for this scan_id, ignore further heap requests.
+                if let Ok(done) = COMPLETED.lock() {
+                    if done.contains(&scan_id) {
                         pgrx::debug1!(
-                            "process_pending_heap_request: heap request received scan_id={} table_oid={} slot_id={}",
-                            scan_id, table_oid, slot_id
-                        );
-                        // Determine next block number for this scan
-                        static PROGRESS: LazyLock<Mutex<HashMap<u64, u32>>> =
-                            LazyLock::new(|| Mutex::new(HashMap::new()));
-                        static COMPLETED: LazyLock<Mutex<HashSet<u64>>> =
-                            LazyLock::new(|| Mutex::new(HashSet::new()));
-                        let blkno = {
-                            let mut map = PROGRESS.lock().unwrap();
-                            let e = map.entry(scan_id).or_insert(0);
-                            let cur = *e;
-                            *e = e.saturating_add(1);
-                            cur
-                        };
-                        pgrx::debug1!(
-                            "process_pending_heap_request: computed blkno={} for scan_id={}",
-                            blkno,
+                            "process_pending_heap_requests: ignoring request for completed scan_id={}",
                             scan_id
                         );
-                        // Open relation with AccessShareLock and validate block number
-                        let rel_oid = Oid::from(table_oid);
-                        let rel = unsafe {
-                            pg_sys::relation_open(
-                                rel_oid,
-                                pg_sys::AccessShareLock as pg_sys::LOCKMODE,
-                            )
-                        };
-                        if rel.is_null() {
-                            // Relation not found; cannot serve this request
-                            pgrx::warning!(
-                                "process_pending_heap_request: relation {} not found",
-                                table_oid
-                            );
-                            return;
-                        }
-                        // Use RelationGetNumberOfBlocksInFork to get heap size in blocks
-                        let nblocks = unsafe {
-                            pg_sys::RelationGetNumberOfBlocksInFork(
-                                rel,
-                                pg_sys::ForkNumber::MAIN_FORKNUM,
-                            )
-                        } as u32;
-                        if blkno >= nblocks {
-                            // End of relation reached: send EOF for this scan
-                            pgrx::debug1!(
-                                "process_pending_heap_request: EOF scan_id={} slot_id={} (blkno {} >= nblocks {})",
-                                scan_id, slot_id, blkno, nblocks
-                            );
-                            let _ = prepare_scan_eof(&mut shared.recv, scan_id);
-                            let _ = shared.signal_server();
-                            // Reset scan progress for this scan_id to allow future scans to start from 0
-                            {
-                                let mut map = PROGRESS.lock().unwrap();
-                                map.remove(&scan_id);
-                            }
-                            {
-                                let mut done = COMPLETED.lock().unwrap();
-                                done.insert(scan_id);
-                            }
-                            HEAP_EOF_SENT.with(|f| f.set(true));
-                            unsafe {
-                                pg_sys::relation_close(
-                                    rel,
-                                    pg_sys::AccessShareLock as pg_sys::LOCKMODE,
-                                )
-                            };
-                            return;
-                        }
-                        // Read the requested block
-                        let buf = unsafe {
-                            pg_sys::ReadBufferExtended(
-                                rel,
-                                pg_sys::ForkNumber::MAIN_FORKNUM,
-                                blkno as pg_sys::BlockNumber,
-                                pg_sys::ReadBufferMode::RBM_NORMAL,
-                                std::ptr::null_mut(),
-                            )
-                        };
-                        if buf <= 0 {
-                            unsafe { pg_sys::RelationClose(rel) };
-                            pgrx::warning!(
-                                "process_pending_heap_request: ReadBufferExtended failed"
-                            );
-                            return;
-                        }
-                        // Lock buffer for shared access while copying
-                        unsafe {
-                            pg_sys::LockBuffer(buf, pg_sys::BUFFER_LOCK_SHARE as i32);
-                        }
-                        let blksz = pg_sys::BLCKSZ as usize;
-                        let page_ptr = unsafe { pg_sys::BufferGetPage(buf) } as *const u8;
-                        let page = unsafe { std::slice::from_raw_parts(page_ptr, blksz) };
-                        // Compute number of offsets (max line pointer number)
-                        let hdr = unsafe { &*(page_ptr as *const pg_sys::PageHeaderData) };
-                        let lower = hdr.pd_lower as usize;
-                        let num_offsets = if lower < std::mem::size_of::<pg_sys::PageHeaderData>() {
-                            0u16
-                        } else {
-                            let cnt = (lower - std::mem::size_of::<pg_sys::PageHeaderData>())
-                                / std::mem::size_of::<pg_sys::ItemIdData>();
-                            u16::try_from(cnt).unwrap_or(u16::MAX)
-                        };
-                        // Prepare visibility bitmap using MVCC visibility against the active snapshot
-                        let bytes = (num_offsets as usize).div_ceil(8);
-                        // Obtain SHM visibility buffer and zero it (avoid heap allocation)
-                        let conn = connection_id().unwrap_or_default() as usize;
-                        let base = slot_blocks_base_for(conn);
-                        let layout = slot_blocks_layout();
-                        let vis_ptr =
-                            unsafe { slot_block_vis_ptr(base, layout, slot_id as usize, 0) };
-                        let cap = layout.vis_bytes_per_block;
-                        let vis_len = std::cmp::min(bytes, cap);
-                        unsafe { std::ptr::write_bytes(vis_ptr, 0u8, vis_len) };
-                        // Snapshot to use for visibility checks; if none, treat all as visible
-                        let snapshot = unsafe { pg_sys::GetActiveSnapshot() };
-                        // Iterate 1-based offsets up to num_offsets
-                        for off in 1..=num_offsets as usize {
-                            // Fetch line pointer; skip non-normal entries
-                            let itemid = unsafe {
-                                pg_sys::PageGetItemId(
-                                    page_ptr as pg_sys::Page,
-                                    off as pg_sys::OffsetNumber,
-                                )
-                            };
-                            if itemid.is_null() {
-                                continue;
-                            }
-                            // Check ItemId flags (LP_NORMAL) by unpacking the 32-bit representation
-                            let raw: u32 = unsafe { std::ptr::read(itemid as *const u32) };
-                            let flags_u8 = ((raw >> 15) & 0x03) as u8;
-                            if (flags_u8 as u32) != pg_sys::LP_NORMAL {
-                                continue;
-                            }
-                            // Build TID and perform HOT-chain visibility search within the buffer
-                            let mut htup: pg_sys::HeapTupleData = unsafe { std::mem::zeroed() };
-                            htup.t_tableOid = pg_sys::Oid::from(table_oid);
-                            unsafe {
-                                pg_sys::ItemPointerSetBlockNumber(
-                                    &mut htup.t_self,
-                                    blkno as pg_sys::BlockNumber,
-                                );
-                                pg_sys::ItemPointerSetOffsetNumber(
-                                    &mut htup.t_self,
-                                    off as pg_sys::OffsetNumber,
-                                );
-                            }
-                            let is_visible = if snapshot.is_null() {
-                                true
-                            } else {
-                                let mut all_dead: bool = false;
-                                unsafe {
-                                    pg_sys::heap_hot_search_buffer(
-                                        &mut htup.t_self,                        // in/out TID
-                                        rel,                                     // relation
-                                        buf,                                     // buffer
-                                        snapshot,                                // snapshot
-                                        &mut htup as *mut pg_sys::HeapTupleData, // out tuple
-                                        &mut all_dead as *mut bool,              // all-dead flag
-                                        true,                                    // first_call
-                                    )
-                                }
-                            };
-                            if is_visible {
-                                // Mark the actual visible member of a HOT chain
-                                let vis_off: usize =
-                                    unsafe { pg_sys::ItemPointerGetOffsetNumber(&htup.t_self) }
-                                        as usize;
-                                let idx0 = vis_off.saturating_sub(1);
-                                let byte = idx0 / 8;
-                                if byte < vis_len {
-                                    let bit = 1u8 << ((idx0 % 8) as u8);
-                                    unsafe {
-                                        let p = vis_ptr.add(byte);
-                                        *p |= bit;
-                                    }
-                                }
-                            }
-                        }
-                        // Publish page bytes and the computed visibility bitmap already stored in SHM, then notify executor
-                        let _ = shm_write_heap_block(slot_id, page);
-                        // Send lightweight metadata indicating the SHM bitmap length
-                        let _ = prepare_heap_block_meta_shm(
-                            &mut shared.recv,
-                            scan_id,
-                            slot_id,
-                            table_oid,
-                            blkno,
-                            num_offsets,
-                            vis_len as u16,
+                        continue;
+                    }
+                }
+
+                pgrx::debug1!(
+                    "process_pending_heap_requests: heap request received scan_id={} table_oid={} slot_id={} block_idx={}",
+                    scan_id, table_oid, slot_id, block_idx
+                );
+
+                // Determine next block number for this scan.
+                let blkno = {
+                    let mut map = PROGRESS.lock().unwrap();
+                    let e = map.entry(scan_id).or_insert(0);
+                    let cur = *e;
+                    *e = e.saturating_add(1);
+                    cur
+                };
+                pgrx::debug1!(
+                    "process_pending_heap_requests: computed blkno={} for scan_id={}",
+                    blkno,
+                    scan_id
+                );
+
+                // Open relation with AccessShareLock and validate block number.
+                let rel_oid = Oid::from(table_oid);
+                let rel = unsafe {
+                    pg_sys::relation_open(rel_oid, pg_sys::AccessShareLock as pg_sys::LOCKMODE)
+                };
+                if rel.is_null() {
+                    pgrx::warning!(
+                        "process_pending_heap_requests: relation {} not found",
+                        table_oid
+                    );
+                    continue;
+                }
+
+                let nblocks = unsafe {
+                    pg_sys::RelationGetNumberOfBlocksInFork(rel, pg_sys::ForkNumber::MAIN_FORKNUM)
+                } as u32;
+                if blkno >= nblocks {
+                    pgrx::debug1!(
+                        "process_pending_heap_requests: EOF scan_id={} slot_id={} block_idx={} (blkno {} >= nblocks {})",
+                        scan_id, slot_id, block_idx, blkno, nblocks
+                    );
+                    let _ = prepare_scan_eof(&mut shared.recv, scan_id);
+                    should_signal = true;
+                    {
+                        let mut map = PROGRESS.lock().unwrap();
+                        map.remove(&scan_id);
+                    }
+                    {
+                        let mut done = COMPLETED.lock().unwrap();
+                        done.insert(scan_id);
+                    }
+                    HEAP_EOF_SENT.with(|f| f.set(true));
+                    unsafe {
+                        pg_sys::relation_close(rel, pg_sys::AccessShareLock as pg_sys::LOCKMODE)
+                    };
+                    continue;
+                }
+
+                // Read and lock the requested block.
+                let buf = unsafe {
+                    pg_sys::ReadBufferExtended(
+                        rel,
+                        pg_sys::ForkNumber::MAIN_FORKNUM,
+                        blkno as pg_sys::BlockNumber,
+                        pg_sys::ReadBufferMode::RBM_NORMAL,
+                        std::ptr::null_mut(),
+                    )
+                };
+                if buf <= 0 {
+                    unsafe { pg_sys::RelationClose(rel) };
+                    pgrx::warning!("process_pending_heap_requests: ReadBufferExtended failed");
+                    continue;
+                }
+                unsafe {
+                    pg_sys::LockBuffer(buf, pg_sys::BUFFER_LOCK_SHARE as i32);
+                }
+
+                let blksz = pg_sys::BLCKSZ as usize;
+                let page_ptr = unsafe { pg_sys::BufferGetPage(buf) } as *const u8;
+                let page = unsafe { std::slice::from_raw_parts(page_ptr, blksz) };
+                let hdr = unsafe { &*(page_ptr as *const pg_sys::PageHeaderData) };
+                let lower = hdr.pd_lower as usize;
+                let num_offsets = if lower < std::mem::size_of::<pg_sys::PageHeaderData>() {
+                    0u16
+                } else {
+                    let cnt = (lower - std::mem::size_of::<pg_sys::PageHeaderData>())
+                        / std::mem::size_of::<pg_sys::ItemIdData>();
+                    u16::try_from(cnt).unwrap_or(u16::MAX)
+                };
+
+                // Prepare visibility bitmap using MVCC visibility against the active snapshot.
+                let bytes = (num_offsets as usize).div_ceil(8);
+                let conn = connection_id().unwrap_or_default() as usize;
+                let base = slot_blocks_base_for(conn);
+                let layout = slot_blocks_layout();
+                let vis_ptr = unsafe {
+                    slot_block_vis_ptr(base, layout, slot_id as usize, block_idx as usize)
+                };
+                let cap = layout.vis_bytes_per_block;
+                let vis_len = std::cmp::min(bytes, cap);
+                unsafe { std::ptr::write_bytes(vis_ptr, 0u8, vis_len) };
+
+                let snapshot = unsafe { pg_sys::GetActiveSnapshot() };
+                for off in 1..=num_offsets as usize {
+                    let itemid = unsafe {
+                        pg_sys::PageGetItemId(page_ptr as pg_sys::Page, off as pg_sys::OffsetNumber)
+                    };
+                    if itemid.is_null() {
+                        continue;
+                    }
+                    let raw: u32 = unsafe { std::ptr::read(itemid as *const u32) };
+                    let flags_u8 = ((raw >> 15) & 0x03) as u8;
+                    if (flags_u8 as u32) != pg_sys::LP_NORMAL {
+                        continue;
+                    }
+
+                    let mut htup: pg_sys::HeapTupleData = unsafe { std::mem::zeroed() };
+                    htup.t_tableOid = pg_sys::Oid::from(table_oid);
+                    unsafe {
+                        pg_sys::ItemPointerSetBlockNumber(
+                            &mut htup.t_self,
+                            blkno as pg_sys::BlockNumber,
                         );
-                        if let (true, Some(metrics)) = (
-                            executor::telemetry::probe_enabled(),
-                            probe_metrics_current(),
-                        ) {
-                            metrics.publish_backend_page(executor::telemetry::monotonic_now_ns());
-                        }
-                        let _ = shared.signal_server();
-                        if let (Some(serve_t0_ns), Some(metrics)) =
-                            (serve_t0_ns, probe_metrics_current())
-                        {
-                            metrics.record_backend_heap_serve(
-                                executor::telemetry::monotonic_now_ns().saturating_sub(serve_t0_ns),
-                            );
-                        }
-                        let us = t0.elapsed().as_micros() as u64;
-                        pgrx::debug1!(
-                            "process_pending_heap_request: served blkno={} scan_id={} in {} us",
-                            blkno,
-                            scan_id,
-                            us
+                        pg_sys::ItemPointerSetOffsetNumber(
+                            &mut htup.t_self,
+                            off as pg_sys::OffsetNumber,
                         );
-                        // Unlock and release buffer; close relation
+                    }
+                    let is_visible = if snapshot.is_null() {
+                        true
+                    } else {
+                        let mut all_dead: bool = false;
                         unsafe {
-                            pg_sys::UnlockReleaseBuffer(buf);
-                            pg_sys::relation_close(
+                            pg_sys::heap_hot_search_buffer(
+                                &mut htup.t_self,
                                 rel,
-                                pg_sys::AccessShareLock as pg_sys::LOCKMODE,
-                            );
+                                buf,
+                                snapshot,
+                                &mut htup as *mut pg_sys::HeapTupleData,
+                                &mut all_dead as *mut bool,
+                                true,
+                            )
+                        }
+                    };
+                    if is_visible {
+                        let vis_off: usize =
+                            unsafe { pg_sys::ItemPointerGetOffsetNumber(&htup.t_self) } as usize;
+                        let idx0 = vis_off.saturating_sub(1);
+                        let byte = idx0 / 8;
+                        if byte < vis_len {
+                            let bit = 1u8 << ((idx0 % 8) as u8);
+                            unsafe {
+                                let p = vis_ptr.add(byte);
+                                *p |= bit;
+                            }
                         }
                     }
                 }
-                DataPacket::Eof => {
-                    // Ignore EOF from executor in backend context
+
+                // Publish page bytes and SHM metadata.
+                let _ = shm_write_heap_block(slot_id, block_idx, page);
+                let _ = prepare_heap_block_meta_shm(
+                    &mut shared.recv,
+                    scan_id,
+                    slot_id,
+                    block_idx,
+                    table_oid,
+                    blkno,
+                    num_offsets,
+                    vis_len as u16,
+                );
+                should_signal = true;
+
+                if let (true, Some(metrics)) = (
+                    executor::telemetry::probe_enabled(),
+                    probe_metrics_current(),
+                ) {
+                    metrics.publish_backend_page(executor::telemetry::monotonic_now_ns());
                 }
+                if let (Some(serve_t0_ns), Some(metrics)) = (serve_t0_ns, probe_metrics_current()) {
+                    metrics.record_backend_heap_serve(
+                        executor::telemetry::monotonic_now_ns().saturating_sub(serve_t0_ns),
+                    );
+                }
+                let us = t0.elapsed().as_micros() as u64;
+                pgrx::debug1!(
+                    "process_pending_heap_requests: served blkno={} scan_id={} in {} us",
+                    blkno,
+                    scan_id,
+                    us
+                );
+                unsafe {
+                    pg_sys::UnlockReleaseBuffer(buf);
+                    pg_sys::relation_close(rel, pg_sys::AccessShareLock as pg_sys::LOCKMODE);
+                }
+            }
+            DataPacket::Eof => {
+                // Ignore EOF from executor in backend context.
+                drain_frame_payload(&mut shared.send, header.length as usize);
             }
         }
     }
+
+    if should_signal {
+        let _ = shared.signal_server();
+    }
+    handled
 }
 
 thread_local! {
@@ -1459,14 +1478,13 @@ fn type_to_oid(dtype: &DataType) -> AnyResult<pg_sys::Oid> {
     Ok(oid)
 }
 
-/// Copy a heap page into the shared memory buffer for the given `slot_id`.
+/// Copy a heap page into the shared memory buffer for the given (`slot_id`, `block_idx`).
 /// Returns the number of bytes copied (clamped to `layout.block_len`).
-fn shm_write_heap_block(slot_id: u16, page: &[u8]) -> AnyResult<u32> {
+fn shm_write_heap_block(slot_id: u16, block_idx: u16, page: &[u8]) -> AnyResult<u32> {
     let conn = connection_id()? as usize;
     let base = slot_blocks_base_for(conn);
     let layout = slot_blocks_layout();
-    // For now use block index 0; double-buffering can rotate indices later.
-    let dst = unsafe { slot_block_ptr(base, layout, slot_id as usize, 0) };
+    let dst = unsafe { slot_block_ptr(base, layout, slot_id as usize, block_idx as usize) };
     let n = std::cmp::min(layout.block_len, page.len());
     unsafe {
         std::ptr::copy_nonoverlapping(page.as_ptr(), dst, n);
