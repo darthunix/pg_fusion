@@ -1,3 +1,4 @@
+use crate::budget::{BudgetScheduler, CreditCell, SchedulerConfig};
 use crate::buffer::LockFreeBuffer;
 use crate::fsm::executor::StateMachine;
 use crate::fsm::Action;
@@ -41,6 +42,12 @@ use tokio::task::JoinHandle;
 const EXECUTOR_TARGET: &str = "executor::server";
 const FUSION_TARGET: &str = "pg_fusion::server";
 
+#[derive(Debug)]
+struct ScanBudgetRuntime {
+    scheduler: BudgetScheduler,
+    dispatch_batch: usize,
+}
+
 #[derive(Default)]
 pub struct Storage {
     state: StateMachine,
@@ -50,6 +57,7 @@ pub struct Storage {
     registry: Arc<HeapScanRegistry>,
     exec_task: Option<JoinHandle<()>>,
     pg_attrs: Option<Vec<PgAttrWire>>,
+    scan_budget: Option<ScanBudgetRuntime>,
 }
 
 impl Storage {
@@ -297,6 +305,39 @@ impl<'bytes> Connection<'bytes> {
         // Per-scan EOF notification
         let scan_id = read_u64_msgpack(&mut self.recv_socket.buffer)?;
         storage.registry.close(scan_id);
+        if let Some(runtime) = storage.scan_budget.as_mut() {
+            match runtime.scheduler.release_one_for_scan(scan_id) {
+                Ok(Some(credit)) => {
+                    log_trace!(
+                        EXECUTOR_TARGET,
+                        scan_id,
+                        slot_id = credit.slot_id,
+                        block_idx = credit.block_idx,
+                        "heap eof: reclaimed one inflight credit"
+                    );
+                }
+                Ok(None) => {
+                    log_trace!(
+                        EXECUTOR_TARGET,
+                        scan_id,
+                        "heap eof: no inflight credits to reclaim"
+                    );
+                }
+                Err(e) => {
+                    log_warn!(
+                        FUSION_TARGET,
+                        "heap eof: failed to reclaim credit for scan {}: {:?}",
+                        scan_id,
+                        e
+                    );
+                }
+            }
+            let _ = runtime.scheduler.mark_scan_eof(scan_id);
+        }
+        let dispatched = dispatch_heap_requests(self, storage, usize::MAX)?;
+        if dispatched > 0 {
+            let _ = self.signal_client();
+        }
         Ok(())
     }
 
@@ -391,43 +432,37 @@ impl<'bytes> Connection<'bytes> {
                     crate::telemetry::monotonic_now_ns().saturating_sub(tx_send_t0),
                 );
             }
-
-            // Request the next heap block for this scan using the same slot.
-            log_trace!(
-                EXECUTOR_TARGET,
-                scan_id = meta.scan_id,
-                table_oid = meta.table_oid,
-                slot_id = meta.slot_id,
-                "requesting next heap block"
-            );
-            let req_t0 = crate::telemetry::probe_enabled().then(crate::telemetry::monotonic_now_ns);
-            let req_res = request_heap_block(
-                &mut self.send_buffer,
-                meta.scan_id,
-                meta.table_oid,
-                meta.slot_id,
-            );
-            if let Err(ref e) = req_res {
-                log_error!(
-                    FUSION_TARGET,
-                    "failed to request next heap block for scan {}: {e}",
-                    meta.scan_id
-                );
-            }
-            if let Some(req_t0) = req_t0 {
-                let metrics = crate::telemetry::conn_telemetry(self.id);
-                let done_ns = crate::telemetry::monotonic_now_ns();
-                metrics.record_worker_request_next(done_ns.saturating_sub(req_t0));
-                if req_res.is_ok() {
-                    metrics.publish_worker_heap_request(done_ns);
-                }
-            }
         } else {
             log_trace!(
                 FUSION_TARGET,
                 scan_id = meta.scan_id,
                 "received heap block for unknown scan_id; dropping"
             );
+        }
+
+        let credit = CreditCell {
+            slot_id: meta.slot_id,
+            block_idx: 0,
+        };
+        let mut should_dispatch = false;
+        if let Some(runtime) = storage.scan_budget.as_mut() {
+            if let Err(e) = runtime.scheduler.release(meta.scan_id, credit) {
+                log_warn!(
+                    FUSION_TARGET,
+                    "failed to release credit after heap block (scan={}, slot={}): {:?}",
+                    meta.scan_id,
+                    meta.slot_id,
+                    e
+                );
+            } else {
+                should_dispatch = true;
+            }
+        }
+        if should_dispatch {
+            let dispatched = dispatch_heap_requests(self, storage, usize::MAX)?;
+            if dispatched > 0 {
+                let _ = self.signal_client();
+            }
         }
 
         if let Some(heap_msg_t0) = heap_msg_t0 {
@@ -922,6 +957,81 @@ fn parse(query: SmolStr) -> Result<TaskResult> {
     Ok(TaskResult::Parsing((stmt, tables)))
 }
 
+fn env_usize(name: &str, default: usize) -> usize {
+    if let Ok(s) = std::env::var(name) {
+        if let Ok(n) = s.parse::<usize>() {
+            return n.max(1);
+        }
+    }
+    default.max(1)
+}
+
+fn build_scan_budget_runtime() -> ScanBudgetRuntime {
+    let slot_count = crate::shm::try_slot_blocks_layout()
+        .map(|layout| layout.slot_count)
+        .unwrap_or(2)
+        .max(1);
+    let scheduler = BudgetScheduler::with_slot_blocks(
+        slot_count,
+        // Protocol currently addresses only slot_id in heap requests.
+        // block_idx support will be wired later in the protocol.
+        1,
+        SchedulerConfig {
+            quantum: env_usize("PG_FUSION_HEAP_QUANTUM", 1),
+            max_inflight_per_scan: env_usize("PG_FUSION_HEAP_MAX_INFLIGHT_PER_SCAN", 4),
+        },
+    );
+    ScanBudgetRuntime {
+        scheduler,
+        dispatch_batch: env_usize("PG_FUSION_HEAP_DISPATCH_BATCH", 8),
+    }
+}
+
+fn dispatch_heap_requests(
+    conn: &mut Connection<'_>,
+    storage: &mut Storage,
+    max_requests: usize,
+) -> Result<usize> {
+    let Some(runtime) = storage.scan_budget.as_mut() else {
+        return Ok(0);
+    };
+    let max_requests = max_requests.min(runtime.dispatch_batch);
+    if max_requests == 0 {
+        return Ok(0);
+    }
+
+    let requests = runtime.scheduler.dispatch(max_requests);
+    if requests.is_empty() {
+        return Ok(0);
+    }
+
+    let req_t0 = crate::telemetry::probe_enabled().then(crate::telemetry::monotonic_now_ns);
+    for req in &requests {
+        log_trace!(
+            EXECUTOR_TARGET,
+            scan_id = req.scan_id,
+            table_oid = req.table_oid,
+            slot_id = req.credit.slot_id,
+            block_idx = req.credit.block_idx,
+            "dispatching heap request"
+        );
+        request_heap_block(
+            &mut conn.send_buffer,
+            req.scan_id,
+            req.table_oid,
+            req.credit.slot_id,
+        )?;
+    }
+
+    if let Some(req_t0) = req_t0 {
+        let metrics = crate::telemetry::conn_telemetry(conn.id);
+        let done_ns = crate::telemetry::monotonic_now_ns();
+        metrics.record_worker_request_next(done_ns.saturating_sub(req_t0));
+        metrics.publish_worker_heap_request(done_ns);
+    }
+    Ok(requests.len())
+}
+
 fn open_data_flow(_conn: &mut Connection, storage: &mut Storage) -> Result<TaskResult> {
     if storage.physical_plan.is_none() {
         bail!(FusionError::NotFound(
@@ -938,6 +1048,7 @@ fn open_data_flow(_conn: &mut Connection, storage: &mut Storage) -> Result<TaskR
         "open_data_flow: reserving scan registry capacity"
     );
     storage.registry.reserve(scan_count);
+    let mut budget = build_scan_budget_runtime();
     // Register channels per scan in the connection-local registry; no response payload
     let _ = for_each_heap_scan::<_, Error>(phys, |id, table_oid| {
         log_trace!(
@@ -947,8 +1058,17 @@ fn open_data_flow(_conn: &mut Connection, storage: &mut Storage) -> Result<TaskR
             "open_data_flow: registering scan channel"
         );
         let _ = storage.registry.register(id, 16);
+        if let Err(e) = budget.scheduler.register_scan(id, table_oid) {
+            log_warn!(
+                FUSION_TARGET,
+                "open_data_flow: failed to register budget scan {}: {:?}",
+                id,
+                e
+            );
+        }
         Ok(())
     });
+    storage.scan_budget = Some(budget);
     Ok(TaskResult::Noop)
 }
 
@@ -1077,36 +1197,14 @@ fn start_data_flow(conn: &mut Connection, storage: &mut Storage) -> Result<TaskR
     protocol::exec::prepare_exec_ready(&mut conn.send_buffer)?;
     // Immediately notify backend to observe ExecReady without waiting for prefetch signals
     let _ = conn.signal_client();
-    // No demo row: result rows will be written by the execution task
-    // Kick off initial heap block requests for each scan using per-scan assigned slot
-    // Maintain a small prefetch window so executor has data ready when polling.
-    fn prefetch_window() -> usize {
-        if let Ok(s) = std::env::var("PG_FUSION_PREFETCH") {
-            if let Ok(n) = s.parse::<usize>() {
-                return n.max(1);
-            }
-        }
-        4
-    }
-    let prefetch = prefetch_window();
-    if let Some(phys) = storage.physical_plan.as_ref() {
-        let registry = Arc::clone(&storage.registry);
-        let _ = for_each_heap_scan::<_, Error>(phys, |id, table_oid| {
-            let slot = registry.slot_for(id).unwrap_or(0);
-            for n in 0..prefetch {
-                log_trace!(
-                    EXECUTOR_TARGET,
-                    scan_id = id,
-                    table_oid,
-                    slot_id = slot,
-                    prefetch = n,
-                    "start_data_flow: initial heap request"
-                );
-                request_heap_block(&mut conn.send_buffer, id, table_oid, slot)?;
-            }
-            Ok(())
-        });
-        // Signal the client once after all prefetch requests are queued
+    // Schedule initial heap page requests according to credit budget.
+    let dispatched = dispatch_heap_requests(conn, storage, usize::MAX)?;
+    if dispatched > 0 {
+        log_trace!(
+            EXECUTOR_TARGET,
+            dispatched,
+            "start_data_flow: initial heap requests queued"
+        );
         let _ = conn.signal_client();
     }
     Ok(TaskResult::Noop)

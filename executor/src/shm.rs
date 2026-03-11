@@ -25,6 +25,19 @@ fn get() -> (*mut u8, SlotBlocksLayout) {
     (base, layout)
 }
 
+pub fn try_slot_blocks_layout() -> Option<SlotBlocksLayout> {
+    let base = SLOT_BLOCKS_BASE.load(Ordering::Acquire);
+    if base.is_null() {
+        return None;
+    }
+    SLOT_BLOCKS_LAYOUT.get().copied()
+}
+
+pub fn slot_blocks_layout() -> SlotBlocksLayout {
+    let (_, layout) = get();
+    layout
+}
+
 /// Copy the heap page bytes from shared memory for the given `slot` into an owned Vec.
 pub fn copy_block(slot: usize) -> Vec<u8> {
     let (base, layout) = get();
