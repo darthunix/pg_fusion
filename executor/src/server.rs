@@ -1053,7 +1053,6 @@ fn dispatch_heap_requests(
         )?;
     }
     std::io::Write::flush(&mut conn.send_buffer)?;
-    let _ = conn.signal_client();
 
     if let Some(req_t0) = req_t0 {
         let metrics = crate::telemetry::conn_telemetry(conn.id);
