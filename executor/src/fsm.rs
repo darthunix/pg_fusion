@@ -36,7 +36,6 @@ state_machine! {
     LogicalPlan => {
         Failure => Initialized[Flush],
         Bind => LogicalPlan[Bind],
-        Explain => Initialized[Explain],
         Optimize => LogicalPlan[Optimize],
         Translate => PhysicalPlan[Translate],
     },
