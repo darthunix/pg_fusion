@@ -1,4 +1,4 @@
-use executor::server::{Connection, Storage};
+use executor::server::{Connection, HeapFlowConfig, Storage};
 use executor::stack::TreiberStack;
 use pgrx::bgworkers::{BackgroundWorker, BackgroundWorkerBuilder, SignalWakeFlags};
 use pgrx::pg_sys::AsPgCStr;
@@ -13,12 +13,10 @@ use std::sync::OnceLock;
 use tokio::runtime::Builder;
 use tokio::signal::unix::{signal as unix_signal, SignalKind};
 
-// Tokio worker thread count: PG_FUSION_TOKIO_THREADS or default to min(4, available cores)
+// Tokio worker thread count from GUC or default to min(4, available cores)
 fn tokio_thread_number() -> usize {
-    if let Ok(s) = std::env::var("PG_FUSION_TOKIO_THREADS") {
-        if let Ok(n) = s.parse::<usize>() {
-            return n.max(1);
-        }
+    if let Some(n) = crate::tokio_threads() {
+        return n.max(1);
     }
     std::thread::available_parallelism()
         .map(|n| n.get())
@@ -366,6 +364,11 @@ pub extern "C-unwind" fn worker_main(_arg: pg_sys::Datum) {
                 let mut storage = Storage::default();
                 // Ensure registry knows this connection id for SHM addressing
                 storage.set_registry_conn(id);
+                storage.set_heap_flow_config(HeapFlowConfig {
+                    quantum: crate::heap_quantum(),
+                    max_inflight_per_scan: crate::heap_max_inflight_per_scan(),
+                    dispatch_batch: crate::heap_dispatch_batch(),
+                });
                 loop {
                     // Wait until data is available (or flag is already set).
                     if let Err(e) = conn.poll().await {
@@ -436,8 +439,7 @@ fn init_tracing_file_logger() {
     if GUARD.get().is_some() {
         return;
     }
-    let path =
-        std::env::var("PG_FUSION_LOG").unwrap_or_else(|_| "/tmp/pg_fusion_worker.log".to_string());
+    let path = crate::executor_log_path();
     let p = Path::new(&path);
     if let Some(parent) = p.parent() {
         let _ = fs::create_dir_all(parent);
@@ -453,7 +455,7 @@ fn init_tracing_file_logger() {
     let file_appender = tracing_appender::rolling::never(dir, file);
     let (nb, guard) = tracing_appender::non_blocking(file_appender);
 
-    let filter = tracing_subscriber::EnvFilter::try_from_default_env()
+    let filter = tracing_subscriber::EnvFilter::try_new(crate::executor_log_filter())
         .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info"));
 
     let subscriber = tracing_subscriber::fmt()

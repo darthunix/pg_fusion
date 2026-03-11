@@ -761,7 +761,7 @@ unsafe extern "C-unwind" fn exec_df_scan(
     }
     loop {
         // Make progress on pending heap block requests in a small batch.
-        process_pending_heap_requests(&mut shared, heap_request_batch());
+        process_pending_heap_requests(&mut shared, crate::heap_request_batch());
         // Try to fetch a row from result ring
         if let Some(slot) = unsafe { try_store_wire_tuple_from_result(_node) } {
             EMPTY_SPINS.with(|f| f.set(0));
@@ -818,16 +818,6 @@ unsafe extern "C-unwind" fn exec_df_scan(
         // Otherwise, wait to be signaled and retry (short 1ms guard)
         wait_latch(Some(Duration::from_millis(1)));
     }
-}
-
-#[inline]
-fn heap_request_batch() -> usize {
-    if let Ok(s) = std::env::var("PG_FUSION_HEAP_REQUEST_BATCH") {
-        if let Ok(n) = s.parse::<usize>() {
-            return n.max(1);
-        }
-    }
-    8
 }
 
 fn drain_frame_payload(send: &mut LockFreeBuffer, mut remaining: usize) {
