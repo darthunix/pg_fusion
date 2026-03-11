@@ -1,4 +1,3 @@
-use crate::scan::{HeapScanProvider, HeapScanRegistry};
 use ahash::AHashMap;
 use anyhow::Result;
 use datafusion::arrow::datatypes::{DataType, SchemaRef};
@@ -17,6 +16,7 @@ use datafusion_sql::TableReference;
 use once_cell::sync::Lazy;
 use protocol::metadata::NAMEDATALEN;
 use rmp::decode::{read_array_len, read_bool, read_str_len, read_u32, read_u8};
+use scan::{HeapScanProvider, HeapScanRegistry, HeapScanTelemetryHooks};
 use smallvec::SmallVec;
 use std::collections::HashMap;
 use std::io::Read;
@@ -24,6 +24,31 @@ use std::str::from_utf8;
 use std::sync::Arc;
 
 static BUILDIN: Lazy<Arc<Builtin>> = Lazy::new(|| Arc::new(Builtin::new()));
+
+fn heap_scan_probe_enabled() -> bool {
+    crate::telemetry::probe_enabled()
+}
+
+fn heap_scan_now_ns() -> u64 {
+    crate::telemetry::monotonic_now_ns()
+}
+
+fn heap_scan_record_wait(conn_id: usize, delta_ns: u64) {
+    crate::telemetry::conn_telemetry(conn_id).record_worker_heap_scan_wait(delta_ns);
+}
+
+fn heap_scan_record_decode(conn_id: usize, delta_ns: u64) {
+    crate::telemetry::conn_telemetry(conn_id).record_worker_heap_scan_decode(delta_ns);
+}
+
+fn heap_scan_telemetry_hooks() -> HeapScanTelemetryHooks {
+    HeapScanTelemetryHooks {
+        enabled: heap_scan_probe_enabled,
+        now_ns: heap_scan_now_ns,
+        record_wait: heap_scan_record_wait,
+        record_decode: heap_scan_record_decode,
+    }
+}
 
 #[derive(PartialEq, Eq, Hash)]
 pub struct Table {
@@ -216,10 +241,11 @@ impl Catalog {
             let schema = Arc::new(datafusion::arrow::datatypes::Schema::new(fields));
             // Register HeapScanProvider backed by HeapScanRegistry; allocate scan ids per-scan at runtime.
             // Keep the table OID so executor can request heap blocks.
-            let provider = Arc::new(HeapScanProvider::new(
+            let provider = Arc::new(HeapScanProvider::with_telemetry(
                 oid,
                 Arc::clone(&schema),
                 Arc::clone(&self.registry),
+                heap_scan_telemetry_hooks(),
             ));
             let source = Arc::new(DefaultTableSource::new(provider));
             tables.insert(table_ref, source as Arc<dyn TableSource>);

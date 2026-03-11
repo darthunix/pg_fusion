@@ -25,18 +25,17 @@ pub(super) fn decode_block_to_batch(
     block: &HeapPageBlock,
     proj_schema: &SchemaRef,
     attrs_full: &[PgAttrMeta],
-    proj_indices: &[usize],
+    proj_indices: Option<&[usize]>,
 ) -> DFResult<DecodeOutput> {
-    let empty = RecordBatch::new_empty(Arc::clone(proj_schema));
     if unsafe { HeapPage::from_slice(&block.page) }.is_err() {
         return Ok(DecodeOutput {
-            batch: empty,
+            batch: RecordBatch::new_empty(Arc::clone(proj_schema)),
             decoded_rows: 0,
         });
     }
 
     let total_cols = proj_schema.fields().len();
-    let mut builders = make_builders(proj_schema, block.num_offsets as usize)
+    let mut builders = make_builders(proj_schema, estimate_row_capacity(block))
         .map_err(|e| datafusion::error::DataFusionError::Execution(format!("{e}")))?;
 
     let page_hdr = unsafe { &*(block.page.as_ptr() as *const pg_sys::PageHeaderData) } as *const _;
@@ -48,23 +47,19 @@ pub(super) fn decode_block_to_batch(
 
     let mut decoded_rows = 0usize;
     for tup in iter_visible_tuples(&block.page, vis.as_ref()) {
-        let iter = unsafe {
-            decode_tuple_project(
-                page_hdr,
-                tup.bytes,
-                attrs_full,
-                proj_indices.iter().copied(),
-            )
+        let tuple_decoded = if let Some(indices) = proj_indices {
+            let iter = unsafe {
+                decode_tuple_project(page_hdr, tup.bytes, attrs_full, indices.iter().copied())
+            };
+            append_tuple_into_builders(iter, &mut builders, total_cols)
+        } else {
+            let iter = unsafe {
+                decode_tuple_project(page_hdr, tup.bytes, attrs_full, 0..attrs_full.len())
+            };
+            append_tuple_into_builders(iter, &mut builders, total_cols)
         };
-        let Ok(mut iter) = iter else {
+        if !tuple_decoded {
             continue;
-        };
-        for b in builders.iter_mut().take(total_cols) {
-            match iter.next() {
-                Some(Ok(v)) => append_scalar(b, v),
-                Some(Err(_)) => append_null(b),
-                None => append_null(b),
-            }
         }
         decoded_rows += 1;
     }
@@ -73,6 +68,50 @@ pub(super) fn decode_block_to_batch(
         batch: finish_batch(builders, proj_schema, decoded_rows)?,
         decoded_rows,
     })
+}
+
+#[inline]
+fn append_tuple_into_builders<I>(
+    iter: anyhow::Result<storage::heap::DecodedIter<'_, I>>,
+    builders: &mut [ColBuilder],
+    total_cols: usize,
+) -> bool
+where
+    I: Iterator<Item = usize>,
+{
+    let Ok(mut iter) = iter else {
+        return false;
+    };
+    for b in builders.iter_mut().take(total_cols) {
+        match iter.next() {
+            Some(Ok(v)) => append_scalar(b, v),
+            Some(Err(_)) => append_null(b),
+            None => append_null(b),
+        }
+    }
+    true
+}
+
+#[inline]
+fn estimate_row_capacity(block: &HeapPageBlock) -> usize {
+    let max_rows = block.num_offsets as usize;
+    if block.vis_len == 0 || block.vis.is_empty() || max_rows == 0 {
+        return max_rows;
+    }
+    let needed = max_rows.div_ceil(8);
+    let bytes = &block.vis[..block.vis.len().min(needed)];
+    let mut visible = 0usize;
+    for (i, b) in bytes.iter().copied().enumerate() {
+        let mut bits = b.count_ones() as usize;
+        // Trim bits beyond num_offsets in the final byte.
+        if i + 1 == needed && (max_rows % 8) != 0 {
+            let keep = max_rows % 8;
+            let mask = (1u8 << keep) - 1;
+            bits = (b & mask).count_ones() as usize;
+        }
+        visible += bits;
+    }
+    visible.min(max_rows)
 }
 
 pub(super) fn attrs_from_schema(schema: &SchemaRef) -> Vec<PgAttrMeta> {
@@ -169,7 +208,8 @@ fn make_builders(schema: &SchemaRef, capacity: usize) -> Result<Vec<ColBuilder>,
             ArrowDataType::Float32 => ColBuilder::F32(Float32Builder::with_capacity(capacity)),
             ArrowDataType::Float64 => ColBuilder::F64(Float64Builder::with_capacity(capacity)),
             ArrowDataType::Utf8 => {
-                ColBuilder::Utf8(StringBuilder::with_capacity(capacity, capacity * 8))
+                let bytes_capacity = capacity.saturating_mul(4);
+                ColBuilder::Utf8(StringBuilder::with_capacity(capacity, bytes_capacity))
             }
             ArrowDataType::Date32 => ColBuilder::Date32(Date32Builder::with_capacity(capacity)),
             ArrowDataType::Time64(_) => {

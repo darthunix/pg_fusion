@@ -9,12 +9,13 @@ importance: 0.7
 
 # Component: Executor
 
-- Planning/exec: DataFusion with single partition; `HeapScanProvider -> HeapScanExec -> HeapScanStream`.
+- Planning/exec: DataFusion with single partition; scan provider/exec/stream live in separate `scan` crate (`HeapScanProvider -> HeapScanExec -> HeapScanStream`).
 - FSM contract: `Explain` is handled only after `Translate` (i.e., in `PhysicalPlan` state). `LogicalPlan` no longer accepts `Explain`.
-- Scans: per‑connection `ScanRegistry` with bounded channels; issues `request_heap_block` and pipelines next on receipt (single in‑flight block per scan).
+- Scans: per‑connection `HeapScanRegistry` (from `scan` crate) with bounded channels; issues `request_heap_block` and pipelines next on receipt (single in‑flight block per scan).
 - Heap: on receiving a `Heap` meta packet, immediately copies the heap page and visibility bitmap out of SHM into owned `Vec<u8>` to avoid slot reuse races; applies visibility bitmap (LSB‑first, 1‑based LP indices) to filter tuples; decodes via `storage::heap::decode_tuple_project` using iterator projection; builds Arrow batches.
-  - Heap scanner implementation now lives under `executor/src/scan/heap/` with focused submodules: `visibility.rs` (bitmap checks), `page_iter.rs` (visible tuple iteration over heap page), `decode.rs` (tuple->Arrow decode/builders).
-- API boundary: scan internals are crate-private (`mod scan` in `executor/src/lib.rs`); heap scan types/helpers are crate-scoped (`pub(crate)`/`pub(super)`).
+  - Heap scanner implementation now lives under `scan/src/heap/` with focused submodules: `visibility.rs` (bitmap checks), `page_iter.rs` (visible tuple iteration over heap page), `decode.rs` (tuple->Arrow decode/builders).
+  - Decode path now avoids eager empty-batch allocation, estimates row-capacity from visibility bitmap, and reuses full-schema projection without allocating `proj_indices` for identity/full scans.
+- API boundary: `executor` consumes the external `scan` crate API and injects telemetry via `HeapScanTelemetryHooks`.
 - Results: encodes each row via `encode_wire_tuple` and writes to per‑connection result ring; signals backend.
 
 Current Limitations
