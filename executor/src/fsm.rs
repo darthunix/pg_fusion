@@ -1,7 +1,7 @@
 use rust_fsm::*;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum Action {
+pub enum QueryFlowAction {
     Bind,
     Parse,
     Compile,
@@ -15,7 +15,7 @@ pub enum Action {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum ExecutorState {
+pub enum QueryFlowState {
     Statement,
     Initialized,
     LogicalPlan,
@@ -87,8 +87,8 @@ pub enum ScanFlowState {
 }
 
 state_machine! {
-    #[state_machine(input(protocol::ControlPacket), state(crate::fsm::ExecutorState), output(crate::fsm::Action))]
-    pub executor(Initialized)
+    #[state_machine(input(protocol::QueryPacket), state(crate::fsm::QueryFlowState), output(crate::fsm::QueryFlowAction))]
+    pub query_flow(Initialized)
 
     Initialized => {
         Parse => Statement[Parse],
@@ -154,38 +154,38 @@ state_machine! {
 #[cfg(test)]
 mod tests {
     use super::{
-        data_flow, scan_flow, Action, DataFlowAction, DataFlowEvent, DataFlowState, ExecutorState,
-        ScanFlowAction, ScanFlowEvent, ScanFlowState,
+        data_flow, query_flow, scan_flow, DataFlowAction, DataFlowEvent, DataFlowState,
+        QueryFlowAction, QueryFlowState, ScanFlowAction, ScanFlowEvent, ScanFlowState,
     };
 
     #[test]
-    fn executor_happy_path_reaches_physical_plan() {
-        let mut machine = super::executor::StateMachine::new();
+    fn query_flow_happy_path_reaches_physical_plan() {
+        let mut machine = query_flow::StateMachine::new();
 
-        assert_eq!(machine.state(), &ExecutorState::Initialized);
+        assert_eq!(machine.state(), &QueryFlowState::Initialized);
         assert_eq!(
-            machine.consume(&protocol::ControlPacket::Parse).unwrap(),
-            Some(Action::Parse)
+            machine.consume(&protocol::QueryPacket::Parse).unwrap(),
+            Some(QueryFlowAction::Parse)
         );
-        assert_eq!(machine.state(), &ExecutorState::Statement);
+        assert_eq!(machine.state(), &QueryFlowState::Statement);
         assert_eq!(
-            machine.consume(&protocol::ControlPacket::Metadata).unwrap(),
-            Some(Action::Compile)
+            machine.consume(&protocol::QueryPacket::Metadata).unwrap(),
+            Some(QueryFlowAction::Compile)
         );
-        assert_eq!(machine.state(), &ExecutorState::LogicalPlan);
+        assert_eq!(machine.state(), &QueryFlowState::LogicalPlan);
         assert_eq!(
-            machine.consume(&protocol::ControlPacket::Bind).unwrap(),
-            Some(Action::Bind)
-        );
-        assert_eq!(
-            machine.consume(&protocol::ControlPacket::Optimize).unwrap(),
-            Some(Action::Optimize)
+            machine.consume(&protocol::QueryPacket::Bind).unwrap(),
+            Some(QueryFlowAction::Bind)
         );
         assert_eq!(
-            machine.consume(&protocol::ControlPacket::Translate).unwrap(),
-            Some(Action::Translate)
+            machine.consume(&protocol::QueryPacket::Optimize).unwrap(),
+            Some(QueryFlowAction::Optimize)
         );
-        assert_eq!(machine.state(), &ExecutorState::PhysicalPlan);
+        assert_eq!(
+            machine.consume(&protocol::QueryPacket::Translate).unwrap(),
+            Some(QueryFlowAction::Translate)
+        );
+        assert_eq!(machine.state(), &QueryFlowState::PhysicalPlan);
     }
 
     #[test]

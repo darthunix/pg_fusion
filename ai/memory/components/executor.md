@@ -3,13 +3,14 @@ id: comp-executor-0001
 type: fact
 scope: executor
 tags: ["datafusion", "scan", "result-ring", "wire-tuple", "shm"]
-updated_at: "2026-03-11"
+updated_at: "2026-03-14"
 importance: 0.7
 ---
 
 # Component: Executor
 
 - Planning/exec: DataFusion with single partition; scan provider/exec/stream live in separate `scan` crate (`HeapScanProvider -> HeapScanExec -> HeapScanStream`).
+- Query orchestration now uses layered FSMs: top-level `query_flow` consumes `protocol::QueryPacket`, `data_flow` models execution-session lifecycle, and `scan_flow` models per-scan lifecycle.
 - FSM contract: `Explain` is handled only after `Translate` (i.e., in `PhysicalPlan` state). `LogicalPlan` no longer accepts `Explain`.
 - Scans: per‑connection `HeapScanRegistry` (from `scan` crate) with bounded channels; issues `request_heap_block` and pipelines next on receipt (single in‑flight block per scan).
 - Heap: on receiving a `Heap` meta packet, immediately copies the heap page and visibility bitmap out of SHM into owned `Vec<u8>` to avoid slot reuse races; applies visibility bitmap (LSB‑first, 1‑based LP indices) to filter tuples; decodes via `storage::heap::decode_tuple_project` using iterator projection; builds Arrow batches.

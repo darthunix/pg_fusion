@@ -1,4 +1,4 @@
-use crate::{write_header, ControlPacket, Direction, Flag, Header, Tape};
+use crate::{write_header, Direction, Flag, Header, QueryPacket, Tape};
 use anyhow::{bail, Result};
 use rmp::decode::{read_array_len, read_i16, read_i32, read_u32, read_u8};
 use rmp::encode::{write_array_len, write_i16, write_i32, write_u32, write_u8};
@@ -45,7 +45,7 @@ pub fn prepare_column_layout(stream: &mut impl Tape, attrs: &[PgAttrWire]) -> Re
     let length = u16::try_from(len_final - len_init)?;
     let header = Header {
         direction: Direction::ToServer,
-        tag: ControlPacket::ColumnLayout as u8,
+        tag: QueryPacket::ColumnLayout as u8,
         length,
         flag: Flag::Last,
     };

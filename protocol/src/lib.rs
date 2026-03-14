@@ -52,10 +52,10 @@ impl TryFrom<u8> for Direction {
     }
 }
 
-// Control packets correspond to planning/metadata/coordination messages.
+// Query packets correspond to planning/metadata/coordination messages.
 #[repr(u8)]
 #[derive(Clone, Debug, PartialEq)]
-pub enum ControlPacket {
+pub enum QueryPacket {
     None = 0,
     Bind = 1,
     Failure = 2,
@@ -72,26 +72,26 @@ pub enum ControlPacket {
     ColumnLayout = 14,
 }
 
-impl TryFrom<u8> for ControlPacket {
+impl TryFrom<u8> for QueryPacket {
     type Error = FusionError;
 
     fn try_from(value: u8) -> Result<Self, Self::Error> {
         assert!(value < 128);
         match value {
-            0 => Ok(ControlPacket::None),
-            1 => Ok(ControlPacket::Bind),
-            2 => Ok(ControlPacket::Failure),
-            3 => Ok(ControlPacket::Metadata),
-            4 => Ok(ControlPacket::Parse),
-            5 => Ok(ControlPacket::Explain),
-            6 => Ok(ControlPacket::Columns),
-            7 => Ok(ControlPacket::Optimize),
-            8 => Ok(ControlPacket::Translate),
-            13 => Ok(ControlPacket::ExecReady),
-            16 => Ok(ControlPacket::BeginScan),
-            17 => Ok(ControlPacket::ExecScan),
-            18 => Ok(ControlPacket::EndScan),
-            14 => Ok(ControlPacket::ColumnLayout),
+            0 => Ok(QueryPacket::None),
+            1 => Ok(QueryPacket::Bind),
+            2 => Ok(QueryPacket::Failure),
+            3 => Ok(QueryPacket::Metadata),
+            4 => Ok(QueryPacket::Parse),
+            5 => Ok(QueryPacket::Explain),
+            6 => Ok(QueryPacket::Columns),
+            7 => Ok(QueryPacket::Optimize),
+            8 => Ok(QueryPacket::Translate),
+            13 => Ok(QueryPacket::ExecReady),
+            16 => Ok(QueryPacket::BeginScan),
+            17 => Ok(QueryPacket::ExecScan),
+            18 => Ok(QueryPacket::EndScan),
+            14 => Ok(QueryPacket::ColumnLayout),
             _ => Err(FusionError::Deserialize(
                 "control_packet".into(),
                 value.into(),
