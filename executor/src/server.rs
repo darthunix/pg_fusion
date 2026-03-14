@@ -101,7 +101,6 @@ type RuntimeEventRx = UnboundedReceiver<RuntimeEvent>;
 
 #[allow(dead_code)]
 enum InboundMessage {
-    ColumnLayout,
     Data {
         packet: DataPacket,
         payload_len: u16,
@@ -547,9 +546,6 @@ impl<'bytes> Connection<'bytes> {
         };
 
         match message {
-            InboundMessage::ColumnLayout => {
-                let _ = self.handle_column_layout_packet(storage, QueryPacket::ColumnLayout as u8)?;
-            }
             InboundMessage::Data {
                 packet: DataPacket::Heap,
                 payload_len,
@@ -690,10 +686,6 @@ impl<'bytes> Connection<'bytes> {
                 "process_message_flow_driven: header direction ToClient, ignoring"
             );
             return Ok(None);
-        }
-
-        if header.tag == QueryPacket::ColumnLayout as u8 {
-            return Ok(Some(InboundMessage::ColumnLayout));
         }
 
         if is_data_tag(header.tag) {
@@ -1033,17 +1025,12 @@ impl<'a, 'bytes> QueryPacketCtx<'a, 'bytes> {
         runtime_events_tx: &RuntimeEventTx,
     ) -> Result<ActionExecOutcome> {
         let task = match action {
+            Some(QueryFlowAction::CaptureColumnLayout) => self.action_capture_column_layout()?,
             Some(QueryFlowAction::OpenDataFlow) => open_data_flow_impl(self.conn, self.storage)?,
             Some(QueryFlowAction::StartDataFlow) => {
                 start_data_flow_impl(self.conn, self.storage, Some(runtime_events_tx.clone()))?
             }
             Some(QueryFlowAction::EndDataFlow) => end_data_flow_impl(self.storage)?,
-            Some(QueryFlowAction::CaptureColumnLayout) => {
-                bail!(FusionError::FailedTo(
-                    "execute query flow action".into(),
-                    "ColumnLayout must be handled by the column-layout packet path".into(),
-                ));
-            }
             _ => return self.execute_action(action, skip_metadata).await,
         };
         Ok(ActionExecOutcome::Task(task))
@@ -1106,6 +1093,15 @@ impl<'a, 'bytes> QueryPacketCtx<'a, 'bytes> {
                     explain_len = explain.len(),
                     "process_message: prepared Explain"
                 );
+                Ok(QueryLoopStep::Break)
+            }
+            TaskResult::CapturedColumnLayout(attrs) => {
+                log_trace!(
+                    EXECUTOR_TARGET,
+                    pg_attrs = attrs.len(),
+                    "process_message_flow_driven: captured column layout"
+                );
+                self.storage.pg_attrs = Some(attrs);
                 Ok(QueryLoopStep::Break)
             }
             TaskResult::Noop => Ok(QueryLoopStep::Break),
@@ -1220,6 +1216,12 @@ impl<'a, 'bytes> QueryPacketCtx<'a, 'bytes> {
         };
         log_trace!(EXECUTOR_TARGET, "process_message: QueryFlowAction::Translate");
         translate(plan).await
+    }
+
+    #[inline]
+    fn action_capture_column_layout(&mut self) -> Result<TaskResult> {
+        let attrs = consume_column_layout(&mut self.conn.recv_socket.buffer)?;
+        Ok(TaskResult::CapturedColumnLayout(attrs))
     }
 
     #[inline]
@@ -1734,6 +1736,7 @@ enum TaskResult {
     Optimized(LogicalPlan),
     Translated(Option<Arc<dyn ExecutionPlan>>),
     Explain(SmolStr),
+    CapturedColumnLayout(Vec<PgAttrWire>),
     Noop,
 }
 
@@ -1819,6 +1822,79 @@ mod tests {
         );
         storage.shadow_scan_flow_event(42, ScanFlowEvent::ScanEof, "test");
         assert!(!storage.shadow_scan_flows.contains_key(&42));
+    }
+
+    #[tokio::test]
+    async fn flow_driven_column_layout_moves_query_into_execution() -> Result<()> {
+        use crate::layout::{connection_layout, connection_ptrs};
+
+        static BYTES: ConnMemory = ConnMemory::new();
+        let state = Arc::new(SharedState::new(unsafe { &*BYTES.flags.get() }));
+
+        let layout = connection_layout(PAYLOAD_SIZE, PAYLOAD_SIZE).expect("layout");
+        let base = unsafe { (*BYTES.conn.get()).0.as_mut_ptr() };
+        let (recv_base, send_base, _pid_ptr) = unsafe { connection_ptrs(base, layout) };
+
+        let socket = unsafe {
+            Socket::from_layout_with_state(
+                0,
+                Arc::clone(&state),
+                recv_base,
+                layout.recv_socket_layout,
+            )
+        };
+        let send_buffer =
+            unsafe { LockFreeBuffer::from_layout(send_base, layout.send_buffer_layout) };
+        static SERVER_PID: AtomicI32 = AtomicI32::new(0);
+        static CLIENT_PID: AtomicI32 = AtomicI32::new(0);
+        let mut conn = Connection::new(0, socket, send_buffer, &SERVER_PID, &CLIENT_PID);
+        let mut storage = Storage {
+            registry: Arc::new(HeapScanRegistry::new()),
+            ..Default::default()
+        };
+        let (runtime_tx, mut runtime_rx) = tokio::sync::mpsc::unbounded_channel();
+
+        assert_eq!(storage.state.state(), &QueryFlowState::Initialized);
+        assert_eq!(
+            storage.state.consume(&QueryPacket::Parse)?,
+            Some(QueryFlowAction::Parse)
+        );
+        assert_eq!(
+            storage.state.consume(&QueryPacket::Metadata)?,
+            Some(QueryFlowAction::Compile)
+        );
+        assert_eq!(
+            storage.state.consume(&QueryPacket::Bind)?,
+            Some(QueryFlowAction::Bind)
+        );
+        assert_eq!(
+            storage.state.consume(&QueryPacket::Optimize)?,
+            Some(QueryFlowAction::Optimize)
+        );
+        assert_eq!(
+            storage.state.consume(&QueryPacket::Translate)?,
+            Some(QueryFlowAction::Translate)
+        );
+        assert_eq!(storage.state.state(), &QueryFlowState::PhysicalPlan);
+
+        prepare_column_layout(
+            &mut conn.recv_socket.buffer,
+            &[PgAttrWire {
+                atttypid: 23,
+                typmod: -1,
+                attlen: 4,
+                attalign: 4,
+                attbyval: true,
+                nullable: true,
+            }],
+        )?;
+
+        conn.process_message_flow_driven(&mut storage, &mut runtime_rx, &runtime_tx)
+            .await?;
+
+        assert_eq!(storage.state.state(), &QueryFlowState::Execution);
+        assert_eq!(storage.pg_attrs.as_ref().map(Vec::len), Some(1));
+        Ok(())
     }
 
     // Local mocks for metadata processing used by tests
