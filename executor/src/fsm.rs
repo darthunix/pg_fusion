@@ -1,6 +1,6 @@
 use rust_fsm::*;
 
-#[derive(Debug)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Action {
     Bind,
     Parse,
@@ -14,12 +14,76 @@ pub enum Action {
     EndDataFlow,
 }
 
-#[derive(Debug, PartialEq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ExecutorState {
     Statement,
     Initialized,
     LogicalPlan,
     PhysicalPlan,
+}
+
+/// Events for the execution-time data flow that begins after a physical plan is built.
+///
+/// This is intentionally narrower than the top-level executor FSM:
+/// it models only the coarse lifecycle inside `PhysicalPlan`.
+/// Per-scan traffic like heap pages and scan EOF lives in `scan_flow`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DataFlowEvent {
+    BeginScan,
+    ExecScan,
+    TaskFinished,
+    EndScan,
+    Failure,
+}
+
+/// Side effects we expect the runtime layer to perform while transitioning the
+/// data flow lifecycle.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DataFlowAction {
+    OpenFlow,
+    StartFlow,
+    FinishFlow,
+    CloseFlow,
+    ResetFlow,
+}
+
+/// High-level state of the per-connection scan/runtime pipeline.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DataFlowState {
+    Closed,
+    Opened,
+    Running,
+    Finished,
+}
+
+/// Events for a single heap scan lifecycle.
+///
+/// This FSM deliberately models the scan lifecycle, not scheduler counters like
+/// `inflight` credits. Those remain runtime data carried alongside the state.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ScanFlowEvent {
+    Register,
+    StartStream,
+    HeapPage,
+    ScanEof,
+    EndScan,
+    Failure,
+}
+
+/// Side effects expected from a single scan lifecycle transition.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ScanFlowAction {
+    RegisterScan,
+    ObserveStreamStart,
+    RouteHeapPage,
+    CloseScan,
+    ResetScan,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ScanFlowState {
+    Closed,
+    Active,
 }
 
 state_machine! {
@@ -45,5 +109,151 @@ state_machine! {
         BeginScan => PhysicalPlan[OpenDataFlow],
         ExecScan => PhysicalPlan[StartDataFlow],
         EndScan => PhysicalPlan[EndDataFlow],
+    }
+}
+
+state_machine! {
+    #[state_machine(input(crate::fsm::DataFlowEvent), state(crate::fsm::DataFlowState), output(crate::fsm::DataFlowAction))]
+    pub data_flow(Closed)
+
+    Closed => {
+        BeginScan => Opened[OpenFlow],
+    },
+    Opened => {
+        Failure => Closed[ResetFlow],
+        ExecScan => Running[StartFlow],
+        EndScan => Closed[CloseFlow],
+    },
+    Running => {
+        Failure => Closed[ResetFlow],
+        TaskFinished => Finished[FinishFlow],
+        EndScan => Closed[CloseFlow],
+    },
+    Finished => {
+        Failure => Closed[ResetFlow],
+        EndScan => Closed[CloseFlow],
+    }
+}
+
+state_machine! {
+    #[state_machine(input(crate::fsm::ScanFlowEvent), state(crate::fsm::ScanFlowState), output(crate::fsm::ScanFlowAction))]
+    pub scan_flow(Closed)
+
+    Closed => {
+        Register => Active[RegisterScan],
+    },
+    Active => {
+        Failure => Closed[ResetScan],
+        StartStream => Active[ObserveStreamStart],
+        HeapPage => Active[RouteHeapPage],
+        EndScan => Closed[CloseScan],
+        ScanEof => Closed[CloseScan],
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        data_flow, scan_flow, Action, DataFlowAction, DataFlowEvent, DataFlowState, ExecutorState,
+        ScanFlowAction, ScanFlowEvent, ScanFlowState,
+    };
+
+    #[test]
+    fn executor_happy_path_reaches_physical_plan() {
+        let mut machine = super::executor::StateMachine::new();
+
+        assert_eq!(machine.state(), &ExecutorState::Initialized);
+        assert_eq!(
+            machine.consume(&protocol::ControlPacket::Parse).unwrap(),
+            Some(Action::Parse)
+        );
+        assert_eq!(machine.state(), &ExecutorState::Statement);
+        assert_eq!(
+            machine.consume(&protocol::ControlPacket::Metadata).unwrap(),
+            Some(Action::Compile)
+        );
+        assert_eq!(machine.state(), &ExecutorState::LogicalPlan);
+        assert_eq!(
+            machine.consume(&protocol::ControlPacket::Bind).unwrap(),
+            Some(Action::Bind)
+        );
+        assert_eq!(
+            machine.consume(&protocol::ControlPacket::Optimize).unwrap(),
+            Some(Action::Optimize)
+        );
+        assert_eq!(
+            machine.consume(&protocol::ControlPacket::Translate).unwrap(),
+            Some(Action::Translate)
+        );
+        assert_eq!(machine.state(), &ExecutorState::PhysicalPlan);
+    }
+
+    #[test]
+    fn data_flow_happy_path_runs_to_finished() {
+        let mut machine = data_flow::StateMachine::new();
+
+        assert_eq!(machine.state(), &DataFlowState::Closed);
+        assert_eq!(
+            machine.consume(&DataFlowEvent::BeginScan).unwrap(),
+            Some(DataFlowAction::OpenFlow)
+        );
+        assert_eq!(machine.state(), &DataFlowState::Opened);
+        assert_eq!(
+            machine.consume(&DataFlowEvent::ExecScan).unwrap(),
+            Some(DataFlowAction::StartFlow)
+        );
+        assert_eq!(machine.state(), &DataFlowState::Running);
+        assert_eq!(
+            machine.consume(&DataFlowEvent::TaskFinished).unwrap(),
+            Some(DataFlowAction::FinishFlow)
+        );
+        assert_eq!(machine.state(), &DataFlowState::Finished);
+        assert_eq!(
+            machine.consume(&DataFlowEvent::EndScan).unwrap(),
+            Some(DataFlowAction::CloseFlow)
+        );
+        assert_eq!(machine.state(), &DataFlowState::Closed);
+    }
+
+    #[test]
+    fn data_flow_rejects_exec_before_open() {
+        let mut machine = data_flow::StateMachine::new();
+
+        assert!(machine.consume(&DataFlowEvent::ExecScan).is_err());
+        assert_eq!(machine.state(), &DataFlowState::Closed);
+    }
+
+    #[test]
+    fn scan_flow_happy_path_streams_until_eof() {
+        let mut machine = scan_flow::StateMachine::new();
+
+        assert_eq!(machine.state(), &ScanFlowState::Closed);
+        assert_eq!(
+            machine.consume(&ScanFlowEvent::Register).unwrap(),
+            Some(ScanFlowAction::RegisterScan)
+        );
+        assert_eq!(machine.state(), &ScanFlowState::Active);
+        assert_eq!(
+            machine.consume(&ScanFlowEvent::StartStream).unwrap(),
+            Some(ScanFlowAction::ObserveStreamStart)
+        );
+        assert_eq!(machine.state(), &ScanFlowState::Active);
+        assert_eq!(
+            machine.consume(&ScanFlowEvent::HeapPage).unwrap(),
+            Some(ScanFlowAction::RouteHeapPage)
+        );
+        assert_eq!(
+            machine.consume(&ScanFlowEvent::ScanEof).unwrap(),
+            Some(ScanFlowAction::CloseScan)
+        );
+        assert_eq!(machine.state(), &ScanFlowState::Closed);
+    }
+
+    #[test]
+    fn scan_flow_rejects_pages_before_stream_attach() {
+        let mut machine = scan_flow::StateMachine::new();
+
+        assert!(machine.consume(&ScanFlowEvent::HeapPage).is_err());
+        assert_eq!(machine.state(), &ScanFlowState::Closed);
     }
 }
