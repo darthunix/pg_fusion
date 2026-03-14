@@ -28,7 +28,7 @@ use protocol::parse::prepare_query;
 use protocol::tuple::decode_wire_tuple;
 use protocol::tuple::{prepare_column_layout, PgAttrWire};
 use protocol::Tape;
-use protocol::{ControlPacket, DataPacket, Direction};
+use protocol::{DataPacket, Direction, QueryPacket};
 use rmp::decode::read_bin_len;
 use rmp::encode::{write_array_len, write_bool, write_str, write_u32, write_u8};
 use smallvec::SmallVec;
@@ -388,9 +388,9 @@ unsafe extern "C-unwind" fn create_df_scan_state(cscan: *mut pg_sys::CustomScan)
         if header.direction != Direction::ToClient {
             continue;
         }
-        match ControlPacket::try_from(header.tag) {
-            Ok(ControlPacket::None) => continue,
-            Ok(ControlPacket::Failure) => match read_error(&mut shared.send) {
+        match QueryPacket::try_from(header.tag) {
+            Ok(QueryPacket::None) => continue,
+            Ok(QueryPacket::Failure) => match read_error(&mut shared.send) {
                 Ok(msg) => error!("Failed to compile the query: {}", msg),
                 Err(err) => error!("Double error: {}", err),
             },
@@ -399,7 +399,7 @@ unsafe extern "C-unwind" fn create_df_scan_state(cscan: *mut pg_sys::CustomScan)
                 drain_remaining = header.length as usize;
                 continue;
             }
-            Ok(ControlPacket::Metadata) => {
+            Ok(QueryPacket::Metadata) => {
                 pgrx::debug1!("handshake: got Metadata");
                 if let Err(err) = handle_metadata(&mut shared.send, &mut shared.recv) {
                     let _ = request_failure(&mut shared.recv);
@@ -410,7 +410,7 @@ unsafe extern "C-unwind" fn create_df_scan_state(cscan: *mut pg_sys::CustomScan)
                     error!("Failed to signal server: {}", err);
                 }
             }
-            Ok(ControlPacket::Bind) => {
+            Ok(QueryPacket::Bind) => {
                 pgrx::debug1!("handshake: got Bind");
                 // For now, send empty params (queries without params)
                 if let Err(err) = prepare_params(&mut shared.recv, || {
@@ -427,7 +427,7 @@ unsafe extern "C-unwind" fn create_df_scan_state(cscan: *mut pg_sys::CustomScan)
                     error!("Failed to signal server: {}", err);
                 }
             }
-            Ok(ControlPacket::Columns) => {
+            Ok(QueryPacket::Columns) => {
                 pgrx::debug1!("handshake: got Columns, consuming");
                 // We'll build a Postgres TargetEntry list for the scan's output
                 // and assign it to custom_scan_tlist after consumption.
@@ -516,10 +516,10 @@ unsafe extern "C-unwind" fn create_df_scan_state(cscan: *mut pg_sys::CustomScan)
                 break;
             }
 
-            Ok(ControlPacket::Parse)
-            | Ok(ControlPacket::Explain)
-            | Ok(ControlPacket::Optimize)
-            | Ok(ControlPacket::Translate) => {
+            Ok(QueryPacket::Parse)
+            | Ok(QueryPacket::Explain)
+            | Ok(QueryPacket::Optimize)
+            | Ok(QueryPacket::Translate) => {
                 let _ = request_failure(&mut shared.recv);
                 let _ = shared.signal_server();
                 error!(
@@ -527,10 +527,10 @@ unsafe extern "C-unwind" fn create_df_scan_state(cscan: *mut pg_sys::CustomScan)
                     header.tag
                 )
             }
-            Ok(ControlPacket::BeginScan)
-            | Ok(ControlPacket::ExecScan)
-            | Ok(ControlPacket::EndScan)
-            | Ok(ControlPacket::ExecReady) => {
+            Ok(QueryPacket::BeginScan)
+            | Ok(QueryPacket::ExecScan)
+            | Ok(QueryPacket::EndScan)
+            | Ok(QueryPacket::ExecReady) => {
                 // Ignore execution-time control messages during planning
                 pgrx::debug1!(
                     "handshake: ignoring execution-time packet tag={}",
@@ -538,7 +538,7 @@ unsafe extern "C-unwind" fn create_df_scan_state(cscan: *mut pg_sys::CustomScan)
                 );
                 continue;
             }
-            Ok(ControlPacket::ColumnLayout) => continue,
+            Ok(QueryPacket::ColumnLayout) => continue,
             Err(_) => continue,
         }
     }
@@ -735,13 +735,13 @@ unsafe extern "C-unwind" fn exec_df_scan(
             if header.direction != Direction::ToClient {
                 continue;
             }
-            match ControlPacket::try_from(header.tag) {
-                Ok(ControlPacket::ExecReady) => {
+            match QueryPacket::try_from(header.tag) {
+                Ok(QueryPacket::ExecReady) => {
                     pgrx::debug1!("exec_df_scan: ExecReady received (conn={})", id);
                     EXEC_READY_SEEN.with(|seen| seen.set(true));
                     break;
                 }
-                Ok(ControlPacket::Failure) => match read_error(&mut shared.send) {
+                Ok(QueryPacket::Failure) => match read_error(&mut shared.send) {
                     Ok(msg) => error!("Executor failed to start: {}", msg),
                     Err(err) => error!("Double error: {}", err),
                 },
@@ -1362,9 +1362,9 @@ unsafe extern "C-unwind" fn explain_df_scan(
         if header.direction != Direction::ToClient {
             continue;
         }
-        match ControlPacket::try_from(header.tag) {
-            Ok(ControlPacket::None) => continue,
-            Ok(ControlPacket::Failure) => match read_error(&mut shared.send) {
+        match QueryPacket::try_from(header.tag) {
+            Ok(QueryPacket::None) => continue,
+            Ok(QueryPacket::Failure) => match read_error(&mut shared.send) {
                 Ok(msg) => error!("Failed to compile the query: {}", msg),
                 Err(err) => error!("Double error: {}", err),
             },
@@ -1372,7 +1372,7 @@ unsafe extern "C-unwind" fn explain_df_scan(
                 // Not expected for EXPLAIN; ignore.
                 continue;
             }
-            Ok(ControlPacket::Explain) => {
+            Ok(QueryPacket::Explain) => {
                 let len = read_bin_len(&mut shared.send)
                     .expect("Failed to read length in explain message");
                 let mut buf = SmallVec::<[u8; 256]>::new();

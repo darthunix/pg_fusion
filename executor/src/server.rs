@@ -1,7 +1,7 @@
 use crate::budget::{BudgetScheduler, CreditCell, SchedulerConfig};
 use crate::buffer::LockFreeBuffer;
-use crate::fsm::executor::StateMachine;
-use crate::fsm::Action;
+use crate::fsm::query_flow::StateMachine;
+use crate::fsm::QueryFlowAction;
 use crate::ipc::Socket;
 use crate::logging::{log_debug, log_error, log_trace, log_warn};
 use crate::sql::Catalog;
@@ -31,7 +31,7 @@ use protocol::metadata::prepare_table_refs;
 use protocol::parse::read_query;
 use protocol::tuple::{consume_column_layout, PgAttrWire};
 use protocol::Tape;
-use protocol::{consume_header, is_data_tag, ControlPacket, DataPacket, Direction};
+use protocol::{consume_header, is_data_tag, DataPacket, Direction, QueryPacket};
 use rmp::decode::{read_u16 as read_u16_msgpack, read_u64 as read_u64_msgpack};
 use scan::{count_heap_scans, for_each_heap_scan, HeapPageBlock, HeapScanRegistry};
 use smol_str::{format_smolstr, SmolStr};
@@ -283,7 +283,7 @@ impl<'bytes> Connection<'bytes> {
             return Ok(());
         }
 
-        let packet = ControlPacket::try_from(header.tag)?;
+        let packet = QueryPacket::try_from(header.tag)?;
         if !self.handle_control_packet(storage, packet).await? {
             return Ok(());
         }
@@ -300,7 +300,7 @@ impl<'bytes> Connection<'bytes> {
 
     #[inline]
     fn handle_column_layout_packet(&mut self, storage: &mut Storage, tag: u8) -> Result<bool> {
-        if tag != ControlPacket::ColumnLayout as u8 {
+        if tag != QueryPacket::ColumnLayout as u8 {
             return Ok(false);
         }
         let attrs = consume_column_layout(&mut self.recv_socket.buffer)?;
@@ -517,12 +517,12 @@ impl<'bytes> Connection<'bytes> {
     async fn handle_control_packet(
         &mut self,
         storage: &mut Storage,
-        mut packet: ControlPacket,
+        mut packet: QueryPacket,
     ) -> Result<bool> {
         // Do not flush send_buffer here; backend is the reader for responses.
         // Guard against spurious EndScan (e.g., after EXPLAIN) when no PhysicalPlan is active.
-        if packet == ControlPacket::EndScan
-            && storage.state.state() != &crate::fsm::ExecutorState::PhysicalPlan
+        if packet == QueryPacket::EndScan
+            && storage.state.state() != &crate::fsm::QueryFlowState::PhysicalPlan
         {
             log_trace!(
                 EXECUTOR_TARGET,
@@ -531,7 +531,7 @@ impl<'bytes> Connection<'bytes> {
             return Ok(false);
         }
 
-        let mut ctx = ControlPacketCtx {
+        let mut ctx = QueryPacketCtx {
             conn: self,
             storage,
         };
@@ -551,8 +551,8 @@ impl<'bytes> Connection<'bytes> {
                 unreachable!("handled ReturnFalse above");
             };
             match ctx.apply_task_result(result, &mut packet, &mut skip_metadata)? {
-                ControlLoopStep::Continue => continue,
-                ControlLoopStep::Break => break,
+                QueryLoopStep::Continue => continue,
+                QueryLoopStep::Break => break,
             }
         }
         Ok(true)
@@ -573,42 +573,42 @@ enum ActionExecOutcome {
     ReturnFalse,
 }
 
-enum ControlLoopStep {
+enum QueryLoopStep {
     Continue,
     Break,
 }
 
-struct ControlPacketCtx<'a, 'bytes> {
+struct QueryPacketCtx<'a, 'bytes> {
     conn: &'a mut Connection<'bytes>,
     storage: &'a mut Storage,
 }
 
-impl<'a, 'bytes> ControlPacketCtx<'a, 'bytes> {
+impl<'a, 'bytes> QueryPacketCtx<'a, 'bytes> {
     #[inline]
     async fn execute_action(
         &mut self,
-        action: Option<Action>,
+        action: Option<QueryFlowAction>,
         skip_metadata: bool,
     ) -> Result<ActionExecOutcome> {
         let task = match action {
-            Some(Action::Bind) => self.action_bind()?,
-            Some(Action::Compile) => self.action_compile(skip_metadata)?,
-            Some(Action::Explain) => self.action_explain()?,
-            Some(Action::Optimize) => self.action_optimize()?,
-            Some(Action::Flush) => {
+            Some(QueryFlowAction::Bind) => self.action_bind()?,
+            Some(QueryFlowAction::Compile) => self.action_compile(skip_metadata)?,
+            Some(QueryFlowAction::Explain) => self.action_explain()?,
+            Some(QueryFlowAction::Optimize) => self.action_optimize()?,
+            Some(QueryFlowAction::Flush) => {
                 log_trace!(
                     EXECUTOR_TARGET,
-                    "process_message: Action::Flush (reset state)"
+                    "process_message: QueryFlowAction::Flush (reset state)"
                 );
                 // Do not flush send_buffer here; only backend should move read head.
                 self.storage.flush();
                 return Ok(ActionExecOutcome::ReturnFalse);
             }
-            Some(Action::Parse) => self.action_parse()?,
-            Some(Action::Translate) => self.action_translate().await?,
-            Some(Action::OpenDataFlow) => self.action_open_data_flow()?,
-            Some(Action::StartDataFlow) => self.action_start_data_flow()?,
-            Some(Action::EndDataFlow) => self.action_end_data_flow()?,
+            Some(QueryFlowAction::Parse) => self.action_parse()?,
+            Some(QueryFlowAction::Translate) => self.action_translate().await?,
+            Some(QueryFlowAction::OpenDataFlow) => self.action_open_data_flow()?,
+            Some(QueryFlowAction::StartDataFlow) => self.action_start_data_flow()?,
+            Some(QueryFlowAction::EndDataFlow) => self.action_end_data_flow()?,
             None => {
                 bail!(FusionError::NotFound(
                     "find an action".into(),
@@ -623,9 +623,9 @@ impl<'a, 'bytes> ControlPacketCtx<'a, 'bytes> {
     fn apply_task_result(
         &mut self,
         result: TaskResult,
-        packet: &mut ControlPacket,
+        packet: &mut QueryPacket,
         skip_metadata: &mut bool,
-    ) -> Result<ControlLoopStep> {
+    ) -> Result<QueryLoopStep> {
         match result {
             TaskResult::Bind(plan) => {
                 prepare_columns(&mut self.conn.send_buffer, plan.schema().fields())?;
@@ -636,12 +636,12 @@ impl<'a, 'bytes> ControlPacketCtx<'a, 'bytes> {
                 );
                 self.storage.logical_plan = Some(plan);
                 // Immediately schedule an Optimize pass for the next loop iteration.
-                *packet = ControlPacket::Optimize;
+                *packet = QueryPacket::Optimize;
                 log_trace!(
                     EXECUTOR_TARGET,
                     "process_message: scheduling Optimize after Bind"
                 );
-                Ok(ControlLoopStep::Continue)
+                Ok(QueryLoopStep::Continue)
             }
             TaskResult::Compilation(plan) => {
                 self.storage.logical_plan = Some(plan);
@@ -650,16 +650,16 @@ impl<'a, 'bytes> ControlPacketCtx<'a, 'bytes> {
                     EXECUTOR_TARGET,
                     "process_message: requested params after Compilation"
                 );
-                Ok(ControlLoopStep::Break)
+                Ok(QueryLoopStep::Break)
             }
             TaskResult::Optimized(plan) => {
                 self.storage.logical_plan = Some(plan);
-                *packet = ControlPacket::Translate;
+                *packet = QueryPacket::Translate;
                 log_trace!(
                     EXECUTOR_TARGET,
                     "process_message: scheduling Translate after Optimize"
                 );
-                Ok(ControlLoopStep::Continue)
+                Ok(QueryLoopStep::Continue)
             }
             TaskResult::Translated(phys) => {
                 self.storage.physical_plan = phys;
@@ -667,7 +667,7 @@ impl<'a, 'bytes> ControlPacketCtx<'a, 'bytes> {
                     EXECUTOR_TARGET,
                     "process_message: transitioned to PhysicalPlan (built physical plan)"
                 );
-                Ok(ControlLoopStep::Break)
+                Ok(QueryLoopStep::Break)
             }
             TaskResult::Explain(explain) => {
                 prepare_explain(&mut self.conn.send_buffer, explain.as_str())?;
@@ -676,20 +676,20 @@ impl<'a, 'bytes> ControlPacketCtx<'a, 'bytes> {
                     explain_len = explain.len(),
                     "process_message: prepared Explain"
                 );
-                Ok(ControlLoopStep::Break)
+                Ok(QueryLoopStep::Break)
             }
-            TaskResult::Noop => Ok(ControlLoopStep::Break),
+            TaskResult::Noop => Ok(QueryLoopStep::Break),
             TaskResult::Parsing((stmt, tables)) => {
                 self.storage.statement = Some(stmt);
                 if tables.is_empty() {
                     // We don't need any table metadata for this query.
                     // Let's move connection to the next state.
                     *skip_metadata = true;
-                    *packet = ControlPacket::Metadata;
+                    *packet = QueryPacket::Metadata;
                     log_trace!(EXECUTOR_TARGET,
-                        "process_message: no tables, skipping metadata, forcing ControlPacket::Metadata"
+                        "process_message: no tables, skipping metadata, forcing QueryPacket::Metadata"
                     );
-                    Ok(ControlLoopStep::Continue)
+                    Ok(QueryLoopStep::Continue)
                 } else {
                     log_trace!(
                         EXECUTOR_TARGET,
@@ -697,7 +697,7 @@ impl<'a, 'bytes> ControlPacketCtx<'a, 'bytes> {
                         "process_message: preparing table refs"
                     );
                     prepare_table_refs(&mut self.conn.send_buffer, tables.as_slice())?;
-                    Ok(ControlLoopStep::Break)
+                    Ok(QueryLoopStep::Break)
                 }
             }
         }
@@ -714,7 +714,7 @@ impl<'a, 'bytes> ControlPacketCtx<'a, 'bytes> {
         let params = read_params(&mut self.conn.recv_socket.buffer)?;
         log_trace!(
             EXECUTOR_TARGET,
-            "process_message: Action::Bind with {} params",
+            "process_message: QueryFlowAction::Bind with {} params",
             params.len()
         );
         bind(plan, params)
@@ -739,7 +739,7 @@ impl<'a, 'bytes> ControlPacketCtx<'a, 'bytes> {
         log_trace!(
             EXECUTOR_TARGET,
             skip_metadata,
-            "process_message: Action::Compile (catalog {}loaded)",
+            "process_message: QueryFlowAction::Compile (catalog {}loaded)",
             if skip_metadata { "not " } else { "" }
         );
         compile(stmt, &catalog)
@@ -747,7 +747,7 @@ impl<'a, 'bytes> ControlPacketCtx<'a, 'bytes> {
 
     #[inline]
     fn action_explain(&mut self) -> Result<TaskResult> {
-        log_trace!(EXECUTOR_TARGET, "process_message: Action::Explain");
+        log_trace!(EXECUTOR_TARGET, "process_message: QueryFlowAction::Explain");
         if let Some(phys) = self.storage.physical_plan.as_ref() {
             explain_physical(phys)
         } else {
@@ -766,7 +766,7 @@ impl<'a, 'bytes> ControlPacketCtx<'a, 'bytes> {
                 "while processing optimize message".into(),
             ));
         };
-        log_trace!(EXECUTOR_TARGET, "process_message: Action::Optimize");
+        log_trace!(EXECUTOR_TARGET, "process_message: QueryFlowAction::Optimize");
         optimize(plan)
     }
 
@@ -775,7 +775,7 @@ impl<'a, 'bytes> ControlPacketCtx<'a, 'bytes> {
         let query = read_query(&mut self.conn.recv_socket.buffer)?;
         log_trace!(EXECUTOR_TARGET,
             query = %query,
-            "process_message: Action::Parse"
+            "process_message: QueryFlowAction::Parse"
         );
         parse(query.into())
     }
@@ -788,25 +788,25 @@ impl<'a, 'bytes> ControlPacketCtx<'a, 'bytes> {
                 "while processing translate message".into(),
             ));
         };
-        log_trace!(EXECUTOR_TARGET, "process_message: Action::Translate");
+        log_trace!(EXECUTOR_TARGET, "process_message: QueryFlowAction::Translate");
         translate(plan).await
     }
 
     #[inline]
     fn action_open_data_flow(&mut self) -> Result<TaskResult> {
-        log_trace!(EXECUTOR_TARGET, "process_message: Action::OpenDataFlow");
+        log_trace!(EXECUTOR_TARGET, "process_message: QueryFlowAction::OpenDataFlow");
         open_data_flow(self.conn, self.storage)
     }
 
     #[inline]
     fn action_start_data_flow(&mut self) -> Result<TaskResult> {
-        log_trace!(EXECUTOR_TARGET, "process_message: Action::StartDataFlow");
+        log_trace!(EXECUTOR_TARGET, "process_message: QueryFlowAction::StartDataFlow");
         start_data_flow(self.conn, self.storage)
     }
 
     #[inline]
     fn action_end_data_flow(&mut self) -> Result<TaskResult> {
-        log_trace!(EXECUTOR_TARGET, "process_message: Action::EndDataFlow");
+        log_trace!(EXECUTOR_TARGET, "process_message: QueryFlowAction::EndDataFlow");
         end_data_flow(self.storage)
     }
 }
@@ -1263,7 +1263,7 @@ enum TaskResult {
 mod tests {
     use super::*;
     use crate::buffer::LockFreeBuffer;
-    use crate::fsm::ExecutorState;
+    use crate::fsm::QueryFlowState;
     use crate::ipc::SharedState;
     use core::mem::size_of;
     use protocol::bind::prepare_params;
@@ -1271,7 +1271,7 @@ mod tests {
     use protocol::explain::request_explain;
     use protocol::metadata::process_metadata_with_response;
     use protocol::parse::prepare_query;
-    use protocol::ControlPacket;
+    use protocol::QueryPacket;
     use rmp::decode::read_bin_len;
     use std::cell::UnsafeCell;
     use std::ffi::CStr;
@@ -1388,7 +1388,7 @@ mod tests {
         tokio::spawn(async move {
             let mut storage = storage;
             // Test parsing a query with tables.
-            assert_eq!(storage.state.state(), &ExecutorState::Initialized);
+            assert_eq!(storage.state.state(), &QueryFlowState::Initialized);
             let sql = "select a from t";
             prepare_query(&mut conn.recv_socket.buffer, sql).expect("Failed to prepare SQL");
             conn.process_message(&mut storage)
@@ -1398,11 +1398,11 @@ mod tests {
                 unreachable!();
             };
             assert_eq!(storage.statement, Some(stmt));
-            assert_eq!(storage.state.state(), &ExecutorState::Statement);
+            assert_eq!(storage.state.state(), &QueryFlowState::Statement);
 
             // Test parsing a query without tables.
             flush(&mut conn, &mut storage);
-            assert_eq!(storage.state.state(), &ExecutorState::Initialized);
+            assert_eq!(storage.state.state(), &QueryFlowState::Initialized);
             let sql = "select 1";
             prepare_query(&mut conn.recv_socket.buffer, sql).expect("Failed to prepare SQL");
             conn.process_message(&mut storage)
@@ -1418,7 +1418,7 @@ mod tests {
                 unreachable!();
             };
             assert_eq!(storage.logical_plan, Some(plan));
-            assert_eq!(storage.state.state(), &ExecutorState::LogicalPlan);
+            assert_eq!(storage.state.state(), &QueryFlowState::LogicalPlan);
         })
         .await?;
         Ok(())
@@ -1453,20 +1453,20 @@ mod tests {
         };
         tokio::spawn(async move {
             let mut storage = storage;
-            assert_eq!(storage.state.state(), &ExecutorState::Initialized);
+            assert_eq!(storage.state.state(), &QueryFlowState::Initialized);
             let sql = "select a from public.t1 where b = $1";
             prepare_query(&mut conn.recv_socket.buffer, sql).expect("Failed to prepare SQL");
             conn.process_message(&mut storage)
                 .await
                 .expect("Failed to process parse message");
             assert_eq!(conn.recv_socket.buffer.len(), 0);
-            assert_eq!(storage.state.state(), &ExecutorState::Statement);
+            assert_eq!(storage.state.state(), &QueryFlowState::Statement);
 
             // 1) Parse -> Statement, server requests Metadata
             let header =
                 consume_header(&mut conn.send_buffer).expect("Failed to consume metadata header");
             assert_eq!(header.direction, Direction::ToClient);
-            assert_eq!(header.tag, ControlPacket::Metadata as u8);
+            assert_eq!(header.tag, QueryPacket::Metadata as u8);
             process_metadata_with_response(
                 &mut conn.send_buffer,
                 &mut conn.recv_socket.buffer,
@@ -1480,13 +1480,13 @@ mod tests {
                 .await
                 .expect("Failed to process metadata message");
             assert_eq!(conn.recv_socket.buffer.len(), 0);
-            assert_eq!(storage.state.state(), &ExecutorState::LogicalPlan);
+            assert_eq!(storage.state.state(), &QueryFlowState::LogicalPlan);
 
             // 3) Server requests Bind (Columns will be sent back), then we send params
             let header =
                 consume_header(&mut conn.send_buffer).expect("Failed to consume bind header");
             assert_eq!(header.direction, Direction::ToClient);
-            assert_eq!(header.tag, ControlPacket::Bind as u8);
+            assert_eq!(header.tag, QueryPacket::Bind as u8);
             prepare_params(&mut conn.recv_socket.buffer, || {
                 (1, vec![Ok(ScalarValue::Int32(Some(1)))].into_iter())
             })
@@ -1496,14 +1496,14 @@ mod tests {
                 .await
                 .expect("Failed to process bind/optimize/translate messages");
             assert_eq!(conn.recv_socket.buffer.len(), 0);
-            assert_eq!(storage.state.state(), &ExecutorState::PhysicalPlan);
+            assert_eq!(storage.state.state(), &QueryFlowState::PhysicalPlan);
             // Optionally, physical plan may or may not be built in this environment
             // assert!(storage.physical_plan.is_some() || storage.physical_plan.is_none());
 
             let header =
                 consume_header(&mut conn.send_buffer).expect("Failed to consume bind header");
             assert_eq!(header.direction, Direction::ToClient);
-            assert_eq!(header.tag, ControlPacket::Columns as u8);
+            assert_eq!(header.tag, QueryPacket::Columns as u8);
             type Payload = (i16, u8, bool, Vec<u8>);
             let mut columns: Vec<Payload> = Vec::new();
             let columns_ptr = &mut columns as *mut Vec<Payload> as *mut c_void;
@@ -1527,11 +1527,11 @@ mod tests {
                 .await
                 .expect("Failed to process explain message");
             assert_eq!(conn.recv_socket.buffer.len(), 0);
-            assert_eq!(storage.state.state(), &ExecutorState::Initialized);
+            assert_eq!(storage.state.state(), &QueryFlowState::Initialized);
             let header =
                 consume_header(&mut conn.send_buffer).expect("Failed to consume explain header");
             assert_eq!(header.direction, Direction::ToClient);
-            assert_eq!(header.tag, ControlPacket::Explain as u8);
+            assert_eq!(header.tag, QueryPacket::Explain as u8);
             let len =
                 read_bin_len(&mut conn.send_buffer).expect("Failed to get explain length") as usize;
             let mut buffer = vec![0u8; len];
@@ -1584,7 +1584,7 @@ mod tests {
         tokio::spawn(async move {
             let mut storage = storage;
             // Drive to PhysicalPlan state for a query that touches one table
-            assert_eq!(storage.state.state(), &ExecutorState::Initialized);
+            assert_eq!(storage.state.state(), &QueryFlowState::Initialized);
             let sql = "select a from public.t1 where b = $1";
             prepare_query(&mut conn.recv_socket.buffer, sql).expect("prepare SQL");
             conn.process_message(&mut storage)
@@ -1593,7 +1593,7 @@ mod tests {
             // Metadata request -> supply it
             let header = consume_header(&mut conn.send_buffer).expect("consume metadata hdr");
             assert_eq!(header.direction, Direction::ToClient);
-            assert_eq!(header.tag, ControlPacket::Metadata as u8);
+            assert_eq!(header.tag, QueryPacket::Metadata as u8);
             process_metadata_with_response(
                 &mut conn.send_buffer,
                 &mut conn.recv_socket.buffer,
@@ -1608,7 +1608,7 @@ mod tests {
                 .expect("process metadata msg");
             let header = consume_header(&mut conn.send_buffer).expect("consume bind hdr");
             assert_eq!(header.direction, Direction::ToClient);
-            assert_eq!(header.tag, ControlPacket::Bind as u8);
+            assert_eq!(header.tag, QueryPacket::Bind as u8);
             // Provide params then proceed to PhysicalPlan
             prepare_params(&mut conn.recv_socket.buffer, || {
                 (1, vec![Ok(ScalarValue::Int32(Some(1)))].into_iter())
@@ -1617,7 +1617,7 @@ mod tests {
             conn.process_message(&mut storage)
                 .await
                 .expect("bind/opt/translate");
-            assert_eq!(storage.state.state(), &ExecutorState::PhysicalPlan);
+            assert_eq!(storage.state.state(), &QueryFlowState::PhysicalPlan);
 
             // Now send BeginScan; executor should register channels without sending payload
             request_begin_scan(&mut conn.recv_socket.buffer).expect("write BeginScan");

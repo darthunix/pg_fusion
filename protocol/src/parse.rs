@@ -1,4 +1,4 @@
-use crate::{write_c_str, write_header, ControlPacket, Direction, Flag, Header, Tape};
+use crate::{write_c_str, write_header, Direction, Flag, Header, QueryPacket, Tape};
 use anyhow::Result;
 use rmp::decode::read_bin_len;
 use std::io::Read;
@@ -26,7 +26,7 @@ pub fn prepare_query(stream: &mut impl Tape, query: &str) -> Result<()> {
     let length = u16::try_from(len_final - len_init)?;
     let header = Header {
         direction: Direction::ToServer,
-        tag: ControlPacket::Parse as u8,
+        tag: QueryPacket::Parse as u8,
         length,
         flag: Flag::Last,
     };

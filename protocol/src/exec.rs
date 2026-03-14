@@ -17,15 +17,15 @@ fn write_empty_control(stream: &mut impl std::io::Write, tag: u8) -> Result<()> 
 }
 
 pub fn request_begin_scan(stream: &mut impl std::io::Write) -> Result<()> {
-    write_empty_control(stream, crate::ControlPacket::BeginScan as u8)
+    write_empty_control(stream, crate::QueryPacket::BeginScan as u8)
 }
 
 pub fn request_exec_scan(stream: &mut impl std::io::Write) -> Result<()> {
-    write_empty_control(stream, crate::ControlPacket::ExecScan as u8)
+    write_empty_control(stream, crate::QueryPacket::ExecScan as u8)
 }
 
 pub fn request_end_scan(stream: &mut impl std::io::Write) -> Result<()> {
-    write_empty_control(stream, crate::ControlPacket::EndScan as u8)
+    write_empty_control(stream, crate::QueryPacket::EndScan as u8)
 }
 
 #[inline]
@@ -43,7 +43,7 @@ fn write_empty_to_client(stream: &mut impl std::io::Write, tag: u8) -> Result<()
 }
 
 pub fn prepare_exec_ready(stream: &mut impl std::io::Write) -> Result<()> {
-    write_empty_to_client(stream, crate::ControlPacket::ExecReady as u8)
+    write_empty_to_client(stream, crate::QueryPacket::ExecReady as u8)
 }
 
 /// Send a per-scan EOF notification from backend to executor as a data packet.
