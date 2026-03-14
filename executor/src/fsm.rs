@@ -3,6 +3,7 @@ use rust_fsm::*;
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum QueryFlowAction {
     Bind,
+    CaptureColumnLayout,
     Parse,
     Compile,
     Flush,
@@ -20,12 +21,13 @@ pub enum QueryFlowState {
     Initialized,
     LogicalPlan,
     PhysicalPlan,
+    Execution,
 }
 
-/// Events for the execution-time data flow that begins after a physical plan is built.
+/// Events for the execution-time data flow that begins after a query reaches execution-ready state.
 ///
 /// This is intentionally narrower than the top-level executor FSM:
-/// it models only the coarse lifecycle inside `PhysicalPlan`.
+/// it models only the coarse lifecycle after `query_flow` enters `Execution`.
 /// Per-scan traffic like heap pages and scan EOF lives in `scan_flow`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum DataFlowEvent {
@@ -106,9 +108,13 @@ state_machine! {
     PhysicalPlan => {
         Failure => Initialized[Flush],
         Explain => Initialized[Explain],
-        BeginScan => PhysicalPlan[OpenDataFlow],
-        ExecScan => PhysicalPlan[StartDataFlow],
-        EndScan => PhysicalPlan[EndDataFlow],
+        ColumnLayout => Execution[CaptureColumnLayout],
+    },
+    Execution => {
+        Failure => Initialized[Flush],
+        BeginScan => Execution[OpenDataFlow],
+        ExecScan => Execution[StartDataFlow],
+        EndScan => Initialized[EndDataFlow],
     }
 }
 
@@ -159,7 +165,7 @@ mod tests {
     };
 
     #[test]
-    fn query_flow_happy_path_reaches_physical_plan() {
+    fn query_flow_happy_path_reaches_execution() {
         let mut machine = query_flow::StateMachine::new();
 
         assert_eq!(machine.state(), &QueryFlowState::Initialized);
@@ -186,6 +192,11 @@ mod tests {
             Some(QueryFlowAction::Translate)
         );
         assert_eq!(machine.state(), &QueryFlowState::PhysicalPlan);
+        assert_eq!(
+            machine.consume(&protocol::QueryPacket::ColumnLayout).unwrap(),
+            Some(QueryFlowAction::CaptureColumnLayout)
+        );
+        assert_eq!(machine.state(), &QueryFlowState::Execution);
     }
 
     #[test]
