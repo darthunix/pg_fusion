@@ -2,7 +2,8 @@ use crate::budget::{BudgetScheduler, CreditCell, SchedulerConfig};
 use crate::buffer::LockFreeBuffer;
 use crate::fsm::query_flow::StateMachine as QueryFlowStateMachine;
 use crate::fsm::{
-    data_flow, scan_flow, DataFlowEvent, DataFlowState, QueryFlowAction, ScanFlowEvent,
+    data_flow, scan_flow, DataFlowEvent, DataFlowState, QueryFlowAction, QueryFlowState,
+    ScanFlowEvent,
     ScanFlowState,
 };
 use crate::ipc::Socket;
@@ -41,6 +42,7 @@ use smol_str::{format_smolstr, SmolStr};
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicI32, Ordering};
 use std::sync::Arc;
+use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender};
 use tokio::task::JoinHandle;
 
 const EXECUTOR_TARGET: &str = "executor::server";
@@ -80,11 +82,39 @@ struct ScanBudgetRuntime {
     dispatch_batch: usize,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum DataFlowTaskOutcome {
+    Finished,
+    Failed(SmolStr),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum RuntimeEvent {
+    DataFlowCompleted {
+        epoch: u64,
+        outcome: DataFlowTaskOutcome,
+    },
+}
+
+type RuntimeEventTx = UnboundedSender<RuntimeEvent>;
+type RuntimeEventRx = UnboundedReceiver<RuntimeEvent>;
+
+#[allow(dead_code)]
+enum InboundMessage {
+    ColumnLayout,
+    Data {
+        packet: DataPacket,
+        payload_len: u16,
+    },
+    Query(QueryPacket),
+}
+
 #[derive(Default)]
 pub struct Storage {
     state: QueryFlowStateMachine,
     shadow_data_flow: data_flow::StateMachine,
     shadow_scan_flows: HashMap<u64, scan_flow::StateMachine>,
+    data_flow_epoch: u64,
     statement: Option<Statement>,
     logical_plan: Option<LogicalPlan>,
     physical_plan: Option<Arc<dyn ExecutionPlan>>,
@@ -213,10 +243,90 @@ impl Storage {
         }
     }
 
+    fn consume_data_flow_skeleton(
+        &mut self,
+        event: DataFlowEvent,
+        source: &'static str,
+    ) -> Result<()> {
+        let state_before = *self.shadow_data_flow.state();
+        match self.shadow_data_flow.consume(&event) {
+            Ok(Some(action)) => {
+                log_trace!(
+                    EXECUTOR_TARGET,
+                    source,
+                    ?event,
+                    state_before = ?state_before,
+                    state_after = ?self.shadow_data_flow.state(),
+                    ?action,
+                    "data flow skeleton transition"
+                );
+                Ok(())
+            }
+            Ok(None) => {
+                log_trace!(
+                    EXECUTOR_TARGET,
+                    source,
+                    ?event,
+                    state_before = ?state_before,
+                    state_after = ?self.shadow_data_flow.state(),
+                    "data flow skeleton transition without action"
+                );
+                Ok(())
+            }
+            Err(e) => bail!(FusionError::FailedTo(
+                "advance data flow".into(),
+                format_smolstr!(
+                    "source={source} event={event:?} state={state_before:?} error={e:?}"
+                ),
+            )),
+        }
+    }
+
+    fn handle_runtime_event_skeleton(
+        &mut self,
+        event: RuntimeEvent,
+        source: &'static str,
+    ) -> Result<()> {
+        match event {
+            RuntimeEvent::DataFlowCompleted { epoch, outcome } => {
+                if epoch != self.data_flow_epoch {
+                    log_trace!(
+                        EXECUTOR_TARGET,
+                        source,
+                        event_epoch = epoch,
+                        current_epoch = self.data_flow_epoch,
+                        "ignoring stale runtime completion event"
+                    );
+                    return Ok(());
+                }
+
+                match outcome {
+                    DataFlowTaskOutcome::Finished => {
+                        self.consume_data_flow_skeleton(DataFlowEvent::TaskFinished, source)?;
+                    }
+                    DataFlowTaskOutcome::Failed(error) => {
+                        log_warn!(
+                            FUSION_TARGET,
+                            source,
+                            epoch,
+                            error = %error,
+                            "data flow task reported failure"
+                        );
+                        if self.shadow_data_flow.state() != &DataFlowState::Closed {
+                            self.consume_data_flow_skeleton(DataFlowEvent::Failure, source)?;
+                        }
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
     pub fn flush(&mut self) {
         // Preserve the registry across flushes
         let registry = Arc::clone(&self.registry);
         let heap_flow = self.heap_flow;
+        let data_flow_epoch = self.data_flow_epoch;
         // Abort any running execution task to avoid leaks
         if let Some(handle) = self.exec_task.take() {
             handle.abort();
@@ -224,6 +334,7 @@ impl Storage {
         *self = Self::default();
         self.registry = registry;
         self.heap_flow = heap_flow;
+        self.data_flow_epoch = data_flow_epoch;
     }
 
     pub fn set_registry_conn(&mut self, conn_id: usize) {
@@ -421,11 +532,52 @@ impl<'bytes> Connection<'bytes> {
         Ok(())
     }
 
+    #[allow(dead_code)]
+    async fn process_message_flow_driven(
+        &mut self,
+        storage: &mut Storage,
+        runtime_events_rx: &mut RuntimeEventRx,
+        runtime_events_tx: &RuntimeEventTx,
+    ) -> Result<()> {
+        self.sync_probe_epoch();
+        self.drain_runtime_events_skeleton(storage, runtime_events_rx)?;
+
+        let Some(message) = self.read_inbound_message_skeleton()? else {
+            return Ok(());
+        };
+
+        match message {
+            InboundMessage::ColumnLayout => {
+                let _ = self.handle_column_layout_packet(storage, QueryPacket::ColumnLayout as u8)?;
+            }
+            InboundMessage::Data {
+                packet: DataPacket::Heap,
+                payload_len,
+            } => {
+                self.handle_heap_data_packet(storage, payload_len).await?;
+            }
+            InboundMessage::Data {
+                packet: DataPacket::Eof,
+                ..
+            } => {
+                self.handle_eof_data_packet(storage)?;
+            }
+            InboundMessage::Query(packet) => {
+                self.handle_control_packet_flow_driven(storage, packet, runtime_events_tx)
+                    .await?;
+            }
+        }
+
+        Ok(())
+    }
+
     #[inline]
     fn handle_column_layout_packet(&mut self, storage: &mut Storage, tag: u8) -> Result<bool> {
         if tag != QueryPacket::ColumnLayout as u8 {
             return Ok(false);
         }
+        let action = storage.state.consume(&QueryPacket::ColumnLayout)?;
+        debug_assert_eq!(action, Some(QueryFlowAction::CaptureColumnLayout));
         let attrs = consume_column_layout(&mut self.recv_socket.buffer)?;
         log_trace!(
             EXECUTOR_TARGET,
@@ -495,6 +647,63 @@ impl<'bytes> Connection<'bytes> {
         }
         let _ = dispatch_heap_requests(self, storage, usize::MAX)?;
         Ok(())
+    }
+
+    #[allow(dead_code)]
+    fn drain_runtime_events_skeleton(
+        &mut self,
+        storage: &mut Storage,
+        runtime_events_rx: &mut RuntimeEventRx,
+    ) -> Result<()> {
+        while let Ok(event) = runtime_events_rx.try_recv() {
+            storage.handle_runtime_event_skeleton(event, "runtime event")?;
+        }
+        Ok(())
+    }
+
+    #[allow(dead_code)]
+    fn read_inbound_message_skeleton(&mut self) -> Result<Option<InboundMessage>> {
+        let t0 = std::time::Instant::now();
+        if self.recv_socket.buffer.len() < 6 {
+            log_trace!(
+                EXECUTOR_TARGET,
+                "process_message_flow_driven: woke but no header bytes available"
+            );
+            return Ok(None);
+        }
+
+        let header = consume_header(&mut self.recv_socket.buffer)?;
+        log_debug!(EXECUTOR_TARGET,
+            direction = ?header.direction,
+            tag = header.tag,
+            flag = ?header.flag,
+            length = header.length,
+            recv_unread = self.recv_socket.buffer.len(),
+            send_unread = self.send_buffer.len(),
+            elapsed_us = t0.elapsed().as_micros() as u64,
+            "process_message_flow_driven: header received"
+        );
+
+        if header.direction == Direction::ToClient {
+            log_trace!(
+                EXECUTOR_TARGET,
+                "process_message_flow_driven: header direction ToClient, ignoring"
+            );
+            return Ok(None);
+        }
+
+        if header.tag == QueryPacket::ColumnLayout as u8 {
+            return Ok(Some(InboundMessage::ColumnLayout));
+        }
+
+        if is_data_tag(header.tag) {
+            return Ok(Some(InboundMessage::Data {
+                packet: DataPacket::try_from(header.tag)?,
+                payload_len: header.length,
+            }));
+        }
+
+        Ok(Some(InboundMessage::Query(QueryPacket::try_from(header.tag)?)))
     }
 
     #[inline]
@@ -645,13 +854,13 @@ impl<'bytes> Connection<'bytes> {
         mut packet: QueryPacket,
     ) -> Result<bool> {
         // Do not flush send_buffer here; backend is the reader for responses.
-        // Guard against spurious EndScan (e.g., after EXPLAIN) when no PhysicalPlan is active.
+        // Guard against spurious EndScan (e.g., after EXPLAIN) when no Execution state is active.
         if packet == QueryPacket::EndScan
-            && storage.state.state() != &crate::fsm::QueryFlowState::PhysicalPlan
+            && storage.state.state() != &QueryFlowState::Execution
         {
             log_trace!(
                 EXECUTOR_TARGET,
-                "process_message: ignoring EndScan outside PhysicalPlan state"
+                "process_message: ignoring EndScan outside Execution state"
             );
             return Ok(false);
         }
@@ -683,6 +892,53 @@ impl<'bytes> Connection<'bytes> {
         Ok(true)
     }
 
+    #[allow(dead_code)]
+    async fn handle_control_packet_flow_driven(
+        &mut self,
+        storage: &mut Storage,
+        mut packet: QueryPacket,
+        runtime_events_tx: &RuntimeEventTx,
+    ) -> Result<()> {
+        if packet == QueryPacket::EndScan
+            && storage.state.state() != &QueryFlowState::Execution
+        {
+            log_trace!(
+                EXECUTOR_TARGET,
+                "process_message_flow_driven: ignoring EndScan outside Execution state"
+            );
+            return Ok(());
+        }
+
+        let mut ctx = QueryPacketCtx {
+            conn: self,
+            storage,
+        };
+        let mut skip_metadata = false;
+        loop {
+            let action = ctx.storage.state.consume(&packet)?;
+            log_trace!(EXECUTOR_TARGET,
+                current_packet = ?packet,
+                action = ?action,
+                "process_message_flow_driven: query flow consumed"
+            );
+            ctx.consume_data_flow_for_query_action_skeleton(action)?;
+            let exec_outcome = ctx
+                .execute_action_flow_driven(action, skip_metadata, runtime_events_tx)
+                .await?;
+            if matches!(exec_outcome, ActionExecOutcome::ReturnFalse) {
+                return Ok(());
+            }
+            let ActionExecOutcome::Task(result) = exec_outcome else {
+                unreachable!("handled ReturnFalse above");
+            };
+            match ctx.apply_task_result(result, &mut packet, &mut skip_metadata)? {
+                QueryLoopStep::Continue => continue,
+                QueryLoopStep::Break => break,
+            }
+        }
+        Ok(())
+    }
+
     pub fn handle_error(&mut self, error: FusionError) {
         self.send_buffer.rollback();
         self.recv_socket.buffer.flush_read();
@@ -710,6 +966,24 @@ struct QueryPacketCtx<'a, 'bytes> {
 
 impl<'a, 'bytes> QueryPacketCtx<'a, 'bytes> {
     #[inline]
+    fn consume_data_flow_for_query_action_skeleton(
+        &mut self,
+        action: Option<QueryFlowAction>,
+    ) -> Result<()> {
+        let Some(event) = (match action {
+            Some(QueryFlowAction::OpenDataFlow) => Some(DataFlowEvent::BeginScan),
+            Some(QueryFlowAction::StartDataFlow) => Some(DataFlowEvent::ExecScan),
+            Some(QueryFlowAction::EndDataFlow) => Some(DataFlowEvent::EndScan),
+            _ => None,
+        }) else {
+            return Ok(());
+        };
+
+        self.storage
+            .consume_data_flow_skeleton(event, "query flow -> data flow")
+    }
+
+    #[inline]
     async fn execute_action(
         &mut self,
         action: Option<QueryFlowAction>,
@@ -717,6 +991,12 @@ impl<'a, 'bytes> QueryPacketCtx<'a, 'bytes> {
     ) -> Result<ActionExecOutcome> {
         let task = match action {
             Some(QueryFlowAction::Bind) => self.action_bind()?,
+            Some(QueryFlowAction::CaptureColumnLayout) => {
+                bail!(FusionError::FailedTo(
+                    "execute query flow action".into(),
+                    "ColumnLayout must be handled by the column-layout packet path".into(),
+                ));
+            }
             Some(QueryFlowAction::Compile) => self.action_compile(skip_metadata)?,
             Some(QueryFlowAction::Explain) => self.action_explain()?,
             Some(QueryFlowAction::Optimize) => self.action_optimize()?,
@@ -741,6 +1021,30 @@ impl<'a, 'bytes> QueryPacketCtx<'a, 'bytes> {
                     "consumed packet with no action".into()
                 ));
             }
+        };
+        Ok(ActionExecOutcome::Task(task))
+    }
+
+    #[inline]
+    async fn execute_action_flow_driven(
+        &mut self,
+        action: Option<QueryFlowAction>,
+        skip_metadata: bool,
+        runtime_events_tx: &RuntimeEventTx,
+    ) -> Result<ActionExecOutcome> {
+        let task = match action {
+            Some(QueryFlowAction::OpenDataFlow) => open_data_flow_impl(self.conn, self.storage)?,
+            Some(QueryFlowAction::StartDataFlow) => {
+                start_data_flow_impl(self.conn, self.storage, Some(runtime_events_tx.clone()))?
+            }
+            Some(QueryFlowAction::EndDataFlow) => end_data_flow_impl(self.storage)?,
+            Some(QueryFlowAction::CaptureColumnLayout) => {
+                bail!(FusionError::FailedTo(
+                    "execute query flow action".into(),
+                    "ColumnLayout must be handled by the column-layout packet path".into(),
+                ));
+            }
+            _ => return self.execute_action(action, skip_metadata).await,
         };
         Ok(ActionExecOutcome::Task(task))
     }
@@ -791,7 +1095,7 @@ impl<'a, 'bytes> QueryPacketCtx<'a, 'bytes> {
                 self.storage.physical_plan = phys;
                 log_trace!(
                     EXECUTOR_TARGET,
-                    "process_message: transitioned to PhysicalPlan (built physical plan)"
+                    "process_message: transitioned to PhysicalPlan (built physical plan; waiting for column layout)"
                 );
                 Ok(QueryLoopStep::Break)
             }
@@ -1190,6 +1494,12 @@ fn dispatch_heap_requests(
 }
 
 fn open_data_flow(_conn: &mut Connection, storage: &mut Storage) -> Result<TaskResult> {
+    let result = open_data_flow_impl(_conn, storage)?;
+    storage.shadow_data_flow_event(DataFlowEvent::BeginScan, "open data flow");
+    Ok(result)
+}
+
+fn open_data_flow_impl(_conn: &mut Connection, storage: &mut Storage) -> Result<TaskResult> {
     if storage.physical_plan.is_none() {
         bail!(FusionError::NotFound(
             "Physical plan".into(),
@@ -1231,11 +1541,21 @@ fn open_data_flow(_conn: &mut Connection, storage: &mut Storage) -> Result<TaskR
         storage.shadow_scan_flow_event(id, ScanFlowEvent::Register, "open data flow");
     }
     storage.scan_budget = Some(budget);
-    storage.shadow_data_flow_event(DataFlowEvent::BeginScan, "open data flow");
+    storage.data_flow_epoch = storage.data_flow_epoch.wrapping_add(1);
     Ok(TaskResult::Noop)
 }
 
 fn start_data_flow(conn: &mut Connection, storage: &mut Storage) -> Result<TaskResult> {
+    let result = start_data_flow_impl(conn, storage, None)?;
+    storage.shadow_data_flow_event(DataFlowEvent::ExecScan, "start data flow");
+    Ok(result)
+}
+
+fn start_data_flow_impl(
+    conn: &mut Connection,
+    storage: &mut Storage,
+    runtime_events_tx: Option<RuntimeEventTx>,
+) -> Result<TaskResult> {
     if storage.physical_plan.is_none() {
         bail!(FusionError::NotFound(
             "Physical plan".into(),
@@ -1266,6 +1586,7 @@ fn start_data_flow(conn: &mut Connection, storage: &mut Storage) -> Result<TaskR
 
     let conn_id = conn.id;
     let client_pid_val = conn.client_pid.load(std::sync::atomic::Ordering::Relaxed); // snapshot pid
+    let data_flow_epoch = storage.data_flow_epoch;
     log_trace!(
         EXECUTOR_TARGET,
         conn_id,
@@ -1273,6 +1594,7 @@ fn start_data_flow(conn: &mut Connection, storage: &mut Storage) -> Result<TaskR
     );
     let t0 = std::time::Instant::now();
     let handle = tokio::spawn(async move {
+        let mut task_failure = None;
         // Execute all output partitions and merge them into the single result ring
         let mut ring = crate::shm::result_ring_writer_for(conn_id);
         let probe_metrics =
@@ -1293,6 +1615,9 @@ fn start_data_flow(conn: &mut Connection, storage: &mut Storage) -> Result<TaskR
                                     FUSION_TARGET,
                                     "execution stream error (part {part}): {e}"
                                 );
+                                task_failure.get_or_insert_with(|| {
+                                    format_smolstr!("execution stream error (part {part}): {e}")
+                                });
                                 break;
                             }
                             Ok(batch) => {
@@ -1332,6 +1657,9 @@ fn start_data_flow(conn: &mut Connection, storage: &mut Storage) -> Result<TaskR
                 }
                 Err(e) => {
                     log_error!(FUSION_TARGET, "failed to start partition {part}: {e}");
+                    task_failure.get_or_insert_with(|| {
+                        format_smolstr!("failed to start partition {part}: {e}")
+                    });
                 }
             }
         }
@@ -1348,6 +1676,17 @@ fn start_data_flow(conn: &mut Connection, storage: &mut Storage) -> Result<TaskR
         let pid = client_pid_val;
         if pid > 0 && pid != i32::MAX {
             unsafe { libc::kill(pid as libc::pid_t, libc::SIGUSR1) };
+        }
+
+        if let Some(tx) = runtime_events_tx {
+            let outcome = match task_failure {
+                Some(error) => DataFlowTaskOutcome::Failed(error),
+                None => DataFlowTaskOutcome::Finished,
+            };
+            let _ = tx.send(RuntimeEvent::DataFlowCompleted {
+                epoch: data_flow_epoch,
+                outcome,
+            });
         }
     });
     storage.exec_task = Some(handle);
@@ -1371,15 +1710,19 @@ fn start_data_flow(conn: &mut Connection, storage: &mut Storage) -> Result<TaskR
             "start_data_flow: initial heap requests queued"
         );
     }
-    storage.shadow_data_flow_event(DataFlowEvent::ExecScan, "start data flow");
     Ok(TaskResult::Noop)
 }
 
 fn end_data_flow(storage: &mut Storage) -> Result<TaskResult> {
+    let result = end_data_flow_impl(storage)?;
+    storage.shadow_data_flow_event(DataFlowEvent::EndScan, "end data flow");
+    Ok(result)
+}
+
+fn end_data_flow_impl(storage: &mut Storage) -> Result<TaskResult> {
     // Use unified reset to ensure state machine returns to Initialized and
     // any in-flight execution task is aborted, while preserving registry object.
     storage.shadow_end_all_scans("end data flow");
-    storage.shadow_data_flow_event(DataFlowEvent::EndScan, "end data flow");
     storage.flush();
     Ok(TaskResult::Noop)
 }
@@ -1406,6 +1749,7 @@ mod tests {
     use protocol::explain::request_explain;
     use protocol::metadata::process_metadata_with_response;
     use protocol::parse::prepare_query;
+    use protocol::tuple::{prepare_column_layout, PgAttrWire};
     use protocol::QueryPacket;
     use rmp::decode::read_bin_len;
     use std::cell::UnsafeCell;
@@ -1713,6 +2057,60 @@ mod tests {
             assert!(!explain.is_empty());
             // Physical explain should contain execution nodes (e.g., *Exec)
             assert!(explain.contains("Exec"));
+
+            flush(&mut conn, &mut storage);
+            assert_eq!(storage.state.state(), &QueryFlowState::Initialized);
+
+            prepare_query(&mut conn.recv_socket.buffer, sql).expect("Failed to prepare SQL");
+            conn.process_message(&mut storage)
+                .await
+                .expect("Failed to process parse message");
+            let header =
+                consume_header(&mut conn.send_buffer).expect("Failed to consume metadata header");
+            assert_eq!(header.direction, Direction::ToClient);
+            assert_eq!(header.tag, QueryPacket::Metadata as u8);
+            process_metadata_with_response(
+                &mut conn.send_buffer,
+                &mut conn.recv_socket.buffer,
+                mock_schema_table_lookup,
+                mock_table_lookup,
+                mock_table_serialize,
+            )
+            .expect("Failed to process metadata");
+            conn.process_message(&mut storage)
+                .await
+                .expect("Failed to process metadata message");
+            let header =
+                consume_header(&mut conn.send_buffer).expect("Failed to consume bind header");
+            assert_eq!(header.direction, Direction::ToClient);
+            assert_eq!(header.tag, QueryPacket::Bind as u8);
+            prepare_params(&mut conn.recv_socket.buffer, || {
+                (1, vec![Ok(ScalarValue::Int32(Some(1)))].into_iter())
+            })
+            .expect("Failed to prepare params");
+            conn.process_message(&mut storage)
+                .await
+                .expect("Failed to process bind/optimize/translate messages");
+            assert_eq!(storage.state.state(), &QueryFlowState::PhysicalPlan);
+
+            prepare_column_layout(
+                &mut conn.recv_socket.buffer,
+                &[PgAttrWire {
+                    atttypid: 23,
+                    typmod: -1,
+                    attlen: 4,
+                    attalign: 4,
+                    attbyval: true,
+                    nullable: true,
+                }],
+            )
+            .expect("Failed to prepare column layout");
+            conn.process_message(&mut storage)
+                .await
+                .expect("Failed to process column layout");
+            assert_eq!(storage.state.state(), &QueryFlowState::Execution);
+            assert_eq!(storage.pg_attrs.as_ref().map(Vec::len), Some(1));
+
         })
         .await?;
         Ok(())
@@ -1784,6 +2182,23 @@ mod tests {
                 .await
                 .expect("bind/opt/translate");
             assert_eq!(storage.state.state(), &QueryFlowState::PhysicalPlan);
+
+            prepare_column_layout(
+                &mut conn.recv_socket.buffer,
+                &[PgAttrWire {
+                    atttypid: 23,
+                    typmod: -1,
+                    attlen: 4,
+                    attalign: 4,
+                    attbyval: true,
+                    nullable: true,
+                }],
+            )
+            .expect("prepare column layout");
+            conn.process_message(&mut storage)
+                .await
+                .expect("process column layout");
+            assert_eq!(storage.state.state(), &QueryFlowState::Execution);
 
             // Now send BeginScan; executor should register channels without sending payload
             request_begin_scan(&mut conn.recv_socket.buffer).expect("write BeginScan");
