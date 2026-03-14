@@ -1,7 +1,10 @@
 use crate::budget::{BudgetScheduler, CreditCell, SchedulerConfig};
 use crate::buffer::LockFreeBuffer;
-use crate::fsm::query_flow::StateMachine;
-use crate::fsm::QueryFlowAction;
+use crate::fsm::query_flow::StateMachine as QueryFlowStateMachine;
+use crate::fsm::{
+    data_flow, scan_flow, DataFlowEvent, DataFlowState, QueryFlowAction, ScanFlowEvent,
+    ScanFlowState,
+};
 use crate::ipc::Socket;
 use crate::logging::{log_debug, log_error, log_trace, log_warn};
 use crate::sql::Catalog;
@@ -35,6 +38,7 @@ use protocol::{consume_header, is_data_tag, DataPacket, Direction, QueryPacket};
 use rmp::decode::{read_u16 as read_u16_msgpack, read_u64 as read_u64_msgpack};
 use scan::{count_heap_scans, for_each_heap_scan, HeapPageBlock, HeapScanRegistry};
 use smol_str::{format_smolstr, SmolStr};
+use std::collections::HashMap;
 use std::sync::atomic::{AtomicI32, Ordering};
 use std::sync::Arc;
 use tokio::task::JoinHandle;
@@ -78,7 +82,9 @@ struct ScanBudgetRuntime {
 
 #[derive(Default)]
 pub struct Storage {
-    state: StateMachine,
+    state: QueryFlowStateMachine,
+    shadow_data_flow: data_flow::StateMachine,
+    shadow_scan_flows: HashMap<u64, scan_flow::StateMachine>,
     statement: Option<Statement>,
     logical_plan: Option<LogicalPlan>,
     physical_plan: Option<Arc<dyn ExecutionPlan>>,
@@ -90,6 +96,123 @@ pub struct Storage {
 }
 
 impl Storage {
+    fn shadow_data_flow_event(&mut self, event: DataFlowEvent, source: &'static str) {
+        let state_before = *self.shadow_data_flow.state();
+        match self.shadow_data_flow.consume(&event) {
+            Ok(Some(action)) => {
+                log_trace!(
+                    EXECUTOR_TARGET,
+                    source,
+                    ?event,
+                    state_before = ?state_before,
+                    state_after = ?self.shadow_data_flow.state(),
+                    ?action,
+                    "shadow data flow transition"
+                );
+            }
+            Ok(None) => {
+                log_trace!(
+                    EXECUTOR_TARGET,
+                    source,
+                    ?event,
+                    state_before = ?state_before,
+                    state_after = ?self.shadow_data_flow.state(),
+                    "shadow data flow transition without action"
+                );
+            }
+            Err(e) => {
+                log_warn!(
+                    FUSION_TARGET,
+                    source,
+                    ?event,
+                    state_before = ?state_before,
+                    error = ?e,
+                    "shadow data flow rejected transition"
+                );
+            }
+        }
+    }
+
+    fn shadow_scan_flow_event(&mut self, scan_id: u64, event: ScanFlowEvent, source: &'static str) {
+        if !self.shadow_scan_flows.contains_key(&scan_id) && !matches!(event, ScanFlowEvent::Register)
+        {
+            log_warn!(
+                FUSION_TARGET,
+                source,
+                scan_id,
+                ?event,
+                "shadow scan flow missing machine for event"
+            );
+            return;
+        }
+
+        let remove_after = {
+            let machine = self
+                .shadow_scan_flows
+                .entry(scan_id)
+                .or_insert_with(scan_flow::StateMachine::new);
+            let state_before = *machine.state();
+            match machine.consume(&event) {
+                Ok(Some(action)) => {
+                    log_trace!(
+                        EXECUTOR_TARGET,
+                        source,
+                        scan_id,
+                        ?event,
+                        state_before = ?state_before,
+                        state_after = ?machine.state(),
+                        ?action,
+                        "shadow scan flow transition"
+                    );
+                }
+                Ok(None) => {
+                    log_trace!(
+                        EXECUTOR_TARGET,
+                        source,
+                        scan_id,
+                        ?event,
+                        state_before = ?state_before,
+                        state_after = ?machine.state(),
+                        "shadow scan flow transition without action"
+                    );
+                }
+                Err(e) => {
+                    log_warn!(
+                        FUSION_TARGET,
+                        source,
+                        scan_id,
+                        ?event,
+                        state_before = ?state_before,
+                        error = ?e,
+                        "shadow scan flow rejected transition"
+                    );
+                }
+            }
+            machine.state() == &ScanFlowState::Closed && !matches!(event, ScanFlowEvent::Register)
+        };
+
+        if remove_after {
+            let _ = self.shadow_scan_flows.remove(&scan_id);
+        }
+    }
+
+    fn shadow_end_all_scans(&mut self, source: &'static str) {
+        let active_scan_ids: Vec<u64> = self.shadow_scan_flows.keys().copied().collect();
+        for scan_id in active_scan_ids {
+            self.shadow_scan_flow_event(scan_id, ScanFlowEvent::EndScan, source);
+        }
+    }
+
+    fn shadow_failure(&mut self, source: &'static str) {
+        if self.shadow_data_flow.state() != &DataFlowState::Closed {
+            self.shadow_data_flow_event(DataFlowEvent::Failure, source);
+        }
+        let active_scan_ids: Vec<u64> = self.shadow_scan_flows.keys().copied().collect();
+        for scan_id in active_scan_ids {
+            self.shadow_scan_flow_event(scan_id, ScanFlowEvent::Failure, source);
+        }
+    }
+
     pub fn flush(&mut self) {
         // Preserve the registry across flushes
         let registry = Arc::clone(&self.registry);
@@ -339,6 +462,7 @@ impl<'bytes> Connection<'bytes> {
     fn handle_eof_data_packet(&mut self, storage: &mut Storage) -> Result<()> {
         // Per-scan EOF notification
         let scan_id = read_u64_msgpack(&mut self.recv_socket.buffer)?;
+        storage.shadow_scan_flow_event(scan_id, ScanFlowEvent::ScanEof, "heap eof");
         storage.registry.close(scan_id);
         if let Some(runtime) = storage.scan_budget.as_mut() {
             match runtime.scheduler.release_one_for_scan(scan_id) {
@@ -423,6 +547,7 @@ impl<'bytes> Connection<'bytes> {
             vis_len,
             "heap bitmap vis_len (shm) received"
         );
+        storage.shadow_scan_flow_event(meta.scan_id, ScanFlowEvent::HeapPage, "heap packet");
 
         if let Some(tx) = storage.registry.sender(meta.scan_id) {
             let copy_t0 =
@@ -601,6 +726,7 @@ impl<'a, 'bytes> QueryPacketCtx<'a, 'bytes> {
                     "process_message: QueryFlowAction::Flush (reset state)"
                 );
                 // Do not flush send_buffer here; only backend should move read head.
+                self.storage.shadow_failure("query flow flush");
                 self.storage.flush();
                 return Ok(ActionExecOutcome::ReturnFalse);
             }
@@ -1080,8 +1206,13 @@ fn open_data_flow(_conn: &mut Connection, storage: &mut Storage) -> Result<TaskR
     );
     storage.registry.reserve(scan_count);
     let mut budget = build_scan_budget_runtime(storage.heap_flow);
-    // Register channels per scan in the connection-local registry; no response payload
+    let mut scan_defs = Vec::with_capacity(scan_count);
     let _ = for_each_heap_scan::<_, Error>(phys, |id, table_oid| {
+        scan_defs.push((id, table_oid));
+        Ok(())
+    });
+    // Register channels per scan in the connection-local registry; no response payload
+    for (id, table_oid) in scan_defs {
         log_trace!(
             EXECUTOR_TARGET,
             scan_id = id,
@@ -1097,9 +1228,10 @@ fn open_data_flow(_conn: &mut Connection, storage: &mut Storage) -> Result<TaskR
                 e
             );
         }
-        Ok(())
-    });
+        storage.shadow_scan_flow_event(id, ScanFlowEvent::Register, "open data flow");
+    }
     storage.scan_budget = Some(budget);
+    storage.shadow_data_flow_event(DataFlowEvent::BeginScan, "open data flow");
     Ok(TaskResult::Noop)
 }
 
@@ -1239,12 +1371,15 @@ fn start_data_flow(conn: &mut Connection, storage: &mut Storage) -> Result<TaskR
             "start_data_flow: initial heap requests queued"
         );
     }
+    storage.shadow_data_flow_event(DataFlowEvent::ExecScan, "start data flow");
     Ok(TaskResult::Noop)
 }
 
 fn end_data_flow(storage: &mut Storage) -> Result<TaskResult> {
     // Use unified reset to ensure state machine returns to Initialized and
     // any in-flight execution task is aborted, while preserving registry object.
+    storage.shadow_end_all_scans("end data flow");
+    storage.shadow_data_flow_event(DataFlowEvent::EndScan, "end data flow");
     storage.flush();
     Ok(TaskResult::Noop)
 }
@@ -1263,7 +1398,7 @@ enum TaskResult {
 mod tests {
     use super::*;
     use crate::buffer::LockFreeBuffer;
-    use crate::fsm::QueryFlowState;
+    use crate::fsm::{DataFlowState, QueryFlowState, ScanFlowState};
     use crate::ipc::SharedState;
     use core::mem::size_of;
     use protocol::bind::prepare_params;
@@ -1309,6 +1444,37 @@ mod tests {
         storage.flush();
         conn.recv_socket.buffer.flush_read();
         conn.send_buffer.flush_read();
+    }
+
+    #[test]
+    fn shadow_data_flow_tracks_open_start_end() {
+        let mut storage = Storage::default();
+
+        assert_eq!(storage.shadow_data_flow.state(), &DataFlowState::Closed);
+        storage.shadow_data_flow_event(DataFlowEvent::BeginScan, "test");
+        assert_eq!(storage.shadow_data_flow.state(), &DataFlowState::Opened);
+        storage.shadow_data_flow_event(DataFlowEvent::ExecScan, "test");
+        assert_eq!(storage.shadow_data_flow.state(), &DataFlowState::Running);
+        storage.shadow_data_flow_event(DataFlowEvent::EndScan, "test");
+        assert_eq!(storage.shadow_data_flow.state(), &DataFlowState::Closed);
+    }
+
+    #[test]
+    fn shadow_scan_flow_tracks_register_page_and_eof() {
+        let mut storage = Storage::default();
+
+        storage.shadow_scan_flow_event(42, ScanFlowEvent::Register, "test");
+        assert_eq!(
+            storage.shadow_scan_flows.get(&42).map(|m| *m.state()),
+            Some(ScanFlowState::Active)
+        );
+        storage.shadow_scan_flow_event(42, ScanFlowEvent::HeapPage, "test");
+        assert_eq!(
+            storage.shadow_scan_flows.get(&42).map(|m| *m.state()),
+            Some(ScanFlowState::Active)
+        );
+        storage.shadow_scan_flow_event(42, ScanFlowEvent::ScanEof, "test");
+        assert!(!storage.shadow_scan_flows.contains_key(&42));
     }
 
     // Local mocks for metadata processing used by tests
