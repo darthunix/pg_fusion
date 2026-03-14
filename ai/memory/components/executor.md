@@ -20,11 +20,13 @@ importance: 0.7
   - Decode path now avoids eager empty-batch allocation, estimates row-capacity from visibility bitmap, and reuses full-schema projection without allocating `proj_indices` for identity/full scans.
 - API boundary: `executor` consumes the external `scan` crate API and injects telemetry via `HeapScanTelemetryHooks`.
 - Results: encodes each row via `encode_wire_tuple` and writes to per‑connection result ring; signals backend.
+- Long-term redesign direction: current worker-side heap/page decode path is likely transitional. A preferred future shape is for backend to own scan/materialization semantics and stream Arrow-friendly batches to the worker instead of raw heap pages.
 
 Current Limitations
 - Filter pushdown: not implemented — `supports_filters_pushdown()` returns Unsupported; `_filters` in `scan()` is ignored (FilterExec runs upstream).
 - Limit pushdown: `_limit` ignored; no early stop after producing K rows.
 - Aggregates: tuples fully decoded into Arrow and then aggregated by DF (extra allocations/copies).
+- Raw heap page protocol is increasingly viewed as a dead end for TOAST correctness and future index scan support.
 
 Planned Optimizations
 - Filters: Inexact pushdown for simple predicates (col op literal: =, !=, <, ≤, >, ≥; AND/OR); evaluate per tuple before decoding varlena; retain upstream FilterExec.

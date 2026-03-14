@@ -48,3 +48,12 @@ In short: a PostgreSQL (pgrx) extension intercepts planning/execution and delega
 - Result ring: executor writes length‑prefixed wire tuples to the per‑connection lock‑free result ring and nudges backend (SIGUSR1).
 - Backend assembly: backend reads frames, decodes wire header, reconstructs `Datum[]/isnull[]` by `attlen/attalign/attbyval`, forms `MinimalTuple` via `heap_form_minimal_tuple`, and stores into `TupleTableSlot`.
 - Visibility: heap page visibility bitmap is carried out‑of‑band in SHM and applied in `PgScanStream` to filter invisible tuples. Backend computes bitmap via `HeapTupleSatisfiesVisibility` against the active snapshot.
+
+## Proposed Redesign Direction
+
+This is not implemented yet, but the current architecture is increasingly seen as transitional:
+
+- Control plane: remove the planning ping-pong (`Parse -> Metadata -> Bind -> Optimize -> Translate -> Columns -> ColumnLayout`) and instead build the DataFusion logical plan on the backend, serialize it through SHM, and let the worker only deserialize + continue execution planning.
+- Data plane: stop shipping raw PostgreSQL heap pages/visibility bitmaps to the worker. That boundary forces the worker to reimplement PostgreSQL tuple decoding semantics, complicates TOAST handling, and does not extend naturally to index scans.
+- Preferred future boundary: PostgreSQL backend keeps ownership of table/index access, snapshot visibility, TOAST/detoast, and slot materialization. It then repacks rows into an Arrow-friendly batch/wire format and streams batches to the worker.
+- Consequence: worker-side `storage::heap`/page-oriented scan logic would become legacy or transitional. The worker would instead consume batch streams, while PostgreSQL remains the source of truth for physical access methods.
