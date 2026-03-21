@@ -8,13 +8,13 @@ use std::slice;
 /// While attached, the lease provides safe access to the page bytes and will
 /// return the page to the pool on drop. Use [`PageLease::into_descriptor`] to
 /// detach ownership for cross-process handoff.
-pub struct PageLease<'a> {
-    pub(crate) pool: &'a PagePool,
+pub struct PageLease {
+    pub(crate) pool: PagePool,
     pub(crate) descriptor: PageDescriptor,
     pub(crate) detached: bool,
 }
 
-impl PageLease<'_> {
+impl PageLease {
     /// Return a non-owning snapshot of the current lease identity.
     ///
     /// The returned descriptor cannot be released until this lease is detached
@@ -65,7 +65,7 @@ impl PageLease<'_> {
     }
 }
 
-impl Drop for PageLease<'_> {
+impl Drop for PageLease {
     fn drop(&mut self) {
         if !self.detached {
             let _ = self.pool.release_attached(self.descriptor);
