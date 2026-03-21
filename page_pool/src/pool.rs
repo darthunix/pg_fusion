@@ -192,7 +192,7 @@ impl PagePool {
     /// On success this returns an attached [`PageLease`]. Dropping that lease
     /// returns the page to the pool unless it has been detached with
     /// [`PageLease::into_descriptor`].
-    pub fn try_acquire(&self) -> Result<PageLease<'_>, AcquireError> {
+    pub fn try_acquire(&self) -> Result<PageLease, AcquireError> {
         let page_id = match self.freelist().allocate() {
             Ok(page_id) => page_id,
             Err(StackError::Empty) => {
@@ -253,7 +253,7 @@ impl PagePool {
                         + 1;
                     self.observe_high_watermark(leased_pages);
                     return Ok(PageLease {
-                        pool: self,
+                        pool: *self,
                         descriptor: PageDescriptor {
                             pool_id: self.pool_id,
                             page_id,
