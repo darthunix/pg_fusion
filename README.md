@@ -9,6 +9,7 @@ Why: PostgreSQL’s Volcano (row‑at‑a‑time) engine is great for OLTP but s
 - Extension (pgrx) sits in the backend process and drives Parse/Bind/Optimize/Translate/Begin/Exec/End.
 - Executor (runtime) runs DataFusion; `HeapScanProvider → HeapScanExec → HeapScanStream` scans heap pages from shared memory and produces Arrow RecordBatches.
 - Protocol defines control/data packets and a compact wire tuple format with explicit alignment.
+- Low-level shared-memory building blocks such as `lockfree` and `page_pool` live in standalone workspace crates; `page_pool` is not yet wired into the runtime path.
 
 See: `ai/memory/architecture.md` and component notes in `ai/memory/components/`.
 
@@ -19,6 +20,8 @@ See: `ai/memory/architecture.md` and component notes in `ai/memory/components/`.
 - `protocol/` — shared packets and wire formats
 - `storage/` — heap page reader + zero‑allocation tuple decoder to DataFusion `ScalarValue`
 - `common/` — shared errors/types
+- `lockfree/` — standalone shared-memory lock-free primitives
+- `page_pool/` — standalone fixed-page shared-memory ownership pool
 
 ## Build & test
 
