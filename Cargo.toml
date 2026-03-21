@@ -2,6 +2,7 @@
 members = [
   "lockfree",
   "page_pool",
+  "page_transfer",
   "executor",
   "scan",
   "postgres",
