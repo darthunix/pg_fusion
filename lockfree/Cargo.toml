@@ -1,0 +1,8 @@
+[package]
+name = "lockfree"
+version = "25.0.0"
+edition = "2021"
+
+[lib]
+crate-type = ["lib"]
+doctest = false

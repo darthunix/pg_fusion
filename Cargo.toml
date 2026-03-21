@@ -1,5 +1,6 @@
 [workspace]
 members = [
+  "lockfree",
   "executor",
   "scan",
   "postgres",
