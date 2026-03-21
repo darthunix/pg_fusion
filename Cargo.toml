@@ -1,6 +1,7 @@
 [workspace]
 members = [
   "lockfree",
+  "page_pool",
   "executor",
   "scan",
   "postgres",
