@@ -37,6 +37,7 @@ static SLOT_BLOCKS_BASE: AtomicPtr<u8> = AtomicPtr::new(ptr::null_mut());
 static SLOT_BLOCKS_LAYOUT_CACHE: OnceLock<executor::layout::SlotBlocksLayout> = OnceLock::new();
 static RESULT_RING_BASE: AtomicPtr<u8> = AtomicPtr::new(ptr::null_mut());
 static RESULT_RING_LAYOUT_CACHE: OnceLock<executor::layout::BufferLayout> = OnceLock::new();
+static TREIBER_STACK_HANDLE: OnceLock<TreiberStack> = OnceLock::new();
 
 #[pg_guard]
 pub(crate) unsafe extern "C-unwind" fn init_datafusion_worker() {
@@ -136,8 +137,7 @@ pub unsafe extern "C-unwind" fn init_shmem() {
         if !found {
             std::ptr::write_bytes(base_u8, 0, layout.layout.size());
             let (hdr_ptr, next_ptr) = treiber_stack_ptrs(base_u8, layout);
-            let stack = TreiberStack::new(next_ptr, num);
-            ptr::write(hdr_ptr, stack);
+            let _ = TreiberStack::init_in_place(hdr_ptr, next_ptr, num);
         }
         info!(
             "init_shmem: treiber stack ready: bytes={} nodes={} found={}",
@@ -474,7 +474,7 @@ fn init_tracing_file_logger() {
 
 // Accessor for Treiber stack stored in shared memory
 pub(crate) fn treiber_stack() -> &'static TreiberStack {
-    unsafe {
+    TREIBER_STACK_HANDLE.get_or_init(|| unsafe {
         let num = crate::max_backends() as usize;
         let layout = executor::layout::treiber_stack_layout(num).expect("treiber_stack_layout");
         let mut found = false;
@@ -483,9 +483,9 @@ pub(crate) fn treiber_stack() -> &'static TreiberStack {
             layout.layout.size(),
             &mut found,
         ) as *mut u8;
-        let (hdr_ptr, _next_ptr) = executor::layout::treiber_stack_ptrs(base, layout);
-        &*hdr_ptr
-    }
+        let (hdr_ptr, next_ptr) = executor::layout::treiber_stack_ptrs(base, layout);
+        TreiberStack::attach(hdr_ptr, next_ptr)
+    })
 }
 
 pub(crate) fn shared_flags_slice() -> &'static [AtomicBool] {
