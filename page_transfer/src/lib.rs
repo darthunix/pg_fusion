@@ -9,7 +9,9 @@
 //! V1 intentionally keeps the model simple:
 //!
 //! - one `PageTx` talks to one `PageRx`
-//! - exactly one page/message may be in flight per side at a time
+//! - one sender-side writer or unsent outbound page may exist at a time
+//! - receiver accepts frames sequentially, but accepted pages may outlive the
+//!   receiver state and not block later accepts
 //! - the carrier is assumed reliable and ordered
 //! - received pages are read-only
 //! - there are no acks, retries, or credits
@@ -33,8 +35,9 @@
 //! 4. Encode the control frame with [`encode_frame`] or feed bytes through
 //!    [`FrameDecoder`].
 //! 5. Accept the frame on the other side with [`PageRx::accept`].
-//! 6. Read the page payload through [`ReceivedPage::payload`] and then release
-//!    it with [`ReceivedPage::release`].
+//! 6. Read the page payload through [`ReceivedPage::payload`] and release it
+//!    later with [`ReceivedPage::release`]. Holding the page does not block
+//!    subsequent [`PageRx::accept`] calls.
 
 mod codec;
 mod error;

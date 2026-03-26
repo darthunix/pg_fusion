@@ -74,7 +74,7 @@ fn begin_rejects_page_payload_capacity_larger_than_u32() {
 }
 
 #[test]
-fn sender_and_receiver_enforce_single_active_page_and_close_terminal() {
+fn sender_enforces_single_active_handle_and_close_is_terminal() {
     let (_region, pool) = init_pool(cfg(64, 1));
     let tx = PageTx::new(pool);
     let rx = PageRx::new(pool);
@@ -97,19 +97,13 @@ fn sender_and_receiver_enforce_single_active_page_and_close_terminal() {
         ReceiveEvent::Page(page) => page,
         ReceiveEvent::Closed => panic!("expected page"),
     };
-    assert!(matches!(
-        rx.accept(OwnedFrame::Close(crate::wire::CloseFrame {
-            transfer_id: 2
-        })),
-        Err(RxError::Busy)
-    ));
-    drop(page);
 
     let close = tx.close().expect("close");
     match rx.accept(close).expect("accept close") {
         ReceiveEvent::Closed => {}
         ReceiveEvent::Page(_) => panic!("expected close"),
     }
+    drop(page);
     assert!(matches!(
         tx.begin(TEST_KIND, TEST_FLAGS),
         Err(TxError::Closed)
@@ -120,6 +114,42 @@ fn sender_and_receiver_enforce_single_active_page_and_close_terminal() {
         })),
         Err(RxError::Closed)
     ));
+}
+
+#[test]
+fn receiver_accepts_next_page_while_previous_page_is_alive() {
+    let (_region, pool) = init_pool(cfg(64, 2));
+    let tx = PageTx::new(pool);
+    let rx = PageRx::new(pool);
+
+    let mut writer = tx.begin(TEST_KIND, 0).expect("begin page1");
+    writer.write_all(b"page1").expect("write page1");
+    let outbound = writer.finish().expect("finish page1");
+    let frame = outbound.frame();
+    outbound.mark_sent();
+
+    let page1 = match rx.accept(frame).expect("accept page1") {
+        ReceiveEvent::Page(page) => page,
+        ReceiveEvent::Closed => panic!("expected page1"),
+    };
+    assert_eq!(page1.payload(), b"page1");
+
+    let mut writer = tx.begin(TEST_KIND, 0).expect("begin page2");
+    writer.write_all(b"page2").expect("write page2");
+    let outbound = writer.finish().expect("finish page2");
+    let frame = outbound.frame();
+    outbound.mark_sent();
+
+    let page2 = match rx.accept(frame).expect("accept page2") {
+        ReceiveEvent::Page(page) => page,
+        ReceiveEvent::Closed => panic!("expected page2"),
+    };
+    assert_eq!(page2.payload(), b"page2");
+
+    drop(page2);
+    assert_eq!(pool.snapshot().free_pages, 1);
+    drop(page1);
+    assert_eq!(pool.snapshot().free_pages, 2);
 }
 
 #[test]
@@ -243,6 +273,7 @@ fn handles_are_send_and_sync_where_expected() {
     assert_send::<PageWriter>();
     assert_send::<OutboundPage>();
     assert_send::<ReceivedPage>();
+    assert_sync::<ReceivedPage>();
 }
 
 #[test]

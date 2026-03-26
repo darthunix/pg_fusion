@@ -9,7 +9,9 @@ use std::sync::Arc;
 ///
 /// `PageRx` is cheap to clone and accepts one ordered sender stream. It
 /// validates transfer ordering, detached page ownership, and the in-page
-/// message header before returning a [`ReceivedPage`].
+/// message header before returning a detached [`ReceivedPage`]. A successfully
+/// accepted page does not keep the receiver busy; later frames may be accepted
+/// while earlier received pages are still alive.
 #[derive(Clone)]
 pub struct PageRx {
     inner: Arc<RxInner>,
@@ -26,8 +28,7 @@ struct RxInner {
 enum RxPhase {
     Idle = 0,
     Accepting = 1,
-    PageActive = 2,
-    Closed = 3,
+    Closed = 2,
 }
 
 impl RxPhase {
@@ -35,8 +36,7 @@ impl RxPhase {
         match raw {
             0 => Self::Idle,
             1 => Self::Accepting,
-            2 => Self::PageActive,
-            3 => Self::Closed,
+            2 => Self::Closed,
             _ => unreachable!("invalid rx phase {raw}"),
         }
     }
@@ -65,7 +65,7 @@ impl RxInner {
                     }
                 }
                 RxPhase::Closed => return Err(RxError::Closed),
-                RxPhase::Accepting | RxPhase::PageActive => return Err(RxError::Busy),
+                RxPhase::Accepting => return Err(RxError::Busy),
             }
         }
     }
@@ -94,12 +94,6 @@ impl RxInner {
 
     fn finish_page_accept(&self) {
         debug_assert_eq!(self.current_phase(), RxPhase::Accepting);
-        self.phase
-            .store(RxPhase::PageActive as u8, Ordering::Release);
-    }
-
-    fn finish_page(&self) {
-        debug_assert_eq!(self.current_phase(), RxPhase::PageActive);
         self.phase.store(RxPhase::Idle as u8, Ordering::Release);
     }
 }
@@ -119,10 +113,12 @@ impl PageRx {
     /// Accept one decoded transport frame.
     ///
     /// `Page` frames yield a [`ReceivedPage`]. `Close` is terminal and moves
-    /// the receiver into the closed state. If page-header validation fails
-    /// after the detached descriptor has been accepted locally, the temporary
-    /// page guard releases the page back to the pool before returning the
-    /// error.
+    /// the receiver into the closed state. Successful page accepts return the
+    /// receiver to `Idle` before handing the detached page to the caller, so
+    /// later frames may be accepted while earlier received pages remain alive.
+    /// If page-header validation fails after the detached descriptor has been
+    /// accepted locally, the temporary page guard releases the page back to the
+    /// pool before returning the error.
     pub fn accept(&self, frame: OwnedFrame) -> Result<ReceiveEvent, RxError> {
         self.inner.begin_accept()?;
 
@@ -140,7 +136,7 @@ impl PageRx {
                 Ok(ReceiveEvent::Closed)
             }
             OwnedFrame::Page(frame) => {
-                let page = match ReceivedPage::new(self.clone(), frame.descriptor) {
+                let page = match ReceivedPage::new(self.inner.pool, frame.descriptor) {
                     Ok(page) => page,
                     Err(err) => {
                         self.inner.cancel_accept();
@@ -162,22 +158,22 @@ pub enum ReceiveEvent {
 }
 
 struct PendingReceivedPage {
-    rx: PageRx,
+    pool: PagePool,
     descriptor: PageDescriptor,
     armed: bool,
 }
 
 impl PendingReceivedPage {
-    fn new(rx: PageRx, descriptor: PageDescriptor) -> Self {
+    fn new(pool: PagePool, descriptor: PageDescriptor) -> Self {
         Self {
-            rx,
+            pool,
             descriptor,
             armed: true,
         }
     }
 
     fn bytes(&self) -> Result<&[u8], RxError> {
-        unsafe { self.rx.inner.pool.page_bytes(self.descriptor) }.map_err(RxError::Access)
+        unsafe { self.pool.page_bytes(self.descriptor) }.map_err(RxError::Access)
     }
 
     fn into_received_page(
@@ -188,7 +184,7 @@ impl PendingReceivedPage {
     ) -> ReceivedPage {
         self.armed = false;
         ReceivedPage {
-            rx: self.rx.clone(),
+            pool: self.pool,
             descriptor: self.descriptor,
             kind,
             flags,
@@ -201,13 +197,13 @@ impl PendingReceivedPage {
 impl Drop for PendingReceivedPage {
     fn drop(&mut self) {
         if self.armed {
-            let _ = self.rx.inner.pool.release(self.descriptor);
+            let _ = self.pool.release(self.descriptor);
         }
     }
 }
 
 pub struct ReceivedPage {
-    rx: PageRx,
+    pool: PagePool,
     descriptor: PageDescriptor,
     kind: MessageKind,
     flags: u16,
@@ -216,8 +212,8 @@ pub struct ReceivedPage {
 }
 
 impl ReceivedPage {
-    fn new(rx: PageRx, descriptor: PageDescriptor) -> Result<Self, RxError> {
-        let pending = PendingReceivedPage::new(rx, descriptor);
+    fn new(pool: PagePool, descriptor: PageDescriptor) -> Result<Self, RxError> {
+        let pending = PendingReceivedPage::new(pool, descriptor);
         let bytes = pending.bytes()?;
         let header = decode_page_header(&bytes[..PAGE_HEADER_LEN]).map_err(RxError::InvalidPage)?;
         let capacity = bytes.len().saturating_sub(PAGE_HEADER_LEN);
@@ -250,9 +246,7 @@ impl ReceivedPage {
     /// Borrow the validated message payload bytes.
     pub fn payload(&self) -> &[u8] {
         let bytes = unsafe {
-            self.rx
-                .inner
-                .pool
+            self.pool
                 .page_bytes(self.descriptor)
                 .expect("received page descriptor must remain valid until release")
         };
@@ -261,13 +255,10 @@ impl ReceivedPage {
 
     /// Release the detached page back to the pool.
     pub fn release(mut self) -> Result<(), RxError> {
-        self.rx
-            .inner
-            .pool
+        self.pool
             .release(self.descriptor)
             .map_err(RxError::Release)?;
         self.released = true;
-        self.rx.inner.finish_page();
         Ok(())
     }
 }
@@ -275,8 +266,7 @@ impl ReceivedPage {
 impl Drop for ReceivedPage {
     fn drop(&mut self) {
         if !self.released {
-            let _ = self.rx.inner.pool.release(self.descriptor);
-            self.rx.inner.finish_page();
+            let _ = self.pool.release(self.descriptor);
         }
     }
 }
