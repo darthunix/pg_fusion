@@ -3,7 +3,7 @@ id: comp-executor-0001
 type: fact
 scope: executor
 tags: ["datafusion", "scan", "result-ring", "wire-tuple", "shm"]
-updated_at: "2026-03-14"
+updated_at: "2026-03-26"
 importance: 0.7
 ---
 
@@ -21,6 +21,7 @@ importance: 0.7
 - API boundary: `executor` consumes the external `scan` crate API and injects telemetry via `HeapScanTelemetryHooks`.
 - Results: encodes each row via `encode_wire_tuple` and writes to per‑connection result ring; signals backend.
 - Long-term redesign direction: current worker-side heap/page decode path is likely transitional. A preferred future shape is for backend to own scan/materialization semantics and stream Arrow-friendly batches to the worker instead of raw heap pages.
+  - `page_arrow` now exists as an unwired standalone crate for that future boundary: it imports one `page_transfer::ReceivedPage` as a zero-copy Arrow `RecordBatch`, rejects trailing bytes after the declared IPC body, and returns the page to the pool when the final Arrow reference drops except for zero-buffer owned fallbacks.
 
 Current Limitations
 - Filter pushdown: not implemented — `supports_filters_pushdown()` returns Unsupported; `_filters` in `scan()` is ignored (FilterExec runs upstream).

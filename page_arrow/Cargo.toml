@@ -1,0 +1,21 @@
+[package]
+name = "page_arrow"
+version = "25.0.0"
+edition = "2021"
+description = "Zero-copy Arrow RecordBatch import from page_transfer pages"
+readme = "README.md"
+
+[lib]
+crate-type = ["lib"]
+doctest = false
+
+[dependencies]
+arrow-array = { workspace = true }
+arrow-buffer = { workspace = true }
+arrow-ipc = { workspace = true, features = ["lz4"] }
+arrow-schema = { workspace = true }
+page_transfer = { path = "../page_transfer", version = "25.0" }
+thiserror = "2.0"
+
+[dev-dependencies]
+page_pool = { path = "../page_pool", version = "25.0" }

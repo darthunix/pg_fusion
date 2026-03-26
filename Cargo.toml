@@ -3,6 +3,7 @@ members = [
   "lockfree",
   "page_pool",
   "page_transfer",
+  "page_arrow",
   "executor",
   "scan",
   "postgres",
@@ -26,6 +27,10 @@ codegen-units = 1
 pgrx-pg-sys = "0.16"
 pgrx = "0.16"
 pgrx-tests = "0.16"
+arrow-array = "53.4.1"
+arrow-buffer = "53.4.1"
+arrow-ipc = "53.4.1"
+arrow-schema = "53.4.1"
 datafusion-common = "44.0"
 datafusion = "44.0"
 datafusion-sql = "44.0"
