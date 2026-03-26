@@ -3,7 +3,7 @@ id: arch-overview-0001
 type: fact
 scope: repo
 tags: ["architecture", "datafusion", "pgrx", "shared-memory", "ipc", "visibility", "utility_hook"]
-updated_at: "2026-01-10"
+updated_at: "2026-03-26"
 importance: 0.8
 ---
 
@@ -18,6 +18,7 @@ In short: a PostgreSQL (pgrx) extension intercepts planning/execution and delega
 - `protocol/`: control and data messages, wire tuple/attribute formats, types.
 - `storage/`: low‑level heap page reader and attribute decoder to ScalarValue.
 - `common/`: shared errors/types (FusionError).
+- `page_arrow/`: import-only zero-copy Arrow `RecordBatch` wrapper over `page_transfer` pages.
 
 ## Control Path
 
@@ -57,3 +58,4 @@ This is not implemented yet, but the current architecture is increasingly seen a
 - Data plane: stop shipping raw PostgreSQL heap pages/visibility bitmaps to the worker. That boundary forces the worker to reimplement PostgreSQL tuple decoding semantics, complicates TOAST handling, and does not extend naturally to index scans.
 - Preferred future boundary: PostgreSQL backend keeps ownership of table/index access, snapshot visibility, TOAST/detoast, and slot materialization. It then repacks rows into an Arrow-friendly batch/wire format and streams batches to the worker.
 - Consequence: worker-side `storage::heap`/page-oriented scan logic would become legacy or transitional. The worker would instead consume batch streams, while PostgreSQL remains the source of truth for physical access methods.
+- Supporting building block now exists: `page_arrow` can consume a `page_transfer::ReceivedPage` whose payload contains exactly one Arrow IPC batch and expose it as a plain `RecordBatch` backed directly by the page bytes. It is intentionally strict in v1: external schema, no copy fallback for data-bearing batches, no dictionaries, no compression, trailing bytes rejected, and page release tied to final Arrow buffer drop except for zero-buffer owned fallbacks.
