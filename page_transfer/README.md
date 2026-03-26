@@ -37,7 +37,7 @@ ReceivedPage::payload -> ReceivedPage::release
 Important behavior:
 
 - One `PageTx` allows at most one active writer or unsent outbound page.
-- One `PageRx` allows at most one active received page.
+- One `PageRx` serializes `accept()` calls, but a live `ReceivedPage` does not block later accepts.
 - Dropping `OutboundPage` before `mark_sent()` rolls the page back locally.
 - If a detached page is accepted but its in-page header is malformed, an internal RAII guard releases it automatically so malformed input does not leak pool capacity.
 

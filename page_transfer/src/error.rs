@@ -218,7 +218,7 @@ impl fmt::Display for RxError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Closed => write!(f, "page receiver is closed"),
-            Self::Busy => write!(f, "page receiver already has an active page"),
+            Self::Busy => write!(f, "page receiver is already accepting a frame"),
             Self::UnexpectedTransferId { expected, actual } => {
                 write!(f, "unexpected transfer id {actual}, expected {expected}")
             }
