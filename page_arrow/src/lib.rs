@@ -7,6 +7,8 @@
 //! Ordinary imported batches extend page lifetime through Arrow buffer ownership.
 //! Zero-buffer batches such as empty-schema or `Null`-only payloads decode as
 //! owned Arrow structures and may release the page before `import()` returns.
+//! Holding an imported batch does not keep `page_transfer::PageRx` busy for
+//! later accepts.
 
 mod error;
 
