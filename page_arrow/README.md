@@ -20,3 +20,5 @@ The page payload contract for v1 is:
 Ordinary imported batches keep the page alive through Arrow buffer ownership. When the last Arrow reference drops, the page is returned to the underlying `page_pool`.
 
 Zero-buffer batches such as empty-schema or `Null`-only payloads decode as owned Arrow structures and may release the page before `import()` returns.
+
+Keeping a page-backed batch alive does not pin `page_transfer::PageRx`; later page accepts can proceed while earlier imported batches are still in scope.

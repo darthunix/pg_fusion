@@ -68,9 +68,7 @@ fn encode_batch_payload(batch: &RecordBatch, options: &IpcWriteOptions) -> Vec<u
     payload
 }
 
-fn send_page(pool: PagePool, kind: u16, flags: u16, payload: &[u8]) -> ReceivedPage {
-    let tx = PageTx::new(pool);
-    let rx = PageRx::new(pool);
+fn send_page_via(tx: &PageTx, rx: &PageRx, kind: u16, flags: u16, payload: &[u8]) -> ReceivedPage {
     let mut writer = tx.begin(kind, flags).expect("begin");
     writer.write_all(payload).expect("write payload");
     let outbound = writer.finish().expect("finish");
@@ -87,6 +85,12 @@ fn send_page(pool: PagePool, kind: u16, flags: u16, payload: &[u8]) -> ReceivedP
         ReceiveEvent::Page(page) => page,
         ReceiveEvent::Closed => panic!("unexpected close"),
     }
+}
+
+fn send_page(pool: PagePool, kind: u16, flags: u16, payload: &[u8]) -> ReceivedPage {
+    let tx = PageTx::new(pool);
+    let rx = PageRx::new(pool);
+    send_page_via(&tx, &rx, kind, flags, payload)
 }
 
 fn scalar_batch() -> RecordBatch {
@@ -174,6 +178,33 @@ fn imports_scalar_batch_zero_copy() {
     drop(imported);
     assert_eq!(pool.snapshot().leased_pages, 1);
     drop(column);
+    assert_eq!(pool.snapshot().leased_pages, 0);
+}
+
+#[test]
+fn import_does_not_block_accepting_next_page() {
+    let batch = scalar_batch();
+    let options = IpcWriteOptions::try_new(16, false, MetadataVersion::V5).expect("ipc opts");
+    let payload = encode_batch_payload(&batch, &options);
+
+    let (_region, pool) = init_pool(cfg(8192, 2));
+    let tx = PageTx::new(pool);
+    let rx = PageRx::new(pool);
+    let decoder = ArrowPageDecoder::new(batch.schema()).expect("decoder");
+
+    let page1 = send_page_via(&tx, &rx, ARROW_IPC_BATCH_KIND, 0, &payload);
+    let imported1 = decoder.import(page1).expect("import page1");
+    assert_eq!(imported1, batch);
+    assert_eq!(pool.snapshot().leased_pages, 1);
+
+    let page2 = send_page_via(&tx, &rx, ARROW_IPC_BATCH_KIND, 0, &payload);
+    let imported2 = decoder.import(page2).expect("import page2");
+    assert_eq!(imported2, batch);
+    assert_eq!(pool.snapshot().leased_pages, 2);
+
+    drop(imported2);
+    assert_eq!(pool.snapshot().leased_pages, 1);
+    drop(imported1);
     assert_eq!(pool.snapshot().leased_pages, 0);
 }
 

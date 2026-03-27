@@ -27,6 +27,7 @@ importance: 0.72
   - importer consumes `ReceivedPage`
   - Arrow buffers are created with `arrow_buffer::Buffer::from_custom_allocation`
   - the custom allocation owner retains the `ReceivedPage`
+  - retaining that `ReceivedPage` keeps the detached page leased, but no longer keeps `PageRx` busy for later accepts
   - ordinary page-backed batches release the page back to `page_pool` only after the last Arrow buffer reference drops
   - zero-buffer batches such as empty-schema or `Null`-only payloads decode as owned Arrow structures and may release the page before `import()` returns
 - Current status:
