@@ -11,6 +11,7 @@ mod tests;
 use arrow_schema::{DataType, Schema};
 pub use error::LayoutError;
 use std::mem::size_of;
+use std::ptr;
 
 pub const BLOCK_MAGIC: u32 = 0x3242_4150; // "PAB2"
 pub const BLOCK_VERSION: u16 = 1;
@@ -652,9 +653,376 @@ impl ByteView {
     }
 }
 
+/// Zero-allocation read-only view over an initialized raw page block.
+///
+/// `BlockRef` validates the block on open and then provides copy-based access
+/// to the on-page header, column descriptors, front-region buffers, and shared
+/// tail pool without allocating.
+#[derive(Debug)]
+pub struct BlockRef<'a> {
+    block: &'a [u8],
+    header: BlockHeader,
+}
+
+impl<'a> BlockRef<'a> {
+    /// Opens and validates an initialized block in-place.
+    pub fn open(block: &'a [u8]) -> Result<Self, LayoutError> {
+        let header = read_struct::<BlockHeader>(block, 0)?;
+        let desc_count = usize::from(header.col_count);
+        validate_block_prefix(block, &header, desc_count)?;
+        validate_desc_layout_in_block(block, &header)?;
+        Ok(Self { block, header })
+    }
+
+    pub fn block_size(&self) -> u32 {
+        self.header.block_size
+    }
+
+    pub fn row_count(&self) -> u32 {
+        self.header.row_count
+    }
+
+    pub fn max_rows(&self) -> u32 {
+        self.header.max_rows
+    }
+
+    pub fn pool_base(&self) -> u32 {
+        self.header.pool_base
+    }
+
+    pub fn tail_cursor(&self) -> u32 {
+        self.header.tail_cursor
+    }
+
+    pub fn column_count(&self) -> usize {
+        usize::from(self.header.col_count)
+    }
+
+    pub fn header(&self) -> BlockHeader {
+        self.header
+    }
+
+    pub fn desc(&self, index: usize) -> Result<ColumnDesc, LayoutError> {
+        let col_count = self.column_count();
+        if index >= col_count {
+            return Err(LayoutError::ColumnIndexOutOfBounds { index, col_count });
+        }
+        read_struct(self.block, desc_offset(index))
+    }
+
+    pub fn column_layout(&self, index: usize) -> Result<ColumnLayout, LayoutError> {
+        column_layout_from_desc(index, self.max_rows(), self.desc(index)?)
+    }
+
+    pub fn validity_bytes(&self, index: usize) -> Result<&[u8], LayoutError> {
+        let layout = self.column_layout(index)?;
+        block_range(
+            self.block,
+            byte_range(layout.validity_off, layout.validity_len)?,
+        )
+    }
+
+    pub fn values_bytes(&self, index: usize) -> Result<&[u8], LayoutError> {
+        let layout = self.column_layout(index)?;
+        block_range(
+            self.block,
+            byte_range(layout.values_off, layout.values_len)?,
+        )
+    }
+
+    pub fn validity(&self, index: usize, row: u32) -> Result<bool, LayoutError> {
+        let bytes = self.validity_bytes(index)?;
+        Ok(bitmap_get(bytes, row))
+    }
+
+    pub fn view(&self, index: usize, row: u32) -> Result<ByteView, LayoutError> {
+        let layout = self.column_layout(index)?;
+        let type_tag = layout.type_tag;
+        if !type_tag.is_view() {
+            return Err(LayoutError::InconsistentViewFlag {
+                index,
+                type_tag,
+                flags: layout.flags.bits(),
+            });
+        }
+        if row >= self.max_rows() {
+            return Err(LayoutError::RowCountExceedsMaxRows {
+                row_count: row,
+                max_rows: self.max_rows(),
+            });
+        }
+        let slot_off = layout
+            .values_off
+            .checked_add(
+                row.checked_mul(size_of::<ByteView>() as u32)
+                    .ok_or(LayoutError::SizeOverflow)?,
+            )
+            .ok_or(LayoutError::SizeOverflow)?;
+        let view = read_struct::<ByteView>(
+            self.block,
+            usize::try_from(slot_off).map_err(|_| LayoutError::SizeOverflow)?,
+        )?;
+        view.validate(self.header.shared_pool_capacity()?)?;
+        Ok(view)
+    }
+
+    pub fn shared_pool(&self) -> Result<&[u8], LayoutError> {
+        block_range(
+            self.block,
+            byte_range(self.header.pool_base, self.header.shared_pool_capacity()?)?,
+        )
+    }
+}
+
+/// Zero-allocation mutable view over an initialized raw page block.
+///
+/// The wrapper keeps a local copy of the header for fast repeated access and
+/// writes it back in-place whenever mutable block state changes.
+#[derive(Debug)]
+pub struct BlockMut<'a> {
+    block: &'a mut [u8],
+    header: BlockHeader,
+}
+
+impl<'a> BlockMut<'a> {
+    /// Opens and validates an initialized block in-place.
+    pub fn open(block: &'a mut [u8]) -> Result<Self, LayoutError> {
+        let header = read_struct::<BlockHeader>(block, 0)?;
+        let desc_count = usize::from(header.col_count);
+        validate_block_prefix(block, &header, desc_count)?;
+        validate_desc_layout_in_block(block, &header)?;
+        Ok(Self { block, header })
+    }
+
+    pub fn block_size(&self) -> u32 {
+        self.header.block_size
+    }
+
+    pub fn row_count(&self) -> u32 {
+        self.header.row_count
+    }
+
+    pub fn max_rows(&self) -> u32 {
+        self.header.max_rows
+    }
+
+    pub fn pool_base(&self) -> u32 {
+        self.header.pool_base
+    }
+
+    pub fn tail_cursor(&self) -> u32 {
+        self.header.tail_cursor
+    }
+
+    pub fn column_count(&self) -> usize {
+        usize::from(self.header.col_count)
+    }
+
+    pub fn header(&self) -> BlockHeader {
+        self.header
+    }
+
+    pub fn desc(&self, index: usize) -> Result<ColumnDesc, LayoutError> {
+        let col_count = self.column_count();
+        if index >= col_count {
+            return Err(LayoutError::ColumnIndexOutOfBounds { index, col_count });
+        }
+        read_struct(self.block, desc_offset(index))
+    }
+
+    pub fn write_desc(&mut self, index: usize, desc: ColumnDesc) -> Result<(), LayoutError> {
+        let col_count = self.column_count();
+        if index >= col_count {
+            return Err(LayoutError::ColumnIndexOutOfBounds { index, col_count });
+        }
+        write_struct(self.block, desc_offset(index), desc)
+    }
+
+    pub fn column_layout(&self, index: usize) -> Result<ColumnLayout, LayoutError> {
+        column_layout_from_desc(index, self.max_rows(), self.desc(index)?)
+    }
+
+    pub fn validity_bytes_mut(&mut self, index: usize) -> Result<&mut [u8], LayoutError> {
+        let layout = self.column_layout(index)?;
+        block_range_mut(
+            self.block,
+            byte_range(layout.validity_off, layout.validity_len)?,
+        )
+    }
+
+    pub fn values_bytes_mut(&mut self, index: usize) -> Result<&mut [u8], LayoutError> {
+        let layout = self.column_layout(index)?;
+        block_range_mut(
+            self.block,
+            byte_range(layout.values_off, layout.values_len)?,
+        )
+    }
+
+    pub fn set_validity(&mut self, index: usize, row: u32, valid: bool) -> Result<(), LayoutError> {
+        let bytes = self.validity_bytes_mut(index)?;
+        bitmap_set(bytes, row, valid);
+        Ok(())
+    }
+
+    pub fn validity(&self, index: usize, row: u32) -> Result<bool, LayoutError> {
+        let bytes = self.validity_bytes(index)?;
+        Ok(bitmap_get(bytes, row))
+    }
+
+    pub fn validity_bytes(&self, index: usize) -> Result<&[u8], LayoutError> {
+        let layout = self.column_layout(index)?;
+        block_range(
+            self.block,
+            byte_range(layout.validity_off, layout.validity_len)?,
+        )
+    }
+
+    pub fn values_bytes(&self, index: usize) -> Result<&[u8], LayoutError> {
+        let layout = self.column_layout(index)?;
+        block_range(
+            self.block,
+            byte_range(layout.values_off, layout.values_len)?,
+        )
+    }
+
+    pub fn set_row_count(&mut self, row_count: u32) -> Result<(), LayoutError> {
+        self.header.row_count = row_count;
+        self.write_header()
+    }
+
+    pub fn set_tail_cursor(&mut self, tail_cursor: u32) -> Result<(), LayoutError> {
+        self.header.tail_cursor = tail_cursor;
+        self.write_header()
+    }
+
+    pub fn increment_null_count(&mut self, index: usize) -> Result<(), LayoutError> {
+        let mut desc = self.desc(index)?;
+        desc.null_count = desc
+            .null_count
+            .checked_add(1)
+            .ok_or(LayoutError::SizeOverflow)?;
+        self.write_desc(index, desc)
+    }
+
+    pub fn write_view(
+        &mut self,
+        index: usize,
+        row: u32,
+        view: ByteView,
+    ) -> Result<(), LayoutError> {
+        let layout = self.column_layout(index)?;
+        let type_tag = layout.type_tag;
+        if !type_tag.is_view() {
+            return Err(LayoutError::InconsistentViewFlag {
+                index,
+                type_tag,
+                flags: layout.flags.bits(),
+            });
+        }
+        if row >= self.max_rows() {
+            return Err(LayoutError::RowCountExceedsMaxRows {
+                row_count: row,
+                max_rows: self.max_rows(),
+            });
+        }
+        view.validate(self.header.shared_pool_capacity()?)?;
+        let slot_off = layout
+            .values_off
+            .checked_add(
+                row.checked_mul(size_of::<ByteView>() as u32)
+                    .ok_or(LayoutError::SizeOverflow)?,
+            )
+            .ok_or(LayoutError::SizeOverflow)?;
+        write_struct(
+            self.block,
+            usize::try_from(slot_off).map_err(|_| LayoutError::SizeOverflow)?,
+            view,
+        )
+    }
+
+    pub fn tail_alloc(&mut self, len: u32) -> Result<Option<u32>, LayoutError> {
+        if len == 0 {
+            return Ok(Some(self.header.tail_cursor));
+        }
+        let next = self
+            .header
+            .tail_cursor
+            .checked_sub(len)
+            .ok_or(LayoutError::SizeOverflow)?;
+        if next < self.header.pool_base {
+            return Ok(None);
+        }
+        self.header.tail_cursor = next;
+        self.write_header()?;
+        Ok(Some(next))
+    }
+
+    pub fn tail_bytes_mut(&mut self, start: u32, len: u32) -> Result<&mut [u8], LayoutError> {
+        block_range_mut(self.block, byte_range(start, len)?)
+    }
+
+    pub fn validate(&self) -> Result<(), LayoutError> {
+        validate_block_prefix(self.block, &self.header, self.column_count())?;
+        validate_desc_layout_in_block(self.block, &self.header)
+    }
+
+    fn write_header(&mut self) -> Result<(), LayoutError> {
+        write_struct(self.block, 0, self.header)
+    }
+}
+
+/// Initializes an empty raw block in-place from a precomputed layout plan.
+///
+/// The function zeroes the block contents up to `plan.block_size()` and writes
+/// the v1 [`BlockHeader`] plus [`ColumnDesc`] array at the front.
+pub fn init_block(block: &mut [u8], plan: &LayoutPlan, schema_id: u32) -> Result<(), LayoutError> {
+    let block_size = usize::try_from(plan.block_size()).map_err(|_| LayoutError::SizeOverflow)?;
+    if block.len() < block_size {
+        return Err(LayoutError::BlockSliceTooSmall {
+            required: block_size,
+            actual: block.len(),
+        });
+    }
+    block[..block_size].fill(0);
+    write_struct(block, 0, plan.block_header(schema_id))?;
+    for (index, desc) in plan.column_descs().enumerate() {
+        write_struct(block, desc_offset(index), desc)?;
+    }
+    Ok(())
+}
+
+/// Validates the full block contract without allocating.
+pub fn validate_block(header: &BlockHeader, descs: &[ColumnDesc]) -> Result<(), LayoutError> {
+    validate_header(header, descs.len())?;
+    validate_desc_layout(header, descs)
+}
+
 /// Returns the number of bytes needed to store a bitmap for `row_count` rows.
 pub fn bitmap_bytes(row_count: u32) -> u32 {
     row_count.div_ceil(8)
+}
+
+/// Returns the bit value at `index` from a packed bitmap.
+pub fn bitmap_get(bytes: &[u8], index: u32) -> bool {
+    let byte_index = usize::try_from(index / 8).expect("u32 fits into usize");
+    let bit_index = index % 8;
+    bytes
+        .get(byte_index)
+        .map(|byte| (byte & (1 << bit_index)) != 0)
+        .unwrap_or(false)
+}
+
+/// Sets or clears the bit at `index` in a packed bitmap.
+pub fn bitmap_set(bytes: &mut [u8], index: u32, value: bool) {
+    let byte_index = usize::try_from(index / 8).expect("u32 fits into usize");
+    let bit_index = index % 8;
+    if let Some(byte) = bytes.get_mut(byte_index) {
+        if value {
+            *byte |= 1 << bit_index;
+        } else {
+            *byte &= !(1 << bit_index);
+        }
+    }
 }
 
 /// Validates the global header invariants for a block instance.
@@ -718,6 +1086,167 @@ pub fn validate_header(header: &BlockHeader, desc_count: usize) -> Result<(), La
             alignment: BUFFER_ALIGNMENT,
         });
     }
+    Ok(())
+}
+
+fn validate_block_prefix(
+    block: &[u8],
+    header: &BlockHeader,
+    desc_count: usize,
+) -> Result<(), LayoutError> {
+    let block_size = usize::try_from(header.block_size).map_err(|_| LayoutError::SizeOverflow)?;
+    if block.len() < block_size {
+        return Err(LayoutError::BlockSliceTooSmall {
+            required: block_size,
+            actual: block.len(),
+        });
+    }
+
+    let prefix_len = desc_offset(desc_count);
+    if block.len() < prefix_len {
+        return Err(LayoutError::BlockSliceTooSmall {
+            required: prefix_len,
+            actual: block.len(),
+        });
+    }
+
+    validate_header(header, desc_count)
+}
+
+fn validate_desc_layout(header: &BlockHeader, descs: &[ColumnDesc]) -> Result<(), LayoutError> {
+    let mut cursor = header.front_base;
+    for (index, desc) in descs.iter().copied().enumerate() {
+        let layout = column_layout_from_desc(index, header.max_rows, desc)?;
+        if desc.validity_off != cursor {
+            return Err(LayoutError::ColumnDescMismatch { index });
+        }
+        cursor = cursor
+            .checked_add(layout.validity_len)
+            .ok_or(LayoutError::SizeOverflow)?;
+        if desc.values_off != cursor {
+            return Err(LayoutError::ColumnDescMismatch { index });
+        }
+        cursor = cursor
+            .checked_add(layout.values_len)
+            .ok_or(LayoutError::SizeOverflow)?;
+        if desc.reserved0 != 0 {
+            return Err(LayoutError::ColumnDescMismatch { index });
+        }
+    }
+    if cursor != header.pool_base {
+        return Err(LayoutError::PoolBaseMismatch {
+            expected: cursor,
+            actual: header.pool_base,
+        });
+    }
+    Ok(())
+}
+
+fn validate_desc_layout_in_block(block: &[u8], header: &BlockHeader) -> Result<(), LayoutError> {
+    let mut cursor = header.front_base;
+    for index in 0..usize::from(header.col_count) {
+        let desc = read_struct::<ColumnDesc>(block, desc_offset(index))?;
+        let layout = column_layout_from_desc(index, header.max_rows, desc)?;
+        if desc.validity_off != cursor {
+            return Err(LayoutError::ColumnDescMismatch { index });
+        }
+        cursor = cursor
+            .checked_add(layout.validity_len)
+            .ok_or(LayoutError::SizeOverflow)?;
+        if desc.values_off != cursor {
+            return Err(LayoutError::ColumnDescMismatch { index });
+        }
+        cursor = cursor
+            .checked_add(layout.values_len)
+            .ok_or(LayoutError::SizeOverflow)?;
+        if desc.reserved0 != 0 {
+            return Err(LayoutError::ColumnDescMismatch { index });
+        }
+    }
+    if cursor != header.pool_base {
+        return Err(LayoutError::PoolBaseMismatch {
+            expected: cursor,
+            actual: header.pool_base,
+        });
+    }
+    Ok(())
+}
+
+fn column_layout_from_desc(
+    index: usize,
+    max_rows: u32,
+    desc: ColumnDesc,
+) -> Result<ColumnLayout, LayoutError> {
+    let type_tag = desc.type_tag()?;
+    let flags = desc.flags();
+    if flags.is_view() != type_tag.is_view() {
+        return Err(LayoutError::InconsistentViewFlag {
+            index,
+            type_tag,
+            flags: flags.bits(),
+        });
+    }
+    let validity_len = align_up_u32(bitmap_bytes(max_rows), BUFFER_ALIGNMENT)?;
+    let values_len = type_tag.values_reserved_len(max_rows)?;
+    Ok(ColumnLayout {
+        type_tag,
+        flags,
+        validity_off: desc.validity_off,
+        values_off: desc.values_off,
+        validity_len,
+        values_len,
+    })
+}
+
+fn desc_offset(index: usize) -> usize {
+    size_of::<BlockHeader>() + (index * size_of::<ColumnDesc>())
+}
+
+fn byte_range(offset: u32, len: u32) -> Result<std::ops::Range<usize>, LayoutError> {
+    let start = usize::try_from(offset).map_err(|_| LayoutError::SizeOverflow)?;
+    let len = usize::try_from(len).map_err(|_| LayoutError::SizeOverflow)?;
+    let end = start.checked_add(len).ok_or(LayoutError::SizeOverflow)?;
+    Ok(start..end)
+}
+
+fn block_range(block: &[u8], range: std::ops::Range<usize>) -> Result<&[u8], LayoutError> {
+    block.get(range).ok_or(LayoutError::InvalidHeaderBounds)
+}
+
+fn block_range_mut(
+    block: &mut [u8],
+    range: std::ops::Range<usize>,
+) -> Result<&mut [u8], LayoutError> {
+    block.get_mut(range).ok_or(LayoutError::InvalidHeaderBounds)
+}
+
+fn read_struct<T: Copy>(block: &[u8], offset: usize) -> Result<T, LayoutError> {
+    let end = offset
+        .checked_add(size_of::<T>())
+        .ok_or(LayoutError::SizeOverflow)?;
+    let bytes = block
+        .get(offset..end)
+        .ok_or(LayoutError::BlockSliceTooSmall {
+            required: end,
+            actual: block.len(),
+        })?;
+    let ptr = bytes.as_ptr().cast::<T>();
+    Ok(unsafe { ptr::read_unaligned(ptr) })
+}
+
+fn write_struct<T: Copy>(block: &mut [u8], offset: usize, value: T) -> Result<(), LayoutError> {
+    let actual = block.len();
+    let end = offset
+        .checked_add(size_of::<T>())
+        .ok_or(LayoutError::SizeOverflow)?;
+    let bytes = block
+        .get_mut(offset..end)
+        .ok_or(LayoutError::BlockSliceTooSmall {
+            required: end,
+            actual,
+        })?;
+    let ptr = bytes.as_mut_ptr().cast::<T>();
+    unsafe { ptr::write_unaligned(ptr, value) };
     Ok(())
 }
 
