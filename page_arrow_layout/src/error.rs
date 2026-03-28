@@ -3,6 +3,8 @@ use thiserror::Error;
 
 #[derive(Debug, Error)]
 pub enum LayoutError {
+    #[error("block slice is too small: need at least {required} bytes, got {actual}")]
+    BlockSliceTooSmall { required: usize, actual: usize },
     #[error("unsupported Arrow type at column {index}: {data_type}")]
     UnsupportedArrowType { index: usize, data_type: String },
     #[error("too many columns for page layout: {actual}")]
@@ -43,6 +45,8 @@ pub enum LayoutError {
     },
     #[error("column descriptor mismatch at index {index}")]
     ColumnDescMismatch { index: usize },
+    #[error("column index {index} is out of bounds for block with {col_count} columns")]
+    ColumnIndexOutOfBounds { index: usize, col_count: usize },
     #[error("invalid buffer alignment {alignment}")]
     InvalidAlignment { alignment: u32 },
     #[error("byte view length {len} is invalid")]
