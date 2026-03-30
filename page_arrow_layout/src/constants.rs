@@ -1,9 +1,9 @@
 //! Public format constants for the raw page layout.
 
-/// Magic value stored in [`crate::BlockHeader::magic`].
+/// Magic value stored in [`crate::raw::BlockHeader::magic`].
 pub const BLOCK_MAGIC: u32 = 0x3242_4150; // "PAB2"
 
-/// Layout format version stored in [`crate::BlockHeader::version`].
+/// Layout format version stored in [`crate::raw::BlockHeader::version`].
 pub const BLOCK_VERSION: u16 = 1;
 
 /// Base alignment used for front-region buffers in the raw block.

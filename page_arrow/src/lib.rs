@@ -26,7 +26,9 @@ use arrow_buffer::alloc::Allocation;
 use arrow_buffer::{BooleanBuffer, Buffer, NullBuffer, ScalarBuffer};
 use arrow_schema::SchemaRef;
 pub use error::{ConfigError, ImportError};
-use page_arrow_layout::{bitmap_bytes, BlockRef, ColumnLayout, LayoutError, TypeTag};
+use page_arrow_layout::bitmap::bitmap_bytes;
+use page_arrow_layout::constants::UUID_WIDTH_BYTES;
+use page_arrow_layout::{BlockRef, ColumnLayout, LayoutError, TypeTag};
 use page_transfer::{MessageKind, ReceivedPage};
 use std::ptr::NonNull;
 use std::slice;
@@ -60,12 +62,13 @@ impl ArrowPageDecoder {
     pub fn new(schema: SchemaRef) -> Result<Self, ConfigError> {
         let mut columns = Vec::with_capacity(schema.fields().len());
         for (index, field) in schema.fields().iter().enumerate() {
-            let type_tag = TypeTag::from_arrow_data_type(index, field.data_type()).map_err(|_| {
-                ConfigError::UnsupportedArrowType {
-                    index,
-                    data_type: field.data_type().to_string(),
-                }
-            })?;
+            let type_tag =
+                TypeTag::from_arrow_data_type(index, field.data_type()).map_err(|_| {
+                    ConfigError::UnsupportedArrowType {
+                        index,
+                        data_type: field.data_type().to_string(),
+                    }
+                })?;
             columns.push(ExpectedColumn {
                 type_tag,
                 nullable: field.is_nullable(),
@@ -93,23 +96,17 @@ impl ArrowPageDecoder {
         let (row_count, shared_pool) = owner.inspect(|payload| {
             let block = BlockRef::open(payload)?;
             self.validate_schema(&block)?;
-            let pool_base = block.pool_base();
-            let tail_cursor = block.tail_cursor();
             Ok((
                 block.row_count(),
                 SharedPoolImport {
-                    offset: usize::try_from(pool_base)
+                    offset: usize::try_from(block.pool_base()).map_err(|_| LayoutError::SizeOverflow)?,
+                    len: usize::try_from(block.shared_pool_capacity()?)
                         .map_err(|_| LayoutError::SizeOverflow)?,
-                    len: usize::try_from(block.header().shared_pool_capacity()?)
-                        .map_err(|_| LayoutError::SizeOverflow)?,
-                    allocated_tail_start: tail_cursor
-                        .checked_sub(pool_base)
-                        .ok_or(LayoutError::InvalidHeaderBounds)?,
+                    allocated_tail_start: block.allocated_shared_pool_offset()?,
                 },
             ))
         })?;
-        let row_count_usize =
-            usize::try_from(row_count).map_err(|_| LayoutError::SizeOverflow)?;
+        let row_count_usize = usize::try_from(row_count).map_err(|_| LayoutError::SizeOverflow)?;
 
         if self.columns.is_empty() {
             return Ok(RecordBatch::try_new_with_options(
@@ -123,31 +120,29 @@ impl ArrowPageDecoder {
         for index in 0..self.columns.len() {
             let (layout, null_count) = owner.inspect(|payload| {
                 let block = BlockRef::open(payload)?;
-                Ok((block.column_layout(index)?, block.desc(index)?.null_count))
+                Ok((block.column_layout(index)?, block.null_count(index)?))
             })?;
             let nulls = self.import_nulls(&owner, index, &layout, row_count, null_count)?;
             let array: ArrayRef = match layout.type_tag {
-                TypeTag::Boolean => Arc::new(self.import_boolean(
-                    &owner, &layout, row_count, nulls,
-                )?),
-                TypeTag::Int16 => Arc::new(
-                    self.import_primitive::<Int16Type>(&owner, &layout, row_count, nulls)?,
-                ),
-                TypeTag::Int32 => Arc::new(
-                    self.import_primitive::<Int32Type>(&owner, &layout, row_count, nulls)?,
-                ),
-                TypeTag::Int64 => Arc::new(
-                    self.import_primitive::<Int64Type>(&owner, &layout, row_count, nulls)?,
-                ),
+                TypeTag::Boolean => {
+                    Arc::new(self.import_boolean(&owner, &layout, row_count, nulls)?)
+                }
+                TypeTag::Int16 => {
+                    Arc::new(self.import_primitive::<Int16Type>(&owner, &layout, row_count, nulls)?)
+                }
+                TypeTag::Int32 => {
+                    Arc::new(self.import_primitive::<Int32Type>(&owner, &layout, row_count, nulls)?)
+                }
+                TypeTag::Int64 => {
+                    Arc::new(self.import_primitive::<Int64Type>(&owner, &layout, row_count, nulls)?)
+                }
                 TypeTag::Float32 => Arc::new(
                     self.import_primitive::<Float32Type>(&owner, &layout, row_count, nulls)?,
                 ),
                 TypeTag::Float64 => Arc::new(
                     self.import_primitive::<Float64Type>(&owner, &layout, row_count, nulls)?,
                 ),
-                TypeTag::Uuid => Arc::new(self.import_uuid(
-                    &owner, &layout, row_count, nulls,
-                )?),
+                TypeTag::Uuid => Arc::new(self.import_uuid(&owner, &layout, row_count, nulls)?),
                 TypeTag::Utf8View => Arc::new(self.import_utf8_view(
                     &owner,
                     index,
@@ -233,8 +228,11 @@ impl ArrowPageDecoder {
             usize::try_from(layout.validity_off).map_err(|_| LayoutError::SizeOverflow)?,
             validity_len,
         )?;
-        let boolean =
-            BooleanBuffer::new(validity, 0, usize::try_from(row_count).map_err(|_| LayoutError::SizeOverflow)?);
+        let boolean = BooleanBuffer::new(
+            validity,
+            0,
+            usize::try_from(row_count).map_err(|_| LayoutError::SizeOverflow)?,
+        );
         let actual_null_count = u32::try_from(
             boolean
                 .len()
@@ -316,8 +314,7 @@ impl ArrowPageDecoder {
             values_len,
         )?;
         Ok(FixedSizeBinaryArray::try_new(
-            i32::try_from(page_arrow_layout::UUID_WIDTH_BYTES)
-                .expect("uuid width fits into i32"),
+            i32::try_from(UUID_WIDTH_BYTES).expect("uuid width fits into i32"),
             values,
             nulls,
         )?)
@@ -332,7 +329,13 @@ impl ArrowPageDecoder {
         shared_pool: SharedPoolImport,
         nulls: Option<NullBuffer>,
     ) -> Result<StringViewArray, ImportError> {
-        self.validate_view_tail(owner, index, layout, row_count, shared_pool.allocated_tail_start)?;
+        self.validate_view_tail(
+            owner,
+            index,
+            layout,
+            row_count,
+            shared_pool.allocated_tail_start,
+        )?;
         let views = self.import_view_slots(owner, layout, row_count)?;
         let shared_pool = owner.buffer_from_payload(shared_pool.offset, shared_pool.len)?;
         Ok(StringViewArray::try_new(views, vec![shared_pool], nulls)?)
@@ -347,7 +350,13 @@ impl ArrowPageDecoder {
         shared_pool: SharedPoolImport,
         nulls: Option<NullBuffer>,
     ) -> Result<BinaryViewArray, ImportError> {
-        self.validate_view_tail(owner, index, layout, row_count, shared_pool.allocated_tail_start)?;
+        self.validate_view_tail(
+            owner,
+            index,
+            layout,
+            row_count,
+            shared_pool.allocated_tail_start,
+        )?;
         let views = self.import_view_slots(owner, layout, row_count)?;
         let shared_pool = owner.buffer_from_payload(shared_pool.offset, shared_pool.len)?;
         Ok(BinaryViewArray::try_new(views, vec![shared_pool], nulls)?)
@@ -472,9 +481,7 @@ impl PageAllocationOwner {
 
     fn payload(&self) -> &[u8] {
         let _keep_page_alive = &self.page;
-        unsafe {
-            slice::from_raw_parts(self.payload_addr as *const u8, self.payload_len)
-        }
+        unsafe { slice::from_raw_parts(self.payload_addr as *const u8, self.payload_len) }
     }
 
     fn payload_end(&self, offset: usize, len: usize) -> Result<usize, ImportError> {

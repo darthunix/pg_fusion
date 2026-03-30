@@ -3,10 +3,11 @@
 use crate::bitmap::bitmap_bytes;
 use crate::constants::{BUFFER_ALIGNMENT, UUID_WIDTH_BYTES};
 use crate::internals::{align_up_u32, aligned_mul, checked_u32};
+use crate::raw::ColumnDesc;
 use crate::LayoutError;
 use arrow_schema::DataType;
 
-/// Raw block-level flags stored in [`crate::BlockHeader::flags`].
+/// Raw block-level flags stored in [`crate::raw::BlockHeader::flags`].
 ///
 /// No block flags are defined in v1; the type exists to keep the on-page
 /// representation explicit and extensible.
@@ -28,7 +29,7 @@ impl BlockFlags {
     }
 }
 
-/// Raw per-column flags stored in [`crate::ColumnDesc::flags`].
+/// Raw per-column flags stored in [`crate::raw::ColumnDesc::flags`].
 ///
 /// These bits describe nullability and whether the column uses the `ByteView`
 /// representation backed by the shared tail pool.
@@ -83,7 +84,7 @@ impl std::ops::BitOrAssign for ColumnFlags {
     }
 }
 
-/// Stable on-page type tag stored in [`crate::ColumnDesc::type_tag`].
+/// Stable on-page type tag stored in [`crate::raw::ColumnDesc::type_tag`].
 ///
 /// This is the layout-level type surface accepted by v1 of the raw page
 /// format. It is intentionally narrower than Arrow's full type system.
@@ -246,7 +247,7 @@ impl ColumnSpec {
 /// Computed front-region layout for one column.
 ///
 /// This is not written to the page directly. It is the planner-side view used
-/// to derive the corresponding [`crate::ColumnDesc`] and to reason about
+/// to derive the corresponding [`crate::raw::ColumnDesc`] and to reason about
 /// reserved front-region lengths.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct ColumnLayout {
@@ -266,8 +267,8 @@ pub struct ColumnLayout {
 
 impl ColumnLayout {
     /// Converts the planned layout into its raw on-page descriptor form.
-    pub const fn desc(self) -> crate::ColumnDesc {
-        crate::ColumnDesc {
+    pub const fn desc(self) -> ColumnDesc {
+        ColumnDesc {
             type_tag: self.type_tag.to_raw(),
             flags: self.flags.bits(),
             validity_off: self.validity_off,

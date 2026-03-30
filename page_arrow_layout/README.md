@@ -16,9 +16,25 @@ The crate provides:
 - block initialization and validation helpers
 - `ByteView` inline / out-of-line constructors and parsers
 
-The public API is re-exported from the crate root. Internally the code is split
-into smaller modules (`constants`, `types`, `plan`, `raw`, `access`,
-`validate`), but consumers normally use `page_arrow_layout::*`.
+The public API is intentionally split into:
+
+- primary root-level API for normal producers/consumers
+- namespaced low-level modules for advanced or test-only use
+
+Most callers should stay on the root API:
+
+- `LayoutPlan`
+- `init_block`
+- `BlockMut`
+- `BlockRef`
+- `ByteView`
+
+Advanced escape hatches remain available under:
+
+- `page_arrow_layout::raw`
+- `page_arrow_layout::validate`
+- `page_arrow_layout::constants`
+- `page_arrow_layout::bitmap`
 
 The format is a front-and-tail page layout:
 
@@ -100,12 +116,12 @@ assert_eq!(block.row_count(), 0);
 
 ### Write rows directly into the block
 
-`BlockMut` is the low-level producer-side API. Fixed-width values are written
-into the reserved front region. Long `Utf8View` / `BinaryView` payloads are
-allocated from the shared tail arena and then referenced by a `ByteView`.
+`BlockMut` is the producer-side API. Fixed-width values are written into the
+reserved front region. Long `Utf8View` / `BinaryView` payloads are allocated
+from the shared tail arena automatically by `write_view_bytes`.
 
 ```rust
-use page_arrow_layout::{init_block, bitmap_set, BlockMut, ByteView, LayoutPlan};
+use page_arrow_layout::{init_block, BlockMut, LayoutPlan, ViewWriteStatus};
 
 # use arrow_schema::{DataType, Field, Schema};
 # let schema = Schema::new(vec![Field::new("flag", DataType::Boolean, true), Field::new("name", DataType::Utf8View, true)]);
@@ -115,19 +131,12 @@ use page_arrow_layout::{init_block, bitmap_set, BlockMut, ByteView, LayoutPlan};
 let mut block = BlockMut::open(&mut block_bytes)?;
 
 // Row 0, column 0: nullable boolean = true
-block.set_validity(0, 0, true)?;
-let values = block.values_bytes_mut(0)?;
-bitmap_set(values, 0, true);
+block.write_bool(0, 0, true)?;
 
 // Row 0, column 1: long Utf8View stored in the shared tail arena
 let value = b"this string does not fit inline";
-block.set_validity(1, 0, true)?;
-let start = block.tail_alloc(value.len() as u32)?.expect("tail capacity");
-block.tail_bytes_mut(start, value.len() as u32)?.copy_from_slice(value);
-let view = ByteView::new_outline(value, start - block.pool_base())?;
-block.write_view(1, 0, view)?;
-
-block.set_row_count(1)?;
+assert_eq!(block.write_view_bytes(1, 0, value)?, ViewWriteStatus::Written);
+block.commit_current_row()?;
 block.validate()?;
 # Ok::<(), page_arrow_layout::LayoutError>(())
 ```
@@ -143,8 +152,6 @@ use page_arrow_layout::{init_block, BlockRef, LayoutPlan};
 # let mut block_bytes = vec![0u8; 512];
 # init_block(&mut block_bytes, &plan)?;
 let block = BlockRef::open(&block_bytes)?;
-let header = block.header();
-let first_desc = block.desc(0)?;
 let first_layout = block.column_layout(0)?;
 
 if first_layout.flags.is_nullable() {
@@ -162,6 +169,34 @@ if first_layout.type_tag.is_view() && block.row_count() > 0 {
 At this layer there is intentionally no Arrow array construction. Consumers
 such as `page_arrow` use `BlockRef` to validate and slice page-backed buffers
 without copying.
+
+### Advanced raw access
+
+If you need to inspect or mutate raw descriptors directly, use the namespaced
+modules instead of relying on root-level re-exports:
+
+```rust
+use page_arrow_layout::raw::{BlockHeader, ColumnDesc};
+use page_arrow_layout::validate::validate_block;
+
+# let header = BlockHeader {
+#     magic: page_arrow_layout::constants::BLOCK_MAGIC,
+#     version: page_arrow_layout::constants::BLOCK_VERSION,
+#     flags: 0,
+#     block_size: 128,
+#     max_rows: 0,
+#     row_count: 0,
+#     col_count: 0,
+#     reserved0: 0,
+#     front_base: 44,
+#     pool_base: 44,
+#     tail_cursor: 128,
+#     reserved1: 0,
+# };
+# let descs: [ColumnDesc; 0] = [];
+validate_block(&header, &descs)?;
+# Ok::<(), page_arrow_layout::LayoutError>(())
+```
 
 ## View Types
 

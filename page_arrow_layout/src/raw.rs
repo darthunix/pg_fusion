@@ -1,4 +1,7 @@
-//! Raw `#[repr(C)]` structs stored directly in the page.
+//! Advanced raw `#[repr(C)]` structs stored directly in the page.
+//!
+//! Most callers should use [`crate::LayoutPlan`], [`crate::BlockRef`], and
+//! [`crate::BlockMut`] instead of manipulating these structs directly.
 
 use crate::constants::{SHARED_VIEW_BUFFER_INDEX, VIEW_INLINE_LEN, VIEW_PREFIX_LEN};
 use crate::{BlockFlags, ColumnFlags, LayoutError, TypeTag};
@@ -16,9 +19,9 @@ use crate::{BlockFlags, ColumnFlags, LayoutError, TypeTag};
 #[repr(C)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct BlockHeader {
-    /// Format magic. Must be [`BLOCK_MAGIC`].
+    /// Format magic. Must be [`crate::constants::BLOCK_MAGIC`].
     pub magic: u32,
-    /// Format version. Must be [`BLOCK_VERSION`].
+    /// Format version. Must be [`crate::constants::BLOCK_VERSION`].
     pub version: u16,
     /// Raw block flags interpreted as [`BlockFlags`].
     pub flags: u16,

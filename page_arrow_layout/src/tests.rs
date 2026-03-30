@@ -1,5 +1,9 @@
 use super::*;
 use arrow_schema::{DataType, Field, Schema};
+use crate::constants::{
+    BUFFER_ALIGNMENT, BUFFER_ALIGNMENT_BIAS, SHARED_VIEW_BUFFER_INDEX,
+};
+use crate::raw::{BlockHeader, ColumnDesc};
 use std::mem::{align_of, size_of};
 
 #[test]
