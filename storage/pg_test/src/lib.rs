@@ -4,6 +4,11 @@ use pgrx::pg_schema;
 ::pgrx::pg_module_magic!();
 
 #[cfg(any(test, feature = "pg_test"))]
+mod page_arrow_pipeline;
+#[cfg(any(test, feature = "pg_test"))]
+mod slot_deform_bench;
+
+#[cfg(any(test, feature = "pg_test"))]
 #[pg_schema]
 mod tests {
     use anyhow::Result as AnyResult;
@@ -181,6 +186,79 @@ mod tests {
             }
         }
         out
+    }
+
+    #[pg_extern]
+    fn slot_deform_vs_page_encode_bench(
+        profile: default!(String, "'mixed'"),
+        rows: default!(i32, "100000"),
+        iterations: default!(i32, "3"),
+        rows_per_page: default!(i32, "64"),
+        payload_capacity_bytes: default!(i32, "8172"),
+    ) -> pgrx::JsonB {
+        super::slot_deform_bench::slot_deform_vs_page_encode_bench(
+            profile,
+            rows,
+            iterations,
+            rows_per_page,
+            payload_capacity_bytes,
+        )
+    }
+
+    #[pg_extern]
+    fn slot_deform_bench_prepare(
+        profile: default!(String, "'mixed'"),
+        rows: default!(i32, "100000"),
+    ) -> pgrx::JsonB {
+        super::slot_deform_bench::slot_deform_bench_prepare(profile, rows)
+    }
+
+    #[pg_extern]
+    fn slot_deform_baseline_bench(
+        profile: default!(String, "'mixed'"),
+        iterations: default!(i32, "3"),
+    ) -> pgrx::JsonB {
+        super::slot_deform_bench::slot_deform_baseline_bench(profile, iterations)
+    }
+
+    #[pg_extern]
+    fn slot_deform_arrow_bench(
+        profile: default!(String, "'mixed'"),
+        iterations: default!(i32, "3"),
+        rows_per_page: default!(i32, "64"),
+        payload_capacity_bytes: default!(i32, "8172"),
+    ) -> pgrx::JsonB {
+        super::slot_deform_bench::slot_deform_arrow_bench(
+            profile,
+            iterations,
+            rows_per_page,
+            payload_capacity_bytes,
+        )
+    }
+
+    #[pg_test]
+    fn page_arrow_pipeline_roundtrip_inside_postgres() {
+        super::page_arrow_pipeline::page_arrow_pipeline_roundtrip_inside_postgres();
+    }
+
+    #[pg_test]
+    fn slot_deform_vs_page_encode_bench_fixed_smoke() {
+        super::slot_deform_bench::slot_deform_vs_page_encode_bench_fixed_smoke();
+    }
+
+    #[pg_test]
+    fn slot_deform_vs_page_encode_bench_mixed_smoke() {
+        super::slot_deform_bench::slot_deform_vs_page_encode_bench_mixed_smoke();
+    }
+
+    #[pg_test]
+    fn slot_deform_vs_page_encode_bench_large_page_smoke() {
+        super::slot_deform_bench::slot_deform_vs_page_encode_bench_large_page_smoke();
+    }
+
+    #[pg_test]
+    fn slot_deform_split_bench_smoke() {
+        super::slot_deform_bench::slot_deform_split_bench_smoke();
     }
 
     #[pg_test]

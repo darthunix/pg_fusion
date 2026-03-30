@@ -76,6 +76,9 @@ cargo build -p pg_fusion
 cargo pgrx test pg17 -p pg_test
 ```
 
+For the Postgres-side page pipeline benchmark under `pg_test`, see
+[`storage/pg_test/README.md`](storage/pg_test/README.md).
+
 ## Developer guidelines
 
 - Rust 2021; keep changes small and focused; surface structured errors (no panics in extension paths).

@@ -21,6 +21,14 @@ pgrx = { workspace = true }
 storage = { path = "..", version = "25.0" }
 datafusion-common = { workspace = true }
 protocol = { path = "../../protocol", version = "25.0" }
+page_pool = { path = "../../page_pool", version = "25.0" }
+page_transfer = { path = "../../page_transfer", version = "25.0" }
+page_arrow_layout = { path = "../../page_arrow_layout", version = "25.0" }
+page_arrow = { path = "../../page_arrow", version = "25.0" }
+pg_slot_arrow = { path = "../../pg_slot_arrow", version = "25.0" }
+arrow-array = { workspace = true }
+arrow-schema = { workspace = true }
+serde_json = "1.0"
 
 [dev-dependencies]
 pgrx-tests = { workspace = true }
