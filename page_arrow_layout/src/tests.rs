@@ -33,7 +33,10 @@ fn plans_mixed_fixed_and_view_schema() {
     assert_eq!(plan.pool_base() % BUFFER_ALIGNMENT, BUFFER_ALIGNMENT_BIAS);
 
     for column in plan.columns() {
-        assert_eq!(column.validity_off % BUFFER_ALIGNMENT, BUFFER_ALIGNMENT_BIAS);
+        assert_eq!(
+            column.validity_off % BUFFER_ALIGNMENT,
+            BUFFER_ALIGNMENT_BIAS
+        );
         assert_eq!(column.values_off % BUFFER_ALIGNMENT, BUFFER_ALIGNMENT_BIAS);
         assert!(column.values_off >= column.validity_off + column.validity_len);
     }
