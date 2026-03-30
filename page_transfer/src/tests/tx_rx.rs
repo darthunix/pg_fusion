@@ -43,6 +43,55 @@ fn writer_appends_unknown_length_and_finish_sets_header() {
 }
 
 #[test]
+fn payload_mut_and_explicit_length_finish_set_header() {
+    let (_region, pool) = init_pool(cfg(64, 1));
+    let tx = PageTx::new(pool);
+    let rx = PageRx::new(pool);
+
+    let mut writer = tx.begin(TEST_KIND, TEST_FLAGS).expect("begin writer");
+    writer.payload_mut()[..11].copy_from_slice(b"hello world");
+
+    let outbound = writer
+        .finish_with_payload_len(11)
+        .expect("finish explicit length");
+    let descriptor = outbound.descriptor();
+    let bytes = unsafe { pool.page_bytes(descriptor) }.expect("page bytes");
+    let header = decode_page_header(&bytes[..PAGE_HEADER_LEN]).expect("decode page header");
+    assert_eq!(header.kind, TEST_KIND);
+    assert_eq!(header.flags, TEST_FLAGS);
+    assert_eq!(header.payload_len, 11);
+    assert_eq!(
+        &bytes[PAGE_HEADER_LEN..PAGE_HEADER_LEN + 11],
+        b"hello world"
+    );
+
+    let frame = outbound.frame();
+    outbound.mark_sent();
+    match rx.accept(frame).expect("accept frame") {
+        ReceiveEvent::Page(page) => {
+            assert_eq!(page.payload(), b"hello world");
+            page.release().expect("release page");
+        }
+        ReceiveEvent::Closed => panic!("expected page"),
+    }
+}
+
+#[test]
+fn explicit_length_finish_rejects_payloads_beyond_capacity() {
+    let (_region, pool) = init_pool(cfg(64, 1));
+    let tx = PageTx::new(pool);
+    let payload_cap = 64 - PAGE_HEADER_LEN;
+
+    let writer = tx.begin(TEST_KIND, TEST_FLAGS).expect("begin writer");
+    assert!(matches!(
+        writer.finish_with_payload_len(payload_cap + 1),
+        Err(TxError::PayloadExceedsCapacity { actual, capacity })
+            if actual == payload_cap + 1 && capacity == payload_cap
+    ));
+    assert_eq!(pool.snapshot().free_pages, 1);
+}
+
+#[test]
 fn writer_drop_rolls_back_and_write_all_errors_when_full() {
     let (_region, pool) = init_pool(cfg(64, 1));
     let tx = PageTx::new(pool);

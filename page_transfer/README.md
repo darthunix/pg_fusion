@@ -27,6 +27,13 @@ PageTx::begin -> PageWriter::write -> PageWriter::finish -> OutboundPage
 OutboundPage::frame -> encode/send -> OutboundPage::mark_sent
 ```
 
+Structured producer flow:
+
+```text
+PageTx::begin -> PageWriter::payload_mut -> producer fills bytes
+-> PageWriter::finish_with_payload_len -> OutboundPage
+```
+
 Receiver flow:
 
 ```text
@@ -40,6 +47,7 @@ Important behavior:
 - One `PageRx` serializes `accept()` calls, but a live `ReceivedPage` does not block later accepts.
 - Dropping `OutboundPage` before `mark_sent()` rolls the page back locally.
 - If a detached page is accepted but its in-page header is malformed, an internal RAII guard releases it automatically so malformed input does not leak pool capacity.
+- `Write` is a convenience API; direct payload-slice access is the low-level producer primitive.
 
 ## Wire and page format
 
@@ -83,8 +91,8 @@ let tx = PageTx::new(pool);
 let rx = PageRx::new(pool);
 
 let mut writer = tx.begin(1, 0).unwrap();
-writer.write_all(b"hello").unwrap();
-let outbound = writer.finish().unwrap();
+writer.payload_mut()[..5].copy_from_slice(b"hello");
+let outbound = writer.finish_with_payload_len(5).unwrap();
 let frame = encode_frame(outbound.frame()).unwrap();
 outbound.mark_sent();
 
