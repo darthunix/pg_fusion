@@ -462,7 +462,7 @@ fn append_row_reports_full_without_committing_the_overflowing_row() {
         encoder.append_row(&mut small).expect("small"),
         AppendStatus::Appended
     );
-    let tail_after_small = encoder.block.tail_cursor();
+    let tail_after_small = encoder.tail_cursor();
     assert_eq!(
         encoder.append_row(&mut huge).expect("huge"),
         AppendStatus::Full
