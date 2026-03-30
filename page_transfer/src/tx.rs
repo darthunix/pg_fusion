@@ -205,6 +205,22 @@ pub struct PageWriter {
 }
 
 impl PageWriter {
+    /// Return the full writable payload region after the in-page header.
+    ///
+    /// Structured producers can fill this slice directly and later call
+    /// [`PageWriter::finish_with_payload_len`] with the number of bytes they
+    /// populated.
+    pub fn payload_mut(&mut self) -> &mut [u8] {
+        let len = self.payload_capacity();
+        let start = PAGE_HEADER_LEN;
+        let end = start + len;
+        &mut self
+            .lease
+            .as_mut()
+            .expect("page writer must hold a lease while active")
+            .bytes_mut()[start..end]
+    }
+
     /// Return how many payload bytes still fit into this page.
     pub fn remaining(&self) -> usize {
         self.payload_capacity().saturating_sub(self.position)
@@ -229,13 +245,29 @@ impl PageWriter {
 
     /// Finalize the in-page header, detach the page, and return an outbound
     /// control object ready for transport encoding.
-    pub fn finish(mut self) -> Result<OutboundPage, TxError> {
+    pub fn finish(self) -> Result<OutboundPage, TxError> {
+        let payload_len = self.position;
+        self.finish_with_payload_len(payload_len)
+    }
+
+    /// Finalize the in-page header using an explicit payload length.
+    ///
+    /// This is the low-level path for producers that write directly into the
+    /// payload slice returned by [`PageWriter::payload_mut`].
+    pub fn finish_with_payload_len(mut self, payload_len: usize) -> Result<OutboundPage, TxError> {
+        let payload_capacity = self.payload_capacity();
+        if payload_len > payload_capacity {
+            return Err(TxError::PayloadExceedsCapacity {
+                actual: payload_len,
+                capacity: payload_capacity,
+            });
+        }
         let mut lease = self
             .lease
             .take()
             .expect("page writer must hold a lease until finish");
-        let payload_len = u32::try_from(self.position).map_err(|_| TxError::PayloadTooLarge {
-            actual: self.position,
+        let payload_len = u32::try_from(payload_len).map_err(|_| TxError::PayloadTooLarge {
+            actual: payload_len,
             max: MAX_PAYLOAD_LEN,
         })?;
         let header = PageHeader {

@@ -17,8 +17,10 @@
 //! - there are no acks, retries, or credits
 //!
 //! Page messages reserve a fixed-size RMP header at the front of the page, then
-//! append payload bytes through [`std::io::Write`]. The payload length is
-//! encoded into the in-page header only when [`PageWriter::finish`] is called.
+//! either append payload bytes through [`std::io::Write`] or fill the payload
+//! slice returned by [`PageWriter::payload_mut`]. The payload length is encoded
+//! into the in-page header only when [`PageWriter::finish`] or
+//! [`PageWriter::finish_with_payload_len`] is called.
 //!
 //! The crate remains runtime-agnostic:
 //!
@@ -30,8 +32,10 @@
 //! Typical send/receive flow:
 //!
 //! 1. Create a [`PageWriter`] with [`PageTx::begin`].
-//! 2. Append bytes into the page through [`std::io::Write`].
-//! 3. Turn the page into an [`OutboundPage`] with [`PageWriter::finish`].
+//! 2. Append bytes into the page through [`std::io::Write`] or write directly
+//!    into [`PageWriter::payload_mut`].
+//! 3. Turn the page into an [`OutboundPage`] with [`PageWriter::finish`] or
+//!    [`PageWriter::finish_with_payload_len`].
 //! 4. Encode the control frame with [`encode_frame`] or feed bytes through
 //!    [`FrameDecoder`].
 //! 5. Accept the frame on the other side with [`PageRx::accept`].

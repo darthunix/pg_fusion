@@ -39,6 +39,7 @@ pub enum TxError {
     PageTooSmall { required: usize, actual: usize },
     PayloadCapacityTooLarge { capacity: usize, max: usize },
     PayloadTooLarge { actual: usize, max: usize },
+    PayloadExceedsCapacity { actual: usize, capacity: usize },
     Acquire(AcquireError),
     Detach(DetachError),
     Encode(EncodeError),
@@ -194,6 +195,12 @@ impl fmt::Display for TxError {
                 write!(
                     f,
                     "page payload length {actual} exceeds maximum encodable payload length {max}"
+                )
+            }
+            Self::PayloadExceedsCapacity { actual, capacity } => {
+                write!(
+                    f,
+                    "page payload length {actual} exceeds page payload capacity {capacity}"
                 )
             }
             Self::Acquire(err) => write!(f, "failed to acquire page: {err}"),
