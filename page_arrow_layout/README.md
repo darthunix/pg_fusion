@@ -1,13 +1,20 @@
 # page_arrow_layout
 
-`page_arrow_layout` defines the shared binary layout for the next zero-copy Arrow page format.
+`page_arrow_layout` defines the shared binary layout for the zero-copy Arrow page format used by `pg_slot_arrow` and `page_arrow`.
 
 It is intentionally narrow:
 
-- layout contract only
-- no page mutation logic
+- shared raw layout contract
 - no Arrow array construction
 - no dependency on `page_transfer`, `page_arrow`, `pg_slot_arrow`, or DataFusion
+
+The crate provides:
+
+- stable `#[repr(C)]` raw structs and constants
+- Arrow-schema-to-layout planning helpers
+- zero-allocation block access via `BlockRef` / `BlockMut`
+- block initialization and validation helpers
+- `ByteView` inline / out-of-line constructors and parsers
 
 The format is a front-and-tail page layout:
 
@@ -45,6 +52,7 @@ Important directional detail:
 - the front region occupies lower offsets and is fully reserved during planning
 - fixed-width columns and view-slot buffers do not "grow" during append; appends only fill the next row index inside already-reserved regions
 - only `tail_cursor` moves at append time, and it moves toward smaller offsets
+- front-region offsets use a fixed `BUFFER_ALIGNMENT_BIAS = 12`, so when the block lives inside a `page_transfer` payload with its current 20-byte in-page header, 8-byte and 16-byte Arrow buffers are still physically aligned for zero-copy import
 
 V1 surface:
 
@@ -57,13 +65,6 @@ V1 surface:
 - `uuid`
 - `Utf8View`
 - `BinaryView`
-
-The crate provides:
-
-- stable `#[repr(C)]` raw structs and constants
-- Arrow-schema-to-layout planning helpers
-- layout validation helpers
-- `ByteView` inline / out-of-line constructors and parsers
 
 ## View Types
 

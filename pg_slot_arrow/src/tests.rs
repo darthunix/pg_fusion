@@ -271,7 +271,7 @@ fn name_data(value: &str) -> Box<pg_sys::NameData> {
 fn init_payload(specs: &[ColumnSpec], max_rows: u32, block_size: usize) -> Vec<u8> {
     let plan = LayoutPlan::new(specs, max_rows, block_size as u32).expect("layout plan");
     let mut payload = vec![0u8; block_size];
-    init_block(&mut payload, &plan, 7).expect("init block");
+    init_block(&mut payload, &plan).expect("init block");
     payload
 }
 

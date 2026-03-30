@@ -10,7 +10,7 @@ fn repr_c_sizes_are_stable() {
     assert_eq!(size_of::<ColumnDesc>(), 20);
     assert_eq!(align_of::<ColumnDesc>(), 4);
 
-    assert_eq!(size_of::<BlockHeader>(), 44);
+    assert_eq!(size_of::<BlockHeader>(), 40);
     assert_eq!(align_of::<BlockHeader>(), 4);
 }
 
@@ -27,14 +27,14 @@ fn plans_mixed_fixed_and_view_schema() {
     let plan = LayoutPlan::from_arrow_schema(&schema, 64, 4096).expect("plan");
     assert_eq!(plan.max_rows(), 64);
     assert_eq!(plan.columns().len(), 5);
-    assert_eq!(plan.front_base(), 144);
+    assert_eq!(plan.front_base(), 140);
     assert!(plan.pool_base() > plan.front_base());
-    assert_eq!(plan.front_base() % BUFFER_ALIGNMENT, 0);
-    assert_eq!(plan.pool_base() % BUFFER_ALIGNMENT, 0);
+    assert_eq!(plan.front_base() % BUFFER_ALIGNMENT, BUFFER_ALIGNMENT_BIAS);
+    assert_eq!(plan.pool_base() % BUFFER_ALIGNMENT, BUFFER_ALIGNMENT_BIAS);
 
     for column in plan.columns() {
-        assert_eq!(column.validity_off % BUFFER_ALIGNMENT, 0);
-        assert_eq!(column.values_off % BUFFER_ALIGNMENT, 0);
+        assert_eq!(column.validity_off % BUFFER_ALIGNMENT, BUFFER_ALIGNMENT_BIAS);
+        assert_eq!(column.values_off % BUFFER_ALIGNMENT, BUFFER_ALIGNMENT_BIAS);
         assert!(column.values_off >= column.validity_off + column.validity_len);
     }
 }
@@ -103,7 +103,7 @@ fn validates_header_and_column_descs() {
         Field::new("txt", DataType::Utf8View, true),
     ]);
     let plan = LayoutPlan::from_arrow_schema(&schema, 32, 2048).expect("plan");
-    let header = plan.block_header(17);
+    let header = plan.block_header();
     let descs: Vec<_> = plan.column_descs().collect();
 
     let validated = LayoutPlan::validate(&header, &descs).expect("validate");
@@ -121,7 +121,7 @@ fn detects_inconsistent_view_flag() {
         1024,
     )
     .expect("plan");
-    let header = plan.block_header(0);
+    let header = plan.block_header();
     let mut descs: Vec<_> = plan.column_descs().collect();
     descs[0].flags |= ColumnFlags::VIEW.bits();
 
