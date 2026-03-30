@@ -2,7 +2,7 @@ use super::{
     set_test_database_encoding, AppendStatus, ConfigError, EncodeError, PageBatchEncoder,
     RowDatumAccess,
 };
-use page_arrow_layout::{init_block, BlockRef, ColumnSpec, LayoutPlan, TypeTag, UUID_WIDTH_BYTES};
+use page_arrow_layout::{init_block, BlockRef, ColumnSpec, LayoutPlan, TypeTag};
 use pgrx_pg_sys as pg_sys;
 use std::alloc::{alloc_zeroed, dealloc, GlobalAlloc, Layout, System};
 use std::cell::Cell;
@@ -276,28 +276,23 @@ fn init_payload(specs: &[ColumnSpec], max_rows: u32, block_size: usize) -> Vec<u
 }
 
 fn bool_at(block: &BlockRef<'_>, col: usize, row: u32) -> bool {
-    let values = block.values_bytes(col).expect("values");
-    page_arrow_layout::bitmap_get(values, row)
+    block.bool_value(col, row).expect("bool value")
 }
 
 fn i32_at(block: &BlockRef<'_>, col: usize, row: u32) -> i32 {
-    let values = block.values_bytes(col).expect("values");
-    let start = (row as usize) * 4;
-    i32::from_le_bytes(values[start..start + 4].try_into().expect("i32 bytes"))
+    let bytes = block.fixed_value(col, row).expect("fixed value");
+    i32::from_le_bytes(bytes.try_into().expect("i32 bytes"))
 }
 
 fn f64_at(block: &BlockRef<'_>, col: usize, row: u32) -> f64 {
-    let values = block.values_bytes(col).expect("values");
-    let start = (row as usize) * 8;
-    f64::from_bits(u64::from_le_bytes(
-        values[start..start + 8].try_into().expect("f64 bytes"),
-    ))
+    let bytes = block.fixed_value(col, row).expect("fixed value");
+    f64::from_bits(u64::from_le_bytes(bytes.try_into().expect("f64 bytes")))
 }
 
 fn uuid_at(block: &BlockRef<'_>, col: usize, row: u32) -> [u8; 16] {
-    let values = block.values_bytes(col).expect("values");
-    let start = (row as usize) * UUID_WIDTH_BYTES as usize;
-    values[start..start + UUID_WIDTH_BYTES as usize]
+    block
+        .fixed_value(col, row)
+        .expect("fixed value")
         .try_into()
         .expect("uuid bytes")
 }
@@ -442,7 +437,7 @@ fn encodes_rows_directly_into_page_arrow_layout_block() {
     assert_eq!(uuid_at(&block, 5, 2), [2; 16]);
     assert_eq!(view_bytes(&block, 6, 0).as_deref(), Some(&b"first"[..]));
     assert_eq!(view_bytes(&block, 6, 2).as_deref(), Some(&b"second"[..]));
-    assert_eq!(block.desc(0).expect("desc").null_count, 1);
+    assert_eq!(block.null_count(0).expect("null count"), 1);
 }
 
 #[test]

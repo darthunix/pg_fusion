@@ -4,7 +4,8 @@ use crate::constants::{BLOCK_MAGIC, BLOCK_VERSION, BUFFER_ALIGNMENT, BUFFER_ALIG
 use crate::internals::{
     align_up_u32_with_bias, checked_u32, column_layout_from_desc, desc_offset, read_struct,
 };
-use crate::{BlockHeader, ColumnDesc, LayoutError};
+use crate::raw::{BlockHeader, ColumnDesc};
+use crate::LayoutError;
 use std::mem::size_of;
 
 /// Validates the full block contract without allocating.
@@ -16,8 +17,9 @@ pub fn validate_block(header: &BlockHeader, descs: &[ColumnDesc]) -> Result<(), 
 /// Validates the global header invariants for a block instance.
 ///
 /// This checks the fixed block metadata only. It does not validate that the
-/// provided [`ColumnDesc`] values match a planned schema; use
-/// [`crate::LayoutPlan::validate`] for full reconstruction and validation.
+/// provided [`ColumnDesc`] values match each other or a caller-side schema; use
+/// [`crate::validate::validate_block`] or [`crate::BlockRef::open`] for full
+/// block validation.
 pub fn validate_header(header: &BlockHeader, desc_count: usize) -> Result<(), LayoutError> {
     if header.magic != BLOCK_MAGIC {
         return Err(LayoutError::InvalidMagic {

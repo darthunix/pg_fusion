@@ -12,9 +12,8 @@ mod tests;
 
 use error::oid_u32;
 pub use error::{ConfigError, EncodeError};
-use page_arrow_layout::{
-    bitmap_set, BlockMut, ByteView, TypeTag, UUID_WIDTH_BYTES, VIEW_INLINE_LEN,
-};
+use page_arrow_layout::constants::UUID_WIDTH_BYTES;
+use page_arrow_layout::{BlockMut, TypeTag, ViewWriteStatus};
 use pgrx_pg_sys as pg_sys;
 use std::ptr;
 use std::slice;
@@ -116,22 +115,17 @@ impl<'payload> PageBatchEncoder<'payload> {
             match result {
                 Ok(CellWrite::Written) => {}
                 Ok(CellWrite::Full) => {
-                    self.block.set_tail_cursor(tail_before)?;
+                    self.block.rollback_tail(tail_before)?;
                     return Ok(AppendStatus::Full);
                 }
                 Err(error) => {
-                    self.block.set_tail_cursor(tail_before)?;
+                    self.block.rollback_tail(tail_before)?;
                     return Err(error);
                 }
             }
         }
 
-        for col_idx in 0..self.block.column_count() {
-            if !self.block.validity(col_idx, row_idx)? {
-                self.block.increment_null_count(col_idx)?;
-            }
-        }
-        self.block.set_row_count(row_idx + 1)?;
+        self.block.commit_current_row()?;
         Ok(AppendStatus::Appended)
     }
 
@@ -165,16 +159,14 @@ impl<'payload> PageBatchEncoder<'payload> {
             if !layout.flags.is_nullable() {
                 return Err(EncodeError::NullInNonNullableColumn { index });
             }
-            self.write_null(index, row_idx, layout.type_tag)?;
+            self.block.write_null(index, row_idx)?;
             return Ok(CellWrite::Written);
         }
 
         match layout.type_tag {
             TypeTag::Boolean => {
                 let value = unsafe { read_bool(datum, self.attr(index)?.attbyval) };
-                self.block.set_validity(index, row_idx, true)?;
-                let values = self.block.values_bytes_mut(index)?;
-                bitmap_set(values, row_idx, value);
+                self.block.write_bool(index, row_idx, value)?;
                 Ok(CellWrite::Written)
             }
             TypeTag::Int16 => {
@@ -218,57 +210,13 @@ impl<'payload> PageBatchEncoder<'payload> {
         }
     }
 
-    fn write_null(
-        &mut self,
-        index: usize,
-        row_idx: u32,
-        type_tag: TypeTag,
-    ) -> Result<(), EncodeError> {
-        self.block.set_validity(index, row_idx, false)?;
-        match type_tag {
-            TypeTag::Boolean => {
-                let values = self.block.values_bytes_mut(index)?;
-                bitmap_set(values, row_idx, false);
-            }
-            TypeTag::Int16 => self.zero_value_slot(index, row_idx, 2)?,
-            TypeTag::Int32 | TypeTag::Float32 => self.zero_value_slot(index, row_idx, 4)?,
-            TypeTag::Int64 | TypeTag::Float64 => self.zero_value_slot(index, row_idx, 8)?,
-            TypeTag::Uuid | TypeTag::Utf8View | TypeTag::BinaryView => {
-                self.zero_value_slot(index, row_idx, 16)?
-            }
-        }
-        Ok(())
-    }
-
     fn write_fixed(
         &mut self,
         index: usize,
         row_idx: u32,
         bytes: &[u8],
     ) -> Result<CellWrite, EncodeError> {
-        self.block.set_validity(index, row_idx, true)?;
-        let layout = self.block.column_layout(index)?;
-        let row_width = layout
-            .type_tag
-            .values_row_width()
-            .ok_or(EncodeError::UnsupportedRowAccess { index })?;
-        if bytes.len()
-            != usize::try_from(row_width)
-                .map_err(|_| page_arrow_layout::LayoutError::SizeOverflow)?
-        {
-            return Err(EncodeError::UnsupportedRowAccess { index });
-        }
-        let start = usize::try_from(
-            row_idx
-                .checked_mul(row_width)
-                .ok_or(page_arrow_layout::LayoutError::SizeOverflow)?,
-        )
-        .map_err(|_| page_arrow_layout::LayoutError::SizeOverflow)?;
-        let end = start
-            .checked_add(bytes.len())
-            .ok_or(page_arrow_layout::LayoutError::SizeOverflow)?;
-        let values = self.block.values_bytes_mut(index)?;
-        values[start..end].copy_from_slice(bytes);
+        self.block.write_fixed(index, row_idx, bytes)?;
         Ok(CellWrite::Written)
     }
 
@@ -284,52 +232,10 @@ impl<'payload> PageBatchEncoder<'payload> {
                 len: bytes.len(),
             });
         }
-        self.block.set_validity(index, row_idx, true)?;
-        let view = if bytes.len() <= VIEW_INLINE_LEN {
-            ByteView::new_inline(bytes)?
-        } else {
-            let len = u32::try_from(bytes.len())
-                .map_err(|_| page_arrow_layout::LayoutError::SizeOverflow)?;
-            let Some(start) = self.block.tail_alloc(len)? else {
-                return Ok(CellWrite::Full);
-            };
-            self.block
-                .tail_bytes_mut(start, len)?
-                .copy_from_slice(bytes);
-            ByteView::new_outline(bytes, start - self.block.pool_base())?
-        };
-        self.block.write_view(index, row_idx, view)?;
-        Ok(CellWrite::Written)
-    }
-
-    fn zero_value_slot(
-        &mut self,
-        index: usize,
-        row_idx: u32,
-        row_width: usize,
-    ) -> Result<(), EncodeError> {
-        let layout = self.block.column_layout(index)?;
-        let width = layout
-            .type_tag
-            .values_row_width()
-            .ok_or(EncodeError::UnsupportedRowAccess { index })?;
-        let width =
-            usize::try_from(width).map_err(|_| page_arrow_layout::LayoutError::SizeOverflow)?;
-        debug_assert_eq!(width, row_width);
-        let start = usize::try_from(
-            row_idx
-                .checked_mul(
-                    u32::try_from(row_width)
-                        .map_err(|_| page_arrow_layout::LayoutError::SizeOverflow)?,
-                )
-                .ok_or(page_arrow_layout::LayoutError::SizeOverflow)?,
-        )
-        .map_err(|_| page_arrow_layout::LayoutError::SizeOverflow)?;
-        let end = start
-            .checked_add(row_width)
-            .ok_or(page_arrow_layout::LayoutError::SizeOverflow)?;
-        self.block.values_bytes_mut(index)?[start..end].fill(0);
-        Ok(())
+        match self.block.write_view_bytes(index, row_idx, bytes)? {
+            ViewWriteStatus::Written => Ok(CellWrite::Written),
+            ViewWriteStatus::Full => Ok(CellWrite::Full),
+        }
     }
 
     fn attr(&self, index: usize) -> Result<&pg_sys::FormData_pg_attribute, EncodeError> {

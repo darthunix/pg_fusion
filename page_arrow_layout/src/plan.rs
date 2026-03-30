@@ -1,9 +1,12 @@
 //! Layout planning from logical column specs or Arrow schema.
 
+use crate::bitmap::bitmap_bytes;
 use crate::constants::{BLOCK_MAGIC, BLOCK_VERSION, BUFFER_ALIGNMENT, BUFFER_ALIGNMENT_BIAS};
 use crate::internals::{align_up_u32_with_bias, checked_u32};
+use crate::raw::{BlockHeader, ColumnDesc};
+#[cfg(test)]
 use crate::validate::validate_header;
-use crate::{BlockFlags, BlockHeader, ColumnDesc, ColumnLayout, ColumnSpec, LayoutError, TypeTag};
+use crate::{BlockFlags, ColumnLayout, ColumnSpec, LayoutError, TypeTag};
 use arrow_schema::Schema;
 use std::mem::size_of;
 
@@ -51,7 +54,7 @@ impl LayoutPlan {
         for spec in specs {
             let flags = spec.flags();
             let validity_len =
-                crate::internals::align_up_u32(crate::bitmap_bytes(max_rows), BUFFER_ALIGNMENT)?;
+                crate::internals::align_up_u32(bitmap_bytes(max_rows), BUFFER_ALIGNMENT)?;
             let values_len = spec.type_tag.values_reserved_len(max_rows)?;
 
             let validity_off = cursor;
@@ -106,7 +109,8 @@ impl LayoutPlan {
     }
 
     /// Reconstructs and validates a plan from a raw header plus descriptors.
-    pub fn validate(header: &BlockHeader, descs: &[ColumnDesc]) -> Result<Self, LayoutError> {
+    #[cfg(test)]
+    pub(crate) fn validate(header: &BlockHeader, descs: &[ColumnDesc]) -> Result<Self, LayoutError> {
         validate_header(header, descs.len())?;
         if usize::from(header.col_count) != descs.len() {
             return Err(LayoutError::ColumnCountMismatch {
@@ -158,7 +162,7 @@ impl LayoutPlan {
     }
 
     /// Builds the initial raw block header for this plan.
-    pub fn block_header(&self) -> BlockHeader {
+    pub(crate) fn block_header(&self) -> BlockHeader {
         BlockHeader {
             magic: BLOCK_MAGIC,
             version: BLOCK_VERSION,
@@ -201,12 +205,13 @@ impl LayoutPlan {
     }
 
     /// Returns the planned per-column layouts.
-    pub fn columns(&self) -> &[ColumnLayout] {
+    #[cfg(test)]
+    pub(crate) fn columns(&self) -> &[ColumnLayout] {
         &self.columns
     }
 
     /// Returns the raw column descriptors that should be written to the page.
-    pub fn column_descs(&self) -> impl ExactSizeIterator<Item = ColumnDesc> + '_ {
+    pub(crate) fn column_descs(&self) -> impl ExactSizeIterator<Item = ColumnDesc> + '_ {
         self.columns.iter().copied().map(ColumnLayout::desc)
     }
 }

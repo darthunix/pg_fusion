@@ -5,7 +5,7 @@ use arrow_array::{
     StringViewArray,
 };
 use arrow_schema::{DataType, Field, Schema};
-use page_arrow_layout::{bitmap_set, init_block, BlockMut, BlockRef, ByteView, LayoutPlan};
+use page_arrow_layout::{init_block, BlockMut, BlockRef, ByteView, LayoutPlan, ViewWriteStatus};
 use page_pool::{PagePool, PagePoolConfig, RegionLayout};
 use page_transfer::{encode_frame, FrameDecoder, PageRx, PageTx, ReceiveEvent, ReceivedPage};
 use pg_slot_arrow::{AppendStatus, PageBatchEncoder, RowDatumAccess};
@@ -134,9 +134,7 @@ impl MockCell {
             Self::Null => (pg_sys::Datum::null(), true),
             Self::Bool(value) => (pg_sys::Datum::from(*value), false),
             Self::I32(value) => (pg_sys::Datum::from(*value), false),
-            Self::Binary(value) => {
-                (pg_sys::Datum::from(value.as_mut_ptr()), false)
-            }
+            Self::Binary(value) => (pg_sys::Datum::from(value.as_mut_ptr()), false),
         }
     }
 }
@@ -195,12 +193,32 @@ fn mixed_batch() -> RecordBatch {
     ]));
 
     let columns: Vec<ArrayRef> = vec![
-        Arc::new(BooleanArray::from(vec![Some(true), None, Some(false), Some(true)])),
+        Arc::new(BooleanArray::from(vec![
+            Some(true),
+            None,
+            Some(false),
+            Some(true),
+        ])),
         Arc::new(Int16Array::from(vec![Some(-7), None, Some(9), Some(12)])),
         Arc::new(Int32Array::from(vec![Some(10), None, Some(30), Some(-40)])),
-        Arc::new(Int64Array::from(vec![Some(100), None, Some(300), Some(-400)])),
-        Arc::new(Float32Array::from(vec![Some(1.5), None, Some(-2.25), Some(0.0)])),
-        Arc::new(Float64Array::from(vec![Some(3.5), None, Some(-4.75), Some(8.25)])),
+        Arc::new(Int64Array::from(vec![
+            Some(100),
+            None,
+            Some(300),
+            Some(-400),
+        ])),
+        Arc::new(Float32Array::from(vec![
+            Some(1.5),
+            None,
+            Some(-2.25),
+            Some(0.0),
+        ])),
+        Arc::new(Float64Array::from(vec![
+            Some(3.5),
+            None,
+            Some(-4.75),
+            Some(8.25),
+        ])),
         Arc::new(uuid_array([
             Some([1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16]),
             None,
@@ -250,21 +268,18 @@ fn encode_layout_payload(batch: &RecordBatch, block_size: usize) -> Vec<u8> {
                 let layout = block.column_layout(col).expect("column layout");
                 let array = batch.column(col);
                 if !array.is_valid(row as usize) {
-                    block.set_validity(col, row, false).expect("validity");
-                    block.increment_null_count(col).expect("null count");
+                    block.write_null(col, row).expect("write null");
                     continue;
                 }
 
-                block.set_validity(col, row, true).expect("validity");
                 match layout.type_tag {
                     page_arrow_layout::TypeTag::Boolean => {
-                        let values = block.values_bytes_mut(col).expect("values");
                         let value = array
                             .as_any()
                             .downcast_ref::<BooleanArray>()
                             .expect("bool")
                             .value(row as usize);
-                        bitmap_set(values, row, value);
+                        block.write_bool(col, row, value).expect("write bool");
                     }
                     page_arrow_layout::TypeTag::Int16 => {
                         let value = array
@@ -273,7 +288,7 @@ fn encode_layout_payload(batch: &RecordBatch, block_size: usize) -> Vec<u8> {
                             .expect("i16")
                             .value(row as usize)
                             .to_le_bytes();
-                        write_fixed(&mut block, col, row, &value);
+                        block.write_fixed(col, row, &value).expect("write fixed");
                     }
                     page_arrow_layout::TypeTag::Int32 => {
                         let value = array
@@ -282,7 +297,7 @@ fn encode_layout_payload(batch: &RecordBatch, block_size: usize) -> Vec<u8> {
                             .expect("i32")
                             .value(row as usize)
                             .to_le_bytes();
-                        write_fixed(&mut block, col, row, &value);
+                        block.write_fixed(col, row, &value).expect("write fixed");
                     }
                     page_arrow_layout::TypeTag::Int64 => {
                         let value = array
@@ -291,7 +306,7 @@ fn encode_layout_payload(batch: &RecordBatch, block_size: usize) -> Vec<u8> {
                             .expect("i64")
                             .value(row as usize)
                             .to_le_bytes();
-                        write_fixed(&mut block, col, row, &value);
+                        block.write_fixed(col, row, &value).expect("write fixed");
                     }
                     page_arrow_layout::TypeTag::Float32 => {
                         let value = array
@@ -301,7 +316,7 @@ fn encode_layout_payload(batch: &RecordBatch, block_size: usize) -> Vec<u8> {
                             .value(row as usize)
                             .to_bits()
                             .to_le_bytes();
-                        write_fixed(&mut block, col, row, &value);
+                        block.write_fixed(col, row, &value).expect("write fixed");
                     }
                     page_arrow_layout::TypeTag::Float64 => {
                         let value = array
@@ -311,7 +326,7 @@ fn encode_layout_payload(batch: &RecordBatch, block_size: usize) -> Vec<u8> {
                             .value(row as usize)
                             .to_bits()
                             .to_le_bytes();
-                        write_fixed(&mut block, col, row, &value);
+                        block.write_fixed(col, row, &value).expect("write fixed");
                     }
                     page_arrow_layout::TypeTag::Uuid => {
                         let value = array
@@ -319,7 +334,7 @@ fn encode_layout_payload(batch: &RecordBatch, block_size: usize) -> Vec<u8> {
                             .downcast_ref::<FixedSizeBinaryArray>()
                             .expect("uuid")
                             .value(row as usize);
-                        write_fixed(&mut block, col, row, value);
+                        block.write_fixed(col, row, value).expect("write fixed");
                     }
                     page_arrow_layout::TypeTag::Utf8View => {
                         let value = array
@@ -328,7 +343,10 @@ fn encode_layout_payload(batch: &RecordBatch, block_size: usize) -> Vec<u8> {
                             .expect("utf8 view")
                             .value(row as usize)
                             .as_bytes();
-                        write_view(&mut block, col, row, value);
+                        assert_eq!(
+                            block.write_view_bytes(col, row, value).expect("write view"),
+                            ViewWriteStatus::Written
+                        );
                     }
                     page_arrow_layout::TypeTag::BinaryView => {
                         let value = array
@@ -336,41 +354,19 @@ fn encode_layout_payload(batch: &RecordBatch, block_size: usize) -> Vec<u8> {
                             .downcast_ref::<BinaryViewArray>()
                             .expect("binary view")
                             .value(row as usize);
-                        write_view(&mut block, col, row, value);
+                        assert_eq!(
+                            block.write_view_bytes(col, row, value).expect("write view"),
+                            ViewWriteStatus::Written
+                        );
                     }
                 }
             }
+            block.commit_current_row().expect("commit row");
         }
-        block
-            .set_row_count(u32::try_from(batch.num_rows()).expect("rows"))
-            .expect("row count");
         block.validate().expect("validate block");
     }
 
     payload
-}
-
-fn write_fixed(block: &mut BlockMut<'_>, col: usize, row: u32, value: &[u8]) {
-    let layout = block.column_layout(col).expect("column layout");
-    let row_width = usize::try_from(layout.type_tag.values_row_width().expect("fixed width"))
-        .expect("row width");
-    let start = usize::try_from(row).expect("row") * row_width;
-    block.values_bytes_mut(col).expect("values")[start..start + value.len()].copy_from_slice(value);
-}
-
-fn write_view(block: &mut BlockMut<'_>, col: usize, row: u32, value: &[u8]) {
-    let view = if value.len() <= page_arrow_layout::VIEW_INLINE_LEN {
-        ByteView::new_inline(value).expect("inline view")
-    } else {
-        let len = u32::try_from(value.len()).expect("view len");
-        let start = block.tail_alloc(len).expect("tail alloc").expect("fits");
-        block
-            .tail_bytes_mut(start, len)
-            .expect("tail bytes")
-            .copy_from_slice(value);
-        ByteView::new_outline(value, start - block.pool_base()).expect("outline view")
-    };
-    block.write_view(col, row, view).expect("write view");
 }
 
 #[test]
@@ -471,7 +467,10 @@ fn rejects_nonzero_flags() {
 fn rejects_plain_utf8_schema() {
     let schema = Arc::new(Schema::new(vec![Field::new("txt", DataType::Utf8, true)]));
     let err = ArrowPageDecoder::new(schema).expect_err("unsupported schema");
-    assert!(matches!(err, ConfigError::UnsupportedArrowType { index: 0, .. }));
+    assert!(matches!(
+        err,
+        ConfigError::UnsupportedArrowType { index: 0, .. }
+    ));
 }
 
 #[test]
@@ -512,8 +511,8 @@ fn rejects_invalid_view_buffer_index() {
     let block = BlockRef::open(&payload).expect("block");
     let layout = block.column_layout(7).expect("txt layout");
     let row = 2usize;
-    let slot_off = usize::try_from(layout.values_off).expect("offset")
-        + row * std::mem::size_of::<ByteView>();
+    let slot_off =
+        usize::try_from(layout.values_off).expect("offset") + row * std::mem::size_of::<ByteView>();
     payload[slot_off + 4..slot_off + 8].copy_from_slice(&1i32.to_le_bytes());
 
     let (_region, pool) = init_pool(cfg(8192, 1));
@@ -572,7 +571,11 @@ fn rejects_view_offset_before_allocated_tail() {
             .expect("string views")
             .value(2);
         block
-            .write_view(7, 2, ByteView::new_outline(long_value.as_bytes(), 0).expect("view"))
+            .write_view(
+                7,
+                2,
+                ByteView::new_outline(long_value.as_bytes(), 0).expect("view"),
+            )
             .expect("write view");
         block.validate().expect("validate");
     }
@@ -580,7 +583,9 @@ fn rejects_view_offset_before_allocated_tail() {
     let (_region, pool) = init_pool(cfg(8192, 1));
     let page = send_page(pool, ARROW_LAYOUT_BATCH_KIND, 0, &payload);
     let decoder = ArrowPageDecoder::new(batch.schema()).expect("decoder");
-    let err = decoder.import(page).expect_err("view before allocated tail");
+    let err = decoder
+        .import(page)
+        .expect_err("view before allocated tail");
     assert!(matches!(
         err,
         ImportError::ViewOffsetBeforeAllocatedTail {

@@ -2,7 +2,8 @@
 
 use crate::bitmap::bitmap_bytes;
 use crate::constants::BUFFER_ALIGNMENT;
-use crate::{ColumnDesc, ColumnLayout, LayoutError};
+use crate::raw::{BlockHeader, ColumnDesc};
+use crate::{ColumnLayout, LayoutError};
 use std::mem::size_of;
 use std::ops::Range;
 use std::ptr;
@@ -34,7 +35,7 @@ pub(crate) fn column_layout_from_desc(
 }
 
 pub(crate) fn desc_offset(index: usize) -> usize {
-    size_of::<crate::BlockHeader>() + (index * size_of::<crate::ColumnDesc>())
+    size_of::<BlockHeader>() + (index * size_of::<ColumnDesc>())
 }
 
 pub(crate) fn byte_range(offset: u32, len: u32) -> Result<Range<usize>, LayoutError> {
