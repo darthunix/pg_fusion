@@ -1,14 +1,13 @@
-use arrow_ipc::MetadataVersion;
 use arrow_schema::ArrowError;
+use page_arrow_layout::{LayoutError, TypeTag};
 use page_transfer::MessageKind;
 use thiserror::Error;
 
 /// Decoder construction errors.
 #[derive(Debug, Error)]
 pub enum ConfigError {
-    /// Dictionary-encoded schemas are intentionally out of scope in v1.
-    #[error("dictionary-encoded schemas are unsupported in page_arrow v1")]
-    UnsupportedDictionarySchema,
+    #[error("unsupported Arrow type at column {index}: {data_type}")]
+    UnsupportedArrowType { index: usize, data_type: String },
 }
 
 /// Import errors for page-backed Arrow batches.
@@ -21,47 +20,39 @@ pub enum ImportError {
     },
     #[error("unsupported page flags: expected 0, got {actual}")]
     UnsupportedFlags { actual: u16 },
-    #[error("payload too small: expected at least {expected} bytes, got {actual}")]
-    PayloadTooSmall { expected: usize, actual: usize },
-    #[error("invalid batch page magic: expected {expected:#x}, got {actual:#x}")]
-    InvalidMagic { expected: u32, actual: u32 },
-    #[error("unsupported batch page version: expected {expected}, got {actual}")]
-    UnsupportedBatchPageVersion { expected: u16, actual: u16 },
-    #[error("batch page reserved field must be 0, got {actual}")]
-    NonZeroReserved { actual: u16 },
-    #[error("invalid metadata length {meta_len}; available bytes after header: {available}")]
-    InvalidMetaLen { meta_len: u32, available: usize },
-    #[error("IPC body start is not aligned to 16 bytes; meta_len is {actual}")]
-    MisalignedIpcBody { actual: usize },
-    #[error("truncated encapsulated IPC message: expected at least {expected_at_least} bytes, got {actual}")]
-    TruncatedEncapsulatedMessage {
-        expected_at_least: usize,
-        actual: usize,
+    #[error("schema column count mismatch: expected {expected}, got {actual}")]
+    SchemaColumnCountMismatch { expected: usize, actual: usize },
+    #[error("schema type mismatch at column {index}: expected {expected}, got {actual:?}")]
+    SchemaTypeMismatch {
+        index: usize,
+        expected: String,
+        actual: TypeTag,
     },
-    #[error("invalid encapsulated IPC message length {actual}")]
-    InvalidEncapsulatedMessageLength { actual: i32 },
-    #[error("invalid IPC message: {0}")]
-    InvalidIpcMessage(String),
-    #[error("unexpected IPC message header {actual}; expected RecordBatch")]
-    UnexpectedMessageHeader { actual: String },
-    #[error("invalid Arrow IPC body length {actual}")]
-    InvalidBodyLen { actual: i64 },
-    #[error("truncated Arrow IPC body: expected at least {expected_at_least} bytes, got {actual}")]
-    TruncatedIpcBody {
-        expected_at_least: usize,
-        actual: usize,
+    #[error("schema nullability mismatch at column {index}: expected {expected}, got {actual}")]
+    SchemaNullabilityMismatch {
+        index: usize,
+        expected: bool,
+        actual: bool,
     },
-    #[error("trailing bytes after Arrow IPC body: expected {expected} bytes, got {actual}")]
-    TrailingPayloadBytes { expected: usize, actual: usize },
-    #[error("compressed Arrow IPC payloads are unsupported in page_arrow v1")]
-    UnsupportedCompression,
-    #[error("unsupported Arrow IPC metadata version: expected {expected:?}, got {actual:?}")]
-    UnsupportedMetadataVersion {
-        expected: MetadataVersion,
-        actual: MetadataVersion,
+    #[error("invalid null count {null_count} at column {index} for row_count {row_count}")]
+    InvalidNullCount {
+        index: usize,
+        row_count: u32,
+        null_count: u32,
     },
-    #[error("record batch decoder returned no batch")]
-    UnexpectedEmptyMessage,
+    #[error("null bitmap count mismatch at column {index}: descriptor says {expected}, bitmap contains {actual} nulls")]
+    NullBitmapCountMismatch {
+        index: usize,
+        expected: u32,
+        actual: u32,
+    },
+    #[error("view at column {index}, row {row} points before the allocated tail region: offset {offset}, allocated tail starts at {allocated_tail_start}")]
+    ViewOffsetBeforeAllocatedTail {
+        index: usize,
+        row: u32,
+        offset: u32,
+        allocated_tail_start: u32,
+    },
     #[error("payload range overflow: offset {offset}, len {len}")]
     PayloadRangeOverflow { offset: usize, len: usize },
     #[error("payload range offset {offset}, len {len} is out of bounds for payload of length {payload_len}")]
@@ -70,6 +61,14 @@ pub enum ImportError {
         offset: usize,
         len: usize,
     },
+    #[error("payload offset {offset} does not provide {required_headroom} bytes of aligned headroom for alignment {alignment}")]
+    MissingAlignedHeadroom {
+        offset: usize,
+        alignment: usize,
+        required_headroom: usize,
+    },
+    #[error(transparent)]
+    Layout(#[from] LayoutError),
     #[error(transparent)]
     Arrow(#[from] ArrowError),
 }
