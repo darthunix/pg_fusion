@@ -1,7 +1,7 @@
 //! Shared zero-copy Arrow page layout contract.
 //!
-//! `page_arrow_layout` defines the binary page layout for a future non-IPC
-//! page format shared by producer-side and consumer-side crates.
+//! `page_arrow_layout` defines the binary page layout shared by producer-side
+//! and consumer-side crates for direct zero-copy page batches.
 
 mod error;
 
@@ -16,6 +16,7 @@ use std::ptr;
 pub const BLOCK_MAGIC: u32 = 0x3242_4150; // "PAB2"
 pub const BLOCK_VERSION: u16 = 1;
 pub const BUFFER_ALIGNMENT: u32 = 16;
+pub const BUFFER_ALIGNMENT_BIAS: u32 = 12;
 pub const VIEW_INLINE_LEN: usize = 12;
 pub const VIEW_PREFIX_LEN: usize = 4;
 pub const SHARED_VIEW_BUFFER_INDEX: i32 = 0;
@@ -152,6 +153,36 @@ impl TypeTag {
         }
     }
 
+    pub fn values_used_len(self, row_count: u32) -> Result<u32, LayoutError> {
+        match self {
+            Self::Boolean => Ok(bitmap_bytes(row_count)),
+            Self::Int16 => checked_u32(
+                usize::try_from(row_count)
+                    .map_err(|_| LayoutError::SizeOverflow)?
+                    .checked_mul(2)
+                    .ok_or(LayoutError::SizeOverflow)?,
+            ),
+            Self::Int32 | Self::Float32 => checked_u32(
+                usize::try_from(row_count)
+                    .map_err(|_| LayoutError::SizeOverflow)?
+                    .checked_mul(4)
+                    .ok_or(LayoutError::SizeOverflow)?,
+            ),
+            Self::Int64 | Self::Float64 => checked_u32(
+                usize::try_from(row_count)
+                    .map_err(|_| LayoutError::SizeOverflow)?
+                    .checked_mul(8)
+                    .ok_or(LayoutError::SizeOverflow)?,
+            ),
+            Self::Uuid | Self::Utf8View | Self::BinaryView => checked_u32(
+                usize::try_from(row_count)
+                    .map_err(|_| LayoutError::SizeOverflow)?
+                    .checked_mul(16)
+                    .ok_or(LayoutError::SizeOverflow)?,
+            ),
+        }
+    }
+
     pub fn from_arrow_data_type(index: usize, data_type: &DataType) -> Result<Self, LayoutError> {
         match data_type {
             DataType::Boolean => Ok(Self::Boolean),
@@ -257,7 +288,7 @@ impl LayoutPlan {
         let col_count = u16::try_from(specs.len()).map_err(|_| LayoutError::TooManyColumns {
             actual: specs.len(),
         })?;
-        let front_base = align_up_u32(
+        let front_base = align_up_u32_with_bias(
             checked_u32(
                 size_of::<BlockHeader>()
                     .checked_add(
@@ -269,6 +300,7 @@ impl LayoutPlan {
                     .ok_or(LayoutError::SizeOverflow)?,
             )?,
             BUFFER_ALIGNMENT,
+            BUFFER_ALIGNMENT_BIAS,
         )?;
 
         let mut cursor = front_base;
@@ -380,13 +412,12 @@ impl LayoutPlan {
         Ok(plan)
     }
 
-    pub fn block_header(&self, schema_id: u32) -> BlockHeader {
+    pub fn block_header(&self) -> BlockHeader {
         BlockHeader {
             magic: BLOCK_MAGIC,
             version: BLOCK_VERSION,
             flags: BlockFlags::NONE.bits(),
             block_size: self.block_size,
-            schema_id,
             max_rows: self.max_rows,
             row_count: 0,
             col_count: u16::try_from(self.columns.len()).expect("validated at construction"),
@@ -432,7 +463,6 @@ impl LayoutPlan {
 /// The header describes the global bounds of the page layout:
 ///
 /// - total block size
-/// - schema identity chosen by the caller
 /// - maximum and current row counts
 /// - the reserved front region start/end
 /// - the current tail cursor for the shared view payload pool
@@ -449,8 +479,6 @@ pub struct BlockHeader {
     pub flags: u16,
     /// Total block size in bytes.
     pub block_size: u32,
-    /// Caller-defined schema identifier associated with this layout.
-    pub schema_id: u32,
     /// Maximum number of rows reserved in the front region.
     pub max_rows: u32,
     /// Number of rows currently populated in the block.
@@ -975,7 +1003,7 @@ impl<'a> BlockMut<'a> {
 ///
 /// The function zeroes the block contents up to `plan.block_size()` and writes
 /// the v1 [`BlockHeader`] plus [`ColumnDesc`] array at the front.
-pub fn init_block(block: &mut [u8], plan: &LayoutPlan, schema_id: u32) -> Result<(), LayoutError> {
+pub fn init_block(block: &mut [u8], plan: &LayoutPlan) -> Result<(), LayoutError> {
     let block_size = usize::try_from(plan.block_size()).map_err(|_| LayoutError::SizeOverflow)?;
     if block.len() < block_size {
         return Err(LayoutError::BlockSliceTooSmall {
@@ -984,7 +1012,7 @@ pub fn init_block(block: &mut [u8], plan: &LayoutPlan, schema_id: u32) -> Result
         });
     }
     block[..block_size].fill(0);
-    write_struct(block, 0, plan.block_header(schema_id))?;
+    write_struct(block, 0, plan.block_header())?;
     for (index, desc) in plan.column_descs().enumerate() {
         write_struct(block, desc_offset(index), desc)?;
     }
@@ -1055,7 +1083,7 @@ pub fn validate_header(header: &BlockHeader, desc_count: usize) -> Result<(), La
             actual: desc_count,
         });
     }
-    let expected_front_base = align_up_u32(
+    let expected_front_base = align_up_u32_with_bias(
         checked_u32(
             size_of::<BlockHeader>()
                 .checked_add(
@@ -1066,6 +1094,7 @@ pub fn validate_header(header: &BlockHeader, desc_count: usize) -> Result<(), La
                 .ok_or(LayoutError::SizeOverflow)?,
         )?,
         BUFFER_ALIGNMENT,
+        BUFFER_ALIGNMENT_BIAS,
     )?;
     if header.front_base != expected_front_base {
         return Err(LayoutError::FrontBaseMismatch {
@@ -1079,7 +1108,9 @@ pub fn validate_header(header: &BlockHeader, desc_count: usize) -> Result<(), La
     {
         return Err(LayoutError::InvalidHeaderBounds);
     }
-    if header.front_base % BUFFER_ALIGNMENT != 0 || header.pool_base % BUFFER_ALIGNMENT != 0 {
+    if header.front_base % BUFFER_ALIGNMENT != BUFFER_ALIGNMENT_BIAS
+        || header.pool_base % BUFFER_ALIGNMENT != BUFFER_ALIGNMENT_BIAS
+    {
         return Err(LayoutError::MisalignedFrontRegion {
             front_base: header.front_base,
             pool_base: header.pool_base,
@@ -1258,6 +1289,17 @@ fn align_up_u32(value: u32, alignment: u32) -> Result<u32, LayoutError> {
     value
         .checked_add(mask)
         .map(|v| v & !mask)
+        .ok_or(LayoutError::SizeOverflow)
+}
+
+fn align_up_u32_with_bias(value: u32, alignment: u32, bias: u32) -> Result<u32, LayoutError> {
+    if bias >= alignment {
+        return Err(LayoutError::InvalidAlignment { alignment });
+    }
+    let delta = alignment - bias;
+    let adjusted = value.checked_add(delta).ok_or(LayoutError::SizeOverflow)?;
+    align_up_u32(adjusted, alignment)?
+        .checked_sub(delta)
         .ok_or(LayoutError::SizeOverflow)
 }
 
