@@ -1,18 +1,18 @@
 [workspace]
 members = [
   "lockfree",
-  "page_pool",
-  "page_transfer",
-  "page_arrow_layout",
-  "page_arrow",
-  "pg_slot_arrow",
+  "page/pool",
+  "page/transfer",
+  "page/layout",
+  "page/import",
+  "pg/slot_encoder",
   "executor",
   "scan",
-  "postgres",
+  "pg/extension",
   "protocol",
   "common",
   "storage",
-  "storage/pg_test",
+  "testing/pg_test",
 ]
 resolver = "2"
 

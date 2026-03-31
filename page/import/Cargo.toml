@@ -1,0 +1,23 @@
+[package]
+name = "import"
+version = "25.0.0"
+edition = "2021"
+description = "Zero-copy Arrow RecordBatch import from transfer pages"
+readme = "README.md"
+
+[lib]
+crate-type = ["lib"]
+doctest = false
+
+[dependencies]
+arrow-array = { workspace = true }
+arrow-buffer = { workspace = true }
+arrow-schema = { workspace = true }
+layout = { path = "../layout", version = "25.0" }
+transfer = { path = "../transfer", version = "25.0" }
+thiserror = "2.0"
+
+[dev-dependencies]
+pool = { path = "../pool", version = "25.0" }
+slot_encoder = { path = "../../pg/slot_encoder", version = "25.0" }
+pgrx-pg-sys = { workspace = true }

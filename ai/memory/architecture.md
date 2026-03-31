@@ -13,14 +13,17 @@ In short: a PostgreSQL (pgrx) extension intercepts planning/execution and delega
 
 ## Top‑Level Directories
 
-- `postgres/`: pgrx extension — plan/execute, IPC with runtime, builds Slot/MinimalTuple.
+- `pg/extension/`: pgrx extension — plan/execute, IPC with runtime, builds Slot/MinimalTuple.
+- `pg/slot_encoder/`: producer-side encoder from PostgreSQL slots into page-backed Arrow layout blocks.
 - `executor/`: DataFusion runtime — parse/optimize/plan/execute, PgScanExec/Stream, encodes results into wire tuples.
 - `protocol/`: control and data messages, wire tuple/attribute formats, types.
 - `storage/`: low‑level heap page reader and attribute decoder to ScalarValue.
 - `common/`: shared errors/types (FusionError).
-- `page_arrow_layout/`: shared zero-copy Arrow page layout contract for future page-backed batch transport.
-- `page_arrow/`: import-only zero-copy Arrow `RecordBatch` wrapper over `page_transfer` pages.
-- `pg_slot_arrow/`: producer-side Arrow IPC payload encoder over PostgreSQL slot rows.
+- `page/pool/`: fixed-page shared-memory ownership pool.
+- `page/transfer/`: page handoff protocol built on `page/pool`.
+- `page/layout/`: shared zero-copy Arrow page layout contract.
+- `page/import/`: import-only zero-copy Arrow `RecordBatch` wrapper over `page/transfer` pages.
+- `testing/pg_test/`: pgrx benchmark/test crate for Postgres-side storage and page pipeline experiments.
 
 ## Control Path
 
@@ -39,7 +42,7 @@ In short: a PostgreSQL (pgrx) extension intercepts planning/execution and delega
 
 ## Responsibilities
 
-- Backend (`postgres/`): PG memory safety, `TupleTableSlot` formation, control FSM, heap IO.
+- Backend (`pg/extension/`): PG memory safety, `TupleTableSlot` formation, control FSM, heap IO.
 - Executor (`executor/`): DataFusion planning/execution, heap requests, decode/encode results, backpressure.
 - Protocol: stable binary formats/messages.
 - Storage: precise heap/attribute decoder (zero‑copy where possible).
@@ -61,6 +64,6 @@ This is not implemented yet, but the current architecture is increasingly seen a
 - Preferred future boundary: PostgreSQL backend keeps ownership of table/index access, snapshot visibility, TOAST/detoast, and slot materialization. It then repacks rows into an Arrow-friendly batch/wire format and streams batches to the worker.
 - Consequence: worker-side `storage::heap`/page-oriented scan logic would become legacy or transitional. The worker would instead consume batch streams, while PostgreSQL remains the source of truth for physical access methods.
 - Supporting building blocks now exist:
-  - `page_arrow_layout` defines the next raw page format as a shared front-and-tail binary layout: fixed-width values, validity bitmaps, and view slots live in a preplanned front region, while long `Utf8View`/`BinaryView` payloads share one reverse-growing tail arena with `buffer_index = 0`. In its first change it is layout-only: structs, constants, planning math, `ByteView`, and validators.
-  - `page_arrow` can consume a `page_transfer::ReceivedPage` whose payload contains exactly one Arrow IPC batch and expose it as a plain `RecordBatch` backed directly by the page bytes. It is intentionally strict in v1: external schema, no copy fallback for data-bearing batches, no dictionaries, no compression, trailing bytes rejected, and page release tied to final Arrow buffer drop except for zero-buffer owned fallbacks. Retaining a page-backed batch no longer pins `PageRx`; receive-side progress is now gated by pool capacity rather than receiver state.
-  - `pg_slot_arrow` can encode already-deformed backend slot rows into the same payload format, writing into a caller-provided mutable payload slice. Its v1 surface is intentionally flat and narrow: bool/int/float, text-like Utf8, `bytea`, and `uuid`.
+  - `page/layout` defines the shared front-and-tail binary layout: fixed-width values, validity bitmaps, and view slots live in a preplanned front region, while long `Utf8View`/`BinaryView` payloads share one reverse-growing tail arena with `buffer_index = 0`.
+  - `page/import` consumes a `page/transfer::ReceivedPage` whose payload is one validated `page/layout` block and exposes it as a plain `RecordBatch` backed directly by the page bytes. It is intentionally strict in v1: external schema, zero-copy for data-bearing batches, no dictionaries, and page release tied to final Arrow buffer drop except for zero-buffer owned fallbacks.
+  - `pg/slot_encoder` writes PostgreSQL `TupleTableSlot` rows directly into initialized `page/layout` blocks. It supports bool/int/float, text-like Utf8View, `bytea` as BinaryView, and `uuid`, and asks PostgreSQL to deform the slot on demand when needed.

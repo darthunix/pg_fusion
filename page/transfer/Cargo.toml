@@ -1,0 +1,17 @@
+[package]
+name = "transfer"
+version = "25.0.0"
+edition = "2021"
+description = "Sans-IO page handoff protocol and page message wrappers over pool"
+readme = "README.md"
+
+[lib]
+crate-type = ["lib"]
+doctest = false
+
+[dependencies]
+pool = { path = "../pool", version = "25.0" }
+rmp = "0.8"
+
+[target.'cfg(unix)'.dev-dependencies]
+libc = "0.2"

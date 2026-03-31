@@ -101,15 +101,15 @@ jobs:
                            /var/run/postgresql/
 
 
-      - name: Run postgres tests
-        working-directory: postgres
+      - name: Run pg_fusion extension tests
+        working-directory: pg/extension
         run: |
           # Run tests with coverage tool
           source <(cargo llvm-cov show-env --export-prefix)
           cargo llvm-cov clean
           cargo build --features "pg${{ env.PG_MAJOR }}, pg_test" --no-default-features
           cargo pgrx test pg${{ env.PG_MAJOR }} --no-default-features
-          cargo llvm-cov report --lcov > ../postgres_lcov.info
+          cargo llvm-cov report --lcov > ../../postgres_lcov.info
 
       - name: Upload postgres coverage report to Codecov
         uses: codecov/codecov-action@v4
@@ -118,8 +118,8 @@ jobs:
           files: ./postgres_lcov.info
           token: ${{ secrets.CODECOV_TOKEN }}
 
-      - name: Run storage pg_test (extension) tests
-        working-directory: storage/pg_test
+      - name: Run pg_test extension tests
+        working-directory: testing/pg_test
         run: |
           # Run tests with coverage tool
           source <(cargo llvm-cov show-env --export-prefix)
