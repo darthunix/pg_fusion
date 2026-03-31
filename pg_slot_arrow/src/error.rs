@@ -3,6 +3,8 @@ use pgrx_pg_sys as pg_sys;
 use thiserror::Error;
 
 #[derive(Debug, Error)]
+/// Configuration-time failures when binding a PostgreSQL `TupleDesc` to an
+/// initialized `page_arrow_layout` block.
 pub enum ConfigError {
     #[error("TupleDesc pointer is null")]
     NullTupleDesc,
@@ -32,6 +34,7 @@ pub enum ConfigError {
 }
 
 #[derive(Debug, Error)]
+/// Row-encoding failures while appending PostgreSQL slots into a block.
 pub enum EncodeError {
     #[error("TupleTableSlot pointer is null")]
     NullSlot,
