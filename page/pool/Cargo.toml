@@ -1,0 +1,16 @@
+[package]
+name = "pool"
+version = "25.0.0"
+edition = "2021"
+description = "Shared-memory fixed-page pool with explicit descriptor handoff"
+readme = "README.md"
+
+[lib]
+crate-type = ["lib"]
+doctest = false
+
+[dependencies]
+lockfree = { path = "../../lockfree", version = "25.0" }
+
+[target.'cfg(unix)'.dev-dependencies]
+libc = "0.2"

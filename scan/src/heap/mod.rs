@@ -111,7 +111,7 @@ impl HeapScanRegistry {
     }
 
     #[inline]
-    fn lock(&self) -> MutexGuard<HashMap<HeapScanId, Entry>> {
+    fn lock(&self) -> MutexGuard<'_, HashMap<HeapScanId, Entry>> {
         // Avoid panics on poisoned mutex by recovering the inner state
         self.inner.lock().unwrap_or_else(|e| e.into_inner())
     }

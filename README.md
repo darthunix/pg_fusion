@@ -9,23 +9,24 @@ Why: PostgreSQL’s Volcano (row‑at‑a‑time) engine is great for OLTP but s
 - Extension (pgrx) sits in the backend process and drives Parse/Bind/Optimize/Translate/Begin/Exec/End.
 - Executor (runtime) runs DataFusion; `HeapScanProvider → HeapScanExec → HeapScanStream` scans heap pages from shared memory and produces Arrow RecordBatches.
 - Protocol defines control/data packets and a compact wire tuple format with explicit alignment.
-- Low-level shared-memory building blocks such as `lockfree`, `page_pool`, `page_transfer`, `page_arrow_layout`, `page_arrow`, and `pg_slot_arrow` live in standalone workspace crates; `page_pool`, `page_transfer`, `page_arrow_layout`, `page_arrow`, and `pg_slot_arrow` are not yet wired into the runtime path.
+- Low-level shared-memory building blocks such as `lockfree`, `page/pool`, `page/transfer`, `page/layout`, `page/import`, and `pg/slot_encoder` live in standalone workspace crates; the `page/*` and `pg/slot_encoder` crates are not yet wired into the runtime path.
 
 See: `ai/memory/architecture.md` and component notes in `ai/memory/components/`.
 
 ## Repository layout
 
-- `postgres/` — pgrx extension (hooks, IPC, TupleTableSlot fill)
+- `pg/extension/` — pgrx extension (hooks, IPC, TupleTableSlot fill)
 - `executor/` — DataFusion runtime (planning/execution, SHM access, result encoding)
 - `protocol/` — shared packets and wire formats
 - `storage/` — heap page reader + zero‑allocation tuple decoder to DataFusion `ScalarValue`
 - `common/` — shared errors/types
 - `lockfree/` — standalone shared-memory lock-free primitives
-- `page_pool/` — standalone fixed-page shared-memory ownership pool
-- `page_transfer/` — standalone sans-IO page handoff protocol over `page_pool`
-- `page_arrow_layout/` — standalone shared zero-copy Arrow page layout contract
-- `page_arrow/` — standalone zero-copy Arrow `RecordBatch` import over `page_transfer`
-- `pg_slot_arrow/` — standalone Arrow IPC payload encoder for PostgreSQL scan-slot rows
+- `page/pool/` — standalone fixed-page shared-memory ownership pool
+- `page/transfer/` — standalone sans-IO page handoff protocol over `page/pool`
+- `page/layout/` — standalone shared zero-copy Arrow page layout contract
+- `page/import/` — standalone zero-copy Arrow `RecordBatch` import over `page/transfer`
+- `pg/slot_encoder/` — standalone layout-block encoder for PostgreSQL scan-slot rows
+- `testing/pg_test/` — pgrx benchmark and test crate for Postgres-side storage/page experiments
 
 ## Build & test
 
@@ -77,7 +78,7 @@ cargo pgrx test pg17 -p pg_test
 ```
 
 For the Postgres-side page pipeline benchmark under `pg_test`, see
-[`storage/pg_test/README.md`](storage/pg_test/README.md).
+[`testing/pg_test/README.md`](testing/pg_test/README.md).
 
 ## Developer guidelines
 

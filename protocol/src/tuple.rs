@@ -110,8 +110,8 @@ const fn max_align(off: usize, align: u8) -> usize {
 /// - u16: bitmap_bytes
 /// - u32: data_bytes
 ///   Followed by:
-/// - [bitmap_bytes] optional null bitmap (LSB-first per attribute)
-/// - [data_bytes] attribute payload area with proper alignment per `PgAttrWire.attalign`.
+/// - `bitmap_bytes`: optional null bitmap (LSB-first per attribute)
+/// - `data_bytes`: attribute payload area with proper alignment per `PgAttrWire.attalign`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct WireHeader {
     pub nattrs: u16,

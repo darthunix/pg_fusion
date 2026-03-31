@@ -11,7 +11,7 @@ importance: 0.95
 
 1) No panics in PG extension paths
 
-- In `postgres/` avoid panicking; return structured errors (`common::FusionError`).
+- In `pg/extension/` avoid panicking; return structured errors (`common::FusionError`).
 
 2) SHM slices/buffers must stay within bounds
 
