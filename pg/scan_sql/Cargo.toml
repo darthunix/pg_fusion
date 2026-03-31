@@ -1,0 +1,17 @@
+[package]
+name = "scan_sql"
+version = "25.0.0"
+edition = "2021"
+description = "Compile DataFusion scan pushdown into PostgreSQL SQL"
+readme = "README.md"
+
+[lib]
+crate-type = ["lib"]
+doctest = false
+
+[dependencies]
+arrow-schema = { workspace = true }
+datafusion-common = { workspace = true }
+datafusion-expr = { workspace = true }
+thiserror = "2.0"
+
