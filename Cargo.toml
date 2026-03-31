@@ -5,6 +5,7 @@ members = [
   "page/transfer",
   "page/layout",
   "page/import",
+  "pg/scan_sql",
   "pg/slot_encoder",
   "executor",
   "scan",
@@ -35,6 +36,7 @@ arrow-ipc = "53.4.1"
 arrow-schema = "53.4.1"
 datafusion-common = "44.0"
 datafusion = "44.0"
+datafusion-expr = "44.0"
 datafusion-sql = "44.0"
 datafusion-catalog = "44.0"
 datafusion-physical-expr = "44.0"
