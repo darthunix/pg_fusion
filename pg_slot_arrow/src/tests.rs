@@ -1,7 +1,4 @@
-use super::{
-    set_test_database_encoding, AppendStatus, ConfigError, EncodeError, PageBatchEncoder,
-    RowDatumAccess,
-};
+use super::{set_test_database_encoding, AppendStatus, ConfigError, EncodeError, PageBatchEncoder};
 use page_arrow_layout::{init_block, BlockRef, ColumnSpec, LayoutPlan, TypeTag};
 use pgrx_pg_sys as pg_sys;
 use std::alloc::{alloc_zeroed, dealloc, GlobalAlloc, Layout, System};
@@ -137,6 +134,7 @@ struct OwnedSlot {
     slot: Box<pg_sys::TupleTableSlot>,
     values: Vec<pg_sys::Datum>,
     isnull: Vec<bool>,
+    _cells: Vec<MockCell>,
 }
 
 impl OwnedSlot {
@@ -149,6 +147,30 @@ impl OwnedSlot {
             slot,
             values,
             isnull,
+            _cells: Vec::new(),
+        };
+        owned.slot.tts_values = owned.values.as_mut_ptr();
+        owned.slot.tts_isnull = owned.isnull.as_mut_ptr();
+        owned
+    }
+
+    fn from_cells(tupdesc: pg_sys::TupleDesc, mut cells: Vec<MockCell>) -> Self {
+        let mut values = Vec::with_capacity(cells.len());
+        let mut isnull = Vec::with_capacity(cells.len());
+        for cell in &mut cells {
+            let (datum, is_null) = cell.datum();
+            values.push(datum);
+            isnull.push(is_null);
+        }
+        let mut slot =
+            Box::new(unsafe { MaybeUninit::<pg_sys::TupleTableSlot>::zeroed().assume_init() });
+        slot.tts_tupleDescriptor = tupdesc;
+        slot.tts_nvalid = values.len() as i16;
+        let mut owned = Self {
+            slot,
+            values,
+            isnull,
+            _cells: cells,
         };
         owned.slot.tts_values = owned.values.as_mut_ptr();
         owned.slot.tts_isnull = owned.isnull.as_mut_ptr();
@@ -187,26 +209,6 @@ impl MockCell {
                 false,
             ),
         }
-    }
-}
-
-struct MockRow {
-    cells: Vec<MockCell>,
-}
-
-impl MockRow {
-    fn new(cells: Vec<MockCell>) -> Self {
-        Self { cells }
-    }
-}
-
-impl RowDatumAccess for MockRow {
-    fn with_datum<R, F>(&mut self, col_idx: usize, f: F) -> Result<R, EncodeError>
-    where
-        F: FnOnce(pg_sys::Datum, bool) -> Result<R, EncodeError>,
-    {
-        let (datum, is_null) = self.cells[col_idx].datum();
-        f(datum, is_null)
     }
 }
 
@@ -373,40 +375,49 @@ fn encodes_rows_directly_into_page_arrow_layout_block() {
         unsafe { PageBatchEncoder::new(tuple_desc.ptr, &mut payload) }.expect("encoder");
 
     let mut rows = vec![
-        MockRow::new(vec![
-            MockCell::Bool(true),
-            MockCell::I32(11),
-            MockCell::F64(3.25),
-            MockCell::Utf8(short_varlena(b"alpha")),
-            MockCell::Binary(short_varlena(b"\x00\x01")),
-            MockCell::Uuid(Box::new([1; 16])),
-            MockCell::Name(name_data("first")),
-        ]),
-        MockRow::new(vec![
-            MockCell::Null,
-            MockCell::Null,
-            MockCell::Null,
-            MockCell::Null,
-            MockCell::Null,
-            MockCell::Null,
-            MockCell::Null,
-        ]),
-        MockRow::new(vec![
-            MockCell::Bool(false),
-            MockCell::I32(22),
-            MockCell::F64(-6.5),
-            MockCell::Utf8(short_varlena(b"abcdefghijklmnop")),
-            MockCell::Binary(short_varlena(
-                b"\x10\x11\x12\x13\x14\x15\x16\x17\x18\x19\x1a\x1b\x1c",
-            )),
-            MockCell::Uuid(Box::new([2; 16])),
-            MockCell::Name(name_data("second")),
-        ]),
+        OwnedSlot::from_cells(
+            tuple_desc.ptr,
+            vec![
+                MockCell::Bool(true),
+                MockCell::I32(11),
+                MockCell::F64(3.25),
+                MockCell::Utf8(short_varlena(b"alpha")),
+                MockCell::Binary(short_varlena(b"\x00\x01")),
+                MockCell::Uuid(Box::new([1; 16])),
+                MockCell::Name(name_data("first")),
+            ],
+        ),
+        OwnedSlot::from_cells(
+            tuple_desc.ptr,
+            vec![
+                MockCell::Null,
+                MockCell::Null,
+                MockCell::Null,
+                MockCell::Null,
+                MockCell::Null,
+                MockCell::Null,
+                MockCell::Null,
+            ],
+        ),
+        OwnedSlot::from_cells(
+            tuple_desc.ptr,
+            vec![
+                MockCell::Bool(false),
+                MockCell::I32(22),
+                MockCell::F64(-6.5),
+                MockCell::Utf8(short_varlena(b"abcdefghijklmnop")),
+                MockCell::Binary(short_varlena(
+                    b"\x10\x11\x12\x13\x14\x15\x16\x17\x18\x19\x1a\x1b\x1c",
+                )),
+                MockCell::Uuid(Box::new([2; 16])),
+                MockCell::Name(name_data("second")),
+            ],
+        ),
     ];
 
-    for row in &mut rows {
+    for slot in &mut rows {
         assert_eq!(
-            encoder.append_row(row).expect("append"),
+            encoder.append_slot(slot.as_mut_ptr()).expect("append"),
             AppendStatus::Appended
         );
     }
@@ -441,7 +452,7 @@ fn encodes_rows_directly_into_page_arrow_layout_block() {
 }
 
 #[test]
-fn append_row_reports_full_without_committing_the_overflowing_row() {
+fn append_slot_reports_full_without_committing_the_overflowing_row() {
     let _encoding = EncodingGuard::utf8();
     let specs = [ColumnSpec::new(TypeTag::Utf8View, true)];
     let attrs = [TestAttr {
@@ -455,16 +466,20 @@ fn append_row_reports_full_without_committing_the_overflowing_row() {
     let mut encoder =
         unsafe { PageBatchEncoder::new(tuple_desc.ptr, &mut payload) }.expect("encoder");
 
-    let mut small = MockRow::new(vec![MockCell::Utf8(short_varlena(b"ok"))]);
-    let mut huge = MockRow::new(vec![MockCell::Utf8(short_varlena(&[b'x'; 96]))]);
+    let mut small =
+        OwnedSlot::from_cells(tuple_desc.ptr, vec![MockCell::Utf8(short_varlena(b"ok"))]);
+    let mut huge = OwnedSlot::from_cells(
+        tuple_desc.ptr,
+        vec![MockCell::Utf8(short_varlena(&[b'x'; 96]))],
+    );
 
     assert_eq!(
-        encoder.append_row(&mut small).expect("small"),
+        encoder.append_slot(small.as_mut_ptr()).expect("small"),
         AppendStatus::Appended
     );
     let tail_after_small = encoder.tail_cursor();
     assert_eq!(
-        encoder.append_row(&mut huge).expect("huge"),
+        encoder.append_slot(huge.as_mut_ptr()).expect("huge"),
         AppendStatus::Full
     );
     let encoded = encoder.finish().expect("finish");
@@ -579,12 +594,15 @@ fn encodes_empty_short_varlena_values() {
     let mut encoder =
         unsafe { PageBatchEncoder::new(tuple_desc.ptr, &mut payload) }.expect("encoder");
 
-    let mut row = MockRow::new(vec![
-        MockCell::Utf8(short_varlena(b"")),
-        MockCell::Binary(short_varlena(b"")),
-    ]);
+    let mut slot = OwnedSlot::from_cells(
+        tuple_desc.ptr,
+        vec![
+            MockCell::Utf8(short_varlena(b"")),
+            MockCell::Binary(short_varlena(b"")),
+        ],
+    );
     assert_eq!(
-        encoder.append_row(&mut row).expect("append"),
+        encoder.append_slot(slot.as_mut_ptr()).expect("append"),
         AppendStatus::Appended
     );
     encoder.finish().expect("finish");
@@ -653,7 +671,7 @@ fn new_is_allocation_free_after_block_initialization() {
 }
 
 #[test]
-fn append_row_is_allocation_free_after_encoder_construction() {
+fn append_slot_mixed_is_allocation_free_after_encoder_construction() {
     let _encoding = EncodingGuard::utf8();
     let specs = [
         ColumnSpec::new(TypeTag::Boolean, true),
@@ -691,17 +709,20 @@ fn append_row_is_allocation_free_after_encoder_construction() {
     let mut payload = init_payload(&specs, 4, 2048);
     let mut encoder =
         unsafe { PageBatchEncoder::new(tuple_desc.ptr, &mut payload) }.expect("encoder");
-    let mut row = MockRow::new(vec![
-        MockCell::Bool(true),
-        MockCell::Utf8(short_varlena(b"abcdefghijklmno")),
-        MockCell::Binary(short_varlena(
-            b"\x00\x01\x02\x03\x04\x05\x06\x07\x08\x09\x0a\x0b\x0c",
-        )),
-        MockCell::Uuid(Box::new([9; 16])),
-    ]);
+    let mut slot = OwnedSlot::from_cells(
+        tuple_desc.ptr,
+        vec![
+            MockCell::Bool(true),
+            MockCell::Utf8(short_varlena(b"abcdefghijklmno")),
+            MockCell::Binary(short_varlena(
+                b"\x00\x01\x02\x03\x04\x05\x06\x07\x08\x09\x0a\x0b\x0c",
+            )),
+            MockCell::Uuid(Box::new([9; 16])),
+        ],
+    );
 
     let (allocations, status) =
-        count_thread_allocations(|| encoder.append_row(&mut row).expect("append row"));
+        count_thread_allocations(|| encoder.append_slot(slot.as_mut_ptr()).expect("append slot"));
     assert_eq!(allocations, 0);
     assert_eq!(status, AppendStatus::Appended);
 }
@@ -754,9 +775,12 @@ fn finish_is_allocation_free() {
     let mut payload = init_payload(&specs, 2, 512);
     let mut encoder =
         unsafe { PageBatchEncoder::new(tuple_desc.ptr, &mut payload) }.expect("encoder");
-    let mut row = MockRow::new(vec![MockCell::Utf8(short_varlena(b"alpha"))]);
+    let mut slot = OwnedSlot::from_cells(
+        tuple_desc.ptr,
+        vec![MockCell::Utf8(short_varlena(b"alpha"))],
+    );
     assert_eq!(
-        encoder.append_row(&mut row).expect("append"),
+        encoder.append_slot(slot.as_mut_ptr()).expect("append"),
         AppendStatus::Appended
     );
 

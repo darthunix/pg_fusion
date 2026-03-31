@@ -8,7 +8,7 @@ use arrow_schema::{DataType, Field, Schema};
 use page_arrow_layout::{init_block, BlockMut, BlockRef, ByteView, LayoutPlan, ViewWriteStatus};
 use page_pool::{PagePool, PagePoolConfig, RegionLayout};
 use page_transfer::{encode_frame, FrameDecoder, PageRx, PageTx, ReceiveEvent, ReceivedPage};
-use pg_slot_arrow::{AppendStatus, PageBatchEncoder, RowDatumAccess};
+use pg_slot_arrow::{AppendStatus, PageBatchEncoder};
 use pgrx_pg_sys as pg_sys;
 use std::alloc::{alloc, dealloc, Layout};
 use std::io::Write;
@@ -121,11 +121,48 @@ impl Drop for OwnedTupleDesc {
     }
 }
 
+struct OwnedSlot {
+    slot: Box<pg_sys::TupleTableSlot>,
+    values: Vec<pg_sys::Datum>,
+    isnull: Vec<bool>,
+    _cells: Vec<MockCell>,
+}
+
+impl OwnedSlot {
+    fn from_cells(tupdesc: pg_sys::TupleDesc, mut cells: Vec<MockCell>) -> Self {
+        let mut values = Vec::with_capacity(cells.len());
+        let mut isnull = Vec::with_capacity(cells.len());
+        for cell in &mut cells {
+            let (datum, is_null) = cell.datum();
+            values.push(datum);
+            isnull.push(is_null);
+        }
+        let mut slot = Box::new(unsafe {
+            std::mem::MaybeUninit::<pg_sys::TupleTableSlot>::zeroed().assume_init()
+        });
+        slot.tts_tupleDescriptor = tupdesc;
+        slot.tts_nvalid = values.len() as i16;
+        let mut owned = Self {
+            slot,
+            values,
+            isnull,
+            _cells: cells,
+        };
+        owned.slot.tts_values = owned.values.as_mut_ptr();
+        owned.slot.tts_isnull = owned.isnull.as_mut_ptr();
+        owned
+    }
+
+    fn as_mut_ptr(&mut self) -> *mut pg_sys::TupleTableSlot {
+        &mut *self.slot
+    }
+}
+
 enum MockCell {
     Null,
     Bool(bool),
     I32(i32),
-    Binary(Vec<u8>),
+    Uuid(Box<[u8; 16]>),
 }
 
 impl MockCell {
@@ -134,44 +171,8 @@ impl MockCell {
             Self::Null => (pg_sys::Datum::null(), true),
             Self::Bool(value) => (pg_sys::Datum::from(*value), false),
             Self::I32(value) => (pg_sys::Datum::from(*value), false),
-            Self::Binary(value) => (pg_sys::Datum::from(value.as_mut_ptr()), false),
+            Self::Uuid(value) => (pg_sys::Datum::from(value.as_mut_ptr()), false),
         }
-    }
-}
-
-struct MockRow {
-    cells: Vec<MockCell>,
-}
-
-impl MockRow {
-    fn new(cells: Vec<MockCell>) -> Self {
-        Self { cells }
-    }
-}
-
-impl RowDatumAccess for MockRow {
-    fn with_datum<R, F>(&mut self, col_idx: usize, f: F) -> Result<R, pg_slot_arrow::EncodeError>
-    where
-        F: FnOnce(pg_sys::Datum, bool) -> Result<R, pg_slot_arrow::EncodeError>,
-    {
-        let (datum, is_null) = self.cells[col_idx].datum();
-        f(datum, is_null)
-    }
-}
-
-fn short_varlena(data: &[u8]) -> Vec<u8> {
-    if data.len() + 1 < 0x80 {
-        let total = data.len() + 1;
-        let mut out = Vec::with_capacity(total);
-        out.push(((total as u8) << 1) | 0x01);
-        out.extend_from_slice(data);
-        out
-    } else {
-        let total = data.len() + 4;
-        let mut out = Vec::with_capacity(total);
-        out.extend_from_slice(&(((total as u32) << 2).to_le_bytes()));
-        out.extend_from_slice(data);
-        out
     }
 }
 
@@ -603,7 +604,7 @@ fn imports_pg_slot_arrow_produced_payload() {
     let schema = Arc::new(Schema::new(vec![
         Field::new("b", DataType::Boolean, true),
         Field::new("i32", DataType::Int32, true),
-        Field::new("bin", DataType::BinaryView, true),
+        Field::new("uuid", DataType::FixedSizeBinary(16), true),
     ]));
     let attrs = [
         TestAttr {
@@ -619,10 +620,10 @@ fn imports_pg_slot_arrow_produced_payload() {
             attalign: b'i',
         },
         TestAttr {
-            oid: pg_sys::BYTEAOID,
-            attlen: -1,
+            oid: pg_sys::UUIDOID,
+            attlen: 16,
             attbyval: false,
-            attalign: b'i',
+            attalign: b'c',
         },
     ];
     let tuple_desc = OwnedTupleDesc::new(&attrs);
@@ -635,46 +636,63 @@ fn imports_pg_slot_arrow_produced_payload() {
         vec![
             Arc::new(BooleanArray::from(vec![Some(true), None, Some(false)])),
             Arc::new(Int32Array::from(vec![Some(11), None, Some(-22)])),
-            Arc::new(BinaryViewArray::from(vec![
-                Some(&b"\x01\x02\x03"[..]),
-                None,
-                Some(&b"this producer path also writes a longer binary view"[..]),
-            ])),
+            Arc::new(
+                FixedSizeBinaryArray::try_from_sparse_iter_with_size(
+                    [
+                        Some([1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16]),
+                        None,
+                        Some([16, 15, 14, 13, 12, 11, 10, 9, 8, 7, 6, 5, 4, 3, 2, 1]),
+                    ]
+                    .into_iter(),
+                    16,
+                )
+                .expect("uuid"),
+            ),
         ],
     )
     .expect("expected batch");
 
     unsafe {
         let mut encoder = PageBatchEncoder::new(tuple_desc.ptr, &mut payload).expect("encoder");
+        let mut row1 = OwnedSlot::from_cells(
+            tuple_desc.ptr,
+            vec![
+                MockCell::Bool(true),
+                MockCell::I32(11),
+                MockCell::Uuid(Box::new([
+                    1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16,
+                ])),
+            ],
+        );
+        let mut row2 = OwnedSlot::from_cells(
+            tuple_desc.ptr,
+            vec![MockCell::Null, MockCell::Null, MockCell::Null],
+        );
+        let mut row3 = OwnedSlot::from_cells(
+            tuple_desc.ptr,
+            vec![
+                MockCell::Bool(false),
+                MockCell::I32(-22),
+                MockCell::Uuid(Box::new([
+                    16, 15, 14, 13, 12, 11, 10, 9, 8, 7, 6, 5, 4, 3, 2, 1,
+                ])),
+            ],
+        );
         assert_eq!(
             encoder
-                .append_row(&mut MockRow::new(vec![
-                    MockCell::Bool(true),
-                    MockCell::I32(11),
-                    MockCell::Binary(short_varlena(b"\x01\x02\x03")),
-                ]))
+                .append_slot(row1.as_mut_ptr())
                 .expect("append row 1"),
             AppendStatus::Appended
         );
         assert_eq!(
             encoder
-                .append_row(&mut MockRow::new(vec![
-                    MockCell::Null,
-                    MockCell::Null,
-                    MockCell::Null,
-                ]))
+                .append_slot(row2.as_mut_ptr())
                 .expect("append row 2"),
             AppendStatus::Appended
         );
         assert_eq!(
             encoder
-                .append_row(&mut MockRow::new(vec![
-                    MockCell::Bool(false),
-                    MockCell::I32(-22),
-                    MockCell::Binary(short_varlena(
-                        b"this producer path also writes a longer binary view",
-                    )),
-                ]))
+                .append_slot(row3.as_mut_ptr())
                 .expect("append row 3"),
             AppendStatus::Appended
         );

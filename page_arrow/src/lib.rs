@@ -99,7 +99,8 @@ impl ArrowPageDecoder {
             Ok((
                 block.row_count(),
                 SharedPoolImport {
-                    offset: usize::try_from(block.pool_base()).map_err(|_| LayoutError::SizeOverflow)?,
+                    offset: usize::try_from(block.pool_base())
+                        .map_err(|_| LayoutError::SizeOverflow)?,
                     len: usize::try_from(block.shared_pool_capacity()?)
                         .map_err(|_| LayoutError::SizeOverflow)?,
                     allocated_tail_start: block.allocated_shared_pool_offset()?,
