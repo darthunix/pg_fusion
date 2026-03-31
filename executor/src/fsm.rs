@@ -193,7 +193,9 @@ mod tests {
         );
         assert_eq!(machine.state(), &QueryFlowState::PhysicalPlan);
         assert_eq!(
-            machine.consume(&protocol::QueryPacket::ColumnLayout).unwrap(),
+            machine
+                .consume(&protocol::QueryPacket::ColumnLayout)
+                .unwrap(),
             Some(QueryFlowAction::CaptureColumnLayout)
         );
         assert_eq!(machine.state(), &QueryFlowState::Execution);

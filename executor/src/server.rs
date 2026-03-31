@@ -3,8 +3,7 @@ use crate::buffer::LockFreeBuffer;
 use crate::fsm::query_flow::StateMachine as QueryFlowStateMachine;
 use crate::fsm::{
     data_flow, scan_flow, DataFlowEvent, DataFlowState, QueryFlowAction, QueryFlowState,
-    ScanFlowEvent,
-    ScanFlowState,
+    ScanFlowEvent, ScanFlowState,
 };
 use crate::ipc::Socket;
 use crate::logging::{log_debug, log_error, log_trace, log_warn};
@@ -163,7 +162,8 @@ impl Storage {
     }
 
     fn shadow_scan_flow_event(&mut self, scan_id: u64, event: ScanFlowEvent, source: &'static str) {
-        if !self.shadow_scan_flows.contains_key(&scan_id) && !matches!(event, ScanFlowEvent::Register)
+        if !self.shadow_scan_flows.contains_key(&scan_id)
+            && !matches!(event, ScanFlowEvent::Register)
         {
             log_warn!(
                 FUSION_TARGET,
@@ -695,7 +695,9 @@ impl<'bytes> Connection<'bytes> {
             }));
         }
 
-        Ok(Some(InboundMessage::Query(QueryPacket::try_from(header.tag)?)))
+        Ok(Some(InboundMessage::Query(QueryPacket::try_from(
+            header.tag,
+        )?)))
     }
 
     #[inline]
@@ -847,9 +849,7 @@ impl<'bytes> Connection<'bytes> {
     ) -> Result<bool> {
         // Do not flush send_buffer here; backend is the reader for responses.
         // Guard against spurious EndScan (e.g., after EXPLAIN) when no Execution state is active.
-        if packet == QueryPacket::EndScan
-            && storage.state.state() != &QueryFlowState::Execution
-        {
+        if packet == QueryPacket::EndScan && storage.state.state() != &QueryFlowState::Execution {
             log_trace!(
                 EXECUTOR_TARGET,
                 "process_message: ignoring EndScan outside Execution state"
@@ -891,9 +891,7 @@ impl<'bytes> Connection<'bytes> {
         mut packet: QueryPacket,
         runtime_events_tx: &RuntimeEventTx,
     ) -> Result<()> {
-        if packet == QueryPacket::EndScan
-            && storage.state.state() != &QueryFlowState::Execution
-        {
+        if packet == QueryPacket::EndScan && storage.state.state() != &QueryFlowState::Execution {
             log_trace!(
                 EXECUTOR_TARGET,
                 "process_message_flow_driven: ignoring EndScan outside Execution state"
@@ -1192,7 +1190,10 @@ impl<'a, 'bytes> QueryPacketCtx<'a, 'bytes> {
                 "while processing optimize message".into(),
             ));
         };
-        log_trace!(EXECUTOR_TARGET, "process_message: QueryFlowAction::Optimize");
+        log_trace!(
+            EXECUTOR_TARGET,
+            "process_message: QueryFlowAction::Optimize"
+        );
         optimize(plan)
     }
 
@@ -1214,7 +1215,10 @@ impl<'a, 'bytes> QueryPacketCtx<'a, 'bytes> {
                 "while processing translate message".into(),
             ));
         };
-        log_trace!(EXECUTOR_TARGET, "process_message: QueryFlowAction::Translate");
+        log_trace!(
+            EXECUTOR_TARGET,
+            "process_message: QueryFlowAction::Translate"
+        );
         translate(plan).await
     }
 
@@ -1226,19 +1230,28 @@ impl<'a, 'bytes> QueryPacketCtx<'a, 'bytes> {
 
     #[inline]
     fn action_open_data_flow(&mut self) -> Result<TaskResult> {
-        log_trace!(EXECUTOR_TARGET, "process_message: QueryFlowAction::OpenDataFlow");
+        log_trace!(
+            EXECUTOR_TARGET,
+            "process_message: QueryFlowAction::OpenDataFlow"
+        );
         open_data_flow(self.conn, self.storage)
     }
 
     #[inline]
     fn action_start_data_flow(&mut self) -> Result<TaskResult> {
-        log_trace!(EXECUTOR_TARGET, "process_message: QueryFlowAction::StartDataFlow");
+        log_trace!(
+            EXECUTOR_TARGET,
+            "process_message: QueryFlowAction::StartDataFlow"
+        );
         start_data_flow(self.conn, self.storage)
     }
 
     #[inline]
     fn action_end_data_flow(&mut self) -> Result<TaskResult> {
-        log_trace!(EXECUTOR_TARGET, "process_message: QueryFlowAction::EndDataFlow");
+        log_trace!(
+            EXECUTOR_TARGET,
+            "process_message: QueryFlowAction::EndDataFlow"
+        );
         end_data_flow(self.storage)
     }
 }
@@ -2186,7 +2199,6 @@ mod tests {
                 .expect("Failed to process column layout");
             assert_eq!(storage.state.state(), &QueryFlowState::Execution);
             assert_eq!(storage.pg_attrs.as_ref().map(Vec::len), Some(1));
-
         })
         .await?;
         Ok(())
