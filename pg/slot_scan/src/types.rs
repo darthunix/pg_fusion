@@ -6,12 +6,40 @@ use std::marker::PhantomData;
 /// Options that affect one `slot_scan` execution.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct ScanOptions {
+    /// Optional prepare-time planner hint used to bias PostgreSQL toward
+    /// fast-start plans.
+    ///
+    /// `slot_scan` currently lowers this to `CURSOR_OPT_FAST_PLAN` during
+    /// `prepare_scan()`. The numeric value is preserved in the API as a fetch
+    /// hint from upstream code, but `slot_scan` does not interpret it as an
+    /// exact row goal.
+    ///
+    /// In the default `scan_sql -> slot_scan` path, this is one of the
+    /// intended lowering targets for `CompiledScan.requested_limit`.
+    pub planner_fetch_hint: Option<usize>,
     /// Optional early-stop hint applied by the scan loop in the current
     /// executor process. This is a local cap, not an exact global SQL LIMIT.
+    ///
+    /// In the default `scan_sql -> slot_scan` path, this is the intended
+    /// run-time lowering target for `CompiledScan.requested_limit`.
     pub local_row_cap: Option<usize>,
 }
 
+/// Leaf scan shape chosen by the current run-time PostgreSQL plan.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum ScanPlanKind {
+    #[default]
+    Unknown,
+    SeqScan,
+    IndexScan,
+    IndexOnlyScan,
+    BitmapHeapScan,
+}
+
 /// Run-time statistics returned after a scan finishes.
+///
+/// These fields reflect the current revalidated portal plan that actually ran,
+/// not metadata captured during `prepare_scan()`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ScanStats {
     /// Number of rows delivered to the sink.
@@ -22,6 +50,8 @@ pub struct ScanStats {
     pub parallel_capable: bool,
     /// Number of workers requested by the run-time `Gather` node, if any.
     pub planned_workers: usize,
+    /// Leaf scan shape chosen by the current run-time PostgreSQL plan.
+    pub plan_kind: ScanPlanKind,
 }
 
 /// Result of one sink row callback.
@@ -41,6 +71,7 @@ pub struct SlotSinkContext {
     planned_workers: usize,
     rows_seen: usize,
     parallel_capable: bool,
+    plan_kind: ScanPlanKind,
 }
 
 impl SlotSinkContext {
@@ -50,6 +81,7 @@ impl SlotSinkContext {
             planned_workers: 0,
             rows_seen: 0,
             parallel_capable: false,
+            plan_kind: ScanPlanKind::Unknown,
         }
     }
 
@@ -76,9 +108,20 @@ impl SlotSinkContext {
         self.parallel_capable
     }
 
-    pub(crate) fn set_runtime_metadata(&mut self, parallel_capable: bool, planned_workers: usize) {
+    /// Leaf scan shape chosen by the current run-time PostgreSQL plan.
+    pub fn plan_kind(&self) -> ScanPlanKind {
+        self.plan_kind
+    }
+
+    pub(crate) fn set_runtime_metadata(
+        &mut self,
+        parallel_capable: bool,
+        planned_workers: usize,
+        plan_kind: ScanPlanKind,
+    ) {
         self.parallel_capable = parallel_capable;
         self.planned_workers = planned_workers;
+        self.plan_kind = plan_kind;
     }
 
     pub(crate) fn bump_rows(&mut self) {

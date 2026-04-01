@@ -1,11 +1,14 @@
 use pgrx::prelude::*;
+use scan_sql::{compile_scan, CompileScanInput, LimitLowering, PgRelation};
 use slot_scan::{
-    prepare_scan, ScanError, ScanOptions, SinkError, SlotSink, SlotSinkAction, SlotSinkContext,
-    SlotSinkMethods,
+    prepare_scan, ScanError, ScanOptions, ScanPlanKind, SinkError, SlotSink, SlotSinkAction,
+    SlotSinkContext, SlotSinkMethods,
 };
 use std::ffi::{c_void, CString};
 
 const SLOT_SCAN_TABLE: &str = "slot_scan_runtime_test";
+const SLOT_SCAN_INDEX_TABLE: &str = "slot_scan_index_test";
+const SLOT_SCAN_PARTITIONED_TABLE: &str = "slot_scan_partitioned_test";
 
 #[derive(Default)]
 struct CountSink {
@@ -17,6 +20,7 @@ struct CountSink {
     first_type_oid: Option<pg_sys::Oid>,
     init_parallel_capable: Option<bool>,
     init_planned_workers: Option<usize>,
+    init_plan_kind: Option<ScanPlanKind>,
 }
 
 static COUNT_SINK_METHODS: SlotSinkMethods = SlotSinkMethods {
@@ -35,6 +39,7 @@ unsafe fn count_sink_init(
     state.init_called = true;
     state.init_parallel_capable = Some(ctx.parallel_capable());
     state.init_planned_workers = Some(ctx.planned_workers());
+    state.init_plan_kind = Some(ctx.plan_kind());
 
     let natts = (*tuple_desc).natts as usize;
     state.tuple_desc_natts = Some(natts);
@@ -81,6 +86,62 @@ fn reset_slot_scan_table(rows: usize) {
     Spi::run(&format!("ANALYZE {SLOT_SCAN_TABLE}")).unwrap();
 }
 
+fn reset_slot_scan_index_table(rows: usize) {
+    Spi::run(&format!("DROP TABLE IF EXISTS {SLOT_SCAN_INDEX_TABLE}")).unwrap();
+    Spi::run(&format!(
+        "CREATE TABLE {SLOT_SCAN_INDEX_TABLE} AS \
+         SELECT g AS id, md5(g::text) AS payload \
+         FROM generate_series(1, {}) AS g",
+        rows
+    ))
+    .unwrap();
+    Spi::run(&format!(
+        "CREATE INDEX {SLOT_SCAN_INDEX_TABLE}_id_idx ON {SLOT_SCAN_INDEX_TABLE} (id)"
+    ))
+    .unwrap();
+    Spi::run(&format!("ANALYZE {SLOT_SCAN_INDEX_TABLE}")).unwrap();
+}
+
+fn reset_slot_scan_partitioned_table(rows: usize) {
+    Spi::run(&format!(
+        "DROP TABLE IF EXISTS {SLOT_SCAN_PARTITIONED_TABLE} CASCADE"
+    ))
+    .unwrap();
+    Spi::run(&format!(
+        "CREATE TABLE {SLOT_SCAN_PARTITIONED_TABLE} (id int, payload text) PARTITION BY RANGE (id)"
+    ))
+    .unwrap();
+    Spi::run(&format!(
+        "CREATE TABLE {SLOT_SCAN_PARTITIONED_TABLE}_p1 PARTITION OF {SLOT_SCAN_PARTITIONED_TABLE} \
+         FOR VALUES FROM (1) TO ({})",
+        (rows / 2) + 1
+    ))
+    .unwrap();
+    Spi::run(&format!(
+        "CREATE TABLE {SLOT_SCAN_PARTITIONED_TABLE}_p2 PARTITION OF {SLOT_SCAN_PARTITIONED_TABLE} \
+         FOR VALUES FROM ({}) TO ({})",
+        (rows / 2) + 1,
+        rows + 1
+    ))
+    .unwrap();
+    Spi::run(&format!(
+        "INSERT INTO {SLOT_SCAN_PARTITIONED_TABLE} \
+         SELECT g AS id, md5(g::text) AS payload \
+         FROM generate_series(1, {}) AS g",
+        rows
+    ))
+    .unwrap();
+    Spi::run(&format!(
+        "CREATE INDEX {SLOT_SCAN_PARTITIONED_TABLE}_p1_id_idx ON {SLOT_SCAN_PARTITIONED_TABLE}_p1 (id)"
+    ))
+    .unwrap();
+    Spi::run(&format!(
+        "CREATE INDEX {SLOT_SCAN_PARTITIONED_TABLE}_p2_id_idx ON {SLOT_SCAN_PARTITIONED_TABLE}_p2 (id)"
+    ))
+    .unwrap();
+    Spi::run(&format!("ANALYZE {SLOT_SCAN_PARTITIONED_TABLE}")).unwrap();
+}
+
 fn enable_parallel_scan_gucs() {
     Spi::run("SET LOCAL debug_parallel_query = on").unwrap();
     Spi::run("SET LOCAL max_parallel_workers = 2").unwrap();
@@ -90,6 +151,14 @@ fn enable_parallel_scan_gucs() {
     Spi::run("SET LOCAL parallel_tuple_cost = 0").unwrap();
     Spi::run("SET LOCAL enable_indexscan = on").unwrap();
     Spi::run("SET LOCAL enable_bitmapscan = on").unwrap();
+}
+
+fn enable_fast_plan_gucs() {
+    Spi::run("SET LOCAL max_parallel_workers_per_gather = 0").unwrap();
+    Spi::run("SET LOCAL cursor_tuple_fraction = 0.000001").unwrap();
+    Spi::run("SET LOCAL enable_indexscan = on").unwrap();
+    Spi::run("SET LOCAL enable_indexonlyscan = off").unwrap();
+    Spi::run("SET LOCAL enable_bitmapscan = off").unwrap();
 }
 
 struct LatestSnapshotGuard;
@@ -217,6 +286,7 @@ pub fn slot_scan_parallel_plan_metadata_smoke() {
     );
     assert_eq!(sink.init_parallel_capable, Some(stats.parallel_capable));
     assert_eq!(sink.init_planned_workers, Some(stats.planned_workers));
+    assert_eq!(sink.init_plan_kind, Some(stats.plan_kind));
 }
 
 pub fn slot_scan_local_row_cap_smoke() {
@@ -226,6 +296,7 @@ pub fn slot_scan_local_row_cap_smoke() {
     let prepared = prepare_scan(
         &format!("SELECT id FROM {SLOT_SCAN_TABLE}"),
         ScanOptions {
+            planner_fetch_hint: None,
             local_row_cap: Some(17),
         },
     )
@@ -250,6 +321,53 @@ pub fn slot_scan_rejects_limit_node() {
     )
     .expect_err("LIMIT should be rejected");
 
+    match err {
+        ScanError::UnsupportedPlan(message) => {
+            assert!(message.contains("LIMIT"), "unexpected message: {message}");
+        }
+        other => panic!("unexpected error: {other:?}"),
+    }
+}
+
+pub fn slot_scan_accepts_scan_sql_external_hint_and_rejects_sql_clause() {
+    reset_slot_scan_table(32);
+    let schema = arrow_schema::Schema::new(vec![
+        arrow_schema::Field::new("id", arrow_schema::DataType::Int32, false),
+        arrow_schema::Field::new("payload", arrow_schema::DataType::Utf8, true),
+    ]);
+    let relation = PgRelation::new(None::<String>, SLOT_SCAN_TABLE);
+    let filters = Vec::new();
+
+    let external_hint = compile_scan(CompileScanInput {
+        relation: &relation,
+        schema: &schema,
+        projection: Some(&[0]),
+        filters: &filters,
+        requested_limit: Some(5),
+        limit_lowering: LimitLowering::ExternalHint,
+    })
+    .expect("compile_scan external hint");
+    assert_eq!(external_hint.requested_limit, Some(5));
+    assert_eq!(external_hint.sql_limit, None);
+    assert!(!external_hint.sql.contains("LIMIT"));
+
+    prepare_scan(&external_hint.sql, ScanOptions::default())
+        .expect("slot_scan should accept SQL without LIMIT");
+
+    let sql_limit = compile_scan(CompileScanInput {
+        relation: &relation,
+        schema: &schema,
+        projection: Some(&[0]),
+        filters: &filters,
+        requested_limit: Some(5),
+        limit_lowering: LimitLowering::SqlClause,
+    })
+    .expect("compile_scan sql limit");
+    assert_eq!(sql_limit.sql_limit, Some(5));
+    assert!(sql_limit.sql.contains("LIMIT 5"));
+
+    let err = prepare_scan(&sql_limit.sql, ScanOptions::default())
+        .expect_err("slot_scan should reject SQL LIMIT");
     match err {
         ScanError::UnsupportedPlan(message) => {
             assert!(message.contains("LIMIT"), "unexpected message: {message}");
@@ -460,4 +578,78 @@ pub fn slot_scan_reuses_active_snapshot_for_read_only_cursor() {
 
     assert_eq!(stats.rows_seen as i64, expected_rows);
     assert_eq!(sink.rows_seen as i64, expected_rows);
+}
+
+pub fn slot_scan_planner_fetch_hint_reports_plan_kind() {
+    reset_slot_scan_index_table(100_000);
+    enable_fast_plan_gucs();
+    let _snapshot = unsafe { LatestSnapshotGuard::acquire() };
+
+    let prepared = prepare_scan(
+        &format!("SELECT payload FROM {SLOT_SCAN_INDEX_TABLE} WHERE id > 50000"),
+        ScanOptions {
+            planner_fetch_hint: Some(1),
+            local_row_cap: None,
+        },
+    )
+    .expect("prepare_scan with planner hint");
+    let mut sink = CountSink::default();
+    let stats = prepared
+        .run(SlotSink::new(&COUNT_SINK_METHODS, &mut sink))
+        .expect("run with planner hint");
+
+    assert_ne!(stats.plan_kind, ScanPlanKind::Unknown);
+    assert_eq!(sink.init_plan_kind, Some(stats.plan_kind));
+}
+
+pub fn slot_scan_planner_fetch_hint_is_independent_from_local_cap() {
+    reset_slot_scan_index_table(50_000);
+    enable_fast_plan_gucs();
+    let _snapshot = unsafe { LatestSnapshotGuard::acquire() };
+    let sql = format!("SELECT payload FROM {SLOT_SCAN_INDEX_TABLE} WHERE id > 25000");
+
+    let prepared = prepare_scan(
+        &sql,
+        ScanOptions {
+            planner_fetch_hint: Some(1),
+            local_row_cap: None,
+        },
+    )
+    .expect("prepare_scan");
+
+    let mut sink = CountSink::default();
+    let stats = prepared
+        .run(SlotSink::new(&COUNT_SINK_METHODS, &mut sink))
+        .expect("run");
+
+    assert_eq!(stats.rows_seen, 25_000);
+    assert_eq!(sink.rows_seen, 25_000);
+    assert!(!stats.hit_local_row_cap);
+    assert_ne!(stats.plan_kind, ScanPlanKind::Unknown);
+}
+
+pub fn slot_scan_append_merges_uniform_child_plan_kind() {
+    reset_slot_scan_partitioned_table(100_000);
+    Spi::run("SET LOCAL max_parallel_workers_per_gather = 0").unwrap();
+    Spi::run("SET LOCAL enable_seqscan = off").unwrap();
+    Spi::run("SET LOCAL enable_indexscan = on").unwrap();
+    Spi::run("SET LOCAL enable_indexonlyscan = off").unwrap();
+    Spi::run("SET LOCAL enable_bitmapscan = off").unwrap();
+    let _snapshot = unsafe { LatestSnapshotGuard::acquire() };
+
+    let prepared = prepare_scan(
+        &format!("SELECT payload FROM {SLOT_SCAN_PARTITIONED_TABLE} WHERE id > 0"),
+        ScanOptions::default(),
+    )
+    .expect("prepare_scan");
+
+    let mut sink = CountSink::default();
+    let stats = prepared
+        .run(SlotSink::new(&COUNT_SINK_METHODS, &mut sink))
+        .expect("run");
+
+    assert_eq!(stats.rows_seen, 100_000);
+    assert_eq!(sink.rows_seen, 100_000);
+    assert_eq!(stats.plan_kind, ScanPlanKind::IndexScan);
+    assert_eq!(sink.init_plan_kind, Some(ScanPlanKind::IndexScan));
 }

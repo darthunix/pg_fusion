@@ -18,6 +18,7 @@ Current scope:
 - no dependency on `scan_sql`, `slot_encoder`, `pool`, `transfer`, `import`,
   or executor-side code
 - callback-driven slot consumption
+- optional planner fetch hint for fast-start planning
 - optional soft local row cap
 - plan-shape validation for a narrow set of scan-oriented plans
 - read-only cursor execution under the caller's active snapshot
@@ -47,6 +48,13 @@ The important contract boundary is:
   scan SQL
 - `slot_scan`: responsible for PostgreSQL plan-shape validation, snapshot-safe
   cursor execution, and callback delivery over the current portal schema
+
+For the intended `scan_sql` integration, the upstream compiler should pass
+`CompiledScan.sql` without `LIMIT` and lower `CompiledScan.requested_limit`
+into both:
+
+- `ScanOptions.planner_fetch_hint` to bias PostgreSQL toward fast-start plans
+- `ScanOptions.local_row_cap` as a soft run-time early-stop hint
 
 ## Callback Contract
 
@@ -102,7 +110,13 @@ static SINK: SlotSinkMethods = SlotSinkMethods {
     abort: Some(sink_abort),
 };
 
-let prepared = prepare_scan("SELECT id FROM my_table WHERE id > 10", ScanOptions::default())?;
+let prepared = prepare_scan(
+    "SELECT id FROM my_table WHERE id > 10",
+    ScanOptions {
+        planner_fetch_hint: Some(100),
+        local_row_cap: Some(100),
+    },
+)?;
 let mut state = RowCounter::default();
 let stats = prepared.run(SlotSink::new(&SINK, &mut state))?;
 assert_eq!(state.rows, stats.rows_seen);
@@ -135,11 +149,18 @@ Important callback rules:
 
 - `slot_scan` is not a SQL sandbox; it expects trusted compiler-generated SQL,
   typically from `scan_sql`
+- `ScanOptions.planner_fetch_hint` is a planner-only hint that currently lowers
+  to PostgreSQL `CURSOR_OPT_FAST_PLAN`; it helps plan choice but does not imply
+  exact row-goal semantics
+- `ScanOptions.local_row_cap` is not an exact global limit; it is the intended
+  run-time lowering target for `scan_sql` fetch hints in the default
+  integration path
 - `PreparedScan` does not expose a stable `TupleDesc`
 - PostgreSQL may revalidate and replan a saved scan before `run()`
 - read-only cursor execution reuses the caller's active snapshot, so
   `slot_scan` stays MVCC-consistent with the surrounding statement
-- `ScanStats.parallel_capable` and `ScanStats.planned_workers` reflect the
-  current run-time plan, not metadata captured during `prepare_scan()`
+- `ScanStats.parallel_capable`, `ScanStats.planned_workers`, and
+  `ScanStats.plan_kind` reflect the current run-time plan, not metadata
+  captured during `prepare_scan()`
 - structural validation lives here; expression-level safety policy belongs to
   the upstream SQL compiler or caller contract

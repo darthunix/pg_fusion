@@ -26,6 +26,7 @@ transfer = { path = "../../page/transfer", version = "25.0" }
 layout = { path = "../../page/layout", version = "25.0" }
 import = { path = "../../page/import", version = "25.0" }
 slot_encoder = { path = "../../pg/slot_encoder", version = "25.0" }
+scan_sql = { path = "../../pg/scan_sql", version = "25.0" }
 slot_scan = { path = "../../pg/slot_scan", version = "25.0" }
 arrow-array = { workspace = true }
 arrow-schema = { workspace = true }

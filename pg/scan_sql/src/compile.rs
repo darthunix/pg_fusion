@@ -8,7 +8,7 @@ use datafusion_expr::{Expr, Operator};
 use crate::error::CompileError;
 use crate::quote::quote_identifier;
 use crate::render::{render_column, render_expr};
-use crate::types::{CompileScanInput, CompiledFilter, CompiledScan, PgRelation};
+use crate::types::{CompileScanInput, CompiledFilter, CompiledScan, LimitLowering, PgRelation};
 
 const DUMMY_PROJECTION_ALIAS: &str = "__pg_fusion_scan_dummy";
 
@@ -74,6 +74,12 @@ pub fn compile_scan(input: CompileScanInput<'_>) -> Result<CompiledScan, Compile
         .collect::<Vec<_>>();
     let all_filters_compiled = residual_filters.is_empty();
 
+    let requested_limit = input.requested_limit;
+    let sql_limit = match input.limit_lowering {
+        LimitLowering::ExternalHint => None,
+        LimitLowering::SqlClause => requested_limit,
+    };
+
     let mut sql = format!("SELECT {select_list} FROM {}", input.relation.render_sql());
     if !pushed_filters.is_empty() {
         sql.push_str(" WHERE ");
@@ -85,13 +91,15 @@ pub fn compile_scan(input: CompileScanInput<'_>) -> Result<CompiledScan, Compile
                 .join(" AND "),
         );
     }
-    if let Some(limit) = input.limit {
+    if let Some(limit) = sql_limit {
         sql.push_str(" LIMIT ");
         sql.push_str(&limit.to_string());
     }
 
     Ok(CompiledScan {
         sql,
+        requested_limit,
+        sql_limit,
         selected_columns,
         output_columns,
         filter_only_columns,

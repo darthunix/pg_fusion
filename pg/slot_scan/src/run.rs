@@ -36,6 +36,7 @@ impl PreparedScan {
                     .is_some_and(|cap| ctx.rows_seen() >= cap),
                 parallel_capable: ctx.parallel_capable(),
                 planned_workers: ctx.planned_workers(),
+                plan_kind: ctx.plan_kind(),
             })
         }
     }
@@ -73,7 +74,11 @@ impl PreparedScan {
                 return Err(ScanError::MissingTupleDesc);
             }
 
-            ctx.set_runtime_metadata(metadata.parallel_capable, metadata.planned_workers);
+            ctx.set_runtime_metadata(
+                metadata.parallel_capable,
+                metadata.planned_workers,
+                metadata.plan_kind,
+            );
 
             if let Some(init) = sink.methods.init {
                 init(ctx, sink.private, tuple_desc)?;

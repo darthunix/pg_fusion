@@ -1,5 +1,5 @@
 use crate::error::ScanError;
-use crate::types::{OwnedSpiPlan, PreparedScan, ScanOptions};
+use crate::types::{OwnedSpiPlan, PreparedScan, ScanOptions, ScanPlanKind};
 use pgrx::pg_sys;
 use pgrx::pg_sys::panic::CaughtError;
 use pgrx::PgTryBuilder;
@@ -11,6 +11,7 @@ use std::panic::AssertUnwindSafe;
 pub(crate) struct PlanMetadata {
     pub(crate) parallel_capable: bool,
     pub(crate) planned_workers: usize,
+    pub(crate) plan_kind: ScanPlanKind,
 }
 
 /// Parses, plans, and structurally validates trusted SQL for later execution.
@@ -27,12 +28,12 @@ pub fn prepare_scan(sql: &str, options: ScanOptions) -> Result<PreparedScan, Sca
     let c_sql = CString::new(sql).map_err(|_| ScanError::InvalidSql)?;
 
     with_spi(|| unsafe {
-        let plan = pg_sys::SPI_prepare_cursor(
-            c_sql.as_ptr(),
-            0,
-            std::ptr::null_mut(),
-            pg_sys::CURSOR_OPT_PARALLEL_OK as i32,
-        );
+        let mut cursor_options = pg_sys::CURSOR_OPT_PARALLEL_OK as i32;
+        if options.planner_fetch_hint.is_some() {
+            cursor_options |= pg_sys::CURSOR_OPT_FAST_PLAN as i32;
+        }
+        let plan =
+            pg_sys::SPI_prepare_cursor(c_sql.as_ptr(), 0, std::ptr::null_mut(), cursor_options);
         if plan.is_null() {
             return Err(spi_status_error("SPI_prepare_cursor", pg_sys::SPI_result));
         }
@@ -176,10 +177,11 @@ pub(crate) unsafe fn inspect_plan(plan: *mut pg_sys::Plan) -> Result<PlanMetadat
     match (*plan).type_ {
         pg_sys::NodeTag::T_Gather => {
             let gather = plan as *mut pg_sys::Gather;
-            inspect_plan((*gather).plan.lefttree)?;
+            let child = inspect_plan((*gather).plan.lefttree)?;
             Ok(PlanMetadata {
                 parallel_capable: true,
                 planned_workers: (*gather).num_workers.max(0) as usize,
+                plan_kind: child.plan_kind,
             })
         }
         pg_sys::NodeTag::T_GatherMerge => Err(ScanError::UnsupportedPlan(
@@ -190,10 +192,11 @@ pub(crate) unsafe fn inspect_plan(plan: *mut pg_sys::Plan) -> Result<PlanMetadat
         }
         pg_sys::NodeTag::T_Append => {
             let append = plan as *mut pg_sys::Append;
-            inspect_plan_list((*append).appendplans)?;
+            let child_metadata = inspect_plan_list_metadata((*append).appendplans)?;
             Ok(PlanMetadata {
                 parallel_capable: false,
                 planned_workers: 0,
+                plan_kind: merge_plan_kinds(child_metadata.into_iter().map(|m| m.plan_kind)),
             })
         }
         pg_sys::NodeTag::T_SeqScan
@@ -201,23 +204,32 @@ pub(crate) unsafe fn inspect_plan(plan: *mut pg_sys::Plan) -> Result<PlanMetadat
         | pg_sys::NodeTag::T_IndexOnlyScan => Ok(PlanMetadata {
             parallel_capable: false,
             planned_workers: 0,
+            plan_kind: match (*plan).type_ {
+                pg_sys::NodeTag::T_SeqScan => ScanPlanKind::SeqScan,
+                pg_sys::NodeTag::T_IndexScan => ScanPlanKind::IndexScan,
+                pg_sys::NodeTag::T_IndexOnlyScan => ScanPlanKind::IndexOnlyScan,
+                _ => unreachable!("matched scan node must have a known plan kind"),
+            },
         }),
         pg_sys::NodeTag::T_BitmapHeapScan => {
             inspect_optional_plan((*plan).lefttree)?;
             Ok(PlanMetadata {
                 parallel_capable: false,
                 planned_workers: 0,
+                plan_kind: ScanPlanKind::BitmapHeapScan,
             })
         }
         pg_sys::NodeTag::T_BitmapIndexScan => Ok(PlanMetadata {
             parallel_capable: false,
             planned_workers: 0,
+            plan_kind: ScanPlanKind::Unknown,
         }),
         pg_sys::NodeTag::T_BitmapAnd => {
             inspect_plan_list((*(plan as *mut pg_sys::BitmapAnd)).bitmapplans)?;
             Ok(PlanMetadata {
                 parallel_capable: false,
                 planned_workers: 0,
+                plan_kind: ScanPlanKind::Unknown,
             })
         }
         pg_sys::NodeTag::T_BitmapOr => {
@@ -225,6 +237,7 @@ pub(crate) unsafe fn inspect_plan(plan: *mut pg_sys::Plan) -> Result<PlanMetadat
             Ok(PlanMetadata {
                 parallel_capable: false,
                 planned_workers: 0,
+                plan_kind: ScanPlanKind::Unknown,
             })
         }
         pg_sys::NodeTag::T_Limit => Err(ScanError::UnsupportedPlan(
@@ -253,6 +266,7 @@ unsafe fn inspect_optional_plan(plan: *mut pg_sys::Plan) -> Result<PlanMetadata,
         Ok(PlanMetadata {
             parallel_capable: false,
             planned_workers: 0,
+            plan_kind: ScanPlanKind::Unknown,
         })
     } else {
         inspect_plan(plan)
@@ -260,14 +274,35 @@ unsafe fn inspect_optional_plan(plan: *mut pg_sys::Plan) -> Result<PlanMetadata,
 }
 
 unsafe fn inspect_plan_list(list: *mut pg_sys::List) -> Result<(), ScanError> {
+    inspect_plan_list_metadata(list).map(|_| ())
+}
+
+unsafe fn inspect_plan_list_metadata(
+    list: *mut pg_sys::List,
+) -> Result<Vec<PlanMetadata>, ScanError> {
     if list.is_null() {
-        return Ok(());
+        return Ok(Vec::new());
     }
+    let mut metadata = Vec::with_capacity((*list).length as usize);
     for idx in 0..(*list).length {
         let plan = list_nth(list, idx) as *mut pg_sys::Plan;
-        inspect_plan(plan)?;
+        metadata.push(inspect_plan(plan)?);
     }
-    Ok(())
+    Ok(metadata)
+}
+
+fn merge_plan_kinds(kinds: impl IntoIterator<Item = ScanPlanKind>) -> ScanPlanKind {
+    let mut non_unknown = kinds
+        .into_iter()
+        .filter(|kind| *kind != ScanPlanKind::Unknown);
+    let Some(first) = non_unknown.next() else {
+        return ScanPlanKind::Unknown;
+    };
+    if non_unknown.all(|kind| kind == first) {
+        first
+    } else {
+        ScanPlanKind::Unknown
+    }
 }
 
 unsafe fn list_nth(list: *mut pg_sys::List, n: i32) -> *mut std::ffi::c_void {

@@ -34,6 +34,12 @@
 //! `slot_scan` stays MVCC-consistent with the surrounding PostgreSQL
 //! statement. Saved scans are prepared with `CURSOR_OPT_PARALLEL_OK` so
 //! PostgreSQL can choose parallel-safe plans.
+//!
+//! In the default `scan_sql -> slot_scan` integration, `scan_sql` should pass
+//! SQL without `LIMIT` and lower `CompiledScan.requested_limit` into both:
+//!
+//! - [`ScanOptions::planner_fetch_hint`] for fast-start planning
+//! - [`ScanOptions::local_row_cap`] for best-effort early stop during `run()`
 
 mod error;
 mod plan;
@@ -43,6 +49,6 @@ mod types;
 pub use error::{ScanError, SinkError};
 pub use plan::prepare_scan;
 pub use types::{
-    PreparedScan, ScanOptions, ScanStats, SlotSink, SlotSinkAction, SlotSinkContext,
+    PreparedScan, ScanOptions, ScanPlanKind, ScanStats, SlotSink, SlotSinkAction, SlotSinkContext,
     SlotSinkMethods,
 };

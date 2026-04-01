@@ -22,7 +22,7 @@ fn test_relation() -> PgRelation {
 }
 
 #[test]
-fn compiles_projection_limit_and_supported_filters() {
+fn compiles_projection_fetch_hint_and_supported_filters() {
     let schema = test_schema();
     let filters = vec![
         Expr::Column(Column::from_name("id")).gt(lit(10_i64)),
@@ -34,10 +34,13 @@ fn compiles_projection_limit_and_supported_filters() {
         schema: &schema,
         projection: Some(&[0, 1]),
         filters: &filters,
-        limit: Some(25),
+        requested_limit: Some(25),
+        limit_lowering: LimitLowering::ExternalHint,
     })
     .unwrap();
 
+    assert_eq!(compiled.requested_limit, Some(25));
+    assert_eq!(compiled.sql_limit, None);
     assert_eq!(compiled.selected_columns, vec![0, 1]);
     assert_eq!(compiled.output_columns, vec![0, 1]);
     assert_eq!(compiled.filter_only_columns, Vec::<usize>::new());
@@ -46,7 +49,30 @@ fn compiles_projection_limit_and_supported_filters() {
     assert_eq!(compiled.residual_filters, Vec::<Expr>::new());
     assert_eq!(
         compiled.sql,
-        "SELECT \"id\", \"name\" FROM \"public\".\"users\" WHERE (\"id\" > 10) AND (\"name\" IS NOT NULL) LIMIT 25"
+        "SELECT \"id\", \"name\" FROM \"public\".\"users\" WHERE (\"id\" > 10) AND (\"name\" IS NOT NULL)"
+    );
+}
+
+#[test]
+fn compiles_sql_limit_when_requested() {
+    let schema = test_schema();
+    let filters = vec![Expr::Column(Column::from_name("id")).gt(lit(10_i64))];
+
+    let compiled = compile_scan(CompileScanInput {
+        relation: &test_relation(),
+        schema: &schema,
+        projection: Some(&[0]),
+        filters: &filters,
+        requested_limit: Some(7),
+        limit_lowering: LimitLowering::SqlClause,
+    })
+    .unwrap();
+
+    assert_eq!(compiled.requested_limit, Some(7));
+    assert_eq!(compiled.sql_limit, Some(7));
+    assert_eq!(
+        compiled.sql,
+        "SELECT \"id\" FROM \"public\".\"users\" WHERE (\"id\" > 10) LIMIT 7"
     );
 }
 
@@ -60,7 +86,8 @@ fn computes_filter_only_columns() {
         schema: &schema,
         projection: Some(&[0]),
         filters: &filters,
-        limit: None,
+        requested_limit: None,
+        limit_lowering: LimitLowering::ExternalHint,
     })
     .unwrap();
 
@@ -88,7 +115,8 @@ fn leaves_unsupported_filters_as_residual() {
         schema: &schema,
         projection: None,
         filters: &[supported.clone(), unsupported.clone()],
-        limit: None,
+        requested_limit: None,
+        limit_lowering: LimitLowering::ExternalHint,
     })
     .unwrap();
 
@@ -119,7 +147,8 @@ fn splits_top_level_and_for_partial_pushdown() {
         schema: &schema,
         projection: Some(&[1]),
         filters: &[filter],
-        limit: None,
+        requested_limit: None,
+        limit_lowering: LimitLowering::ExternalHint,
     })
     .unwrap();
 
@@ -150,7 +179,8 @@ fn includes_residual_filter_columns_in_output() {
         schema: &schema,
         projection: Some(&[1]),
         filters: &[pushed, residual.clone()],
-        limit: None,
+        requested_limit: None,
+        limit_lowering: LimitLowering::ExternalHint,
     })
     .unwrap();
 
@@ -166,7 +196,7 @@ fn includes_residual_filter_columns_in_output() {
 }
 
 #[test]
-fn renders_like_filter_and_limit() {
+fn renders_like_filter_without_sql_limit_by_default() {
     let schema = test_schema();
     let filter = Expr::Like(Like::new(
         false,
@@ -181,15 +211,18 @@ fn renders_like_filter_and_limit() {
         schema: &schema,
         projection: Some(&[1]),
         filters: &[filter],
-        limit: Some(5),
+        requested_limit: Some(5),
+        limit_lowering: LimitLowering::ExternalHint,
     })
     .unwrap();
 
+    assert_eq!(compiled.requested_limit, Some(5));
+    assert_eq!(compiled.sql_limit, None);
     assert_eq!(compiled.output_columns, vec![1]);
     assert_eq!(compiled.residual_filter_columns, Vec::<usize>::new());
     assert_eq!(
         compiled.sql,
-        "SELECT \"name\" FROM \"public\".\"users\" WHERE (\"name\" ILIKE 'al%') LIMIT 5"
+        "SELECT \"name\" FROM \"public\".\"users\" WHERE (\"name\" ILIKE 'al%')"
     );
 }
 
@@ -202,11 +235,14 @@ fn uses_dummy_projection_for_zero_column_scan() {
         schema: &schema,
         projection: Some(&[]),
         filters: &[],
-        limit: None,
+        requested_limit: None,
+        limit_lowering: LimitLowering::ExternalHint,
     })
     .unwrap();
 
     assert!(compiled.uses_dummy_projection);
+    assert_eq!(compiled.requested_limit, None);
+    assert_eq!(compiled.sql_limit, None);
     assert_eq!(compiled.selected_columns, Vec::<usize>::new());
     assert_eq!(compiled.output_columns, Vec::<usize>::new());
     assert_eq!(compiled.residual_filter_columns, Vec::<usize>::new());
@@ -224,7 +260,8 @@ fn errors_on_unknown_column() {
         schema: &schema,
         projection: None,
         filters: &[Expr::Column(Column::from_name("missing")).eq(lit(1_i64))],
-        limit: None,
+        requested_limit: None,
+        limit_lowering: LimitLowering::ExternalHint,
     })
     .unwrap_err();
 
@@ -246,7 +283,8 @@ fn errors_on_relation_mismatch() {
         filters: &[
             Expr::Column(Column::new(Some(TableReference::bare("orders")), "id")).eq(lit(1_i64)),
         ],
-        limit: None,
+        requested_limit: None,
+        limit_lowering: LimitLowering::ExternalHint,
     })
     .unwrap_err();
 
@@ -274,7 +312,8 @@ fn leaves_regex_filters_residual() {
         schema: &schema,
         projection: Some(&[1]),
         filters: std::slice::from_ref(&regex),
-        limit: None,
+        requested_limit: None,
+        limit_lowering: LimitLowering::ExternalHint,
     })
     .unwrap();
 
@@ -295,7 +334,8 @@ fn leaves_non_finite_float_literals_residual() {
         schema: &schema,
         projection: Some(&[1]),
         filters: std::slice::from_ref(&filter),
-        limit: None,
+        requested_limit: None,
+        limit_lowering: LimitLowering::ExternalHint,
     })
     .unwrap();
 
@@ -323,7 +363,8 @@ fn leaves_temporal_cast_targets_residual() {
         schema: &schema,
         projection: Some(&[1]),
         filters: std::slice::from_ref(&filter),
-        limit: None,
+        requested_limit: None,
+        limit_lowering: LimitLowering::ExternalHint,
     })
     .unwrap();
 
@@ -347,7 +388,8 @@ fn renders_nested_negative_without_comment_syntax() {
         schema: &schema,
         projection: Some(&[1]),
         filters: std::slice::from_ref(&filter),
-        limit: None,
+        requested_limit: None,
+        limit_lowering: LimitLowering::ExternalHint,
     })
     .unwrap();
 
@@ -373,7 +415,8 @@ fn folds_empty_in_list_to_false_with_postgresql_semantics() {
         schema: &schema,
         projection: Some(&[1]),
         filters: std::slice::from_ref(&filter),
-        limit: None,
+        requested_limit: None,
+        limit_lowering: LimitLowering::ExternalHint,
     })
     .unwrap();
 
@@ -400,7 +443,8 @@ fn compiles_int8_cast_using_postgresql_smallint_target() {
         schema: &schema,
         projection: Some(&[1]),
         filters: std::slice::from_ref(&filter),
-        limit: None,
+        requested_limit: None,
+        limit_lowering: LimitLowering::ExternalHint,
     })
     .unwrap();
 

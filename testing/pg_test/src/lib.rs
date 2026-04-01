@@ -284,6 +284,11 @@ mod tests {
     }
 
     #[pg_test]
+    fn slot_scan_accepts_scan_sql_external_hint_and_rejects_sql_clause() {
+        super::slot_scan::slot_scan_accepts_scan_sql_external_hint_and_rejects_sql_clause();
+    }
+
+    #[pg_test]
     fn slot_scan_rejects_join_plan() {
         super::slot_scan::slot_scan_rejects_join_plan();
     }
@@ -321,6 +326,21 @@ mod tests {
     #[pg_test]
     fn slot_scan_reuses_active_snapshot_for_read_only_cursor() {
         super::slot_scan::slot_scan_reuses_active_snapshot_for_read_only_cursor();
+    }
+
+    #[pg_test]
+    fn slot_scan_planner_fetch_hint_reports_plan_kind() {
+        super::slot_scan::slot_scan_planner_fetch_hint_reports_plan_kind();
+    }
+
+    #[pg_test]
+    fn slot_scan_planner_fetch_hint_is_independent_from_local_cap() {
+        super::slot_scan::slot_scan_planner_fetch_hint_is_independent_from_local_cap();
+    }
+
+    #[pg_test]
+    fn slot_scan_append_merges_uniform_child_plan_kind() {
+        super::slot_scan::slot_scan_append_merges_uniform_child_plan_kind();
     }
 
     #[pg_test]

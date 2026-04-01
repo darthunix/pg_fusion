@@ -69,7 +69,25 @@ pub struct CompileScanInput<'a> {
     pub schema: &'a Schema,
     pub projection: Option<&'a [usize]>,
     pub filters: &'a [Expr],
-    pub limit: Option<usize>,
+    pub requested_limit: Option<usize>,
+    pub limit_lowering: LimitLowering,
+}
+
+/// Controls how a requested DataFusion fetch/limit hint is lowered.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum LimitLowering {
+    /// Keep the limit as metadata for a downstream runtime such as `slot_scan`.
+    ///
+    /// This is the default because `TableProvider::scan(limit)` in DataFusion
+    /// is a hint, not an exact global `LIMIT` contract.
+    #[default]
+    ExternalHint,
+    /// Render the requested limit directly as a PostgreSQL `LIMIT` clause.
+    ///
+    /// This is intended for consumers that explicitly want SQL-level limit
+    /// semantics and should not be used for the default `scan_sql -> slot_scan`
+    /// path.
+    SqlClause,
 }
 
 /// A filter from the original input that was successfully compiled into PostgreSQL SQL.
@@ -83,6 +101,8 @@ pub struct CompiledFilter {
 #[derive(Debug, Clone, PartialEq)]
 pub struct CompiledScan {
     pub sql: String,
+    pub requested_limit: Option<usize>,
+    pub sql_limit: Option<usize>,
     pub selected_columns: Vec<usize>,
     pub output_columns: Vec<usize>,
     pub filter_only_columns: Vec<usize>,
