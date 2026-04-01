@@ -3,7 +3,7 @@ id: comp-page-arrow-0001
 type: fact
 scope: import
 tags: ["arrow", "layout", "transfer", "shared-memory", "zero-copy"]
-updated_at: "2026-03-31"
+updated_at: "2026-04-01"
 importance: 0.72
 ---
 
@@ -19,7 +19,7 @@ importance: 0.72
 - Wire contract:
   - outer `transfer::MessageKind` must be `import::ARROW_LAYOUT_BATCH_KIND`
   - outer `transfer` flags must be `0`
-  - page payload is exactly one validated `layout` block
+  - page payload is exactly one validated `arrow_layout` block
   - external Arrow schema must match the on-page layout exactly
   - string/binary columns must use `Utf8View` / `BinaryView`
 - Ownership model:
@@ -31,5 +31,5 @@ importance: 0.72
   - zero-buffer batches such as empty-schema payloads decode as owned Arrow structures and may release the page before `import()` returns
 - Current status:
   - crate is implemented and tested in isolation
-  - it imports `layout` pages produced by `slot_encoder` tests and helpers
+  - it imports `arrow_layout` pages produced by `slot_encoder` tests and helpers
   - executor/scan runtime paths do not use it yet

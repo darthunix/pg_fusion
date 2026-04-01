@@ -3,16 +3,16 @@ id: comp-pg-slot-arrow-0001
 type: fact
 scope: slot_encoder
 tags: ["arrow", "layout", "postgres", "slot", "transfer"]
-updated_at: "2026-03-31"
+updated_at: "2026-04-01"
 importance: 0.72
 ---
 
 # Component: slot_encoder
 
-- `slot_encoder` is a standalone workspace crate that writes PostgreSQL `TupleTableSlot` rows directly into an initialized `layout` block.
+- `slot_encoder` is a standalone workspace crate that writes PostgreSQL `TupleTableSlot` rows directly into an initialized `arrow_layout` block.
 - It does not depend on `import`, `transfer`, `storage`, or DataFusion.
 - Public boundary in v1:
-  - caller plans and initializes a block externally through `layout`
+  - caller plans and initializes a block externally through `arrow_layout`
   - `PageBatchEncoder::new(tuple_desc, payload)` validates the block against the PostgreSQL `TupleDesc`
   - `append_slot(slot)` appends one PostgreSQL row and returns `AppendStatus::{Appended, Full}`
   - `finish()` writes final header state and returns `{ row_count, payload_len }`
@@ -32,6 +32,6 @@ importance: 0.72
   - `bytea -> Arrow BinaryView`
   - `uuid -> Arrow FixedSizeBinary(16)`
 - Output contract:
-  - caller-provided payload already contains one initialized `layout` block
-  - `payload_len` currently equals the block size published by `layout`
+  - caller-provided payload already contains one initialized `arrow_layout` block
+  - `payload_len` currently equals the block size published by `arrow_layout`
   - `AppendStatus::Full` means the current row did not fit and must be retried on a fresh block

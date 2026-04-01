@@ -1,5 +1,5 @@
 use super::{set_test_database_encoding, AppendStatus, ConfigError, EncodeError, PageBatchEncoder};
-use layout::{init_block, BlockRef, ColumnSpec, LayoutPlan, TypeTag};
+use arrow_layout::{init_block, BlockRef, ColumnSpec, LayoutPlan, TypeTag};
 use pgrx_pg_sys as pg_sys;
 use std::alloc::{alloc_zeroed, dealloc, GlobalAlloc, Layout, System};
 use std::cell::Cell;

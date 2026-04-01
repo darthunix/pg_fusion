@@ -5,9 +5,9 @@ use crate::datum::{
     with_detoasted_slot_datum,
 };
 use crate::{ConfigError, EncodeError};
-use layout::constants::{UUID_WIDTH_BYTES, VIEW_INLINE_LEN};
-use layout::raw::{BlockHeader, ColumnDesc};
-use layout::{BlockRef, ByteView, TypeTag};
+use arrow_layout::constants::{UUID_WIDTH_BYTES, VIEW_INLINE_LEN};
+use arrow_layout::raw::{BlockHeader, ColumnDesc};
+use arrow_layout::{BlockRef, ByteView, TypeTag};
 use pgrx_pg_sys as pg_sys;
 use std::mem::size_of;
 use std::ptr;
@@ -31,10 +31,10 @@ pub struct EncodedBatch {
 }
 
 /// Direct writer from PostgreSQL `TupleTableSlot` rows into a
-/// `layout` block.
+/// `arrow_layout` block.
 ///
 /// The encoder assumes the payload already contains a valid initialized block
-/// produced by `layout`. It validates that the block layout matches
+/// produced by `arrow_layout`. It validates that the block layout matches
 /// the supplied PostgreSQL `TupleDesc`, then appends rows in-place without
 /// building Rust-side column buffers.
 #[derive(Debug)]
@@ -50,7 +50,7 @@ pub struct PageBatchEncoder<'payload> {
 }
 
 impl<'payload> PageBatchEncoder<'payload> {
-    /// Creates a new encoder over an initialized `layout` block.
+    /// Creates a new encoder over an initialized `arrow_layout` block.
     ///
     /// This validates that the target block and PostgreSQL `TupleDesc` have the
     /// same column count and compatible logical types.
@@ -108,7 +108,7 @@ impl<'payload> PageBatchEncoder<'payload> {
             attrs_ptr,
             col_count: layout_cols,
             needed_attrs: i32::try_from(layout_cols)
-                .map_err(|_| layout::LayoutError::SizeOverflow)?,
+                .map_err(|_| arrow_layout::LayoutError::SizeOverflow)?,
             payload,
             block_ptr,
             descs_ptr,
@@ -204,16 +204,16 @@ impl<'payload> PageBatchEncoder<'payload> {
     /// Finalizes the block and returns the written row count and payload length.
     ///
     /// This writes the encoder's local header state back into the payload and
-    /// reopens the block through `layout` to validate the final
+    /// reopens the block through `arrow_layout` to validate the final
     /// structure.
     pub fn finish(mut self) -> Result<EncodedBatch, EncodeError> {
         self.write_header()?;
         BlockRef::open(&*self.payload)?;
         Ok(EncodedBatch {
             row_count: usize::try_from(self.header.row_count)
-                .map_err(|_| layout::LayoutError::SizeOverflow)?,
+                .map_err(|_| arrow_layout::LayoutError::SizeOverflow)?,
             payload_len: usize::try_from(self.header.block_size)
-                .map_err(|_| layout::LayoutError::SizeOverflow)?,
+                .map_err(|_| arrow_layout::LayoutError::SizeOverflow)?,
         })
     }
 
@@ -276,7 +276,7 @@ impl<'payload> PageBatchEncoder<'payload> {
                 let bytes = unsafe { read_packed_varlena(datum, index)? };
                 self.write_view(index, row_idx, desc, bytes)
             }
-            raw => Err(layout::LayoutError::InvalidTypeTag { raw }.into()),
+            raw => Err(arrow_layout::LayoutError::InvalidTypeTag { raw }.into()),
         }
     }
 
@@ -310,7 +310,8 @@ impl<'payload> PageBatchEncoder<'payload> {
             return Ok(CellWrite::Written);
         }
 
-        let len = u32::try_from(bytes.len()).map_err(|_| layout::LayoutError::SizeOverflow)?;
+        let len =
+            u32::try_from(bytes.len()).map_err(|_| arrow_layout::LayoutError::SizeOverflow)?;
         let Some(start) = self.tail_alloc(len)? else {
             return Ok(CellWrite::Full);
         };
@@ -362,7 +363,7 @@ impl<'payload> PageBatchEncoder<'payload> {
             {
                 self.zero_value_slot(row_idx, desc, 16)
             }
-            raw => return Err(layout::LayoutError::InvalidTypeTag { raw }.into()),
+            raw => return Err(arrow_layout::LayoutError::InvalidTypeTag { raw }.into()),
         }
         self.increment_null_count(index, desc)?;
         Ok(())
@@ -389,7 +390,7 @@ impl<'payload> PageBatchEncoder<'payload> {
         desc.null_count = desc
             .null_count
             .checked_add(1)
-            .ok_or(layout::LayoutError::SizeOverflow)?;
+            .ok_or(arrow_layout::LayoutError::SizeOverflow)?;
         self.write_desc(index, desc);
         Ok(())
     }
@@ -402,7 +403,7 @@ impl<'payload> PageBatchEncoder<'payload> {
         desc.null_count = desc
             .null_count
             .checked_sub(1)
-            .ok_or(layout::LayoutError::SizeOverflow)?;
+            .ok_or(arrow_layout::LayoutError::SizeOverflow)?;
         self.write_desc(index, desc);
         Ok(())
     }
@@ -415,7 +416,7 @@ impl<'payload> PageBatchEncoder<'payload> {
             .header
             .tail_cursor
             .checked_sub(len)
-            .ok_or(layout::LayoutError::SizeOverflow)?;
+            .ok_or(arrow_layout::LayoutError::SizeOverflow)?;
         if next < self.header.pool_base {
             return Ok(None);
         }
@@ -468,10 +469,10 @@ impl<'payload> PageBatchEncoder<'payload> {
             raw if raw == TypeTag::Int32.to_raw() || raw == TypeTag::Float32.to_raw() => 4usize,
             raw if raw == TypeTag::Int64.to_raw() || raw == TypeTag::Float64.to_raw() => 8usize,
             raw if raw == TypeTag::Uuid.to_raw() => 16usize,
-            raw => return Err(layout::LayoutError::InvalidTypeTag { raw }.into()),
+            raw => return Err(arrow_layout::LayoutError::InvalidTypeTag { raw }.into()),
         };
         if bytes.len() != width {
-            return Err(layout::LayoutError::InvalidHeaderBounds.into());
+            return Err(arrow_layout::LayoutError::InvalidHeaderBounds.into());
         }
         let start = desc.values_off as usize + (row_idx as usize * width);
         unsafe {

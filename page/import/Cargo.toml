@@ -13,7 +13,7 @@ doctest = false
 arrow-array = { workspace = true }
 arrow-buffer = { workspace = true }
 arrow-schema = { workspace = true }
-layout = { path = "../layout", version = "25.0" }
+arrow_layout = { path = "../arrow_layout", version = "25.0" }
 transfer = { path = "../transfer", version = "25.0" }
 thiserror = "2.0"
 

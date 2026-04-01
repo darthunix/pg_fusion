@@ -1,6 +1,6 @@
 //! Shared zero-copy Arrow page layout contract.
 //!
-//! `layout` defines the binary page layout shared by producer-side
+//! `arrow_layout` defines the binary page layout shared by producer-side
 //! and consumer-side crates for direct zero-copy page batches.
 //!
 //! Recommended entry points:

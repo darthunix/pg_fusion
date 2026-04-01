@@ -1,5 +1,5 @@
 [package]
-name = "layout"
+name = "arrow_layout"
 version = "25.0.0"
 edition = "2021"
 description = "Shared zero-copy Arrow page layout contract for import and slot_encoder"

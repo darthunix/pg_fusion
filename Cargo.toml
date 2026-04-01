@@ -3,7 +3,7 @@ members = [
   "lockfree",
   "page/pool",
   "page/transfer",
-  "page/layout",
+  "page/arrow_layout",
   "page/import",
   "pg/scan_sql",
   "pg/slot_scan",

@@ -1,15 +1,15 @@
 ---
 id: comp-page-arrow-layout-0001
 type: fact
-scope: layout
+scope: arrow_layout
 tags: ["arrow", "layout", "shared-memory", "zero-copy", "view-types"]
-updated_at: "2026-03-31"
+updated_at: "2026-04-01"
 importance: 0.7
 ---
 
-# Component: layout
+# Component: arrow_layout
 
-- `layout` is a standalone workspace crate that defines the shared binary contract for the next zero-copy Arrow page format.
+- `arrow_layout` is a standalone workspace crate that defines the shared binary contract for the next zero-copy Arrow page format.
 - It is intentionally layout-only in its first change:
   - `#[repr(C)]` raw page structs
   - constants and type tags

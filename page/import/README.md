@@ -13,7 +13,7 @@ The page payload contract is:
 
 - `transfer::MessageKind == import::ARROW_LAYOUT_BATCH_KIND`
 - `transfer` flags must be `0`
-- the payload is one validated `layout` block
+- the payload is one validated `arrow_layout` block
 - the external Arrow schema must exactly match the on-page layout surface
 - string/binary columns must use `Utf8View` / `BinaryView`
 

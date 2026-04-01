@@ -52,7 +52,7 @@ The JSON result contains:
 - `rows`: source table row count per scan
 - `iterations`: number of full rescans
 - `rows_per_page`: current `slot_encoder` batch/page target
-- `payload_capacity_bytes`: writable payload budget passed to `layout`
+- `payload_capacity_bytes`: writable payload budget passed to `arrow_layout`
 - `baseline`: PostgreSQL slot deformation metrics via `slot_getallattrs()`
 - `arrow`: `slot_encoder::append_slot()` metrics, produced page count, and `block_size_bytes`
 - `ratio.arrow_vs_baseline`: Arrow rows/sec divided by PostgreSQL rows/sec

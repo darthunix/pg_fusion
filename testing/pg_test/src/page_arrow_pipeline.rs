@@ -4,9 +4,9 @@ use arrow_array::{
     ArrayRef, BinaryViewArray, BooleanArray, FixedSizeBinaryArray, Float64Array, Int32Array,
     RecordBatch, StringViewArray,
 };
+use arrow_layout::{init_block, LayoutPlan};
 use arrow_schema::{DataType, Field, Schema};
 use import::{ArrowPageDecoder, ARROW_LAYOUT_BATCH_KIND};
-use layout::{init_block, LayoutPlan};
 use pgrx::prelude::*;
 use pgrx::varlena::{rust_byte_slice_to_bytea, rust_str_to_text_p};
 use pool::{PagePool, PagePoolConfig, RegionLayout};

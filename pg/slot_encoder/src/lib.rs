@@ -1,15 +1,15 @@
-//! Producer-side direct writer for `layout` blocks over PostgreSQL
+//! Producer-side direct writer for `arrow_layout` blocks over PostgreSQL
 //! `TupleTableSlot`s.
 //!
 //! The crate intentionally does not depend on `import`, `transfer`,
 //! `storage`, or DataFusion. It only maps PostgreSQL slot values into a
-//! caller-initialized `layout` block.
+//! caller-initialized `arrow_layout` block.
 //!
 //! The intended flow is:
 //!
-//! 1. Build a [`layout::LayoutPlan`] for the target Arrow schema.
+//! 1. Build a [`arrow_layout::LayoutPlan`] for the target Arrow schema.
 //! 2. Allocate a payload buffer and initialize it with
-//!    [`layout::init_block`].
+//!    [`arrow_layout::init_block`].
 //! 3. Construct [`PageBatchEncoder`] from the PostgreSQL
 //!    [`pgrx_pg_sys::TupleDesc`]
 //!    and the mutable payload.

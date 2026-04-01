@@ -9,7 +9,7 @@ Why: PostgreSQL’s Volcano (row‑at‑a‑time) engine is great for OLTP but s
 - Extension (pgrx) sits in the backend process and drives Parse/Bind/Optimize/Translate/Begin/Exec/End.
 - Executor (runtime) runs DataFusion; `HeapScanProvider → HeapScanExec → HeapScanStream` scans heap pages from shared memory and produces Arrow RecordBatches.
 - Protocol defines control/data packets and a compact wire tuple format with explicit alignment.
-- Low-level shared-memory building blocks such as `lockfree`, `page/pool`, `page/transfer`, `page/layout`, `page/import`, `pg/slot_encoder`, and `pg/scan_sql` live in standalone workspace crates; the `page/*`, `pg/slot_encoder`, and `pg/scan_sql` crates are not yet wired into the runtime path.
+- Low-level shared-memory building blocks such as `lockfree`, `page/pool`, `page/transfer`, `page/arrow_layout`, `page/import`, `pg/slot_encoder`, and `pg/scan_sql` live in standalone workspace crates; the `page/*`, `pg/slot_encoder`, and `pg/scan_sql` crates are not yet wired into the runtime path.
 
 See: `ai/memory/architecture.md` and component notes in `ai/memory/components/`.
 
@@ -23,9 +23,9 @@ See: `ai/memory/architecture.md` and component notes in `ai/memory/components/`.
 - `lockfree/` — standalone shared-memory lock-free primitives
 - `page/pool/` — standalone fixed-page shared-memory ownership pool
 - `page/transfer/` — standalone sans-IO page handoff protocol over `page/pool`
-- `page/layout/` — standalone shared zero-copy Arrow page layout contract
+- `page/arrow_layout/` — standalone shared zero-copy Arrow page layout contract
 - `page/import/` — standalone zero-copy Arrow `RecordBatch` import over `page/transfer`
-- `pg/slot_encoder/` — standalone layout-block encoder for PostgreSQL scan-slot rows
+- `pg/slot_encoder/` — standalone arrow-layout-block encoder for PostgreSQL scan-slot rows
 - `pg/scan_sql/` — standalone compiler from DataFusion scan pushdown to PostgreSQL SQL
 - `testing/pg_test/` — pgrx benchmark and test crate for Postgres-side storage/page experiments
 

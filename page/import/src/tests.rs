@@ -4,8 +4,8 @@ use arrow_array::{
     Float64Array, Int16Array, Int32Array, Int64Array, RecordBatch, RecordBatchOptions,
     StringViewArray,
 };
+use arrow_layout::{init_block, BlockMut, BlockRef, ByteView, LayoutPlan, ViewWriteStatus};
 use arrow_schema::{DataType, Field, Schema};
-use layout::{init_block, BlockMut, BlockRef, ByteView, LayoutPlan, ViewWriteStatus};
 use pgrx_pg_sys as pg_sys;
 use pool::{PagePool, PagePoolConfig, RegionLayout};
 use slot_encoder::{AppendStatus, PageBatchEncoder};
@@ -274,7 +274,7 @@ fn encode_layout_payload(batch: &RecordBatch, block_size: usize) -> Vec<u8> {
                 }
 
                 match layout.type_tag {
-                    layout::TypeTag::Boolean => {
+                    arrow_layout::TypeTag::Boolean => {
                         let value = array
                             .as_any()
                             .downcast_ref::<BooleanArray>()
@@ -282,7 +282,7 @@ fn encode_layout_payload(batch: &RecordBatch, block_size: usize) -> Vec<u8> {
                             .value(row as usize);
                         block.write_bool(col, row, value).expect("write bool");
                     }
-                    layout::TypeTag::Int16 => {
+                    arrow_layout::TypeTag::Int16 => {
                         let value = array
                             .as_any()
                             .downcast_ref::<Int16Array>()
@@ -291,7 +291,7 @@ fn encode_layout_payload(batch: &RecordBatch, block_size: usize) -> Vec<u8> {
                             .to_le_bytes();
                         block.write_fixed(col, row, &value).expect("write fixed");
                     }
-                    layout::TypeTag::Int32 => {
+                    arrow_layout::TypeTag::Int32 => {
                         let value = array
                             .as_any()
                             .downcast_ref::<Int32Array>()
@@ -300,7 +300,7 @@ fn encode_layout_payload(batch: &RecordBatch, block_size: usize) -> Vec<u8> {
                             .to_le_bytes();
                         block.write_fixed(col, row, &value).expect("write fixed");
                     }
-                    layout::TypeTag::Int64 => {
+                    arrow_layout::TypeTag::Int64 => {
                         let value = array
                             .as_any()
                             .downcast_ref::<Int64Array>()
@@ -309,7 +309,7 @@ fn encode_layout_payload(batch: &RecordBatch, block_size: usize) -> Vec<u8> {
                             .to_le_bytes();
                         block.write_fixed(col, row, &value).expect("write fixed");
                     }
-                    layout::TypeTag::Float32 => {
+                    arrow_layout::TypeTag::Float32 => {
                         let value = array
                             .as_any()
                             .downcast_ref::<Float32Array>()
@@ -319,7 +319,7 @@ fn encode_layout_payload(batch: &RecordBatch, block_size: usize) -> Vec<u8> {
                             .to_le_bytes();
                         block.write_fixed(col, row, &value).expect("write fixed");
                     }
-                    layout::TypeTag::Float64 => {
+                    arrow_layout::TypeTag::Float64 => {
                         let value = array
                             .as_any()
                             .downcast_ref::<Float64Array>()
@@ -329,7 +329,7 @@ fn encode_layout_payload(batch: &RecordBatch, block_size: usize) -> Vec<u8> {
                             .to_le_bytes();
                         block.write_fixed(col, row, &value).expect("write fixed");
                     }
-                    layout::TypeTag::Uuid => {
+                    arrow_layout::TypeTag::Uuid => {
                         let value = array
                             .as_any()
                             .downcast_ref::<FixedSizeBinaryArray>()
@@ -337,7 +337,7 @@ fn encode_layout_payload(batch: &RecordBatch, block_size: usize) -> Vec<u8> {
                             .value(row as usize);
                         block.write_fixed(col, row, value).expect("write fixed");
                     }
-                    layout::TypeTag::Utf8View => {
+                    arrow_layout::TypeTag::Utf8View => {
                         let value = array
                             .as_any()
                             .downcast_ref::<StringViewArray>()
@@ -349,7 +349,7 @@ fn encode_layout_payload(batch: &RecordBatch, block_size: usize) -> Vec<u8> {
                             ViewWriteStatus::Written
                         );
                     }
-                    layout::TypeTag::BinaryView => {
+                    arrow_layout::TypeTag::BinaryView => {
                         let value = array
                             .as_any()
                             .downcast_ref::<BinaryViewArray>()
@@ -498,7 +498,7 @@ fn rejects_schema_type_mismatch() {
         err,
         ImportError::SchemaTypeMismatch {
             index: 1,
-            actual: layout::TypeTag::Int16,
+            actual: arrow_layout::TypeTag::Int16,
             ..
         }
     ));

@@ -1,6 +1,6 @@
 use crate::error::oid_u32;
 use crate::{ConfigError, EncodeError};
-use layout::TypeTag;
+use arrow_layout::TypeTag;
 use pgrx_pg_sys as pg_sys;
 use std::ptr;
 use std::slice;

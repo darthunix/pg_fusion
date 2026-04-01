@@ -1,5 +1,5 @@
+use arrow_layout::{LayoutError, TypeTag};
 use arrow_schema::ArrowError;
-use layout::{LayoutError, TypeTag};
 use thiserror::Error;
 use transfer::MessageKind;
 

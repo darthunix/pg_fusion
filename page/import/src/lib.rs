@@ -1,7 +1,7 @@
 //! Zero-copy Apache Arrow batch import over `transfer`.
 //!
 //! `import` consumes a [`transfer::ReceivedPage`] whose payload is a
-//! raw [`layout`] block and returns a plain
+//! raw `arrow_layout` block and returns a plain
 //! [`arrow_array::RecordBatch`] backed directly by the shared-memory page
 //! bytes.
 //!
@@ -24,20 +24,20 @@ use arrow_array::{
 };
 use arrow_buffer::alloc::Allocation;
 use arrow_buffer::{BooleanBuffer, Buffer, NullBuffer, ScalarBuffer};
+use arrow_layout::bitmap::bitmap_bytes;
+use arrow_layout::constants::UUID_WIDTH_BYTES;
+use arrow_layout::{BlockRef, ColumnLayout, LayoutError, TypeTag};
 use arrow_schema::SchemaRef;
 pub use error::{ConfigError, ImportError};
-use layout::bitmap::bitmap_bytes;
-use layout::constants::UUID_WIDTH_BYTES;
-use layout::{BlockRef, ColumnLayout, LayoutError, TypeTag};
 use std::ptr::NonNull;
 use std::slice;
 use std::sync::Arc;
 use transfer::{MessageKind, ReceivedPage};
 
-/// `transfer::MessageKind` for layout-backed Arrow pages imported by this crate.
+/// `transfer::MessageKind` for arrow-layout-backed Arrow pages imported by this crate.
 pub const ARROW_LAYOUT_BATCH_KIND: MessageKind = 0x4152;
 
-/// Importer for `layout` batches stored in `transfer` pages.
+/// Importer for `arrow_layout` batches stored in `transfer` pages.
 #[derive(Clone, Debug)]
 pub struct ArrowPageDecoder {
     schema: SchemaRef,

@@ -1,7 +1,7 @@
 use anyhow::Result as AnyResult;
 use anyhow::{bail, Context};
+use arrow_layout::{init_block, LayoutPlan};
 use arrow_schema::{DataType, Field, Schema};
-use layout::{init_block, LayoutPlan};
 use pgrx::prelude::*;
 use serde_json::{json, Value};
 use slot_encoder::{AppendStatus, PageBatchEncoder};

@@ -1,10 +1,10 @@
-use layout::{LayoutError, TypeTag};
+use arrow_layout::{LayoutError, TypeTag};
 use pgrx_pg_sys as pg_sys;
 use thiserror::Error;
 
 #[derive(Debug, Error)]
 /// Configuration-time failures when binding a PostgreSQL `TupleDesc` to an
-/// initialized `layout` block.
+/// initialized `arrow_layout` block.
 pub enum ConfigError {
     #[error("TupleDesc pointer is null")]
     NullTupleDesc,

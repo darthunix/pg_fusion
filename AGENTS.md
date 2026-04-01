@@ -8,7 +8,7 @@
 - `common/`: Shared types and errors (e.g., `FusionError`).
 - `page/pool/`: fixed-page shared-memory ownership pool.
 - `page/transfer/`: page handoff protocol built on `page/pool`.
-- `page/layout/`: shared zero-copy Arrow page layout contract.
+- `page/arrow_layout/`: shared zero-copy Arrow page layout contract.
 - `page/import/`: zero-copy Arrow `RecordBatch` import over `page/transfer`.
 - `storage/`: Low-level Postgres storage helpers (heap pages, tuple iteration/decoding).
   - `storage/src/heap.rs`: Heap page reader with tuple iterators and zero-allocation tuple decoder to Arrow/DataFusion `ScalarValue`. Supports fixed-width, date/time/timestamp/interval, inline varlena text. Projected compressed/external varlena returns an error; non-projected is skipped safely.

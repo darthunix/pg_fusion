@@ -1,6 +1,6 @@
-# layout
+# arrow_layout
 
-`layout` defines the shared binary layout for the zero-copy Arrow page format used by `slot_encoder` and `import`.
+`arrow_layout` defines the shared binary layout for the zero-copy Arrow page format used by `slot_encoder` and `import`.
 
 It is intentionally narrow:
 
@@ -31,10 +31,10 @@ Most callers should stay on the root API:
 
 Advanced escape hatches remain available under:
 
-- `layout::raw`
-- `layout::validate`
-- `layout::constants`
-- `layout::bitmap`
+- `arrow_layout::raw`
+- `arrow_layout::validate`
+- `arrow_layout::constants`
+- `arrow_layout::bitmap`
 
 The format is a front-and-tail page layout:
 
@@ -97,7 +97,7 @@ The crate is usually used in two phases:
 
 ```rust
 use arrow_schema::{DataType, Field, Schema};
-use layout::{init_block, BlockMut, LayoutPlan};
+use arrow_layout::{init_block, BlockMut, LayoutPlan};
 
 let schema = Schema::new(vec![
     Field::new("id", DataType::Int64, false),
@@ -111,7 +111,7 @@ init_block(&mut block_bytes, &plan)?;
 let block = BlockMut::open(&mut block_bytes)?;
 assert_eq!(block.max_rows(), 128);
 assert_eq!(block.row_count(), 0);
-# Ok::<(), layout::LayoutError>(())
+# Ok::<(), arrow_layout::LayoutError>(())
 ```
 
 ### Write rows directly into the block
@@ -121,7 +121,7 @@ reserved front region. Long `Utf8View` / `BinaryView` payloads are allocated
 from the shared tail arena automatically by `write_view_bytes`.
 
 ```rust
-use layout::{init_block, BlockMut, LayoutPlan, ViewWriteStatus};
+use arrow_layout::{init_block, BlockMut, LayoutPlan, ViewWriteStatus};
 
 # use arrow_schema::{DataType, Field, Schema};
 # let schema = Schema::new(vec![Field::new("flag", DataType::Boolean, true), Field::new("name", DataType::Utf8View, true)]);
@@ -138,14 +138,14 @@ let value = b"this string does not fit inline";
 assert_eq!(block.write_view_bytes(1, 0, value)?, ViewWriteStatus::Written);
 block.commit_current_row()?;
 block.validate()?;
-# Ok::<(), layout::LayoutError>(())
+# Ok::<(), arrow_layout::LayoutError>(())
 ```
 
 ### Read and validate a block without allocation
 
 ```rust
 use arrow_schema::{DataType, Field, Schema};
-use layout::{init_block, BlockRef, LayoutPlan};
+use arrow_layout::{init_block, BlockRef, LayoutPlan};
 
 # let schema = Schema::new(vec![Field::new("name", DataType::Utf8View, true)]);
 # let plan = LayoutPlan::from_arrow_schema(&schema, 4, 512)?;
@@ -163,7 +163,7 @@ if first_layout.type_tag.is_view() && block.row_count() > 0 {
     let view = block.view(0, 0)?;
     let _ = view;
 }
-# Ok::<(), layout::LayoutError>(())
+# Ok::<(), arrow_layout::LayoutError>(())
 ```
 
 At this layer there is intentionally no Arrow array construction. Consumers
@@ -176,12 +176,12 @@ If you need to inspect or mutate raw descriptors directly, use the namespaced
 modules instead of relying on root-level re-exports:
 
 ```rust
-use layout::raw::{BlockHeader, ColumnDesc};
-use layout::validate::validate_block;
+use arrow_layout::raw::{BlockHeader, ColumnDesc};
+use arrow_layout::validate::validate_block;
 
 # let header = BlockHeader {
-#     magic: layout::constants::BLOCK_MAGIC,
-#     version: layout::constants::BLOCK_VERSION,
+#     magic: arrow_layout::constants::BLOCK_MAGIC,
+#     version: arrow_layout::constants::BLOCK_VERSION,
 #     flags: 0,
 #     block_size: 128,
 #     max_rows: 0,
@@ -195,7 +195,7 @@ use layout::validate::validate_block;
 # };
 # let descs: [ColumnDesc; 0] = [];
 validate_block(&header, &descs)?;
-# Ok::<(), layout::LayoutError>(())
+# Ok::<(), arrow_layout::LayoutError>(())
 ```
 
 ## View Types

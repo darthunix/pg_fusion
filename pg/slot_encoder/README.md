@@ -1,7 +1,7 @@
 # slot_encoder
 
 `slot_encoder` writes PostgreSQL `TupleTableSlot` rows directly into an initialized
-`layout` block.
+`arrow_layout` block.
 
 It is intentionally narrow:
 
@@ -12,7 +12,7 @@ It is intentionally narrow:
 
 The main API shape is:
 
-- initialize a raw block externally with `layout`
+- initialize a raw block externally with `arrow_layout`
 - create a `PageBatchEncoder` over that mutable block and a PostgreSQL `TupleDesc`
 - append rows from `TupleTableSlot`
 - finalize the block and return `row_count` plus the written payload length
@@ -38,10 +38,10 @@ without Rust heap staging.
 ## Typical usage
 
 The crate expects the caller to allocate and initialize the target block with
-`layout`, then stream slots into it:
+`arrow_layout`, then stream slots into it:
 
 ```rust,ignore
-use layout::{BlockRef, LayoutPlan, init_block};
+use arrow_layout::{BlockRef, LayoutPlan, init_block};
 use slot_encoder::{AppendStatus, PageBatchEncoder};
 
 let plan = LayoutPlan::from_arrow_schema(&schema, rows_per_page, payload_capacity)?;
@@ -80,7 +80,7 @@ caller creates a fresh block whenever `AppendStatus::Full` is returned.
 
 ## Constraints
 
-- The block must already be initialized by `layout`.
+- The block must already be initialized by `arrow_layout`.
 - The `TupleDesc` and appended slots must match the target layout exactly.
 - Dropped PostgreSQL attributes are rejected.
 - `Utf8View` columns require a UTF-8 PostgreSQL server encoding.
