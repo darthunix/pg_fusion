@@ -7,6 +7,8 @@ use pgrx::pg_schema;
 mod page_arrow_pipeline;
 #[cfg(any(test, feature = "pg_test"))]
 mod slot_deform_bench;
+#[cfg(any(test, feature = "pg_test"))]
+mod slot_scan;
 
 #[cfg(any(test, feature = "pg_test"))]
 #[pg_schema]
@@ -259,6 +261,66 @@ mod tests {
     #[pg_test]
     fn slot_deform_split_bench_smoke() {
         super::slot_deform_bench::slot_deform_split_bench_smoke();
+    }
+
+    #[pg_test]
+    fn slot_scan_prepare_and_run_smoke() {
+        super::slot_scan::slot_scan_prepare_and_run_smoke();
+    }
+
+    #[pg_test]
+    fn slot_scan_parallel_plan_metadata_smoke() {
+        super::slot_scan::slot_scan_parallel_plan_metadata_smoke();
+    }
+
+    #[pg_test]
+    fn slot_scan_local_row_cap_smoke() {
+        super::slot_scan::slot_scan_local_row_cap_smoke();
+    }
+
+    #[pg_test]
+    fn slot_scan_rejects_limit_node() {
+        super::slot_scan::slot_scan_rejects_limit_node();
+    }
+
+    #[pg_test]
+    fn slot_scan_rejects_join_plan() {
+        super::slot_scan::slot_scan_rejects_join_plan();
+    }
+
+    #[pg_test]
+    fn slot_scan_rejects_subplans() {
+        super::slot_scan::slot_scan_rejects_subplans();
+    }
+
+    #[pg_test]
+    fn slot_scan_rejects_modifying_cte() {
+        super::slot_scan::slot_scan_rejects_modifying_cte();
+    }
+
+    #[pg_test]
+    fn slot_scan_prepare_catches_postgres_errors() {
+        super::slot_scan::slot_scan_prepare_catches_postgres_errors();
+    }
+
+    #[pg_test]
+    fn slot_scan_run_uses_saved_plan_and_aborts_on_error() {
+        super::slot_scan::slot_scan_run_uses_saved_plan_and_aborts_on_error();
+    }
+
+    #[pg_test]
+    fn slot_scan_run_revalidates_across_search_path_changes() {
+        super::slot_scan::slot_scan_run_revalidates_across_search_path_changes();
+    }
+
+    #[pg_test]
+    fn slot_scan_run_rejects_replanned_limit_shape() {
+        super::slot_scan::slot_scan_run_rejects_replanned_limit_shape();
+    }
+
+    #[pg_test]
+    fn slot_scan_reuses_active_snapshot_for_read_only_cursor() {
+        super::slot_scan::slot_scan_reuses_active_snapshot_for_read_only_cursor();
     }
 
     #[pg_test]

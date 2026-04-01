@@ -18,6 +18,8 @@
 //! - expressions compiled into SQL are expected to run with PostgreSQL semantics
 //! - residual filters are whatever remains for a caller to evaluate above the scan
 //! - this crate does not try to preserve exact DataFusion semantics across the engine boundary
+//! - this crate is the intended upstream producer of trusted scan SQL for
+//!   `slot_scan`
 
 mod compile;
 mod error;

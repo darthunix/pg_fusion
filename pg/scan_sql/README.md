@@ -17,6 +17,11 @@ The crate does not depend on `pgrx`, does not build PostgreSQL planner nodes,
 and does not execute the generated SQL. Its job is only to classify and render
 scan pushdown.
 
+In the intended architecture, `scan_sql` is the producer for `slot_scan`:
+this crate decides which DataFusion scan shapes are safe to lower into
+PostgreSQL SQL, and `slot_scan` later executes that trusted SQL as a PostgreSQL
+scan runtime.
+
 Contract:
 
 - everything compiled into SQL is expected to execute with PostgreSQL semantics
@@ -24,6 +29,8 @@ Contract:
   scan with DataFusion semantics
 - the crate does not try to preserve exact DataFusion semantics across that
   engine boundary
+- only SQL produced by this whitelist-oriented compiler is intended to flow
+  into `slot_scan`
 
 ## API shape
 
@@ -98,3 +105,5 @@ follows PostgreSQL semantics for the pushed portion, not DataFusion exactness.
 - When this crate is eventually wired into a `TableProvider`, compiled filters
   should be treated as PostgreSQL pushdown results, not as proof of
   `TableProviderFilterPushDown::Exact`.
+- `slot_scan` should be treated as a trusted runtime for this compiler output,
+  not as a general-purpose sandbox for arbitrary SQL strings.

@@ -3,7 +3,7 @@ id: comp-scan-sql-0001
 type: fact
 scope: scan_sql
 tags: ["datafusion", "postgresql", "pushdown", "sql", "scan"]
-updated_at: "2026-03-31"
+updated_at: "2026-04-01"
 importance: 0.66
 ---
 
@@ -16,6 +16,9 @@ importance: 0.66
   - unsupported expressions are left in `residual_filters`
   - malformed inputs such as invalid projection indices, unknown columns, or wrong relation qualifiers return `CompileError`
 - The crate does not depend on `pgrx` and does not execute or plan PostgreSQL queries.
+- `scan_sql` is intended to be the trusted upstream producer for `slot_scan`.
+  Expression-level safety policy belongs here; `slot_scan` should execute only
+  compiler-generated SQL from this crate or another equally trusted source.
 - `compile_scan()` currently returns:
   - the rendered SQL string
   - selected projection column indices from the DataFusion scan request
@@ -39,4 +42,5 @@ importance: 0.66
   - the crate is implemented and unit-tested in isolation
   - `scan::HeapScanProvider` still reports `Unsupported` for filter pushdown and does not use `scan_sql` yet
   - a future backend-side SQL scan crate can consume `CompiledScan` to run PostgreSQL planner/executor scans with pushed projection, filters, and limit
+  - that future runtime path should treat `slot_scan` as a trusted executor for compiler-generated SQL, not as a defensive sandbox for arbitrary `SELECT` text
   - when integrated with a `TableProvider`, compiled filters should be treated as PostgreSQL pushdown results rather than proof of DataFusion `Exact` semantics

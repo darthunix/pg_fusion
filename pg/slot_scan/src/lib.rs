@@ -1,0 +1,48 @@
+//! PostgreSQL-side runtime for trusted scan SQL with callback-driven slot
+//! consumption.
+//!
+//! `slot_scan` keeps a narrow boundary:
+//!
+//! - input: trusted, already-compiled PostgreSQL SQL text, typically produced
+//!   by `scan_sql`
+//! - output: callback-driven scan execution over `TupleTableSlot`s plus
+//!   run-time scan statistics
+//! - scope: plan inspection, read-only cursor execution, and optional local
+//!   row cap
+//!
+//! It does **not** handle Arrow encoding, shared-memory page transport,
+//! executor/provider integration, or exact global `LIMIT`.
+//! It also does **not** try to sandbox arbitrary `SELECT` text or prove
+//! expression-level side-effect safety. That responsibility belongs to the
+//! upstream SQL compiler or caller contract.
+//!
+//! Typical flow:
+//!
+//! 1. Call [`prepare_scan()`] to validate the SQL shape and save a reusable SPI
+//!    plan.
+//! 2. Define a static [`SlotSinkMethods`] table.
+//! 3. Build a [`SlotSink`] from those methods plus sink-private state.
+//! 4. Call [`PreparedScan::run()`] to open a read-only cursor and stream slots
+//!    into the callback.
+//!
+//! Result schema and plan metadata are treated as run-time properties of the
+//! revalidated portal opened in [`PreparedScan::run`]. Sink initialization gets
+//! the current `TupleDesc` for that run; [`PreparedScan`] does not expose
+//! stable schema metadata captured during `prepare_scan()`.
+//!
+//! Read-only cursor execution reuses the caller's active snapshot so
+//! `slot_scan` stays MVCC-consistent with the surrounding PostgreSQL
+//! statement. Saved scans are prepared with `CURSOR_OPT_PARALLEL_OK` so
+//! PostgreSQL can choose parallel-safe plans.
+
+mod error;
+mod plan;
+mod run;
+mod types;
+
+pub use error::{ScanError, SinkError};
+pub use plan::prepare_scan;
+pub use types::{
+    PreparedScan, ScanOptions, ScanStats, SlotSink, SlotSinkAction, SlotSinkContext,
+    SlotSinkMethods,
+};

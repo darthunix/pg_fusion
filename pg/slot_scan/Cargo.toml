@@ -1,0 +1,18 @@
+[package]
+name = "slot_scan"
+version = "25.0.0"
+edition = "2021"
+
+[lib]
+crate-type = ["lib"]
+doctest = false
+
+[features]
+default = ["pg17"]
+pg17 = ["pgrx-pg-sys/pg17", "pgrx/pg17"]
+
+[dependencies]
+pgrx = { workspace = true }
+pgrx-pg-sys = { workspace = true }
+thiserror = "2.0"
+

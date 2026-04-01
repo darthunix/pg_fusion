@@ -6,6 +6,7 @@ members = [
   "page/layout",
   "page/import",
   "pg/scan_sql",
+  "pg/slot_scan",
   "pg/slot_encoder",
   "executor",
   "scan",

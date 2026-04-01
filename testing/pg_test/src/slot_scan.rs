@@ -1,0 +1,463 @@
+use pgrx::prelude::*;
+use slot_scan::{
+    prepare_scan, ScanError, ScanOptions, SinkError, SlotSink, SlotSinkAction, SlotSinkContext,
+    SlotSinkMethods,
+};
+use std::ffi::{c_void, CString};
+
+const SLOT_SCAN_TABLE: &str = "slot_scan_runtime_test";
+
+#[derive(Default)]
+struct CountSink {
+    rows_seen: usize,
+    init_called: bool,
+    finish_called: bool,
+    abort_called: bool,
+    tuple_desc_natts: Option<usize>,
+    first_type_oid: Option<pg_sys::Oid>,
+    init_parallel_capable: Option<bool>,
+    init_planned_workers: Option<usize>,
+}
+
+static COUNT_SINK_METHODS: SlotSinkMethods = SlotSinkMethods {
+    init: Some(count_sink_init),
+    consume_slot: count_sink_consume_slot,
+    finish: Some(count_sink_finish),
+    abort: Some(count_sink_abort),
+};
+
+unsafe fn count_sink_init(
+    ctx: &mut SlotSinkContext,
+    private: *mut c_void,
+    tuple_desc: pg_sys::TupleDesc,
+) -> Result<(), SinkError> {
+    let state = &mut *(private as *mut CountSink);
+    state.init_called = true;
+    state.init_parallel_capable = Some(ctx.parallel_capable());
+    state.init_planned_workers = Some(ctx.planned_workers());
+
+    let natts = (*tuple_desc).natts as usize;
+    state.tuple_desc_natts = Some(natts);
+    if natts > 0 {
+        let attrs = (*tuple_desc).attrs.as_slice(natts);
+        state.first_type_oid = Some(attrs[0].atttypid);
+    }
+    Ok(())
+}
+
+unsafe fn count_sink_consume_slot(
+    _ctx: &mut SlotSinkContext,
+    private: *mut c_void,
+    _slot: *mut pg_sys::TupleTableSlot,
+) -> Result<SlotSinkAction, SinkError> {
+    let state = &mut *(private as *mut CountSink);
+    state.rows_seen += 1;
+    Ok(SlotSinkAction::Continue)
+}
+
+unsafe fn count_sink_finish(
+    _ctx: &mut SlotSinkContext,
+    private: *mut c_void,
+) -> Result<(), SinkError> {
+    let state = &mut *(private as *mut CountSink);
+    state.finish_called = true;
+    Ok(())
+}
+
+unsafe fn count_sink_abort(_ctx: &mut SlotSinkContext, private: *mut c_void) {
+    let state = &mut *(private as *mut CountSink);
+    state.abort_called = true;
+}
+
+fn reset_slot_scan_table(rows: usize) {
+    Spi::run(&format!("DROP TABLE IF EXISTS {SLOT_SCAN_TABLE}")).unwrap();
+    Spi::run(&format!(
+        "CREATE TABLE {SLOT_SCAN_TABLE} AS \
+         SELECT g AS id, md5(g::text) AS payload \
+         FROM generate_series(1, {}) AS g",
+        rows
+    ))
+    .unwrap();
+    Spi::run(&format!("ANALYZE {SLOT_SCAN_TABLE}")).unwrap();
+}
+
+fn enable_parallel_scan_gucs() {
+    Spi::run("SET LOCAL debug_parallel_query = on").unwrap();
+    Spi::run("SET LOCAL max_parallel_workers = 2").unwrap();
+    Spi::run("SET LOCAL max_parallel_workers_per_gather = 2").unwrap();
+    Spi::run("SET LOCAL min_parallel_table_scan_size = 0").unwrap();
+    Spi::run("SET LOCAL parallel_setup_cost = 0").unwrap();
+    Spi::run("SET LOCAL parallel_tuple_cost = 0").unwrap();
+    Spi::run("SET LOCAL enable_indexscan = on").unwrap();
+    Spi::run("SET LOCAL enable_bitmapscan = on").unwrap();
+}
+
+struct LatestSnapshotGuard;
+
+impl LatestSnapshotGuard {
+    unsafe fn acquire() -> Self {
+        let snapshot = pg_sys::GetLatestSnapshot();
+        pg_sys::PushActiveSnapshot(snapshot);
+        Self
+    }
+}
+
+impl Drop for LatestSnapshotGuard {
+    fn drop(&mut self) {
+        unsafe {
+            pg_sys::PopActiveSnapshot();
+        }
+    }
+}
+
+struct RegisteredSnapshot(pg_sys::Snapshot);
+
+impl RegisteredSnapshot {
+    unsafe fn capture_active() -> Self {
+        let snapshot = pg_sys::GetActiveSnapshot();
+        assert!(!snapshot.is_null(), "expected an active snapshot");
+        Self(pg_sys::RegisterSnapshot(snapshot))
+    }
+
+    fn as_ptr(&self) -> pg_sys::Snapshot {
+        self.0
+    }
+}
+
+impl Drop for RegisteredSnapshot {
+    fn drop(&mut self) {
+        unsafe {
+            pg_sys::UnregisterSnapshot(self.0);
+        }
+    }
+}
+
+fn count_rows_with_snapshot(qualified: &str, snapshot: pg_sys::Snapshot) -> i64 {
+    let sql = CString::new(format!("SELECT 1 FROM {qualified}")).unwrap();
+
+    Spi::connect(|_| unsafe {
+        let plan = pg_sys::SPI_prepare(sql.as_ptr(), 0, std::ptr::null_mut());
+        assert!(!plan.is_null(), "SPI_prepare returned null");
+
+        let exec_rc = pg_sys::SPI_execute_snapshot(
+            plan,
+            std::ptr::null_mut(),
+            std::ptr::null(),
+            snapshot,
+            std::ptr::null_mut(),
+            true,
+            false,
+            0,
+        );
+        assert_eq!(
+            exec_rc,
+            pg_sys::SPI_OK_SELECT as i32,
+            "unexpected SPI_execute_snapshot status: {exec_rc}",
+        );
+
+        let processed = pg_sys::SPI_processed as i64;
+        let tuptable = pg_sys::SPI_tuptable;
+        if !tuptable.is_null() {
+            pg_sys::SPI_freetuptable(tuptable);
+        }
+
+        let free_rc = pg_sys::SPI_freeplan(plan);
+        assert_eq!(free_rc, 0, "unexpected SPI_freeplan status: {free_rc}");
+
+        processed
+    })
+}
+
+pub fn slot_scan_prepare_and_run_smoke() {
+    reset_slot_scan_table(32);
+    let _snapshot = unsafe { LatestSnapshotGuard::acquire() };
+
+    let prepared = prepare_scan(
+        &format!("SELECT id, payload FROM {SLOT_SCAN_TABLE} WHERE id <= 10"),
+        ScanOptions::default(),
+    )
+    .expect("prepare_scan");
+
+    let mut sink = CountSink::default();
+    let stats = prepared
+        .run(SlotSink::new(&COUNT_SINK_METHODS, &mut sink))
+        .expect("run");
+
+    assert_eq!(stats.rows_seen, 10);
+    assert_eq!(sink.rows_seen, 10);
+    assert!(sink.init_called);
+    assert!(sink.finish_called);
+    assert!(!sink.abort_called);
+    assert_eq!(sink.tuple_desc_natts, Some(2));
+}
+
+pub fn slot_scan_parallel_plan_metadata_smoke() {
+    reset_slot_scan_table(100_000);
+    enable_parallel_scan_gucs();
+    let _snapshot = unsafe { LatestSnapshotGuard::acquire() };
+
+    let prepared = prepare_scan(
+        &format!("SELECT id FROM {SLOT_SCAN_TABLE} WHERE id > 0"),
+        ScanOptions::default(),
+    )
+    .expect("prepare_scan");
+
+    let mut sink = CountSink::default();
+    let stats = prepared
+        .run(SlotSink::new(&COUNT_SINK_METHODS, &mut sink))
+        .expect("run");
+
+    assert!(
+        stats.parallel_capable,
+        "expected a parallel-capable run-time plan"
+    );
+    assert!(
+        stats.planned_workers > 0,
+        "expected planner to choose at least one worker"
+    );
+    assert_eq!(sink.init_parallel_capable, Some(stats.parallel_capable));
+    assert_eq!(sink.init_planned_workers, Some(stats.planned_workers));
+}
+
+pub fn slot_scan_local_row_cap_smoke() {
+    reset_slot_scan_table(256);
+    let _snapshot = unsafe { LatestSnapshotGuard::acquire() };
+
+    let prepared = prepare_scan(
+        &format!("SELECT id FROM {SLOT_SCAN_TABLE}"),
+        ScanOptions {
+            local_row_cap: Some(17),
+        },
+    )
+    .expect("prepare_scan");
+
+    let mut sink = CountSink::default();
+    let stats = prepared
+        .run(SlotSink::new(&COUNT_SINK_METHODS, &mut sink))
+        .expect("run");
+
+    assert_eq!(stats.rows_seen, 17);
+    assert!(stats.hit_local_row_cap);
+    assert_eq!(sink.rows_seen, 17);
+}
+
+pub fn slot_scan_rejects_limit_node() {
+    reset_slot_scan_table(32);
+
+    let err = prepare_scan(
+        &format!("SELECT id FROM {SLOT_SCAN_TABLE} LIMIT 5"),
+        ScanOptions::default(),
+    )
+    .expect_err("LIMIT should be rejected");
+
+    match err {
+        ScanError::UnsupportedPlan(message) => {
+            assert!(message.contains("LIMIT"), "unexpected message: {message}");
+        }
+        other => panic!("unexpected error: {other:?}"),
+    }
+}
+
+pub fn slot_scan_rejects_join_plan() {
+    reset_slot_scan_table(16);
+
+    let err = prepare_scan(
+        &format!(
+            "SELECT a.id FROM {0} a JOIN {0} b ON a.id = b.id",
+            SLOT_SCAN_TABLE
+        ),
+        ScanOptions::default(),
+    )
+    .expect_err("join should be rejected");
+
+    match err {
+        ScanError::UnsupportedPlan(message) => {
+            assert!(message.contains("join"), "unexpected message: {message}");
+        }
+        other => panic!("unexpected error: {other:?}"),
+    }
+}
+
+pub fn slot_scan_rejects_subplans() {
+    reset_slot_scan_table(16);
+
+    let err = prepare_scan(
+        &format!(
+            "SELECT id FROM {SLOT_SCAN_TABLE} WHERE id = (SELECT min(id) FROM {SLOT_SCAN_TABLE})"
+        ),
+        ScanOptions::default(),
+    )
+    .expect_err("subplans should be rejected");
+
+    match err {
+        ScanError::UnsupportedPlan(message) => {
+            assert!(
+                message.contains("subplans") || message.contains("init plans"),
+                "unexpected message: {message}"
+            );
+        }
+        other => panic!("unexpected error: {other:?}"),
+    }
+}
+
+pub fn slot_scan_rejects_modifying_cte() {
+    reset_slot_scan_table(16);
+
+    let err = prepare_scan(
+        &format!(
+            "WITH deleted AS (DELETE FROM {SLOT_SCAN_TABLE} WHERE id = 1 RETURNING 1) \
+             SELECT id FROM {SLOT_SCAN_TABLE}"
+        ),
+        ScanOptions::default(),
+    )
+    .expect_err("modifying CTE should be rejected");
+
+    match err {
+        ScanError::UnsupportedPlan(message) => {
+            assert!(
+                message.contains("modifying CTE"),
+                "unexpected message: {message}"
+            );
+        }
+        other => panic!("unexpected error: {other:?}"),
+    }
+}
+
+pub fn slot_scan_prepare_catches_postgres_errors() {
+    let err = prepare_scan(
+        "SELECT * FROM missing_slot_scan_relation",
+        ScanOptions::default(),
+    )
+    .expect_err("missing table should surface as ScanError");
+
+    match err {
+        ScanError::Postgres(message) => {
+            assert!(
+                message.contains("missing_slot_scan_relation")
+                    || message.contains("does not exist"),
+                "unexpected message: {message}"
+            );
+        }
+        other => panic!("unexpected error: {other:?}"),
+    }
+}
+
+pub fn slot_scan_run_uses_saved_plan_and_aborts_on_error() {
+    reset_slot_scan_table(32);
+
+    let prepared = prepare_scan(
+        &format!("SELECT id FROM {SLOT_SCAN_TABLE}"),
+        ScanOptions::default(),
+    )
+    .expect("prepare_scan");
+
+    Spi::run(&format!("DROP TABLE {SLOT_SCAN_TABLE}")).unwrap();
+
+    let mut sink = CountSink::default();
+    let err = prepared
+        .run(SlotSink::new(&COUNT_SINK_METHODS, &mut sink))
+        .expect_err("run should fail after dropping the prepared relation");
+
+    match err {
+        ScanError::Postgres(_) => {}
+        other => panic!("unexpected error: {other:?}"),
+    }
+
+    assert!(!sink.init_called);
+    assert!(!sink.finish_called);
+    assert!(sink.abort_called);
+}
+
+pub fn slot_scan_run_revalidates_across_search_path_changes() {
+    Spi::run("DROP SCHEMA IF EXISTS slot_scan_a CASCADE").unwrap();
+    Spi::run("DROP SCHEMA IF EXISTS slot_scan_b CASCADE").unwrap();
+    Spi::run("CREATE SCHEMA slot_scan_a").unwrap();
+    Spi::run("CREATE SCHEMA slot_scan_b").unwrap();
+    Spi::run("CREATE TABLE slot_scan_a.drift_t (id int4)").unwrap();
+    Spi::run("CREATE TABLE slot_scan_b.drift_t (id int8)").unwrap();
+    Spi::run("INSERT INTO slot_scan_a.drift_t VALUES (1), (2), (3)").unwrap();
+    Spi::run("INSERT INTO slot_scan_b.drift_t VALUES (10), (20), (30), (40), (50), (60), (70)")
+        .unwrap();
+    let snapshot = unsafe { LatestSnapshotGuard::acquire() };
+
+    Spi::run("SET LOCAL search_path = slot_scan_a").unwrap();
+    let prepared = prepare_scan("SELECT id FROM drift_t", ScanOptions::default()).unwrap();
+    Spi::run("SET LOCAL search_path = slot_scan_b").unwrap();
+
+    let mut sink = CountSink::default();
+    let stats = prepared
+        .run(SlotSink::new(&COUNT_SINK_METHODS, &mut sink))
+        .expect("run");
+
+    assert_eq!(stats.rows_seen, 7);
+    assert_eq!(sink.rows_seen, 7);
+    assert_eq!(sink.first_type_oid, Some(pg_sys::INT8OID));
+
+    drop(snapshot);
+    Spi::run("DROP SCHEMA slot_scan_a CASCADE").unwrap();
+    Spi::run("DROP SCHEMA slot_scan_b CASCADE").unwrap();
+}
+
+pub fn slot_scan_run_rejects_replanned_limit_shape() {
+    Spi::run("DROP SCHEMA IF EXISTS slot_scan_a CASCADE").unwrap();
+    Spi::run("DROP SCHEMA IF EXISTS slot_scan_b CASCADE").unwrap();
+    Spi::run("CREATE SCHEMA slot_scan_a").unwrap();
+    Spi::run("CREATE SCHEMA slot_scan_b").unwrap();
+    Spi::run("CREATE TABLE slot_scan_a.drift_t (id int4)").unwrap();
+    Spi::run("INSERT INTO slot_scan_a.drift_t VALUES (1), (2), (3)").unwrap();
+    Spi::run("CREATE TABLE slot_scan_b.source_t (id int4)").unwrap();
+    Spi::run("INSERT INTO slot_scan_b.source_t VALUES (10), (20), (30)").unwrap();
+    Spi::run("CREATE VIEW slot_scan_b.drift_t AS SELECT id FROM slot_scan_b.source_t LIMIT 1")
+        .unwrap();
+
+    Spi::run("SET LOCAL search_path = slot_scan_a").unwrap();
+    let prepared = prepare_scan("SELECT id FROM drift_t", ScanOptions::default()).unwrap();
+    Spi::run("SET LOCAL search_path = slot_scan_b").unwrap();
+
+    let mut sink = CountSink::default();
+    let err = prepared
+        .run(SlotSink::new(&COUNT_SINK_METHODS, &mut sink))
+        .expect_err("replanned LIMIT shape should be rejected");
+
+    match err {
+        ScanError::UnsupportedPlan(message) => {
+            assert!(message.contains("LIMIT"), "unexpected message: {message}");
+        }
+        other => panic!("unexpected error: {other:?}"),
+    }
+
+    assert!(!sink.init_called);
+    assert!(!sink.finish_called);
+    assert!(sink.abort_called);
+
+    Spi::run("DROP SCHEMA slot_scan_a CASCADE").unwrap();
+    Spi::run("DROP SCHEMA slot_scan_b CASCADE").unwrap();
+}
+
+pub fn slot_scan_reuses_active_snapshot_for_read_only_cursor() {
+    reset_slot_scan_table(3);
+    let _active_snapshot = unsafe { LatestSnapshotGuard::acquire() };
+
+    let prepared = prepare_scan(
+        &format!("SELECT id FROM {SLOT_SCAN_TABLE}"),
+        ScanOptions::default(),
+    )
+    .expect("prepare_scan");
+
+    let snapshot = unsafe { RegisteredSnapshot::capture_active() };
+    Spi::run(&format!(
+        "INSERT INTO {SLOT_SCAN_TABLE} VALUES (999, 'inserted-after-snapshot')"
+    ))
+    .unwrap();
+
+    let expected_rows = count_rows_with_snapshot(SLOT_SCAN_TABLE, snapshot.as_ptr());
+    assert_eq!(expected_rows, 3);
+
+    let mut sink = CountSink::default();
+    let stats = prepared
+        .run(SlotSink::new(&COUNT_SINK_METHODS, &mut sink))
+        .expect("run");
+
+    assert_eq!(stats.rows_seen as i64, expected_rows);
+    assert_eq!(sink.rows_seen as i64, expected_rows);
+}
