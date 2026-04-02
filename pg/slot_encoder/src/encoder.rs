@@ -242,23 +242,23 @@ impl<'payload> PageBatchEncoder<'payload> {
             }
             raw if raw == TypeTag::Int16.to_raw() => {
                 let value = unsafe { read_i16(datum, attr.attbyval) };
-                self.write_fixed(row_idx, desc, &value.to_le_bytes())
+                self.write_fixed(row_idx, desc, &value.to_ne_bytes())
             }
             raw if raw == TypeTag::Int32.to_raw() => {
                 let value = unsafe { read_i32(datum, attr.attbyval) };
-                self.write_fixed(row_idx, desc, &value.to_le_bytes())
+                self.write_fixed(row_idx, desc, &value.to_ne_bytes())
             }
             raw if raw == TypeTag::Int64.to_raw() => {
                 let value = unsafe { read_i64(datum, attr.attbyval) };
-                self.write_fixed(row_idx, desc, &value.to_le_bytes())
+                self.write_fixed(row_idx, desc, &value.to_ne_bytes())
             }
             raw if raw == TypeTag::Float32.to_raw() => {
                 let bits = unsafe { read_f32(datum, attr.attbyval) }.to_bits();
-                self.write_fixed(row_idx, desc, &bits.to_le_bytes())
+                self.write_fixed(row_idx, desc, &bits.to_ne_bytes())
             }
             raw if raw == TypeTag::Float64.to_raw() => {
                 let bits = unsafe { read_f64(datum, attr.attbyval) }.to_bits();
-                self.write_fixed(row_idx, desc, &bits.to_le_bytes())
+                self.write_fixed(row_idx, desc, &bits.to_ne_bytes())
             }
             raw if raw == TypeTag::Uuid.to_raw() => {
                 let bytes = unsafe { read_fixed_bytes(datum, UUID_WIDTH_BYTES as usize, index)? };

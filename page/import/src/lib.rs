@@ -5,6 +5,10 @@
 //! [`arrow_array::RecordBatch`] backed directly by the shared-memory page
 //! bytes.
 //!
+//! The crate assumes the producer used the same-host native-endian
+//! `arrow_layout` contract. It does not attempt endian conversion or support
+//! cross-machine page interchange.
+//!
 //! Ordinary imported batches extend page lifetime through Arrow buffer
 //! ownership. Empty-schema batches contain no page-backed buffers and may
 //! release the page before `import()` returns. Holding an imported batch does

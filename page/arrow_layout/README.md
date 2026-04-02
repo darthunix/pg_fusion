@@ -1,12 +1,18 @@
 # arrow_layout
 
-`arrow_layout` defines the shared binary layout for the zero-copy Arrow page format used by `slot_encoder` and `import`.
+`arrow_layout` defines the shared binary layout for the zero-copy Arrow page format used by `slot_encoder`, `batch_encoder`, and `import`.
 
 It is intentionally narrow:
 
 - shared raw layout contract
 - no Arrow array construction
 - no dependency on `transfer`, `import`, `slot_encoder`, or DataFusion
+
+The format is intentionally a same-host shared-memory contract:
+
+- producer and consumer are expected to run on the same machine and architecture
+- fixed-width numeric values are stored in native-endian form
+- cross-machine, cross-endian, and long-term portable storage use is out of scope
 
 The crate provides:
 
@@ -85,6 +91,10 @@ V1 surface:
 - `uuid`
 - `Utf8View`
 - `BinaryView`
+
+Fixed-width numeric slots use native-endian in-memory bytes. This matches the
+intended usage of the format as a shared-memory page contract between local
+producer and consumer processes.
 
 ## Typical Usage
 

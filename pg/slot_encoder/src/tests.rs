@@ -283,12 +283,12 @@ fn bool_at(block: &BlockRef<'_>, col: usize, row: u32) -> bool {
 
 fn i32_at(block: &BlockRef<'_>, col: usize, row: u32) -> i32 {
     let bytes = block.fixed_value(col, row).expect("fixed value");
-    i32::from_le_bytes(bytes.try_into().expect("i32 bytes"))
+    i32::from_ne_bytes(bytes.try_into().expect("i32 bytes"))
 }
 
 fn f64_at(block: &BlockRef<'_>, col: usize, row: u32) -> f64 {
     let bytes = block.fixed_value(col, row).expect("fixed value");
-    f64::from_bits(u64::from_le_bytes(bytes.try_into().expect("f64 bytes")))
+    f64::from_bits(u64::from_ne_bytes(bytes.try_into().expect("f64 bytes")))
 }
 
 fn uuid_at(block: &BlockRef<'_>, col: usize, row: u32) -> [u8; 16] {

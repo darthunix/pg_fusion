@@ -21,6 +21,12 @@ The encoder does not maintain Rust heap-backed column state. Fixed-size values,
 validity bits, `ByteView` slots, and long view payloads are written directly into
 the target page as rows are appended.
 
+The output format is the same same-host shared-memory `arrow_layout` contract:
+
+- fixed-width numeric values are written in native-endian form
+- producer and consumer are expected to run on the same machine and architecture
+- the pages are not intended to be a portable cross-endian wire/storage format
+
 The current type surface is:
 
 - `bool`

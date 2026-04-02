@@ -1,0 +1,24 @@
+[package]
+name = "batch_encoder"
+version = "25.0.0"
+edition = "2021"
+description = "No-allocation RecordBatch writer for arrow_layout blocks"
+readme = "README.md"
+
+[lib]
+crate-type = ["lib"]
+doctest = false
+
+[dependencies]
+arrow-array = { workspace = true }
+arrow-buffer = { workspace = true }
+arrow-schema = { workspace = true }
+arrow_layout = { path = "../arrow_layout", version = "25.0.0" }
+thiserror = "2.0"
+
+[dev-dependencies]
+criterion = "0.5"
+
+[[bench]]
+name = "encode_block"
+harness = false

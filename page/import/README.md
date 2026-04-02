@@ -17,6 +17,13 @@ The page payload contract is:
 - the external Arrow schema must exactly match the on-page layout surface
 - string/binary columns must use `Utf8View` / `BinaryView`
 
+The format is intentionally same-host and native-endian:
+
+- import assumes the producer wrote fixed-width numeric values in the same
+  native-endian form used by the current machine
+- there is no reader-side endian conversion
+- cross-machine and cross-endian interchange is out of scope
+
 Ordinary imported batches keep the page alive through Arrow buffer ownership. When the last Arrow reference drops, the page is returned to the underlying `pool`.
 
 The crate uses only atomic shared ownership for this lifetime management. There is no internal mutex or other blocking synchronization primitive in the import path.

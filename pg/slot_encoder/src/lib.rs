@@ -21,6 +21,10 @@
 //! The encoder writes fixed-width values, validity bits, `ByteView` slots, and
 //! view payload bytes directly into the target block. It does not build
 //! heap-backed intermediate Arrow arrays.
+//!
+//! The produced pages follow the native-endian, same-host shared-memory
+//! `arrow_layout` contract. They are not intended to be a portable wire or
+//! storage format.
 
 mod bitmap;
 mod datum;

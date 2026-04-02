@@ -3,6 +3,11 @@
 //! `arrow_layout` defines the binary page layout shared by producer-side
 //! and consumer-side crates for direct zero-copy page batches.
 //!
+//! The format is intentionally a same-host shared-memory contract, not a
+//! portable wire or storage format. Fixed-width numeric values are stored in
+//! native-endian form and are only intended to be produced and consumed by
+//! code running on the same machine and architecture.
+//!
 //! Recommended entry points:
 //!
 //! - [`LayoutPlan`] to plan one block shape from Arrow schema or logical specs

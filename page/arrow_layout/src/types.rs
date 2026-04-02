@@ -93,15 +93,15 @@ impl std::ops::BitOrAssign for ColumnFlags {
 pub enum TypeTag {
     /// Bit-packed boolean values plus a validity bitmap.
     Boolean = 1,
-    /// Little-endian signed 16-bit integers.
+    /// Native-endian signed 16-bit integers.
     Int16 = 2,
-    /// Little-endian signed 32-bit integers.
+    /// Native-endian signed 32-bit integers.
     Int32 = 3,
-    /// Little-endian signed 64-bit integers.
+    /// Native-endian signed 64-bit integers.
     Int64 = 4,
-    /// Little-endian IEEE754 32-bit floats.
+    /// Native-endian IEEE754 32-bit floats.
     Float32 = 5,
-    /// Little-endian IEEE754 64-bit floats.
+    /// Native-endian IEEE754 64-bit floats.
     Float64 = 6,
     /// Fixed-width 16-byte values intended for PostgreSQL `uuid`.
     Uuid = 7,

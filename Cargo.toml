@@ -4,6 +4,7 @@ members = [
   "page/pool",
   "page/transfer",
   "page/arrow_layout",
+  "page/batch_encoder",
   "page/import",
   "pg/scan_sql",
   "pg/slot_scan",

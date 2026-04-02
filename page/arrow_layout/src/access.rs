@@ -375,6 +375,65 @@ impl<'a> BlockMut<'a> {
         self.write_header()
     }
 
+    /// Returns mutable access to one column's packed validity bitmap.
+    ///
+    /// This is a low-level bulk-write escape hatch for block-oriented encoders.
+    /// Callers are responsible for keeping the bitmap and descriptor null counts
+    /// consistent.
+    pub fn column_validity_bytes_mut(&mut self, index: usize) -> Result<&mut [u8], LayoutError> {
+        self.validity_bytes_mut(index)
+    }
+
+    /// Returns mutable access to one column's fixed-width values buffer or view slots.
+    ///
+    /// This is a low-level bulk-write escape hatch for block-oriented encoders.
+    pub fn column_values_bytes_mut(&mut self, index: usize) -> Result<&mut [u8], LayoutError> {
+        self.values_bytes_mut(index)
+    }
+
+    /// Reserves `len` bytes from the shared tail arena.
+    ///
+    /// Returns the absolute block offset of the reserved range on success, or
+    /// `Ok(None)` when the tail is full.
+    pub fn reserve_tail(&mut self, len: u32) -> Result<Option<u32>, LayoutError> {
+        self.tail_alloc(len)
+    }
+
+    /// Returns a mutable slice for one tail allocation.
+    pub fn tail_slice_mut(&mut self, start: u32, len: u32) -> Result<&mut [u8], LayoutError> {
+        self.tail_bytes_mut(start, len)
+    }
+
+    /// Adds `delta` to one column descriptor's null count.
+    pub fn add_null_count(&mut self, index: usize, delta: u32) -> Result<(), LayoutError> {
+        if delta == 0 {
+            return Ok(());
+        }
+        let mut desc = self.desc(index)?;
+        desc.null_count = desc
+            .null_count
+            .checked_add(delta)
+            .ok_or(LayoutError::SizeOverflow)?;
+        self.write_desc(index, desc)
+    }
+
+    /// Advances the committed row count by `delta`.
+    pub fn advance_row_count(&mut self, delta: u32) -> Result<(), LayoutError> {
+        let next = self
+            .header
+            .row_count
+            .checked_add(delta)
+            .ok_or(LayoutError::SizeOverflow)?;
+        if next > self.max_rows() {
+            return Err(LayoutError::RowCountExceedsMaxRows {
+                row_count: next,
+                max_rows: self.max_rows(),
+            });
+        }
+        self.header.row_count = next;
+        self.write_header()
+    }
+
     /// Commits the row currently being appended.
     ///
     /// This scans the current `row_count` slot across all columns, updates

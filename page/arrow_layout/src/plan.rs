@@ -207,6 +207,22 @@ impl LayoutPlan {
         self.block_size - self.pool_base
     }
 
+    /// Returns the number of columns described by this plan.
+    pub fn column_count(&self) -> usize {
+        self.columns.len()
+    }
+
+    /// Returns the planned layout for one column.
+    pub fn column_layout(&self, index: usize) -> Result<ColumnLayout, LayoutError> {
+        self.columns
+            .get(index)
+            .copied()
+            .ok_or(LayoutError::ColumnIndexOutOfBounds {
+                index,
+                col_count: self.columns.len(),
+            })
+    }
+
     /// Returns the planned per-column layouts.
     #[cfg(test)]
     pub(crate) fn columns(&self) -> &[ColumnLayout] {

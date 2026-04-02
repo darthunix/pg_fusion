@@ -288,7 +288,7 @@ fn encode_layout_payload(batch: &RecordBatch, block_size: usize) -> Vec<u8> {
                             .downcast_ref::<Int16Array>()
                             .expect("i16")
                             .value(row as usize)
-                            .to_le_bytes();
+                            .to_ne_bytes();
                         block.write_fixed(col, row, &value).expect("write fixed");
                     }
                     arrow_layout::TypeTag::Int32 => {
@@ -297,7 +297,7 @@ fn encode_layout_payload(batch: &RecordBatch, block_size: usize) -> Vec<u8> {
                             .downcast_ref::<Int32Array>()
                             .expect("i32")
                             .value(row as usize)
-                            .to_le_bytes();
+                            .to_ne_bytes();
                         block.write_fixed(col, row, &value).expect("write fixed");
                     }
                     arrow_layout::TypeTag::Int64 => {
@@ -306,7 +306,7 @@ fn encode_layout_payload(batch: &RecordBatch, block_size: usize) -> Vec<u8> {
                             .downcast_ref::<Int64Array>()
                             .expect("i64")
                             .value(row as usize)
-                            .to_le_bytes();
+                            .to_ne_bytes();
                         block.write_fixed(col, row, &value).expect("write fixed");
                     }
                     arrow_layout::TypeTag::Float32 => {
@@ -316,7 +316,7 @@ fn encode_layout_payload(batch: &RecordBatch, block_size: usize) -> Vec<u8> {
                             .expect("f32")
                             .value(row as usize)
                             .to_bits()
-                            .to_le_bytes();
+                            .to_ne_bytes();
                         block.write_fixed(col, row, &value).expect("write fixed");
                     }
                     arrow_layout::TypeTag::Float64 => {
@@ -326,7 +326,7 @@ fn encode_layout_payload(batch: &RecordBatch, block_size: usize) -> Vec<u8> {
                             .expect("f64")
                             .value(row as usize)
                             .to_bits()
-                            .to_le_bytes();
+                            .to_ne_bytes();
                         block.write_fixed(col, row, &value).expect("write fixed");
                     }
                     arrow_layout::TypeTag::Uuid => {
