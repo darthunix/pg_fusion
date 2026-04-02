@@ -8,6 +8,8 @@ mod page_arrow_pipeline;
 #[cfg(any(test, feature = "pg_test"))]
 mod slot_deform_bench;
 #[cfg(any(test, feature = "pg_test"))]
+mod slot_import;
+#[cfg(any(test, feature = "pg_test"))]
 mod slot_scan;
 
 #[cfg(any(test, feature = "pg_test"))]
@@ -341,6 +343,41 @@ mod tests {
     #[pg_test]
     fn slot_scan_append_merges_uniform_child_plan_kind() {
         super::slot_scan::slot_scan_append_merges_uniform_child_plan_kind();
+    }
+
+    #[pg_test]
+    fn slot_import_roundtrips_slot_encoder_page_into_virtual_slot() {
+        super::slot_import::slot_import_roundtrips_slot_encoder_page_into_virtual_slot();
+    }
+
+    #[pg_test]
+    fn slot_import_releases_page_on_first_none_after_last_row() {
+        super::slot_import::slot_import_releases_page_on_first_none_after_last_row();
+    }
+
+    #[pg_test]
+    fn slot_import_uuid_is_page_backed_but_text_and_bytea_are_copied() {
+        super::slot_import::slot_import_uuid_is_page_backed_but_text_and_bytea_are_copied();
+    }
+
+    #[pg_test]
+    fn slot_import_rejects_schema_tupledesc_mismatch() {
+        super::slot_import::slot_import_rejects_schema_tupledesc_mismatch();
+    }
+
+    #[pg_test]
+    fn slot_import_name_overflow_errors() {
+        super::slot_import::slot_import_name_overflow_errors();
+    }
+
+    #[pg_test]
+    fn slot_import_varchar_typmod_rejects_overlength_values() {
+        super::slot_import::slot_import_varchar_typmod_rejects_overlength_values();
+    }
+
+    #[pg_test]
+    fn slot_import_bpchar_typmod_pads_values() {
+        super::slot_import::slot_import_bpchar_typmod_pads_values();
     }
 
     #[pg_test]

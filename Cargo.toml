@@ -9,6 +9,7 @@ members = [
   "pg/scan_sql",
   "pg/slot_scan",
   "pg/slot_encoder",
+  "pg/slot_import",
   "executor",
   "scan",
   "pg/extension",
