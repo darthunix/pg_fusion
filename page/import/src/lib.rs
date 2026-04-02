@@ -41,6 +41,32 @@ use transfer::{MessageKind, ReceivedPage};
 /// `transfer::MessageKind` for arrow-layout-backed Arrow pages imported by this crate.
 pub const ARROW_LAYOUT_BATCH_KIND: MessageKind = 0x4152;
 
+/// Owned page carrier for zero-copy Arrow import.
+///
+/// Implementors must keep the underlying page bytes valid for as long as the
+/// object is alive. `import` retains ownership of the carrier inside Arrow
+/// buffer allocations, so dropping the final imported batch owner also drops
+/// the carrier.
+pub trait OwnedPage: Send + Sync + std::panic::RefUnwindSafe + 'static {
+    fn kind(&self) -> MessageKind;
+    fn flags(&self) -> u16;
+    fn payload(&self) -> &[u8];
+}
+
+impl OwnedPage for ReceivedPage {
+    fn kind(&self) -> MessageKind {
+        ReceivedPage::kind(self)
+    }
+
+    fn flags(&self) -> u16 {
+        ReceivedPage::flags(self)
+    }
+
+    fn payload(&self) -> &[u8] {
+        ReceivedPage::payload(self)
+    }
+}
+
 /// Importer for `arrow_layout` batches stored in `transfer` pages.
 #[derive(Clone, Debug)]
 pub struct ArrowPageDecoder {
@@ -84,6 +110,14 @@ impl ArrowPageDecoder {
 
     /// Import one `ReceivedPage` as a zero-copy Arrow `RecordBatch`.
     pub fn import(&self, page: ReceivedPage) -> Result<RecordBatch, ImportError> {
+        self.import_owned(page)
+    }
+
+    /// Import one owned page carrier as a zero-copy Arrow `RecordBatch`.
+    pub fn import_owned<P>(&self, page: P) -> Result<RecordBatch, ImportError>
+    where
+        P: OwnedPage,
+    {
         if page.kind() != ARROW_LAYOUT_BATCH_KIND {
             return Err(ImportError::WrongKind {
                 expected: ARROW_LAYOUT_BATCH_KIND,
@@ -96,7 +130,7 @@ impl ArrowPageDecoder {
             });
         }
 
-        let owner = Arc::new(PageAllocationOwner::new(page));
+        let owner = Arc::new(PageAllocationOwner::new(Box::new(page)));
         let (row_count, shared_pool) = owner.inspect(|payload| {
             let block = BlockRef::open(payload)?;
             self.validate_schema(&block)?;
@@ -419,13 +453,13 @@ impl ArrowPageDecoder {
 }
 
 struct PageAllocationOwner {
-    page: ReceivedPage,
+    page: Box<dyn OwnedPage>,
     payload_addr: usize,
     payload_len: usize,
 }
 
 impl PageAllocationOwner {
-    fn new(page: ReceivedPage) -> Self {
+    fn new(page: Box<dyn OwnedPage>) -> Self {
         let (payload_addr, payload_len) = {
             let payload = page.payload();
             (payload.as_ptr() as usize, payload.len())

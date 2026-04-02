@@ -356,6 +356,11 @@ mod tests {
     }
 
     #[pg_test]
+    fn slot_import_releases_issuance_permit_after_eof() {
+        super::slot_import::slot_import_releases_issuance_permit_after_eof();
+    }
+
+    #[pg_test]
     fn slot_import_uuid_is_page_backed_but_text_and_bytea_are_copied() {
         super::slot_import::slot_import_uuid_is_page_backed_but_text_and_bytea_are_copied();
     }

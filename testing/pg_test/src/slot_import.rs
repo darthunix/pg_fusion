@@ -2,10 +2,14 @@ use anyhow::{anyhow, bail, Result as AnyResult};
 use arrow_layout::{init_block, BlockMut, LayoutPlan, ViewWriteStatus};
 use arrow_schema::{DataType, Field, Schema};
 use import::ARROW_LAYOUT_BATCH_KIND;
+use issuance::{
+    encode_issued_frame, IssuanceConfig, IssuancePool, IssueEvent, IssuedFrameDecoder,
+    IssuedReceivedPage, IssuedRx, IssuedTx,
+};
 use pgrx::prelude::*;
 use pgrx::varlena::{text_to_rust_str_unchecked, varlena_to_byte_slice};
 use pgrx::PgMemoryContexts;
-use pool::{PagePool, PagePoolConfig, RegionLayout};
+use pool::{PagePool, PagePoolConfig};
 use slot_encoder::{AppendStatus, PageBatchEncoder};
 use slot_import::{ArrowSlotProjector, ConfigError, ProjectError};
 use std::alloc::{alloc_zeroed, dealloc, Layout};
@@ -53,8 +57,8 @@ struct OwnedRegion {
 }
 
 impl OwnedRegion {
-    fn new(region: RegionLayout) -> Self {
-        let layout = Layout::from_size_align(region.size, region.align).expect("region layout");
+    fn new(size: usize, align: usize) -> Self {
+        let layout = Layout::from_size_align(size, align).expect("region layout");
         let base = unsafe { alloc_zeroed(layout) };
         let base = NonNull::new(base).expect("region allocation");
         Self { base, layout }
@@ -72,6 +76,15 @@ struct ImportHarness {
     pool: PagePool,
     tx: PageTx,
     rx: PageRx,
+    payload_capacity: usize,
+}
+
+struct IssuedImportHarness {
+    _page_region: OwnedRegion,
+    _issuance_region: OwnedRegion,
+    issuance: IssuancePool,
+    tx: IssuedTx,
+    rx: IssuedRx,
     payload_capacity: usize,
 }
 
@@ -323,7 +336,7 @@ unsafe fn relation_open_by_name(qualified: &str) -> pg_sys::Relation {
 fn init_import_harness() -> AnyResult<ImportHarness> {
     let config = PagePoolConfig::new(SLOT_IMPORT_PAGE_SIZE, SLOT_IMPORT_PAGE_COUNT)?;
     let region_layout = PagePool::layout(config)?;
-    let region = OwnedRegion::new(region_layout);
+    let region = OwnedRegion::new(region_layout.size, region_layout.align);
     let pool = unsafe { PagePool::init_in_place(region.base, region_layout.size, config) }?;
     let tx = PageTx::new(pool);
     let rx = PageRx::new(pool);
@@ -334,6 +347,36 @@ fn init_import_harness() -> AnyResult<ImportHarness> {
     Ok(ImportHarness {
         _region: region,
         pool,
+        tx,
+        rx,
+        payload_capacity,
+    })
+}
+
+fn init_issued_import_harness() -> AnyResult<IssuedImportHarness> {
+    let config = PagePoolConfig::new(SLOT_IMPORT_PAGE_SIZE, SLOT_IMPORT_PAGE_COUNT)?;
+    let region_layout = PagePool::layout(config)?;
+    let page_region = OwnedRegion::new(region_layout.size, region_layout.align);
+    let pool = unsafe { PagePool::init_in_place(page_region.base, region_layout.size, config) }?;
+
+    let issuance_cfg = IssuanceConfig::new(1)?;
+    let issuance_layout = IssuancePool::layout(issuance_cfg)?;
+    let issuance_region = OwnedRegion::new(issuance_layout.size, issuance_layout.align);
+    let issuance = unsafe {
+        IssuancePool::init_in_place(issuance_region.base, issuance_layout.size, issuance_cfg)
+    }?;
+
+    let tx = IssuedTx::new(PageTx::new(pool), issuance);
+    let rx = IssuedRx::new(PageRx::new(pool), issuance);
+    let payload_capacity = {
+        let mut writer = tx.begin(ARROW_LAYOUT_BATCH_KIND, 0)?;
+        writer.payload_mut().len()
+    };
+
+    Ok(IssuedImportHarness {
+        _page_region: page_region,
+        _issuance_region: issuance_region,
+        issuance,
         tx,
         rx,
         payload_capacity,
@@ -437,6 +480,44 @@ fn send_manual_page(
     match rx.accept(frame)? {
         ReceiveEvent::Page(page) => Ok(page),
         ReceiveEvent::Closed => bail!("unexpected close frame"),
+    }
+}
+
+fn send_issued_encoded_page(
+    tx: &IssuedTx,
+    rx: &IssuedRx,
+    tupdesc: pg_sys::TupleDesc,
+    plan: &LayoutPlan,
+    slot: &mut OwnedMinimalSlot,
+    rows: &[&OwnedMinimalTuple],
+) -> AnyResult<IssuedReceivedPage> {
+    let mut writer = tx.begin(ARROW_LAYOUT_BATCH_KIND, 0)?;
+    let payload_len = {
+        let payload = writer.payload_mut();
+        init_block(payload, plan)?;
+        let mut encoder = unsafe { PageBatchEncoder::new(tupdesc, payload)? };
+        for row in rows {
+            slot.store(row);
+            match encoder.append_slot(slot.as_mut_ptr())? {
+                AppendStatus::Appended => {}
+                AppendStatus::Full => bail!("page encoder reported Full before all rows fit"),
+            }
+        }
+        encoder.finish()?.payload_len
+    };
+    let outbound = writer.finish_with_payload_len(payload_len)?;
+    let frame = encode_issued_frame(outbound.frame())?;
+    outbound.mark_sent();
+
+    let mut decoder = IssuedFrameDecoder::new();
+    let frame = decoder
+        .push(&frame)
+        .next()
+        .transpose()?
+        .ok_or_else(|| anyhow!("no issued frame decoded"))?;
+    match rx.accept(&frame)? {
+        IssueEvent::Page(page) => Ok(page),
+        IssueEvent::Closed => bail!("unexpected close frame"),
     }
 }
 
@@ -581,6 +662,46 @@ pub fn slot_import_releases_page_on_first_none_after_last_row() {
     assert_eq!(harness.pool.snapshot().leased_pages, 0);
 }
 
+pub fn slot_import_releases_issuance_permit_after_eof() {
+    reset_slot_import_table();
+    let relation = OpenRelation::open(SLOT_IMPORT_TABLE);
+    let tupdesc = relation.tuple_desc();
+    let mut input_slot = OwnedMinimalSlot::new(tupdesc).expect("input slot");
+    let rows = build_fixture_tuples(tupdesc).expect("fixture tuples");
+    let harness = init_issued_import_harness().expect("issued harness");
+    let plan = fixture_plan(rows.len(), harness.payload_capacity).expect("layout plan");
+    let page = send_issued_encoded_page(
+        &harness.tx,
+        &harness.rx,
+        tupdesc,
+        &plan,
+        &mut input_slot,
+        &rows.iter().collect::<Vec<_>>(),
+    )
+    .expect("encoded issued page");
+    assert_eq!(harness.issuance.snapshot().leased_permits, 1);
+
+    let per_tuple_memory = PgMemoryContexts::new("slot_import_issued_release");
+    let mut projector =
+        unsafe { ArrowSlotProjector::new(fixture_schema(), tupdesc, per_tuple_memory.value()) }
+            .expect("projector");
+    let mut cursor = projector.open_owned_page(page).expect("cursor");
+    let mut output_slot = OwnedVirtualSlot::new(tupdesc).expect("output slot");
+
+    for _ in 0..rows.len() {
+        let slot = unsafe { cursor.next_into_slot(output_slot.as_mut_ptr()) }
+            .expect("row")
+            .expect("expected row");
+        let _ = slot;
+        assert_eq!(harness.issuance.snapshot().leased_permits, 1);
+    }
+
+    assert!(unsafe { cursor.next_into_slot(output_slot.as_mut_ptr()) }
+        .expect("eof")
+        .is_none());
+    assert_eq!(harness.issuance.snapshot().leased_permits, 0);
+}
+
 pub fn slot_import_uuid_is_page_backed_but_text_and_bytea_are_copied() {
     reset_slot_import_table();
     let relation = OpenRelation::open(SLOT_IMPORT_TABLE);
@@ -668,8 +789,9 @@ pub fn slot_import_name_overflow_errors() {
     let page =
         send_manual_page(&harness.tx, &harness.rx, schema.as_ref(), long_name).expect("page");
     let per_tuple_memory = PgMemoryContexts::new("slot_import_name");
-    let mut projector = unsafe { ArrowSlotProjector::new(schema, tupdesc, per_tuple_memory.value()) }
-        .expect("projector");
+    let mut projector =
+        unsafe { ArrowSlotProjector::new(schema, tupdesc, per_tuple_memory.value()) }
+            .expect("projector");
     let mut cursor = projector.open_page(page).expect("cursor");
     let mut output_slot = OwnedVirtualSlot::new(tupdesc).expect("output slot");
 
@@ -687,8 +809,9 @@ pub fn slot_import_varchar_typmod_rejects_overlength_values() {
     let page = send_manual_page(&harness.tx, &harness.rx, schema.as_ref(), "abcde").expect("page");
 
     let per_tuple_memory = PgMemoryContexts::new("slot_import_varchar_typmod");
-    let mut projector = unsafe { ArrowSlotProjector::new(schema, tupdesc, per_tuple_memory.value()) }
-        .expect("projector");
+    let mut projector =
+        unsafe { ArrowSlotProjector::new(schema, tupdesc, per_tuple_memory.value()) }
+            .expect("projector");
     let mut cursor = projector.open_page(page).expect("cursor");
     let mut output_slot = OwnedVirtualSlot::new(tupdesc).expect("output slot");
 
@@ -709,8 +832,9 @@ pub fn slot_import_bpchar_typmod_pads_values() {
     let page = send_manual_page(&harness.tx, &harness.rx, schema.as_ref(), "abc").expect("page");
 
     let per_tuple_memory = PgMemoryContexts::new("slot_import_bpchar_typmod");
-    let mut projector = unsafe { ArrowSlotProjector::new(schema, tupdesc, per_tuple_memory.value()) }
-        .expect("projector");
+    let mut projector =
+        unsafe { ArrowSlotProjector::new(schema, tupdesc, per_tuple_memory.value()) }
+            .expect("projector");
     let mut cursor = projector.open_page(page).expect("cursor");
     let mut output_slot = OwnedVirtualSlot::new(tupdesc).expect("output slot");
 

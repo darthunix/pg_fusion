@@ -6,6 +6,7 @@ members = [
   "page/arrow_layout",
   "page/batch_encoder",
   "page/import",
+  "page/issuance",
   "pg/scan_sql",
   "pg/slot_scan",
   "pg/slot_encoder",

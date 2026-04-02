@@ -1,0 +1,24 @@
+[package]
+name = "issuance"
+version = "25.0.0"
+edition = "2021"
+description = "Permit issuance layer for shared-memory page handoff"
+readme = "README.md"
+
+[lib]
+crate-type = ["lib"]
+doctest = false
+
+[dependencies]
+import = { path = "../import", version = "25.0" }
+lockfree = { path = "../../lockfree", version = "25.0" }
+pool = { path = "../pool", version = "25.0" }
+transfer = { path = "../transfer", version = "25.0" }
+rmp = "0.8"
+thiserror = "2.0"
+
+[dev-dependencies]
+arrow-array = { workspace = true }
+arrow-schema = { workspace = true }
+arrow_layout = { path = "../arrow_layout", version = "25.0" }
+batch_encoder = { path = "../batch_encoder", version = "25.0" }

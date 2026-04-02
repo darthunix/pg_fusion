@@ -25,6 +25,7 @@ pool = { path = "../../page/pool", version = "25.0" }
 transfer = { path = "../../page/transfer", version = "25.0" }
 arrow_layout = { path = "../../page/arrow_layout", version = "25.0" }
 import = { path = "../../page/import", version = "25.0" }
+issuance = { path = "../../page/issuance", version = "25.0" }
 slot_encoder = { path = "../../pg/slot_encoder", version = "25.0" }
 slot_import = { path = "../../pg/slot_import", version = "25.0" }
 scan_sql = { path = "../../pg/scan_sql", version = "25.0" }

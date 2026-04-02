@@ -5,7 +5,7 @@ use arrow_array::{
 };
 use arrow_layout::TypeTag;
 use arrow_schema::SchemaRef;
-use import::ArrowPageDecoder;
+use import::{ArrowPageDecoder, OwnedPage};
 use pgrx::fcinfo::direct_function_call_as_datum;
 use pgrx::pg_sys;
 use pgrx::pg_sys::panic::CaughtError;
@@ -155,9 +155,12 @@ impl ArrowSlotProjector {
         })
     }
 
-    /// Open one received page for row-by-row projection.
-    pub fn open_page(&mut self, page: ReceivedPage) -> Result<PageSlotCursor<'_>, ProjectError> {
-        let batch = self.decoder.import(page)?;
+    /// Open one owned page carrier for row-by-row projection.
+    pub fn open_owned_page<P>(&mut self, page: P) -> Result<PageSlotCursor<'_>, ProjectError>
+    where
+        P: OwnedPage,
+    {
+        let batch = self.decoder.import_owned(page)?;
         let row_count = batch.num_rows();
         let mut columns = Vec::with_capacity(self.columns.len());
 
@@ -257,6 +260,11 @@ impl ArrowSlotProjector {
             page: Some(ImportedPage { row_count, columns }),
             next_row: 0,
         })
+    }
+
+    /// Open one received page for row-by-row projection.
+    pub fn open_page(&mut self, page: ReceivedPage) -> Result<PageSlotCursor<'_>, ProjectError> {
+        self.open_owned_page(page)
     }
 
     fn project_row(
