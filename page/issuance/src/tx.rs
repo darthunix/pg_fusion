@@ -1,6 +1,7 @@
 use crate::error::{AcquireError, IssuedTxError};
 use crate::pool::{IssuancePool, PermitLease};
 use crate::wire::{IssuedOwnedFrame, IssuedPageFrame};
+use std::fmt;
 use std::io::{self, Write};
 
 /// Sender wrapper that acquires one issuance permit per outbound page.
@@ -23,6 +24,16 @@ pub struct IssuedOutboundPage {
     permits: IssuancePool,
     permit_id: u32,
     sent: bool,
+}
+
+impl fmt::Debug for IssuedOutboundPage {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("IssuedOutboundPage")
+            .field("transfer_id", &self.transfer_id())
+            .field("permit_id", &self.permit_id)
+            .field("sent", &self.sent)
+            .finish()
+    }
 }
 
 impl IssuedTx {

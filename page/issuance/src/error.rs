@@ -62,6 +62,20 @@ pub enum IssuedTxError {
     Tx(transfer::TxError),
 }
 
+impl IssuedTxError {
+    /// Returns true when the sender can make progress by retrying later
+    /// without resetting the logical stream.
+    pub fn is_retryable_backpressure(&self) -> bool {
+        matches!(
+            self,
+            Self::NoPermits
+                | Self::Acquire(AcquireError::Empty)
+                | Self::Tx(transfer::TxError::Busy)
+                | Self::Tx(transfer::TxError::Acquire(pool::AcquireError::Empty))
+        )
+    }
+}
+
 #[derive(Debug)]
 pub enum IssuedRxError {
     PermitPoolMismatch {

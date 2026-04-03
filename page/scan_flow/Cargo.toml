@@ -1,0 +1,19 @@
+[package]
+name = "scan_flow"
+version = "25.0.0"
+edition = "2021"
+description = "Sans-io multi-producer scan page flow between backend and worker roles"
+readme = "README.md"
+
+[lib]
+crate-type = ["lib"]
+doctest = false
+
+[dependencies]
+issuance = { path = "../issuance", version = "25.0" }
+transfer = { path = "../transfer", version = "25.0" }
+rust-fsm = { version = "0.7", features = ["diagram"] }
+thiserror = "2.0"
+
+[dev-dependencies]
+pool = { path = "../pool", version = "25.0" }
