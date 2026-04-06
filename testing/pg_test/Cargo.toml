@@ -22,6 +22,7 @@ storage = { path = "../../storage", version = "25.0" }
 datafusion-common = { workspace = true }
 datafusion-expr = { workspace = true }
 df_catalog = { path = "../../pg/df_catalog", version = "25.0" }
+plan_builder = { path = "../../pg/plan_builder", version = "25.0" }
 protocol = { path = "../../protocol", version = "25.0" }
 pool = { path = "../../page/pool", version = "25.0" }
 transfer = { path = "../../page/transfer", version = "25.0" }
