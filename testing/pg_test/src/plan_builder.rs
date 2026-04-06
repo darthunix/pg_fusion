@@ -1,4 +1,4 @@
-use ::plan_builder::{BuiltPlan, PlanBuildInput, PlanBuilder};
+use ::plan_builder::{BuiltPlan, PlanBuildError, PlanBuildInput, PlanBuilder};
 use datafusion_common::ScalarValue;
 use pgrx::prelude::*;
 
@@ -6,6 +6,12 @@ fn build(sql: &str, params: Vec<ScalarValue>) -> BuiltPlan {
     PlanBuilder::new()
         .build(PlanBuildInput { sql, params })
         .expect("build plan")
+}
+
+fn build_err(sql: &str, params: Vec<ScalarValue>) -> PlanBuildError {
+    PlanBuilder::new()
+        .build(PlanBuildInput { sql, params })
+        .expect_err("plan build should fail")
 }
 
 pub fn plan_builder_lowers_live_table_scan() {
@@ -150,4 +156,44 @@ pub fn plan_builder_supports_builtin_sql_forms() {
 
     let built = build("SELECT extract(day from now())", Vec::new());
     assert!(built.scans.is_empty());
+}
+
+pub fn plan_builder_rejects_exists_subqueries() {
+    Spi::run("DROP TABLE IF EXISTS public.plan_builder_exists_users").unwrap();
+    Spi::run("DROP TABLE IF EXISTS public.plan_builder_exists_orders").unwrap();
+    Spi::run("CREATE TABLE public.plan_builder_exists_users (id int8 NOT NULL)").unwrap();
+    Spi::run("CREATE TABLE public.plan_builder_exists_orders (user_id int8 NOT NULL)").unwrap();
+
+    let error = build_err(
+        "SELECT EXISTS(SELECT 1 FROM public.plan_builder_exists_orders) \
+         FROM public.plan_builder_exists_users",
+        Vec::new(),
+    );
+
+    match error {
+        PlanBuildError::UnsupportedSubquery(message) => {
+            assert!(message.contains("EXISTS"), "{message}");
+        }
+        other => panic!("expected unsupported subquery error, got {other:?}"),
+    }
+}
+
+pub fn plan_builder_rejects_in_subquery_predicates() {
+    Spi::run("DROP TABLE IF EXISTS public.plan_builder_in_users").unwrap();
+    Spi::run("DROP TABLE IF EXISTS public.plan_builder_in_orders").unwrap();
+    Spi::run("CREATE TABLE public.plan_builder_in_users (id int8 NOT NULL)").unwrap();
+    Spi::run("CREATE TABLE public.plan_builder_in_orders (user_id int8 NOT NULL)").unwrap();
+
+    let error = build_err(
+        "SELECT id FROM public.plan_builder_in_users \
+         WHERE id IN (SELECT user_id FROM public.plan_builder_in_orders)",
+        Vec::new(),
+    );
+
+    match error {
+        PlanBuildError::UnsupportedSubquery(message) => {
+            assert!(message.contains("IN (SELECT"), "{message}");
+        }
+        other => panic!("expected unsupported subquery error, got {other:?}"),
+    }
 }

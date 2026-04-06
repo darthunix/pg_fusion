@@ -10,6 +10,8 @@ mod page_arrow_pipeline;
 #[cfg(any(test, feature = "pg_test"))]
 mod plan_builder;
 #[cfg(any(test, feature = "pg_test"))]
+mod plan_codec;
+#[cfg(any(test, feature = "pg_test"))]
 mod slot_deform_bench;
 #[cfg(any(test, feature = "pg_test"))]
 mod slot_import;
@@ -344,6 +346,26 @@ mod tests {
     #[pg_test]
     fn plan_builder_supports_builtin_sql_forms() {
         super::plan_builder::plan_builder_supports_builtin_sql_forms();
+    }
+
+    #[pg_test]
+    fn plan_builder_rejects_exists_subqueries() {
+        super::plan_builder::plan_builder_rejects_exists_subqueries();
+    }
+
+    #[pg_test]
+    fn plan_builder_rejects_in_subquery_predicates() {
+        super::plan_builder::plan_builder_rejects_in_subquery_predicates();
+    }
+
+    #[pg_test]
+    fn plan_codec_roundtrips_live_pg_scan() {
+        super::plan_codec::plan_codec_roundtrips_live_pg_scan();
+    }
+
+    #[pg_test]
+    fn plan_codec_roundtrips_builtin_sql_forms() {
+        super::plan_codec::plan_codec_roundtrips_builtin_sql_forms();
     }
 
     #[pg_extern]

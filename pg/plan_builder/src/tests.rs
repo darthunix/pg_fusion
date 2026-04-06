@@ -85,6 +85,15 @@ fn build_sql(sql: &str) -> BuiltPlan {
         .unwrap()
 }
 
+fn build_err(sql: &str) -> PlanBuildError {
+    builder()
+        .build(PlanBuildInput {
+            sql,
+            params: Vec::new(),
+        })
+        .unwrap_err()
+}
+
 fn contains_table_scan(plan: &LogicalPlan) -> bool {
     let mut found = false;
     plan.apply(|node| {
@@ -296,6 +305,42 @@ fn rejects_multiple_and_non_query_statements() {
         })
         .unwrap_err();
     assert!(matches!(ddl, PlanBuildError::UnsupportedStatement(_)));
+}
+
+#[test]
+fn rejects_exists_subqueries() {
+    let error = build_err("SELECT EXISTS(SELECT 1 FROM orders) FROM users");
+
+    match error {
+        PlanBuildError::UnsupportedSubquery(message) => {
+            assert!(message.contains("EXISTS"), "{message}");
+        }
+        other => panic!("expected unsupported subquery error, got {other:?}"),
+    }
+}
+
+#[test]
+fn rejects_in_subquery_predicates() {
+    let error = build_err("SELECT id FROM users WHERE id IN (SELECT user_id FROM orders)");
+
+    match error {
+        PlanBuildError::UnsupportedSubquery(message) => {
+            assert!(message.contains("IN (SELECT"), "{message}");
+        }
+        other => panic!("expected unsupported subquery error, got {other:?}"),
+    }
+}
+
+#[test]
+fn rejects_scalar_subqueries() {
+    let error = build_err("SELECT id FROM users WHERE id = (SELECT max(user_id) FROM orders)");
+
+    match error {
+        PlanBuildError::UnsupportedSubquery(message) => {
+            assert!(message.contains("scalar subquery"), "{message}");
+        }
+        other => panic!("expected unsupported subquery error, got {other:?}"),
+    }
 }
 
 #[test]

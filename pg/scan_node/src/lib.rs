@@ -118,6 +118,37 @@ impl PgScanSpec {
         })
     }
 
+    /// Build a scan spec from an already-derived logical output schema.
+    ///
+    /// This constructor is intended for decode paths such as `plan_codec`,
+    /// where the original source schema is no longer available but the logical
+    /// output `DFSchema` has already been serialized alongside the scan spec.
+    pub fn try_new_with_schema(
+        scan_id: impl Into<PgScanId>,
+        table_oid: u32,
+        relation: PgRelation,
+        compiled_scan: CompiledScan,
+        fetch_hints: PgScanFetchHints,
+        schema: DFSchemaRef,
+    ) -> Result<Self> {
+        let expected_len = compiled_scan.output_columns.len();
+        let actual_len = schema.fields().len();
+        if actual_len != expected_len {
+            return Err(DataFusionError::Plan(format!(
+                "PgScanSpec output schema has {actual_len} fields, but compiled scan expects {expected_len} output columns"
+            )));
+        }
+
+        Ok(Self {
+            scan_id: scan_id.into(),
+            table_oid,
+            relation,
+            compiled_scan,
+            fetch_hints,
+            schema,
+        })
+    }
+
     /// DataFusion logical output schema for this scan.
     pub fn schema(&self) -> &DFSchemaRef {
         &self.schema

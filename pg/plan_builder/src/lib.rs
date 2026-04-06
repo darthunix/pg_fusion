@@ -10,6 +10,10 @@
 //! DataFusion logical optimization is pinned to one target partition by default.
 //! This is a DataFusion-level contract only: PostgreSQL-side parallel plans can
 //! still be produced later by `slot_scan`.
+//!
+//! The supported SQL subset intentionally excludes expr-level subqueries and
+//! correlated subqueries. v1 only needs plans that lower PostgreSQL leaf scans
+//! into `PgScanNode` plus ordinary DataFusion relational operators above them.
 
 use std::any::Any;
 use std::collections::HashMap;
@@ -19,7 +23,7 @@ use arrow_schema::SchemaRef;
 use datafusion::config::ConfigOptions;
 use datafusion::execution::SessionStateBuilder;
 use datafusion::execution::SessionStateDefaults;
-use datafusion_common::tree_node::{Transformed, TreeNode};
+use datafusion_common::tree_node::{Transformed, TreeNode, TreeNodeRecursion};
 use datafusion_common::TableReference;
 use datafusion_common::{DFSchema, DataFusionError, Result as DataFusionResult, ScalarValue};
 use datafusion_expr::logical_plan::{Filter, LogicalPlan, Projection, TableScan};
@@ -96,6 +100,8 @@ pub enum PlanBuildError {
     DataFusion(#[from] DataFusionError),
     #[error("PostgreSQL scan SQL compilation failed: {0}")]
     ScanSql(#[from] CompileError),
+    #[error("unsupported SQL shape for PostgreSQL scan planning: {0}")]
+    UnsupportedSubquery(String),
     #[error("{0}")]
     Plan(String),
 }
@@ -152,6 +158,7 @@ where
         let planner = SqlToRel::new(&context);
         let plan = planner.statement_to_plan(statement)?;
         let plan = plan.with_param_values(input.params)?;
+        validate_supported_plan_shape(&plan)?;
         let optimized = optimize_logical_plan(plan, self.config.target_partitions)?;
 
         let mut lowerer = ScanLowerer::new(self.config);
@@ -195,6 +202,75 @@ fn optimize_logical_plan(
 
 fn pg_identifier_max_bytes() -> usize {
     (pg_sys::NAMEDATALEN as usize).saturating_sub(1)
+}
+
+#[derive(Debug, Error)]
+enum UnsupportedSubqueryShape {
+    #[error("EXISTS(...) expressions")]
+    Exists,
+    #[error("IN (SELECT ...) expressions")]
+    InSubquery,
+    #[error("scalar subquery expressions")]
+    ScalarSubquery,
+    #[error("correlated subqueries")]
+    OuterReferenceColumn,
+    #[error("logical subquery plan nodes")]
+    SubqueryPlan,
+}
+
+fn validate_supported_plan_shape(plan: &LogicalPlan) -> Result<(), PlanBuildError> {
+    plan.apply_with_subqueries(|node| {
+        if matches!(node, LogicalPlan::Subquery(_)) {
+            return Err(DataFusionError::External(Box::new(
+                UnsupportedSubqueryShape::SubqueryPlan,
+            )));
+        }
+
+        node.apply_expressions(|expr| {
+            expr.apply(|expr| match expr {
+                Expr::Exists(_) => Err(DataFusionError::External(Box::new(
+                    UnsupportedSubqueryShape::Exists,
+                ))),
+                Expr::InSubquery(_) => Err(DataFusionError::External(Box::new(
+                    UnsupportedSubqueryShape::InSubquery,
+                ))),
+                Expr::ScalarSubquery(_) => Err(DataFusionError::External(Box::new(
+                    UnsupportedSubqueryShape::ScalarSubquery,
+                ))),
+                Expr::OuterReferenceColumn(_, _) => Err(DataFusionError::External(Box::new(
+                    UnsupportedSubqueryShape::OuterReferenceColumn,
+                ))),
+                _ => Ok(TreeNodeRecursion::Continue),
+            })
+        })
+    })
+    .map_err(map_subquery_validation_error)?;
+    Ok(())
+}
+
+fn map_subquery_validation_error(error: DataFusionError) -> PlanBuildError {
+    match recover_subquery_validation_error(error) {
+        Ok(shape) => PlanBuildError::UnsupportedSubquery(shape.to_string()),
+        Err(error) => PlanBuildError::DataFusion(error),
+    }
+}
+
+fn recover_subquery_validation_error(
+    error: DataFusionError,
+) -> Result<UnsupportedSubqueryShape, DataFusionError> {
+    match error {
+        DataFusionError::External(source) => match source.downcast::<UnsupportedSubqueryShape>() {
+            Ok(shape) => Ok(*shape),
+            Err(source) => Err(DataFusionError::External(source)),
+        },
+        DataFusionError::Context(context, source) => {
+            match recover_subquery_validation_error(*source) {
+                Ok(shape) => Ok(shape),
+                Err(source) => Err(DataFusionError::Context(context, Box::new(source))),
+            }
+        }
+        other => Err(other),
+    }
 }
 
 #[derive(Debug)]

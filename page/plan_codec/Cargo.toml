@@ -1,0 +1,27 @@
+[package]
+name = "plan_codec"
+version = "25.0.0"
+edition = "2021"
+description = "Versioned logical-plan codec for PostgreSQL scan nodes"
+readme = "README.md"
+
+[lib]
+crate-type = ["lib"]
+doctest = false
+
+[dependencies]
+bytes = "1"
+datafusion = { workspace = true }
+datafusion-common = { workspace = true }
+datafusion-expr = { workspace = true }
+datafusion-proto = "44.0"
+prost = "0.13"
+rmp = "0.8"
+scan_node = { path = "../../pg/scan_node", version = "25.0" }
+scan_sql = { path = "../../pg/scan_sql", version = "25.0" }
+thiserror = "2.0"
+
+[dev-dependencies]
+arrow-schema = { workspace = true }
+df_catalog = { path = "../../pg/df_catalog", version = "25.0" }
+plan_builder = { path = "../../pg/plan_builder", version = "25.0" }
