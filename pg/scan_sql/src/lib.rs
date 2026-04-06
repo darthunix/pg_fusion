@@ -4,12 +4,14 @@
 //!
 //! - input is `TableProvider::scan()`-shaped metadata: relation, Arrow schema, projection,
 //!   logical filters, and optional fetch/limit hint
+//! - callers also provide the live PostgreSQL identifier byte limit used to
+//!   reject overlong schema, relation, and column names
 //! - output is a deterministic PostgreSQL `SELECT ... FROM ... WHERE ...` string by default,
 //!   plus metadata about which filters compiled into PostgreSQL SQL, which remain residual,
 //!   and how the requested limit was lowered
 //! - unsupported expressions are left in `residual_filters` instead of failing the compile
-//! - malformed inputs such as unknown columns or invalid projection indices return
-//!   [`CompileError`]
+//! - malformed inputs such as unknown columns, overlong identifiers, or invalid
+//!   projection indices return [`CompileError`]
 //!
 //! The compiler targets a single base relation and renders PostgreSQL SQL text. It does not
 //! depend on `pgrx`, does not build PostgreSQL planner nodes, and does not execute the query.
@@ -29,6 +31,7 @@
 
 mod compile;
 mod error;
+mod identifier;
 mod literal;
 mod quote;
 mod render;

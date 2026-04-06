@@ -1,0 +1,22 @@
+[package]
+name = "df_catalog"
+version = "25.0.0"
+edition = "2021"
+description = "Lazy PostgreSQL catalog resolver for backend-side DataFusion planning"
+readme = "README.md"
+
+[lib]
+crate-type = ["lib"]
+doctest = false
+
+[features]
+default = ["pg17"]
+pg17 = ["pgrx/pg17"]
+
+[dependencies]
+arrow-schema = { workspace = true }
+datafusion-common = { workspace = true }
+pgrx = { workspace = true }
+protocol = { path = "../../protocol", version = "25.0" }
+scan_sql = { path = "../scan_sql", version = "25.0" }
+thiserror = "2.0"

@@ -4,6 +4,8 @@ use arrow_schema::Schema;
 use datafusion_common::TableReference;
 use datafusion_expr::Expr;
 
+use crate::error::CompileError;
+use crate::identifier::validate_identifier;
 use crate::quote::quote_identifier;
 
 /// A PostgreSQL relation reference limited to `schema.table` addressing.
@@ -21,24 +23,33 @@ impl PgRelation {
         }
     }
 
-    pub(crate) fn matches_reference(&self, relation: &TableReference) -> bool {
+    pub(crate) fn matches_reference(
+        &self,
+        relation: &TableReference,
+        identifier_max_bytes: usize,
+    ) -> Result<bool, CompileError> {
+        self.validate(identifier_max_bytes)?;
         match relation {
-            TableReference::Bare { table } => table.as_ref() == self.table,
-            TableReference::Partial { schema, table } => {
-                table.as_ref() == self.table
-                    && self
-                        .schema
-                        .as_deref()
-                        .is_some_and(|expected| expected == schema.as_ref())
+            TableReference::Bare { table } => {
+                validate_identifier(table.as_ref(), identifier_max_bytes, "table")?;
+                Ok(table.as_ref() == self.table)
             }
-            TableReference::Full { schema, table, .. } => {
-                table.as_ref() == self.table
-                    && self
-                        .schema
-                        .as_deref()
-                        .is_some_and(|expected| expected == schema.as_ref())
+            TableReference::Partial { schema, table }
+            | TableReference::Full { schema, table, .. } => {
+                validate_identifier(schema.as_ref(), identifier_max_bytes, "schema")?;
+                validate_identifier(table.as_ref(), identifier_max_bytes, "table")?;
+                Ok(self.schema.as_deref().is_some_and(|expected| {
+                    expected == schema.as_ref() && self.table == table.as_ref()
+                }))
             }
         }
+    }
+
+    pub(crate) fn validate(&self, identifier_max_bytes: usize) -> Result<(), CompileError> {
+        if let Some(schema) = &self.schema {
+            validate_identifier(schema, identifier_max_bytes, "schema")?;
+        }
+        validate_identifier(&self.table, identifier_max_bytes, "table")
     }
 
     pub(crate) fn display_name(&self) -> String {
@@ -67,6 +78,12 @@ impl PgRelation {
 pub struct CompileScanInput<'a> {
     pub relation: &'a PgRelation,
     pub schema: &'a Schema,
+    /// Live PostgreSQL identifier byte limit for the backend that produced this schema.
+    ///
+    /// Callers should pass `pg_sys::NAMEDATALEN as usize - 1` from the linked
+    /// PostgreSQL build so `scan_sql` rejects overlong schemas, relations, and
+    /// columns consistently with the backend planner contract.
+    pub identifier_max_bytes: usize,
     pub projection: Option<&'a [usize]>,
     pub filters: &'a [Expr],
     pub requested_limit: Option<usize>,

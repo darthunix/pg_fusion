@@ -6,6 +6,7 @@ use datafusion_expr::expr::BinaryExpr;
 use datafusion_expr::{Expr, Operator};
 
 use crate::error::CompileError;
+use crate::identifier::validate_identifier;
 use crate::quote::quote_identifier;
 use crate::render::{render_column, render_expr};
 use crate::types::{CompileScanInput, CompiledFilter, CompiledScan, LimitLowering, PgRelation};
@@ -17,6 +18,7 @@ const DUMMY_PROJECTION_ALIAS: &str = "__pg_fusion_scan_dummy";
 /// Anything that compiles is expected to run with PostgreSQL semantics. Any
 /// residual filters remain the caller's responsibility above the scan.
 pub fn compile_scan(input: CompileScanInput<'_>) -> Result<CompiledScan, CompileError> {
+    validate_scan_identifiers(input.schema, input.relation, input.identifier_max_bytes)?;
     let selected_columns = validate_projection(input.schema, input.projection)?;
     let mut pushed_filters = Vec::new();
     let mut residual_filters = Vec::new();
@@ -25,7 +27,12 @@ pub fn compile_scan(input: CompileScanInput<'_>) -> Result<CompiledScan, Compile
 
     for (filter_index, filter) in input.filters.iter().enumerate() {
         for conjunct in split_top_level_and(filter) {
-            match render_expr(conjunct, input.schema, input.relation)? {
+            match render_expr(
+                conjunct,
+                input.schema,
+                input.relation,
+                input.identifier_max_bytes,
+            )? {
                 Some(rendered) => {
                     pushed_columns.extend(rendered.referenced_columns.iter().copied());
                     pushed_filters.push(CompiledFilter {
@@ -38,6 +45,7 @@ pub fn compile_scan(input: CompileScanInput<'_>) -> Result<CompiledScan, Compile
                         conjunct,
                         input.schema,
                         input.relation,
+                        input.identifier_max_bytes,
                     )?);
                     residual_filters.push(conjunct.clone());
                 }
@@ -111,6 +119,18 @@ pub fn compile_scan(input: CompileScanInput<'_>) -> Result<CompiledScan, Compile
     })
 }
 
+fn validate_scan_identifiers(
+    schema: &Schema,
+    relation: &PgRelation,
+    identifier_max_bytes: usize,
+) -> Result<(), CompileError> {
+    relation.validate(identifier_max_bytes)?;
+    for field in schema.fields() {
+        validate_identifier(field.name(), identifier_max_bytes, "column")?;
+    }
+    Ok(())
+}
+
 fn validate_projection(
     schema: &Schema,
     projection: Option<&[usize]>,
@@ -154,6 +174,7 @@ fn collect_filter_columns(
     expr: &Expr,
     schema: &Schema,
     relation: &PgRelation,
+    identifier_max_bytes: usize,
 ) -> Result<BTreeSet<usize>, CompileError> {
     let mut columns = BTreeSet::new();
     let mut error = None;
@@ -162,7 +183,7 @@ fn collect_filter_columns(
             return Ok(TreeNodeRecursion::Stop);
         }
         if let Expr::Column(column) = node {
-            match render_column(column, schema, relation) {
+            match render_column(column, schema, relation, identifier_max_bytes) {
                 Ok(rendered) => columns.extend(rendered.referenced_columns),
                 Err(err) => {
                     error = Some(err);

@@ -4,6 +4,8 @@ use datafusion_common::{Column, TableReference};
 use datafusion_expr::expr::{BinaryExpr, Cast, InList, Like};
 use datafusion_expr::{lit, Expr, Operator};
 
+const TEST_IDENTIFIER_MAX_BYTES: usize = 63;
+
 fn test_schema() -> Schema {
     Schema::new(vec![
         Field::new("id", DataType::Int64, false),
@@ -21,6 +23,14 @@ fn test_relation() -> PgRelation {
     PgRelation::new(Some("public"), "users")
 }
 
+fn exact_limit_identifier(prefix: &str) -> String {
+    assert!(prefix.len() < TEST_IDENTIFIER_MAX_BYTES);
+    format!(
+        "{prefix}{}",
+        "x".repeat(TEST_IDENTIFIER_MAX_BYTES - prefix.len())
+    )
+}
+
 #[test]
 fn compiles_projection_fetch_hint_and_supported_filters() {
     let schema = test_schema();
@@ -32,6 +42,7 @@ fn compiles_projection_fetch_hint_and_supported_filters() {
     let compiled = compile_scan(CompileScanInput {
         relation: &test_relation(),
         schema: &schema,
+        identifier_max_bytes: TEST_IDENTIFIER_MAX_BYTES,
         projection: Some(&[0, 1]),
         filters: &filters,
         requested_limit: Some(25),
@@ -61,6 +72,7 @@ fn compiles_sql_limit_when_requested() {
     let compiled = compile_scan(CompileScanInput {
         relation: &test_relation(),
         schema: &schema,
+        identifier_max_bytes: TEST_IDENTIFIER_MAX_BYTES,
         projection: Some(&[0]),
         filters: &filters,
         requested_limit: Some(7),
@@ -84,6 +96,7 @@ fn computes_filter_only_columns() {
     let compiled = compile_scan(CompileScanInput {
         relation: &test_relation(),
         schema: &schema,
+        identifier_max_bytes: TEST_IDENTIFIER_MAX_BYTES,
         projection: Some(&[0]),
         filters: &filters,
         requested_limit: None,
@@ -113,6 +126,7 @@ fn leaves_unsupported_filters_as_residual() {
     let compiled = compile_scan(CompileScanInput {
         relation: &test_relation(),
         schema: &schema,
+        identifier_max_bytes: TEST_IDENTIFIER_MAX_BYTES,
         projection: None,
         filters: &[supported.clone(), unsupported.clone()],
         requested_limit: None,
@@ -145,6 +159,7 @@ fn splits_top_level_and_for_partial_pushdown() {
     let compiled = compile_scan(CompileScanInput {
         relation: &test_relation(),
         schema: &schema,
+        identifier_max_bytes: TEST_IDENTIFIER_MAX_BYTES,
         projection: Some(&[1]),
         filters: &[filter],
         requested_limit: None,
@@ -177,6 +192,7 @@ fn includes_residual_filter_columns_in_output() {
     let compiled = compile_scan(CompileScanInput {
         relation: &test_relation(),
         schema: &schema,
+        identifier_max_bytes: TEST_IDENTIFIER_MAX_BYTES,
         projection: Some(&[1]),
         filters: &[pushed, residual.clone()],
         requested_limit: None,
@@ -209,6 +225,7 @@ fn renders_like_filter_without_sql_limit_by_default() {
     let compiled = compile_scan(CompileScanInput {
         relation: &test_relation(),
         schema: &schema,
+        identifier_max_bytes: TEST_IDENTIFIER_MAX_BYTES,
         projection: Some(&[1]),
         filters: &[filter],
         requested_limit: Some(5),
@@ -233,6 +250,7 @@ fn uses_dummy_projection_for_zero_column_scan() {
     let compiled = compile_scan(CompileScanInput {
         relation: &test_relation(),
         schema: &schema,
+        identifier_max_bytes: TEST_IDENTIFIER_MAX_BYTES,
         projection: Some(&[]),
         filters: &[],
         requested_limit: None,
@@ -258,6 +276,7 @@ fn errors_on_unknown_column() {
     let err = compile_scan(CompileScanInput {
         relation: &test_relation(),
         schema: &schema,
+        identifier_max_bytes: TEST_IDENTIFIER_MAX_BYTES,
         projection: None,
         filters: &[Expr::Column(Column::from_name("missing")).eq(lit(1_i64))],
         requested_limit: None,
@@ -279,6 +298,7 @@ fn errors_on_relation_mismatch() {
     let err = compile_scan(CompileScanInput {
         relation: &test_relation(),
         schema: &schema,
+        identifier_max_bytes: TEST_IDENTIFIER_MAX_BYTES,
         projection: None,
         filters: &[
             Expr::Column(Column::new(Some(TableReference::bare("orders")), "id")).eq(lit(1_i64)),
@@ -299,6 +319,89 @@ fn errors_on_relation_mismatch() {
 }
 
 #[test]
+fn rejects_overlong_column_names() {
+    let long_column = format!("score_{}", "x".repeat(80));
+    let schema = Schema::new(vec![Field::new("score", DataType::Float64, true)]);
+    let filter = Expr::Column(Column::from_name(&long_column)).lt(lit(10.5_f64));
+
+    let err = compile_scan(CompileScanInput {
+        relation: &test_relation(),
+        schema: &schema,
+        identifier_max_bytes: TEST_IDENTIFIER_MAX_BYTES,
+        projection: Some(&[0]),
+        filters: std::slice::from_ref(&filter),
+        requested_limit: None,
+        limit_lowering: LimitLowering::ExternalHint,
+    })
+    .unwrap_err();
+
+    assert_eq!(
+        err,
+        CompileError::OverlongIdentifier {
+            kind: "column",
+            identifier: long_column,
+            max_bytes: TEST_IDENTIFIER_MAX_BYTES,
+        }
+    );
+}
+
+#[test]
+fn rejects_overlong_relation_qualifiers() {
+    let long_schema = format!("schema_{}", "s".repeat(80));
+    let long_table = format!("table_{}", "t".repeat(80));
+    let schema = Schema::new(vec![Field::new("id", DataType::Int64, false)]);
+    let relation = test_relation();
+    let qualified = TableReference::partial(long_schema.as_str(), long_table.as_str());
+    let filter = Expr::Column(Column::new(Some(qualified), "id")).eq(lit(1_i64));
+
+    let err = compile_scan(CompileScanInput {
+        relation: &relation,
+        schema: &schema,
+        identifier_max_bytes: TEST_IDENTIFIER_MAX_BYTES,
+        projection: Some(&[0]),
+        filters: std::slice::from_ref(&filter),
+        requested_limit: None,
+        limit_lowering: LimitLowering::ExternalHint,
+    })
+    .unwrap_err();
+
+    assert_eq!(
+        err,
+        CompileError::OverlongIdentifier {
+            kind: "schema",
+            identifier: long_schema,
+            max_bytes: TEST_IDENTIFIER_MAX_BYTES,
+        }
+    );
+}
+
+#[test]
+fn accepts_exact_limit_column_names() {
+    let exact_column = exact_limit_identifier("score_");
+    let schema = Schema::new(vec![Field::new(&exact_column, DataType::Float64, true)]);
+    let filter = Expr::Column(Column::from_name(&exact_column)).lt(lit(10.5_f64));
+
+    let compiled = compile_scan(CompileScanInput {
+        relation: &test_relation(),
+        schema: &schema,
+        identifier_max_bytes: TEST_IDENTIFIER_MAX_BYTES,
+        projection: Some(&[0]),
+        filters: std::slice::from_ref(&filter),
+        requested_limit: None,
+        limit_lowering: LimitLowering::ExternalHint,
+    })
+    .unwrap();
+
+    assert_eq!(compiled.output_columns, vec![0]);
+    assert_eq!(
+        compiled.sql,
+        format!(
+            "SELECT \"{exact_column}\" FROM \"public\".\"users\" WHERE (\"{exact_column}\" < 10.5)"
+        )
+    );
+}
+
+#[test]
 fn leaves_regex_filters_residual() {
     let schema = test_schema();
     let regex = Expr::BinaryExpr(BinaryExpr::new(
@@ -310,6 +413,7 @@ fn leaves_regex_filters_residual() {
     let compiled = compile_scan(CompileScanInput {
         relation: &test_relation(),
         schema: &schema,
+        identifier_max_bytes: TEST_IDENTIFIER_MAX_BYTES,
         projection: Some(&[1]),
         filters: std::slice::from_ref(&regex),
         requested_limit: None,
@@ -332,6 +436,7 @@ fn leaves_non_finite_float_literals_residual() {
     let compiled = compile_scan(CompileScanInput {
         relation: &test_relation(),
         schema: &schema,
+        identifier_max_bytes: TEST_IDENTIFIER_MAX_BYTES,
         projection: Some(&[1]),
         filters: std::slice::from_ref(&filter),
         requested_limit: None,
@@ -361,6 +466,7 @@ fn leaves_temporal_cast_targets_residual() {
     let compiled = compile_scan(CompileScanInput {
         relation: &test_relation(),
         schema: &schema,
+        identifier_max_bytes: TEST_IDENTIFIER_MAX_BYTES,
         projection: Some(&[1]),
         filters: std::slice::from_ref(&filter),
         requested_limit: None,
@@ -386,6 +492,7 @@ fn renders_nested_negative_without_comment_syntax() {
     let compiled = compile_scan(CompileScanInput {
         relation: &test_relation(),
         schema: &schema,
+        identifier_max_bytes: TEST_IDENTIFIER_MAX_BYTES,
         projection: Some(&[1]),
         filters: std::slice::from_ref(&filter),
         requested_limit: None,
@@ -413,6 +520,7 @@ fn folds_empty_in_list_to_false_with_postgresql_semantics() {
     let compiled = compile_scan(CompileScanInput {
         relation: &test_relation(),
         schema: &schema,
+        identifier_max_bytes: TEST_IDENTIFIER_MAX_BYTES,
         projection: Some(&[1]),
         filters: std::slice::from_ref(&filter),
         requested_limit: None,
@@ -441,6 +549,7 @@ fn compiles_int8_cast_using_postgresql_smallint_target() {
     let compiled = compile_scan(CompileScanInput {
         relation: &test_relation(),
         schema: &schema,
+        identifier_max_bytes: TEST_IDENTIFIER_MAX_BYTES,
         projection: Some(&[1]),
         filters: std::slice::from_ref(&filter),
         requested_limit: None,

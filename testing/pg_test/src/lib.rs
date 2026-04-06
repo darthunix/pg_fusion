@@ -4,6 +4,8 @@ use pgrx::pg_schema;
 ::pgrx::pg_module_magic!();
 
 #[cfg(any(test, feature = "pg_test"))]
+mod df_catalog;
+#[cfg(any(test, feature = "pg_test"))]
 mod page_arrow_pipeline;
 #[cfg(any(test, feature = "pg_test"))]
 mod slot_deform_bench;
@@ -215,6 +217,106 @@ mod tests {
         rows: default!(i32, "100000"),
     ) -> pgrx::JsonB {
         super::slot_deform_bench::slot_deform_bench_prepare(profile, rows)
+    }
+
+    #[pg_test]
+    fn df_catalog_resolves_bare_names_via_search_path() {
+        super::df_catalog::df_catalog_resolves_bare_names_via_search_path();
+    }
+
+    #[pg_test]
+    fn df_catalog_resolves_schema_qualified_tables() {
+        super::df_catalog::df_catalog_resolves_schema_qualified_tables();
+    }
+
+    #[pg_test]
+    fn df_catalog_bare_lookup_prefers_temp_tables() {
+        super::df_catalog::df_catalog_bare_lookup_prefers_temp_tables();
+    }
+
+    #[pg_test]
+    fn df_catalog_resolves_pg_temp_alias() {
+        super::df_catalog::df_catalog_resolves_pg_temp_alias();
+    }
+
+    #[pg_test]
+    fn df_catalog_pg_temp_identity_matches_scan_sql_columns() {
+        super::df_catalog::df_catalog_pg_temp_identity_matches_scan_sql_columns();
+    }
+
+    #[pg_test]
+    fn df_catalog_bare_temp_identity_matches_pg_temp_columns() {
+        super::df_catalog::df_catalog_bare_temp_identity_matches_pg_temp_columns();
+    }
+
+    #[pg_test]
+    fn df_catalog_rejects_overlong_bare_identifiers() {
+        super::df_catalog::df_catalog_rejects_overlong_bare_identifiers();
+    }
+
+    #[pg_test]
+    fn df_catalog_rejects_overlong_qualified_identifiers() {
+        super::df_catalog::df_catalog_rejects_overlong_qualified_identifiers();
+    }
+
+    #[pg_test]
+    fn df_catalog_accepts_exact_limit_bare_identifiers() {
+        super::df_catalog::df_catalog_accepts_exact_limit_bare_identifiers();
+    }
+
+    #[pg_test]
+    fn df_catalog_rejects_overlong_column_names_in_scan_sql() {
+        super::df_catalog::df_catalog_rejects_overlong_column_names_in_scan_sql();
+    }
+
+    #[pg_test]
+    fn df_catalog_rejects_overlong_relation_qualifiers_in_scan_sql() {
+        super::df_catalog::df_catalog_rejects_overlong_relation_qualifiers_in_scan_sql();
+    }
+
+    #[pg_test]
+    fn df_catalog_bare_lookup_handles_long_search_paths() {
+        super::df_catalog::df_catalog_bare_lookup_handles_long_search_paths();
+    }
+
+    #[pg_test]
+    fn df_catalog_pg_temp_without_temp_namespace_reports_missing_table() {
+        super::df_catalog::df_catalog_pg_temp_without_temp_namespace_reports_missing_table();
+    }
+
+    #[pg_test]
+    fn df_catalog_rejects_full_references() {
+        super::df_catalog::df_catalog_rejects_full_references();
+    }
+
+    #[pg_test]
+    fn df_catalog_rejects_plain_views_and_resolves_materialized_views() {
+        super::df_catalog::df_catalog_rejects_plain_views_and_resolves_materialized_views();
+    }
+
+    #[pg_test]
+    fn df_catalog_resolves_partitioned_tables() {
+        super::df_catalog::df_catalog_resolves_partitioned_tables();
+    }
+
+    #[pg_test]
+    fn df_catalog_rejects_unsupported_relation_kinds() {
+        super::df_catalog::df_catalog_rejects_unsupported_relation_kinds();
+    }
+
+    #[pg_test]
+    fn df_catalog_rejects_unsupported_types() {
+        super::df_catalog::df_catalog_rejects_unsupported_types();
+    }
+
+    #[pg_test]
+    fn df_catalog_rejects_timetz_columns() {
+        super::df_catalog::df_catalog_rejects_timetz_columns();
+    }
+
+    #[pg_test]
+    fn df_catalog_skips_dropped_columns_and_preserves_nullability() {
+        super::df_catalog::df_catalog_skips_dropped_columns_and_preserves_nullability();
     }
 
     #[pg_extern]

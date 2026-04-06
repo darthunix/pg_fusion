@@ -4,6 +4,7 @@ use datafusion_expr::expr::{BinaryExpr, Case, Cast, InList, Like, ScalarFunction
 use datafusion_expr::{Expr, Operator};
 
 use crate::error::CompileError;
+use crate::identifier::validate_identifier;
 use crate::literal::{render_cast_target, render_literal, render_string_literal};
 use crate::quote::quote_identifier;
 use crate::types::{PgRelation, RenderedExpr};
@@ -12,34 +13,69 @@ pub(crate) fn render_expr(
     expr: &Expr,
     schema: &Schema,
     relation: &PgRelation,
+    identifier_max_bytes: usize,
 ) -> Result<Option<RenderedExpr>, CompileError> {
     match expr {
-        Expr::Alias(alias) => render_expr(&alias.expr, schema, relation),
-        Expr::Column(column) => render_column(column, schema, relation).map(Some),
+        Expr::Alias(alias) => render_expr(&alias.expr, schema, relation, identifier_max_bytes),
+        Expr::Column(column) => {
+            render_column(column, schema, relation, identifier_max_bytes).map(Some)
+        }
         Expr::Literal(literal) => Ok(render_literal(literal).map(RenderedExpr::new)),
-        Expr::BinaryExpr(binary) => render_binary_expr(binary, schema, relation),
-        Expr::Like(like) => render_like_expr(like, false, schema, relation),
-        Expr::SimilarTo(like) => render_like_expr(like, true, schema, relation),
-        Expr::Not(inner) => render_unary_predicate("NOT", inner, schema, relation, true),
-        Expr::IsNull(inner) => render_postfix_predicate(inner, "IS NULL", schema, relation),
-        Expr::IsNotNull(inner) => render_postfix_predicate(inner, "IS NOT NULL", schema, relation),
-        Expr::IsTrue(inner) => render_postfix_predicate(inner, "IS TRUE", schema, relation),
-        Expr::IsFalse(inner) => render_postfix_predicate(inner, "IS FALSE", schema, relation),
-        Expr::IsUnknown(inner) => render_postfix_predicate(inner, "IS UNKNOWN", schema, relation),
-        Expr::IsNotTrue(inner) => render_postfix_predicate(inner, "IS NOT TRUE", schema, relation),
-        Expr::IsNotFalse(inner) => {
-            render_postfix_predicate(inner, "IS NOT FALSE", schema, relation)
+        Expr::BinaryExpr(binary) => {
+            render_binary_expr(binary, schema, relation, identifier_max_bytes)
         }
-        Expr::IsNotUnknown(inner) => {
-            render_postfix_predicate(inner, "IS NOT UNKNOWN", schema, relation)
+        Expr::Like(like) => render_like_expr(like, false, schema, relation, identifier_max_bytes),
+        Expr::SimilarTo(like) => {
+            render_like_expr(like, true, schema, relation, identifier_max_bytes)
         }
-        Expr::Negative(inner) => render_unary_predicate("-", inner, schema, relation, false),
-        Expr::Between(between) => render_between_expr(between, schema, relation),
-        Expr::Case(case) => render_case_expr(case, schema, relation),
-        Expr::Cast(cast) => render_cast_expr(cast, schema, relation),
+        Expr::Not(inner) => {
+            render_unary_predicate("NOT", inner, schema, relation, true, identifier_max_bytes)
+        }
+        Expr::IsNull(inner) => {
+            render_postfix_predicate(inner, "IS NULL", schema, relation, identifier_max_bytes)
+        }
+        Expr::IsNotNull(inner) => {
+            render_postfix_predicate(inner, "IS NOT NULL", schema, relation, identifier_max_bytes)
+        }
+        Expr::IsTrue(inner) => {
+            render_postfix_predicate(inner, "IS TRUE", schema, relation, identifier_max_bytes)
+        }
+        Expr::IsFalse(inner) => {
+            render_postfix_predicate(inner, "IS FALSE", schema, relation, identifier_max_bytes)
+        }
+        Expr::IsUnknown(inner) => {
+            render_postfix_predicate(inner, "IS UNKNOWN", schema, relation, identifier_max_bytes)
+        }
+        Expr::IsNotTrue(inner) => {
+            render_postfix_predicate(inner, "IS NOT TRUE", schema, relation, identifier_max_bytes)
+        }
+        Expr::IsNotFalse(inner) => render_postfix_predicate(
+            inner,
+            "IS NOT FALSE",
+            schema,
+            relation,
+            identifier_max_bytes,
+        ),
+        Expr::IsNotUnknown(inner) => render_postfix_predicate(
+            inner,
+            "IS NOT UNKNOWN",
+            schema,
+            relation,
+            identifier_max_bytes,
+        ),
+        Expr::Negative(inner) => {
+            render_unary_predicate("-", inner, schema, relation, false, identifier_max_bytes)
+        }
+        Expr::Between(between) => {
+            render_between_expr(between, schema, relation, identifier_max_bytes)
+        }
+        Expr::Case(case) => render_case_expr(case, schema, relation, identifier_max_bytes),
+        Expr::Cast(cast) => render_cast_expr(cast, schema, relation, identifier_max_bytes),
         Expr::TryCast(_) => Ok(None),
-        Expr::ScalarFunction(function) => render_scalar_function(function, schema, relation),
-        Expr::InList(in_list) => render_in_list(in_list, schema, relation),
+        Expr::ScalarFunction(function) => {
+            render_scalar_function(function, schema, relation, identifier_max_bytes)
+        }
+        Expr::InList(in_list) => render_in_list(in_list, schema, relation, identifier_max_bytes),
         Expr::ScalarVariable(_, _)
         | Expr::AggregateFunction(_)
         | Expr::WindowFunction(_)
@@ -58,9 +94,10 @@ pub(crate) fn render_column(
     column: &Column,
     schema: &Schema,
     relation: &PgRelation,
+    identifier_max_bytes: usize,
 ) -> Result<RenderedExpr, CompileError> {
     if let Some(column_relation) = &column.relation {
-        if !relation.matches_reference(column_relation) {
+        if !relation.matches_reference(column_relation, identifier_max_bytes)? {
             return Err(CompileError::UnexpectedRelation {
                 column: column.flat_name(),
                 relation: column_relation.to_string(),
@@ -69,6 +106,7 @@ pub(crate) fn render_column(
         }
     }
 
+    validate_identifier(column.name.as_str(), identifier_max_bytes, "column")?;
     let index = schema
         .fields()
         .iter()
@@ -87,11 +125,12 @@ fn render_binary_expr(
     expr: &BinaryExpr,
     schema: &Schema,
     relation: &PgRelation,
+    identifier_max_bytes: usize,
 ) -> Result<Option<RenderedExpr>, CompileError> {
-    let Some(left) = render_expr(&expr.left, schema, relation)? else {
+    let Some(left) = render_expr(&expr.left, schema, relation, identifier_max_bytes)? else {
         return Ok(None);
     };
-    let Some(right) = render_expr(&expr.right, schema, relation)? else {
+    let Some(right) = render_expr(&expr.right, schema, relation, identifier_max_bytes)? else {
         return Ok(None);
     };
     let Some(operator_sql) = render_operator(expr.op) else {
@@ -107,15 +146,16 @@ fn render_like_expr(
     similar_to: bool,
     schema: &Schema,
     relation: &PgRelation,
+    identifier_max_bytes: usize,
 ) -> Result<Option<RenderedExpr>, CompileError> {
     if similar_to && expr.case_insensitive {
         return Ok(None);
     }
 
-    let Some(value) = render_expr(&expr.expr, schema, relation)? else {
+    let Some(value) = render_expr(&expr.expr, schema, relation, identifier_max_bytes)? else {
         return Ok(None);
     };
-    let Some(pattern) = render_expr(&expr.pattern, schema, relation)? else {
+    let Some(pattern) = render_expr(&expr.pattern, schema, relation, identifier_max_bytes)? else {
         return Ok(None);
     };
 
@@ -156,8 +196,9 @@ fn render_unary_predicate(
     schema: &Schema,
     relation: &PgRelation,
     needs_space: bool,
+    identifier_max_bytes: usize,
 ) -> Result<Option<RenderedExpr>, CompileError> {
-    let Some(inner) = render_expr(expr, schema, relation)? else {
+    let Some(inner) = render_expr(expr, schema, relation, identifier_max_bytes)? else {
         return Ok(None);
     };
     let sql = if operator == "-" {
@@ -175,8 +216,9 @@ fn render_postfix_predicate(
     suffix: &str,
     schema: &Schema,
     relation: &PgRelation,
+    identifier_max_bytes: usize,
 ) -> Result<Option<RenderedExpr>, CompileError> {
-    let Some(inner) = render_expr(expr, schema, relation)? else {
+    let Some(inner) = render_expr(expr, schema, relation, identifier_max_bytes)? else {
         return Ok(None);
     };
     let sql = format!("({} {suffix})", inner.sql);
@@ -187,14 +229,15 @@ fn render_between_expr(
     expr: &datafusion_expr::Between,
     schema: &Schema,
     relation: &PgRelation,
+    identifier_max_bytes: usize,
 ) -> Result<Option<RenderedExpr>, CompileError> {
-    let Some(value) = render_expr(&expr.expr, schema, relation)? else {
+    let Some(value) = render_expr(&expr.expr, schema, relation, identifier_max_bytes)? else {
         return Ok(None);
     };
-    let Some(low) = render_expr(&expr.low, schema, relation)? else {
+    let Some(low) = render_expr(&expr.low, schema, relation, identifier_max_bytes)? else {
         return Ok(None);
     };
-    let Some(high) = render_expr(&expr.high, schema, relation)? else {
+    let Some(high) = render_expr(&expr.high, schema, relation, identifier_max_bytes)? else {
         return Ok(None);
     };
     let not_sql = if expr.negated { " NOT" } else { "" };
@@ -209,12 +252,13 @@ fn render_case_expr(
     expr: &Case,
     schema: &Schema,
     relation: &PgRelation,
+    identifier_max_bytes: usize,
 ) -> Result<Option<RenderedExpr>, CompileError> {
     let mut parts = Vec::new();
     let mut sql = String::from("(CASE");
 
     if let Some(base) = &expr.expr {
-        let Some(base) = render_expr(base, schema, relation)? else {
+        let Some(base) = render_expr(base, schema, relation, identifier_max_bytes)? else {
             return Ok(None);
         };
         sql.push(' ');
@@ -223,10 +267,10 @@ fn render_case_expr(
     }
 
     for (when, then) in &expr.when_then_expr {
-        let Some(when_sql) = render_expr(when, schema, relation)? else {
+        let Some(when_sql) = render_expr(when, schema, relation, identifier_max_bytes)? else {
             return Ok(None);
         };
-        let Some(then_sql) = render_expr(then, schema, relation)? else {
+        let Some(then_sql) = render_expr(then, schema, relation, identifier_max_bytes)? else {
             return Ok(None);
         };
         sql.push_str(" WHEN ");
@@ -238,7 +282,7 @@ fn render_case_expr(
     }
 
     if let Some(otherwise) = &expr.else_expr {
-        let Some(else_sql) = render_expr(otherwise, schema, relation)? else {
+        let Some(else_sql) = render_expr(otherwise, schema, relation, identifier_max_bytes)? else {
             return Ok(None);
         };
         sql.push_str(" ELSE ");
@@ -254,8 +298,9 @@ fn render_cast_expr(
     expr: &Cast,
     schema: &Schema,
     relation: &PgRelation,
+    identifier_max_bytes: usize,
 ) -> Result<Option<RenderedExpr>, CompileError> {
-    let Some(inner) = render_expr(&expr.expr, schema, relation)? else {
+    let Some(inner) = render_expr(&expr.expr, schema, relation, identifier_max_bytes)? else {
         return Ok(None);
     };
     let Some(target) = render_cast_target(&expr.data_type) else {
@@ -269,11 +314,12 @@ fn render_scalar_function(
     function: &ScalarFunction,
     schema: &Schema,
     relation: &PgRelation,
+    identifier_max_bytes: usize,
 ) -> Result<Option<RenderedExpr>, CompileError> {
     let rendered_args = function
         .args
         .iter()
-        .map(|expr| render_expr(expr, schema, relation))
+        .map(|expr| render_expr(expr, schema, relation, identifier_max_bytes))
         .collect::<Result<Vec<_>, _>>()?;
     if rendered_args.iter().any(Option::is_none) {
         return Ok(None);
@@ -306,20 +352,21 @@ fn render_in_list(
     expr: &InList,
     schema: &Schema,
     relation: &PgRelation,
+    identifier_max_bytes: usize,
 ) -> Result<Option<RenderedExpr>, CompileError> {
     if expr.list.is_empty() {
         let sql = if expr.negated { "(TRUE)" } else { "(FALSE)" };
         return Ok(Some(RenderedExpr::new(sql.into())));
     }
 
-    let Some(value) = render_expr(&expr.expr, schema, relation)? else {
+    let Some(value) = render_expr(&expr.expr, schema, relation, identifier_max_bytes)? else {
         return Ok(None);
     };
 
     let rendered_items = expr
         .list
         .iter()
-        .map(|item| render_expr(item, schema, relation))
+        .map(|item| render_expr(item, schema, relation, identifier_max_bytes))
         .collect::<Result<Vec<_>, _>>()?;
     if rendered_items.iter().any(Option::is_none) {
         return Ok(None);

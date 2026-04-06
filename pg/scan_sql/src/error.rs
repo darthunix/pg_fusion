@@ -9,6 +9,13 @@ pub enum CompileError {
     #[error("column `{column}` was not found in the provided schema")]
     UnknownColumn { column: String },
 
+    #[error("{kind} identifier `{identifier}` exceeds PostgreSQL limit of {max_bytes} bytes")]
+    OverlongIdentifier {
+        kind: &'static str,
+        identifier: String,
+        max_bytes: usize,
+    },
+
     #[error(
         "column `{column}` refers to relation `{relation}`, but the scan targets `{expected}`"
     )]

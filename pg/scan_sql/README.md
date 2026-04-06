@@ -6,7 +6,8 @@ single base-table scan.
 The crate is intentionally small:
 
 - input matches `TableProvider::scan()` concerns: relation, Arrow schema,
-  projection, filters, and a requested fetch/limit hint
+  projection, filters, a requested fetch/limit hint, and the live PostgreSQL
+  identifier byte limit
 - output is PostgreSQL `SELECT ... FROM ... WHERE ...` by default, plus
   metadata describing any requested limit
 - unsupported expressions are left as residual filters instead of failing the
@@ -48,6 +49,7 @@ let relation = PgRelation::new(Some("public"), "users");
 let compiled = compile_scan(CompileScanInput {
     relation: &relation,
     schema: &schema,
+    identifier_max_bytes: 63,
     projection: Some(&[0, 2]),
     filters: &filters,
     requested_limit: Some(100),
@@ -104,6 +106,9 @@ follows PostgreSQL semantics for the pushed portion, not DataFusion exactness.
 
 - The compiler targets a single base relation only.
 - `LimitLowering::ExternalHint` is the default and recommended mode.
+- callers must supply the live PostgreSQL identifier byte limit, typically
+  `pg_sys::NAMEDATALEN as usize - 1` in backend-side code, so overlong schema,
+  relation, and column names can be rejected before SQL rendering
 - `LimitLowering::SqlClause` is an explicit opt-in for consumers that really
   want exact PostgreSQL `LIMIT` semantics in the generated SQL.
 - Zero-column projections are rendered with a synthetic dummy select item to

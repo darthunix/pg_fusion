@@ -8,6 +8,7 @@ members = [
   "page/import",
   "page/issuance",
   "page/scan_flow",
+  "pg/df_catalog",
   "pg/scan_sql",
   "pg/slot_scan",
   "pg/slot_encoder",

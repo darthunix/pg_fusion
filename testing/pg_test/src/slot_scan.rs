@@ -341,6 +341,7 @@ pub fn slot_scan_accepts_scan_sql_external_hint_and_rejects_sql_clause() {
     let external_hint = compile_scan(CompileScanInput {
         relation: &relation,
         schema: &schema,
+        identifier_max_bytes: (pg_sys::NAMEDATALEN as usize).saturating_sub(1),
         projection: Some(&[0]),
         filters: &filters,
         requested_limit: Some(5),
@@ -357,6 +358,7 @@ pub fn slot_scan_accepts_scan_sql_external_hint_and_rejects_sql_clause() {
     let sql_limit = compile_scan(CompileScanInput {
         relation: &relation,
         schema: &schema,
+        identifier_max_bytes: (pg_sys::NAMEDATALEN as usize).saturating_sub(1),
         projection: Some(&[0]),
         filters: &filters,
         requested_limit: Some(5),
