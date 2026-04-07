@@ -1,0 +1,26 @@
+[package]
+name = "plan_flow"
+version = "25.0.0"
+edition = "2021"
+description = "Sans-io single-sender multi-page flow for logical plan transfer"
+readme = "README.md"
+
+[lib]
+crate-type = ["lib"]
+doctest = false
+
+[dependencies]
+bytes = "1"
+datafusion-expr = { workspace = true }
+issuance = { path = "../issuance", version = "25.0" }
+plan_codec = { path = "../plan_codec", version = "25.0" }
+rust-fsm = { version = "0.7", features = ["diagram"] }
+transfer = { path = "../transfer", version = "25.0" }
+thiserror = "2.0"
+
+[dev-dependencies]
+arrow-schema = { workspace = true }
+datafusion-common = { workspace = true }
+pool = { path = "../pool", version = "25.0" }
+scan_node = { path = "../../pg/scan_node", version = "25.0" }
+scan_sql = { path = "../../pg/scan_sql", version = "25.0" }

@@ -477,13 +477,13 @@ impl PlanDecodeSession {
         self.finished
     }
 
-    /// Push the next owner-backed input chunk into the decoder.
+    /// Push the next input chunk into the decoder.
     ///
     /// This never returns [`DecodeProgress::Done`]. A decoded plan becomes
     /// ready only after the session has parsed a full envelope; the caller
     /// must then invoke [`Self::finish_input`] to validate EOF at the plan
     /// boundary and receive the final plan.
-    pub fn push_chunk(&mut self, chunk: Bytes) -> Result<DecodeProgress, DecodeError> {
+    pub fn push_chunk(&mut self, chunk: &[u8]) -> Result<DecodeProgress, DecodeError> {
         if let Some(failure) = &self.failed {
             return Err(DecodeError::SessionFailed {
                 state: failure.state.clone(),
@@ -724,7 +724,7 @@ impl PlanDecodeSession {
         Ok(())
     }
 
-    fn buffer_decode_chunk(&mut self, chunk: Bytes) {
+    fn buffer_decode_chunk(&mut self, chunk: &[u8]) {
         if chunk.is_empty() {
             return;
         }
@@ -733,22 +733,23 @@ impl PlanDecodeSession {
             && self.logical_plan_len.is_some()
         {
             self.drain_control_into_logical_plan_segments();
-            let mut chunk = chunk;
+            let mut consumed = 0usize;
             let needed = self
                 .logical_plan_len
                 .expect("logical plan length must exist in payload state")
                 .saturating_sub(self.logical_plan_received);
             if needed > 0 {
                 let take = needed.min(chunk.len());
-                self.push_logical_plan_segment(chunk.split_to(take));
+                self.push_logical_plan_segment(Bytes::copy_from_slice(&chunk[..take]));
+                consumed = take;
             }
-            if !chunk.is_empty() {
-                self.control_buf.extend_from_slice(&chunk);
+            if consumed < chunk.len() {
+                self.control_buf.extend_from_slice(&chunk[consumed..]);
             }
             return;
         }
 
-        self.control_buf.extend_from_slice(&chunk);
+        self.control_buf.extend_from_slice(chunk);
     }
 
     fn push_logical_plan_segment(&mut self, bytes: Bytes) {

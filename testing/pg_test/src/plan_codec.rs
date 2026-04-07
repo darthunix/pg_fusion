@@ -2,7 +2,6 @@ use std::sync::Arc;
 
 use ::plan_builder::{PlanBuildInput, PlanBuilder};
 use ::plan_codec::{DecodeProgress, EncodeProgress, PlanDecodeSession, PlanEncodeSession};
-use bytes::Bytes;
 use datafusion_common::tree_node::{TreeNode, TreeNodeRecursion};
 use datafusion_common::ScalarValue;
 use datafusion_expr::logical_plan::LogicalPlan;
@@ -45,7 +44,7 @@ fn decode_all<const PAGE: usize>(bytes: &[u8]) -> Result<LogicalPlan, ::plan_cod
     assert!(PAGE > 0);
     let mut session = PlanDecodeSession::new();
     for chunk in bytes.chunks(PAGE) {
-        let progress = session.push_chunk(Bytes::copy_from_slice(chunk))?;
+        let progress = session.push_chunk(chunk)?;
         assert!(
             matches!(progress, DecodeProgress::NeedMoreInput),
             "push_chunk must wait for finish_input to finalize the plan"

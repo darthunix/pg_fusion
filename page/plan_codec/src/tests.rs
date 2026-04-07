@@ -7,7 +7,7 @@ use std::hash::{Hash, Hasher};
 use std::sync::Arc;
 
 use arrow_schema::{DataType, Field, Schema};
-use bytes::{Bytes, BytesMut};
+use bytes::BytesMut;
 use datafusion::prelude::SessionContext;
 use datafusion_common::tree_node::{TreeNode, TreeNodeRecursion};
 use datafusion_common::Column;
@@ -142,7 +142,7 @@ fn decode_all<const PAGE: usize>(bytes: &[u8]) -> Result<LogicalPlan, DecodeErro
     assert!(PAGE > 0);
     let mut session = PlanDecodeSession::new();
     for chunk in bytes.chunks(PAGE) {
-        let progress = session.push_chunk(Bytes::copy_from_slice(chunk))?;
+        let progress = session.push_chunk(chunk)?;
         assert!(
             matches!(progress, DecodeProgress::NeedMoreInput),
             "push_chunk must wait for finish_input to finalize the plan"
@@ -407,9 +407,7 @@ fn encoder_rejects_empty_output_chunk() {
 #[test]
 fn decoder_empty_chunk_waits_for_more_input() {
     let mut session = PlanDecodeSession::new();
-    let progress = session
-        .push_chunk(Bytes::new())
-        .expect("empty decode chunk");
+    let progress = session.push_chunk(&[]).expect("empty decode chunk");
     assert!(matches!(progress, DecodeProgress::NeedMoreInput));
     assert!(!session.is_finished());
 }
@@ -422,7 +420,7 @@ fn decoder_reports_unexpected_eof_for_truncated_input() {
     let mut session = PlanDecodeSession::new();
 
     let progress = session
-        .push_chunk(Bytes::copy_from_slice(truncated))
+        .push_chunk(truncated)
         .expect("truncated chunk should still be buffered");
     assert!(matches!(progress, DecodeProgress::NeedMoreInput));
 
@@ -444,7 +442,7 @@ fn decoder_requires_eof_before_returning_done() {
     let mut session = PlanDecodeSession::new();
 
     let progress = session
-        .push_chunk(Bytes::copy_from_slice(&bytes))
+        .push_chunk(&bytes)
         .expect("complete payload should be buffered");
     assert!(matches!(progress, DecodeProgress::NeedMoreInput));
     assert!(!session.is_finished());
@@ -471,12 +469,12 @@ fn decoder_rejects_trailing_bytes_after_plan_boundary_before_eof() {
     let mut session = PlanDecodeSession::new();
 
     let progress = session
-        .push_chunk(Bytes::copy_from_slice(&bytes))
+        .push_chunk(&bytes)
         .expect("complete payload should be buffered");
     assert!(matches!(progress, DecodeProgress::NeedMoreInput));
 
     let err = session
-        .push_chunk(Bytes::from_static(&[0x99]))
+        .push_chunk(&[0x99])
         .expect_err("bytes after the plan boundary must be rejected");
     assert!(matches!(err, DecodeError::TrailingBytes { remaining: 1 }));
 
@@ -521,12 +519,12 @@ fn decoder_poisoned_after_build_stage_failure() {
     encode_envelope_into(&envelope, &mut bytes).expect("encode envelope");
     let mut session = PlanDecodeSession::new();
     let err = session
-        .push_chunk(Bytes::copy_from_slice(&bytes))
+        .push_chunk(&bytes)
         .expect_err("orphan scan spec should fail at build stage");
     assert!(matches!(err, DecodeError::OrphanScanSpec { scan_id: 42 }));
 
     let poisoned = session
-        .push_chunk(Bytes::new())
+        .push_chunk(&[])
         .expect_err("poisoned decoder should not panic");
     assert!(matches!(poisoned, DecodeError::SessionFailed { .. }));
 }

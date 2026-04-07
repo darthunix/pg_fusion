@@ -23,7 +23,6 @@ responsible for page orchestration and carrier interaction.
 ## Example
 
 ```rust,ignore
-use bytes::Bytes;
 use plan_builder::{PlanBuildInput, PlanBuilder};
 use plan_codec::{DecodeProgress, EncodeProgress, PlanDecodeSession, PlanEncodeSession};
 
@@ -50,7 +49,7 @@ loop {
 
 let mut decoder = PlanDecodeSession::new();
 for chunk in encoded.chunks(4096) {
-    let progress = decoder.push_chunk(Bytes::copy_from_slice(chunk))?;
+    let progress = decoder.push_chunk(chunk)?;
     assert!(matches!(progress, DecodeProgress::NeedMoreInput));
 }
 

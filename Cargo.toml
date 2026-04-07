@@ -8,6 +8,7 @@ members = [
   "page/import",
   "page/issuance",
   "page/plan_codec",
+  "page/plan_flow",
   "page/scan_flow",
   "pg/df_catalog",
   "pg/plan_builder",
