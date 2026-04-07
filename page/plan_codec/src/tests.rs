@@ -7,7 +7,7 @@ use std::hash::{Hash, Hasher};
 use std::sync::Arc;
 
 use arrow_schema::{DataType, Field, Schema};
-use bytes::{buf::UninitSlice, Buf, BufMut, Bytes, BytesMut};
+use bytes::{Bytes, BytesMut};
 use datafusion::prelude::SessionContext;
 use datafusion_common::tree_node::{TreeNode, TreeNodeRecursion};
 use datafusion_common::Column;
@@ -112,26 +112,66 @@ fn build_sql(sql: &str) -> BuiltPlan {
         .expect("build plan")
 }
 
+fn encode_all<const PAGE: usize>(plan: &LogicalPlan) -> (Vec<u8>, usize) {
+    assert!(PAGE > 0);
+    let mut session = PlanEncodeSession::new(plan).expect("create encode session");
+    let mut bytes = Vec::new();
+    let mut pages = 0usize;
+
+    loop {
+        let mut chunk = [0u8; PAGE];
+        match session.write_chunk(&mut chunk).expect("write chunk") {
+            EncodeProgress::NeedMoreOutput { written } => {
+                assert!(written > 0, "encoder must make forward progress");
+                bytes.extend_from_slice(&chunk[..written]);
+                pages += 1;
+            }
+            EncodeProgress::Done { written } => {
+                bytes.extend_from_slice(&chunk[..written]);
+                pages += 1;
+                break;
+            }
+        }
+    }
+
+    assert!(session.is_finished());
+    (bytes, pages)
+}
+
+fn decode_all<const PAGE: usize>(bytes: &[u8]) -> Result<LogicalPlan, DecodeError> {
+    assert!(PAGE > 0);
+    let mut session = PlanDecodeSession::new();
+    for chunk in bytes.chunks(PAGE) {
+        let progress = session.push_chunk(Bytes::copy_from_slice(chunk))?;
+        assert!(
+            matches!(progress, DecodeProgress::NeedMoreInput),
+            "push_chunk must wait for finish_input to finalize the plan"
+        );
+    }
+
+    match session.finish_input()? {
+        DecodeProgress::Done(plan) => {
+            assert!(session.is_finished());
+            Ok(*plan)
+        }
+        DecodeProgress::NeedMoreInput => Err(DecodeError::MsgPack(
+            "decode session requires more input".into(),
+        )),
+    }
+}
+
 fn roundtrip(plan: &LogicalPlan) -> LogicalPlan {
-    let mut sink = PagedSink::<17>::new();
-    encode_plan_into(plan, &mut sink).expect("encode plan");
-    assert!(
-        sink.page_count() > 1,
-        "test sink should cross page boundaries"
-    );
-    let mut source = sink.into_source();
-    decode_plan_from(&mut source).expect("decode plan")
+    let (bytes, pages) = encode_all::<17>(plan);
+    assert!(pages > 1, "test encoding should cross page boundaries");
+    decode_all::<17>(&bytes).expect("decode plan")
 }
 
 fn encode_bytes(plan: &LogicalPlan) -> Vec<u8> {
-    let mut sink = BytesMut::new();
-    encode_plan_into(plan, &mut sink).expect("encode plan");
-    sink.to_vec()
+    encode_all::<256>(plan).0
 }
 
 fn decode_bytes(bytes: &[u8]) -> Result<LogicalPlan, DecodeError> {
-    let mut source = Bytes::copy_from_slice(bytes);
-    decode_plan_from(&mut source)
+    decode_all::<256>(bytes)
 }
 
 fn collect_pg_scans(plan: &LogicalPlan) -> Vec<Arc<PgScanSpec>> {
@@ -348,9 +388,147 @@ fn rejects_unsupported_extension_nodes() {
         }),
     });
 
-    let mut sink = BytesMut::new();
-    let err = encode_plan_into(&plan, &mut sink).expect_err("unsupported extension should fail");
+    let err = PlanEncodeSession::new(&plan)
+        .err()
+        .expect("unsupported extension should fail");
     assert!(matches!(err, EncodeError::DataFusion(_)));
+}
+
+#[test]
+fn encoder_rejects_empty_output_chunk() {
+    let plan = build_sql("SELECT id FROM users").logical_plan;
+    let mut session = PlanEncodeSession::new(&plan).expect("encode session");
+    let err = session
+        .write_chunk(&mut [])
+        .expect_err("empty chunk should fail");
+    assert!(matches!(err, EncodeError::EmptyOutputChunk));
+}
+
+#[test]
+fn decoder_empty_chunk_waits_for_more_input() {
+    let mut session = PlanDecodeSession::new();
+    let progress = session
+        .push_chunk(Bytes::new())
+        .expect("empty decode chunk");
+    assert!(matches!(progress, DecodeProgress::NeedMoreInput));
+    assert!(!session.is_finished());
+}
+
+#[test]
+fn decoder_reports_unexpected_eof_for_truncated_input() {
+    let built = build_sql("SELECT id FROM users");
+    let bytes = encode_bytes(&built.logical_plan);
+    let truncated = &bytes[..bytes.len() - 1];
+    let mut session = PlanDecodeSession::new();
+
+    let progress = session
+        .push_chunk(Bytes::copy_from_slice(truncated))
+        .expect("truncated chunk should still be buffered");
+    assert!(matches!(progress, DecodeProgress::NeedMoreInput));
+
+    let err = session
+        .finish_input()
+        .expect_err("EOF should fail on truncation");
+    assert!(matches!(err, DecodeError::UnexpectedEof { .. }));
+
+    let poisoned = session
+        .finish_input()
+        .expect_err("poisoned session should stay failed");
+    assert!(matches!(poisoned, DecodeError::SessionFailed { .. }));
+}
+
+#[test]
+fn decoder_requires_eof_before_returning_done() {
+    let built = build_sql("SELECT id FROM users");
+    let bytes = encode_bytes(&built.logical_plan);
+    let mut session = PlanDecodeSession::new();
+
+    let progress = session
+        .push_chunk(Bytes::copy_from_slice(&bytes))
+        .expect("complete payload should be buffered");
+    assert!(matches!(progress, DecodeProgress::NeedMoreInput));
+    assert!(!session.is_finished());
+
+    match session
+        .finish_input()
+        .expect("EOF should finalize the plan")
+    {
+        DecodeProgress::Done(plan) => {
+            assert_eq!(
+                built.logical_plan.display_indent().to_string(),
+                plan.display_indent().to_string()
+            );
+            assert!(session.is_finished());
+        }
+        DecodeProgress::NeedMoreInput => panic!("EOF must finish or fail"),
+    }
+}
+
+#[test]
+fn decoder_rejects_trailing_bytes_after_plan_boundary_before_eof() {
+    let built = build_sql("SELECT id FROM users");
+    let bytes = encode_bytes(&built.logical_plan);
+    let mut session = PlanDecodeSession::new();
+
+    let progress = session
+        .push_chunk(Bytes::copy_from_slice(&bytes))
+        .expect("complete payload should be buffered");
+    assert!(matches!(progress, DecodeProgress::NeedMoreInput));
+
+    let err = session
+        .push_chunk(Bytes::from_static(&[0x99]))
+        .expect_err("bytes after the plan boundary must be rejected");
+    assert!(matches!(err, DecodeError::TrailingBytes { remaining: 1 }));
+
+    let poisoned = session
+        .finish_input()
+        .expect_err("poisoned session should stay failed");
+    assert!(matches!(poisoned, DecodeError::SessionFailed { .. }));
+}
+
+#[test]
+fn decoder_poisoned_after_build_stage_failure() {
+    let built = build_sql("SELECT extract(day from now())");
+    let mut envelope = collect_plan_envelope(&built.logical_plan).expect("collect envelope");
+    let source_schema = DFSchema::try_from_qualified_schema(
+        datafusion_common::TableReference::partial("public", "users"),
+        user_table().schema.as_ref(),
+    )
+    .expect("dfschema");
+    let compiled = compile_scan(CompileScanInput {
+        relation: &PgRelation::new(Some("public"), "users"),
+        schema: user_table().schema.as_ref(),
+        identifier_max_bytes: TEST_IDENTIFIER_MAX_BYTES,
+        projection: Some(&[0]),
+        filters: &[],
+        requested_limit: None,
+        limit_lowering: LimitLowering::ExternalHint,
+    })
+    .expect("compile scan");
+    let orphan = Arc::new(
+        PgScanSpec::try_new(
+            PgScanId::new(42),
+            42,
+            PgRelation::new(Some("public"), "users"),
+            &source_schema,
+            compiled,
+        )
+        .expect("orphan spec"),
+    );
+    envelope.pg_scan_specs.insert(orphan.scan_id, orphan);
+
+    let mut bytes = BytesMut::new();
+    encode_envelope_into(&envelope, &mut bytes).expect("encode envelope");
+    let mut session = PlanDecodeSession::new();
+    let err = session
+        .push_chunk(Bytes::copy_from_slice(&bytes))
+        .expect_err("orphan scan spec should fail at build stage");
+    assert!(matches!(err, DecodeError::OrphanScanSpec { scan_id: 42 }));
+
+    let poisoned = session
+        .push_chunk(Bytes::new())
+        .expect_err("poisoned decoder should not panic");
+    assert!(matches!(poisoned, DecodeError::SessionFailed { .. }));
 }
 
 #[test]
@@ -471,92 +649,4 @@ fn rejects_malformed_pg_scan_reference_payload() {
     encode_envelope_into(&envelope, &mut sink).expect("re-encode envelope");
     let err = decode_bytes(&sink).expect_err("corrupted extension payload should fail");
     assert!(matches!(err, DecodeError::DataFusion(_)));
-}
-
-#[derive(Debug, Default)]
-struct PagedSink<const PAGE: usize> {
-    pages: Vec<Box<[u8; PAGE]>>,
-    len: usize,
-}
-
-impl<const PAGE: usize> PagedSink<PAGE> {
-    fn new() -> Self {
-        assert!(PAGE > 0);
-        Self::default()
-    }
-
-    fn page_count(&self) -> usize {
-        self.pages.len()
-    }
-
-    fn into_source(self) -> PagedSource<PAGE> {
-        PagedSource {
-            pages: self.pages,
-            len: self.len,
-            pos: 0,
-        }
-    }
-
-    fn ensure_capacity(&mut self) {
-        if self.pages.is_empty() || self.len == self.pages.len() * PAGE {
-            self.pages.push(Box::new([0u8; PAGE]));
-        }
-    }
-}
-
-unsafe impl<const PAGE: usize> BufMut for PagedSink<PAGE> {
-    fn remaining_mut(&self) -> usize {
-        usize::MAX.saturating_sub(self.len)
-    }
-
-    fn chunk_mut(&mut self) -> &mut UninitSlice {
-        self.ensure_capacity();
-        let page_index = self.len / PAGE;
-        let page_offset = self.len % PAGE;
-        let page = &mut self.pages[page_index];
-        let ptr = page.as_mut_ptr();
-        let len = PAGE - page_offset;
-        // SAFETY: `ptr.add(page_offset)` points at writable page memory owned by `self`.
-        unsafe { UninitSlice::from_raw_parts_mut(ptr.add(page_offset), len) }
-    }
-
-    unsafe fn advance_mut(&mut self, cnt: usize) {
-        self.len = self
-            .len
-            .checked_add(cnt)
-            .expect("paged sink length overflow");
-        while self.pages.len() * PAGE < self.len {
-            self.pages.push(Box::new([0u8; PAGE]));
-        }
-    }
-}
-
-#[derive(Debug)]
-struct PagedSource<const PAGE: usize> {
-    pages: Vec<Box<[u8; PAGE]>>,
-    len: usize,
-    pos: usize,
-}
-
-impl<const PAGE: usize> Buf for PagedSource<PAGE> {
-    fn remaining(&self) -> usize {
-        self.len.saturating_sub(self.pos)
-    }
-
-    fn chunk(&self) -> &[u8] {
-        if self.pos >= self.len {
-            return &[];
-        }
-
-        let page_index = self.pos / PAGE;
-        let page_offset = self.pos % PAGE;
-        let page = &self.pages[page_index];
-        let len = usize::min(PAGE - page_offset, self.len - self.pos);
-        &page[page_offset..page_offset + len]
-    }
-
-    fn advance(&mut self, cnt: usize) {
-        assert!(cnt <= self.remaining());
-        self.pos += cnt;
-    }
 }

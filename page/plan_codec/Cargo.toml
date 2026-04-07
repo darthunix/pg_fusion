@@ -17,8 +17,10 @@ datafusion-expr = { workspace = true }
 datafusion-proto = "44.0"
 prost = "0.13"
 rmp = "0.8"
+rust-fsm = { version = "0.7", features = ["diagram"] }
 scan_node = { path = "../../pg/scan_node", version = "25.0" }
 scan_sql = { path = "../../pg/scan_sql", version = "25.0" }
+smallvec = { version = "1.14", features = ["const_generics", "union"] }
 thiserror = "2.0"
 
 [dev-dependencies]

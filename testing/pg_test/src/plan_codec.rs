@@ -1,8 +1,8 @@
 use std::sync::Arc;
 
 use ::plan_builder::{PlanBuildInput, PlanBuilder};
-use ::plan_codec::{decode_plan_from, encode_plan_into};
-use bytes::BytesMut;
+use ::plan_codec::{DecodeProgress, EncodeProgress, PlanDecodeSession, PlanEncodeSession};
+use bytes::Bytes;
 use datafusion_common::tree_node::{TreeNode, TreeNodeRecursion};
 use datafusion_common::ScalarValue;
 use datafusion_expr::logical_plan::LogicalPlan;
@@ -13,11 +13,54 @@ fn roundtrip(sql: &str, params: Vec<ScalarValue>) -> (LogicalPlan, LogicalPlan) 
     let built = PlanBuilder::new()
         .build(PlanBuildInput { sql, params })
         .expect("build plan");
-    let mut sink = BytesMut::new();
-    encode_plan_into(&built.logical_plan, &mut sink).expect("encode plan");
-    let mut source = sink.freeze();
-    let decoded = decode_plan_from(&mut source).expect("decode plan");
+    let encoded = encode_all::<29>(&built.logical_plan);
+    let decoded = decode_all::<31>(&encoded).expect("decode plan");
     (built.logical_plan, decoded)
+}
+
+fn encode_all<const PAGE: usize>(plan: &LogicalPlan) -> Vec<u8> {
+    assert!(PAGE > 0);
+    let mut session = PlanEncodeSession::new(plan).expect("create encode session");
+    let mut bytes = Vec::new();
+
+    loop {
+        let mut chunk = [0u8; PAGE];
+        match session.write_chunk(&mut chunk).expect("write chunk") {
+            EncodeProgress::NeedMoreOutput { written } => {
+                assert!(written > 0, "encoder must make forward progress");
+                bytes.extend_from_slice(&chunk[..written]);
+            }
+            EncodeProgress::Done { written } => {
+                bytes.extend_from_slice(&chunk[..written]);
+                break;
+            }
+        }
+    }
+
+    assert!(session.is_finished());
+    bytes
+}
+
+fn decode_all<const PAGE: usize>(bytes: &[u8]) -> Result<LogicalPlan, ::plan_codec::DecodeError> {
+    assert!(PAGE > 0);
+    let mut session = PlanDecodeSession::new();
+    for chunk in bytes.chunks(PAGE) {
+        let progress = session.push_chunk(Bytes::copy_from_slice(chunk))?;
+        assert!(
+            matches!(progress, DecodeProgress::NeedMoreInput),
+            "push_chunk must wait for finish_input to finalize the plan"
+        );
+    }
+
+    match session.finish_input()? {
+        DecodeProgress::Done(plan) => {
+            assert!(session.is_finished());
+            Ok(*plan)
+        }
+        DecodeProgress::NeedMoreInput => Err(::plan_codec::DecodeError::MsgPack(
+            "decode session requires more input".into(),
+        )),
+    }
 }
 
 fn collect_pg_scans(plan: &LogicalPlan) -> Vec<Arc<scan_node::PgScanSpec>> {

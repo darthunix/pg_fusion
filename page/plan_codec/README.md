@@ -11,32 +11,53 @@ The crate is intentionally narrow:
 - `scan_node::PgScanNode` carries only `scan_id` inside the protobuf logical
   plan; the full `PgScanSpec` table lives alongside it in the outer envelope
 - the payload carries `scan_id`, but never carries snapshot identity
-- callers provide the output/input buffers directly via `bytes::BufMut` /
-  `bytes::Buf`; `plan_codec` does not require a single staged `Vec<u8>`
+- callers use streaming sessions and provide page-sized chunks directly;
+  `plan_codec` does not require a single staged `Vec<u8>` for the full plan
 - expr-level subqueries are out of scope; `pg/plan_builder` rejects them before
   serialization, so this codec only needs to support the leaf-scan planning
   subset
 
 It does not own page rollover or transport. Later `page/plan_flow` is
-responsible for chunking and carrier interaction.
+responsible for page orchestration and carrier interaction.
 
 ## Example
 
 ```rust,ignore
-use bytes::BytesMut;
+use bytes::Bytes;
 use plan_builder::{PlanBuildInput, PlanBuilder};
-use plan_codec::{decode_plan_from, encode_plan_into};
+use plan_codec::{DecodeProgress, EncodeProgress, PlanDecodeSession, PlanEncodeSession};
 
 let built = PlanBuilder::new().build(PlanBuildInput {
     sql: "SELECT id, payload FROM public.orders WHERE id > 10 LIMIT 32",
     params: vec![],
 })?;
 
-let mut sink = BytesMut::new();
-encode_plan_into(&built.logical_plan, &mut sink)?;
+let mut encoder = PlanEncodeSession::new(&built.logical_plan)?;
+let mut encoded = Vec::new();
 
-let mut source = sink.freeze();
-let decoded = decode_plan_from(&mut source)?;
+loop {
+    let mut page = [0u8; 4096];
+    match encoder.write_chunk(&mut page)? {
+        EncodeProgress::NeedMoreOutput { written } => {
+            encoded.extend_from_slice(&page[..written]);
+        }
+        EncodeProgress::Done { written } => {
+            encoded.extend_from_slice(&page[..written]);
+            break;
+        }
+    }
+}
+
+let mut decoder = PlanDecodeSession::new();
+for chunk in encoded.chunks(4096) {
+    let progress = decoder.push_chunk(Bytes::copy_from_slice(chunk))?;
+    assert!(matches!(progress, DecodeProgress::NeedMoreInput));
+}
+
+let decoded = match decoder.finish_input()? {
+    DecodeProgress::Done(plan) => *plan,
+    DecodeProgress::NeedMoreInput => unreachable!("EOF must finish or fail"),
+};
 
 assert_eq!(
     built.logical_plan.display_indent().to_string(),
