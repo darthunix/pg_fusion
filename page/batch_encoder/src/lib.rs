@@ -18,6 +18,13 @@
 //! 4. Append the maximal fitting row prefix from one [`arrow_array::RecordBatch`]
 //! 5. Finalize the block with [`BatchPageEncoder::finish`]
 //!
+//! If an empty page reports `AppendResult { rows_written: 0, full: true }`,
+//! the caller may have simply overestimated `LayoutPlan::max_rows()` for a
+//! variable-width workload. In that case it is valid to reinitialize a fresh
+//! block with a smaller `max_rows` and retry the same first row.
+//! [`EncodeError::RowTooLargeForPage`] is reserved for the terminal case where
+//! the first row still does not fit on an empty page with `max_rows = 1`.
+//!
 //! As with `arrow_layout` itself, this crate is intended only for same-host
 //! shared-memory exchange. It does not produce a portable cross-endian format.
 

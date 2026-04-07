@@ -55,7 +55,7 @@ pub enum EncodeError {
     #[error("start_row {start_row} is out of bounds for batch with {row_count} rows")]
     StartRowOutOfBounds { start_row: usize, row_count: usize },
     #[error(
-        "row {row} requires {required_tail} tail bytes but an empty page only has {page_tail_capacity}"
+        "row {row} requires {required_tail} tail bytes but an empty page with max_rows = 1 only has {page_tail_capacity}"
     )]
     RowTooLargeForPage {
         row: usize,

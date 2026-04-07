@@ -369,9 +369,44 @@ fn append_batch_stops_at_exact_tail_fit() {
 }
 
 #[test]
-fn append_batch_rejects_row_that_cannot_fit_in_empty_page() {
+fn append_batch_returns_retryable_full_for_empty_page_overestimate() {
     let schema = Arc::new(Schema::new(vec![Field::new("txt", DataType::Utf8, true)]));
-    let plan = LayoutPlan::new(&[ColumnSpec::new(TypeTag::Utf8View, true)], 2, 160).expect("plan");
+    let specs = [ColumnSpec::new(TypeTag::Utf8View, true)];
+    let plan = LayoutPlan::new(&specs, 2, 160).expect("plan");
+    let single_row_plan = LayoutPlan::new(&specs, 1, 160).expect("single-row plan");
+    let retryable_len = usize::try_from(plan.shared_pool_capacity()).expect("capacity") + 4;
+    assert!(retryable_len > VIEW_INLINE_LEN);
+    assert!(retryable_len <= usize::try_from(single_row_plan.shared_pool_capacity()).unwrap());
+    let retryable = "x".repeat(retryable_len);
+    let batch = RecordBatch::try_new(
+        Arc::clone(&schema),
+        vec![Arc::new(StringArray::from(vec![Some(retryable.as_str())])) as ArrayRef],
+    )
+    .expect("batch");
+    let mut payload = init_payload(&plan);
+    let mut encoder = BatchPageEncoder::new(schema.as_ref(), &plan, &mut payload).expect("encoder");
+
+    let appended = encoder.append_batch(&batch, 0).expect("retryable full");
+    assert_eq!(
+        appended,
+        AppendResult {
+            rows_written: 0,
+            full: true
+        }
+    );
+
+    let encoded = encoder.finish().expect("finish");
+    assert_eq!(encoded.row_count, 0);
+    let block = BlockRef::open(&payload).expect("block");
+    assert_eq!(block.row_count(), 0);
+    assert_eq!(block.tail_cursor(), block.block_size());
+}
+
+#[test]
+fn append_batch_rejects_row_that_cannot_fit_even_with_single_row_layout() {
+    let schema = Arc::new(Schema::new(vec![Field::new("txt", DataType::Utf8, true)]));
+    let specs = [ColumnSpec::new(TypeTag::Utf8View, true)];
+    let plan = LayoutPlan::new(&specs, 1, 160).expect("plan");
     let oversized_len = usize::try_from(plan.shared_pool_capacity()).expect("capacity") + 1;
     let oversized = "x".repeat(oversized_len);
     let batch = RecordBatch::try_new(

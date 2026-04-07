@@ -95,6 +95,14 @@ impl<'schema, 'payload> BatchPageEncoder<'schema, 'payload> {
     /// This method never partially commits a row. If the block fills, the
     /// caller should finalize it, initialize a fresh block, and retry from
     /// `start_row + rows_written`.
+    ///
+    /// On an empty page with variable-width data, `rows_written = 0` together
+    /// with `full = true` can also mean the caller overestimated `max_rows` for
+    /// this page shape. In that case the caller should retry the same input row
+    /// on a fresh page with a smaller `LayoutPlan::max_rows()`.
+    /// [`EncodeError::RowTooLargeForPage`] is reserved for the terminal case
+    /// where the first row still does not fit on an empty page with
+    /// `max_rows = 1`.
     pub fn append_batch(
         &mut self,
         batch: &RecordBatch,
@@ -130,7 +138,7 @@ impl<'schema, 'payload> BatchPageEncoder<'schema, 'payload> {
                     .block_size()
                     .checked_sub(self.block.pool_base())
                     .ok_or(arrow_layout::LayoutError::InvalidHeaderBounds)?;
-                if required_tail > page_tail_capacity {
+                if required_tail > page_tail_capacity && self.block.max_rows() == 1 {
                     return Err(EncodeError::RowTooLargeForPage {
                         row: start_row,
                         required_tail,

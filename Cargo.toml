@@ -7,6 +7,7 @@ members = [
   "page/batch_encoder",
   "page/import",
   "page/issuance",
+  "page/row_estimator",
   "page/plan_codec",
   "page/plan_flow",
   "page/scan_flow",

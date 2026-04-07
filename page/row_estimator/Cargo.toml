@@ -1,0 +1,19 @@
+[package]
+name = "row_estimator"
+version = "25.0.0"
+edition = "2021"
+description = "Adaptive rows-per-page estimator for arrow_layout blocks"
+readme = "README.md"
+
+[lib]
+crate-type = ["lib"]
+doctest = false
+
+[dependencies]
+arrow_layout = { path = "../arrow_layout", version = "25.0" }
+thiserror = "2.0"
+
+[dev-dependencies]
+arrow-array = { workspace = true }
+arrow-schema = { workspace = true }
+batch_encoder = { path = "../batch_encoder", version = "25.0" }
