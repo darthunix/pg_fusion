@@ -20,7 +20,8 @@
 //!    [`ControlRegion::activate_worker_generation`].
 //! 5. A backend acquires one persistent [`BackendSlotLease`] from that active
 //!    generation.
-//! 6. Each execution starts with [`BackendSlotLease::begin_session`].
+//! 6. Each execution starts with [`BackendSlotLease::begin_session`]. Backend
+//!    traffic to the worker is invalid before this step.
 //! 7. Backends exchange opaque framed payloads through generation-bound
 //!    [`BackendTx`] and [`BackendRx`], while workers use session-bound
 //!    [`WorkerTx`] and [`WorkerRx`] obtained from [`WorkerSlot`].

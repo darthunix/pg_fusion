@@ -182,7 +182,7 @@ impl<'lease, 'region> BackendTx<'lease, 'region> {
     ) -> Result<BackendFrameWriter<'tx, 'lease, 'region>, BackendTxError> {
         self.lease
             .region
-            .validate_lease(
+            .validate_active_backend_session(
                 self.lease.slot_id,
                 self.lease.generation,
                 self.lease.bank_index,
@@ -241,7 +241,7 @@ impl<'tx, 'lease, 'region> BackendFrameWriter<'tx, 'lease, 'region> {
     pub fn commit(self) -> Result<CommitOutcome, BackendTxError> {
         self.lease
             .region
-            .validate_lease(
+            .validate_active_backend_session(
                 self.lease.slot_id,
                 self.lease.generation,
                 self.lease.bank_index,

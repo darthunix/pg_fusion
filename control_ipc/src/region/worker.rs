@@ -77,6 +77,15 @@ impl<'a> Iterator for ReadySlots<'a> {
                     .region
                     .slot_view_in_bank_unchecked(slot_id, bank_index)
             };
+            let session_epoch = slot.session_epoch.load(Ordering::Acquire);
+            let claim_epoch = slot.worker_claim_epoch.load(Ordering::Acquire);
+            if slot.lease_state.load(Ordering::Acquire) != LEASE_STATE_LEASED
+                || session_epoch == 0
+                || claim_epoch == super::WORKER_CLAIM_BLOCKED
+                || claim_epoch == session_epoch
+            {
+                continue;
+            }
             if slot.to_worker_ready.load(Ordering::Acquire)
                 || slot.backend_to_worker.has_pending_frame()
             {

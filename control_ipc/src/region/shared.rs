@@ -209,6 +209,25 @@ impl ControlRegion {
         Ok(slot)
     }
 
+    pub(super) fn validate_active_backend_session(
+        &self,
+        slot_id: u32,
+        generation: u64,
+        bank_index: usize,
+        active: bool,
+    ) -> Result<SlotView<'_>, LeaseError> {
+        let slot = self.validate_lease(slot_id, generation, bank_index, active)?;
+        if slot.session_epoch.load(Ordering::Acquire) == 0
+            || slot.worker_claim_epoch.load(Ordering::Acquire) == WORKER_CLAIM_BLOCKED
+        {
+            return Err(LeaseError::NoActiveSession {
+                slot_id,
+                claimed_generation: generation,
+            });
+        }
+        Ok(slot)
+    }
+
     pub(super) fn claim_worker_slot_epoch(
         &self,
         slot_id: u32,

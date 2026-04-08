@@ -239,9 +239,13 @@ fn reacquired_slot_has_no_active_session_until_begin_session() {
 
     {
         let mut tx = second.to_worker_tx();
-        let mut writer = tx.try_reserve(4).expect("reserve before session");
-        writer.payload_mut().copy_from_slice(b"pre!");
-        assert_commit_published(writer.commit().expect("commit before session"));
+        assert!(matches!(
+            tx.try_reserve(4),
+            Err(BackendTxError::Lease(LeaseError::NoActiveSession {
+                slot_id: 0,
+                claimed_generation: 1
+            }))
+        ));
     }
     assert!(matches!(
         worker.slot(second.slot_id()),
@@ -486,10 +490,7 @@ fn ready_flags_and_multiple_frames_round_trip() {
         assert_eq!(rx.peek_frame().expect("peek 1"), Some(&b"one"[..]));
         rx.consume_frame().expect("consume 1");
     }
-    assert_eq!(
-        worker.ready_slots().collect::<Vec<_>>(),
-        vec![backend.slot_id()]
-    );
+    assert_eq!(worker.ready_slots().next(), None);
     {
         let mut rx = slot.from_backend_rx().expect("rx");
         assert_eq!(rx.peek_frame().expect("peek 2"), Some(&b"two"[..]));
@@ -718,6 +719,25 @@ fn ready_slots_ignores_worker_to_backend_backlog() {
 }
 
 #[test]
+fn ready_slots_ignores_backend_work_for_already_claimed_session() {
+    let layout = ControlRegionLayout::new(1, 64, 64).expect("layout");
+    let (_mem, region) = TestRegion::new(layout);
+    let worker = WorkerControl::attach(&region);
+    let mut backend = BackendSlotLease::acquire(&region).expect("backend");
+    backend.begin_session().expect("session");
+
+    {
+        let mut tx = backend.to_worker_tx();
+        let mut writer = tx.try_reserve(4).expect("reserve");
+        writer.payload_mut().copy_from_slice(b"ping");
+        assert_commit_published(writer.commit().expect("commit"));
+    }
+
+    let _slot = worker.slot(backend.slot_id()).expect("claimed slot");
+    assert_eq!(worker.ready_slots().next(), None);
+}
+
+#[test]
 fn commit_notify_failed_still_publishes_frame() {
     let layout = ControlRegionLayout::new(1, 64, 64).expect("layout");
     let (_mem, region) = TestRegion::new(layout);
@@ -768,10 +788,7 @@ fn consume_frame_restores_ready_flag_if_writer_races_after_clear() {
     })
     .expect("consume with hook");
 
-    assert_eq!(
-        worker.ready_slots().collect::<Vec<_>>(),
-        vec![backend.slot_id()]
-    );
+    assert_eq!(worker.ready_slots().next(), None);
     assert_eq!(rx.peek_frame().expect("peek second"), Some(&b"two!"[..]));
 }
 

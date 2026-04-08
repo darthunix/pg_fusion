@@ -19,6 +19,10 @@ The worker owns generation activation. A worker start or restart must publish a
 fresh generation before any backend acquires a slot. All handles from older
 generations become stale and must be dropped.
 
+`backend_to_worker` traffic is session-scoped. A backend must call
+`begin_session()` before sending frames to the worker; pre-session sends fail
+locally and do not publish backlog into the control rings.
+
 ## Termination contract
 
 Backend termination:

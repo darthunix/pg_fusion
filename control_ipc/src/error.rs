@@ -44,6 +44,10 @@ pub enum LeaseError {
         slot_id: u32,
         claimed_generation: u64,
     },
+    NoActiveSession {
+        slot_id: u32,
+        claimed_generation: u64,
+    },
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -246,6 +250,13 @@ impl fmt::Display for LeaseError {
             } => write!(
                 f,
                 "slot {slot_id} from generation {claimed_generation} is no longer leased"
+            ),
+            Self::NoActiveSession {
+                slot_id,
+                claimed_generation,
+            } => write!(
+                f,
+                "slot {slot_id} from generation {claimed_generation} does not have an active session"
             ),
         }
     }
