@@ -1,0 +1,14 @@
+[package]
+name = "control_ipc"
+version = "25.0.0"
+edition = "2021"
+description = "Allocation-free shared-memory control connection layer for backend/worker coordination"
+readme = "README.md"
+
+[lib]
+crate-type = ["lib"]
+doctest = false
+
+[dependencies]
+libc = "0.2"
+lockfree = { path = "../lockfree", version = "25.0" }

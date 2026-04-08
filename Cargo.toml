@@ -1,6 +1,7 @@
 [workspace]
 members = [
   "lockfree",
+  "control_ipc",
   "page/pool",
   "page/transfer",
   "page/arrow_layout",
