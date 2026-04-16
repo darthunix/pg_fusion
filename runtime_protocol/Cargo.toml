@@ -1,0 +1,19 @@
+[package]
+name = "runtime_protocol"
+version = "25.0.0"
+edition = "2021"
+description = "Typed control-plane protocol for the new backend/worker runtime"
+readme = "README.md"
+
+[lib]
+crate-type = ["lib"]
+doctest = false
+
+[dependencies]
+rmp = "0.8"
+thiserror = "2.0"
+transfer = { path = "../page/transfer", version = "25.0" }
+
+[dev-dependencies]
+plan_flow = { path = "../page/plan_flow", version = "25.0" }
+scan_flow = { path = "../page/scan_flow", version = "25.0" }
