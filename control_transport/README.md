@@ -94,8 +94,7 @@ Worker slot access is raw transport only, so it is intentionally `unsafe`:
 - only one live worker owner is allowed per slot; a second attach returns
   `SlotAccessError::Busy`
 - this crate does not coordinate worker claims across processes or tasks
-- higher layers such as the future session-aware `control_ipc` wrapper are
-  expected to provide that coordination
+- higher layers are expected to provide that coordination
 - dead-backend reaping is conservative: Unix PID reuse can make `kill(pid, 0)`
   observe an unrelated new process as alive, so PID probes are only a
   best-effort liveness hint, not a proof of backend identity
