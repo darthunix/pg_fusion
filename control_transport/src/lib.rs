@@ -10,6 +10,9 @@
 //! - it uses ready flags plus `SIGUSR1` as wakeup hints
 //! - it does not interpret payloads or model execution sessions
 //!
+//! This crate is intentionally Unix-only because it relies on Unix PID probing
+//! and `SIGUSR1` delivery semantics.
+//!
 //! The crate intentionally models worker restart as a hard invalidation
 //! boundary:
 //!
@@ -37,7 +40,13 @@
 //! `WorkerTransport::release_owned_slots_for_exit()` from its PostgreSQL
 //! termination callback before it deactivates the current generation.
 
+#[cfg(not(unix))]
+compile_error!("control_transport currently supports Unix only");
+#[cfg(not(target_has_atomic = "128"))]
+compile_error!("control_transport currently requires targets with 128-bit atomics");
+
 mod error;
+mod process;
 mod region;
 mod ring;
 
@@ -46,10 +55,9 @@ mod tests;
 
 pub use error::{
     AcquireError, AttachError, BackendRxError, BackendTxError, ConfigError, InitError, LeaseError,
-    NotifyError, RxError, SlotAccessError, TxError, WorkerLifecycleError, WorkerRxError,
-    WorkerTxError,
+    NotifyError, ReinitError, RxError, SlotAccessError, TxError, WorkerAttachError,
+    WorkerLifecycleError, WorkerRxError, WorkerTxError,
 };
-pub use region::{
-    BackendRx, BackendSlotLease, BackendTx, CommitOutcome, ControlRx, ControlTx, ReadySlots,
-    TransportRegion, TransportRegionLayout, WorkerRx, WorkerSlot, WorkerTransport, WorkerTx,
-};
+pub use region::{BackendRx, BackendSlotLease, BackendTx, ControlRx, ControlTx};
+pub use region::{CommitOutcome, TransportRegion, TransportRegionLayout};
+pub use region::{ReadySlots, WorkerRx, WorkerSlot, WorkerTransport, WorkerTx};

@@ -3,38 +3,208 @@ use super::layout::{
     validate_region, RegionHeader,
 };
 use super::{
-    SlotView, TransportRegion, TransportRegionLayout, CONTROL_TRANSPORT_MAGIC,
-    CONTROL_TRANSPORT_VERSION, LEASE_STATE_FREE, LEASE_STATE_LEASED, OWNER_BACKEND, OWNER_WORKER,
-    WORKER_STATE_OFFLINE, WORKER_STATE_ONLINE, WORKER_STATE_RESTARTING,
+    LeaseIncarnation, RegionMeta, SlotMeta, SlotView, TransportRegion, TransportRegionLayout,
+    CONTROL_TRANSPORT_MAGIC, CONTROL_TRANSPORT_VERSION, REGION_META_MAX_GENERATION,
+    SLOT_META_MAX_LEASE_EPOCH, WORKER_STATE_OFFLINE, WORKER_STATE_REINITING,
 };
 use crate::error::{
-    AcquireError, AttachError, InitError, LeaseError, SlotAccessError, WorkerLifecycleError,
+    AcquireError, AttachError, InitError, ReinitError, SlotAccessError, WorkerAttachError,
+    WorkerLifecycleError,
 };
+use crate::process::probe_pid_alive;
 use crate::ring::FramedRing;
 use lockfree::{treiber_stack_ptrs, StackError, TreiberStack};
+use portable_atomic::AtomicU128;
+use std::ptr::{self, NonNull};
+use std::sync::atomic::{AtomicBool, AtomicI32, AtomicPtr, AtomicU64, Ordering};
+
 #[cfg(test)]
 use std::cell::RefCell;
-use std::collections::HashMap;
-use std::ptr::NonNull;
-use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU32, AtomicU64, Ordering};
-use std::sync::{Mutex, OnceLock};
-
-type WorkerOwnerRegistry = HashMap<usize, Box<[u64]>>;
-
-fn worker_owner_registry() -> &'static Mutex<WorkerOwnerRegistry> {
-    static REGISTRY: OnceLock<Mutex<WorkerOwnerRegistry>> = OnceLock::new();
-    REGISTRY.get_or_init(|| Mutex::new(HashMap::new()))
-}
 
 #[cfg(test)]
 thread_local! {
-    static WORKER_CLAIM_HOOK: RefCell<Option<Box<dyn FnOnce()>>> = const { RefCell::new(None) };
+    static BACKEND_ACQUIRE_POPPED_HOOK: RefCell<Option<Box<dyn FnOnce()>>> = const { RefCell::new(None) };
+    static REINIT_REBUILD_PASS_HOOK: RefCell<Option<Box<dyn FnOnce()>>> = const { RefCell::new(None) };
+    static FREE_SLOT_PUSHED_HOOK: RefCell<Option<Box<dyn FnOnce()>>> = const { RefCell::new(None) };
+}
+
+struct ProcessWorkerRegistry {
+    owner_pid: i32,
+    region_key: usize,
+    slot_count: u32,
+    entries: Box<[AtomicU128]>,
+}
+
+// This process-local mirror is replaced atomically on PID/region/slot-count
+// changes. Replaced registries are intentionally leaked because concurrent
+// threads may still hold raw references returned before the swap.
+static WORKER_OWNER_REGISTRY: AtomicPtr<ProcessWorkerRegistry> = AtomicPtr::new(ptr::null_mut());
+
+impl ProcessWorkerRegistry {
+    fn new(owner_pid: i32, region_key: usize, slot_count: u32) -> Self {
+        let entries = (0..slot_count)
+            .map(|_| AtomicU128::new(0))
+            .collect::<Vec<_>>()
+            .into_boxed_slice();
+        Self {
+            owner_pid,
+            region_key,
+            slot_count,
+            entries,
+        }
+    }
+
+    fn entry(&self, slot_id: u32) -> &AtomicU128 {
+        &self.entries[slot_id as usize]
+    }
+}
+
+fn pack_local_owner(incarnation: LeaseIncarnation) -> u128 {
+    ((incarnation.generation as u128) << 64) | incarnation.lease_epoch as u128
+}
+
+fn unpack_local_owner(raw: u128) -> LeaseIncarnation {
+    if raw == 0 {
+        return LeaseIncarnation::FREE;
+    }
+    LeaseIncarnation::new((raw >> 64) as u64, raw as u64)
+}
+
+fn install_or_get_worker_owner_registry(
+    owner_pid: i32,
+    region_key: usize,
+    slot_count: u32,
+) -> Result<&'static ProcessWorkerRegistry, WorkerAttachError> {
+    let mut ptr = WORKER_OWNER_REGISTRY.load(Ordering::Acquire);
+    loop {
+        if ptr.is_null() {
+            let candidate = Box::new(ProcessWorkerRegistry::new(
+                owner_pid, region_key, slot_count,
+            ));
+            let candidate_ptr = Box::into_raw(candidate);
+            match WORKER_OWNER_REGISTRY.compare_exchange(
+                ptr::null_mut(),
+                candidate_ptr,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            ) {
+                Ok(_) => return Ok(unsafe { &*candidate_ptr }),
+                Err(existing) => {
+                    unsafe {
+                        drop(Box::from_raw(candidate_ptr));
+                    }
+                    ptr = existing;
+                    continue;
+                }
+            }
+        }
+
+        debug_assert!(!ptr.is_null());
+        let registry = unsafe { &*ptr };
+        if registry.owner_pid == owner_pid
+            && registry.region_key == region_key
+            && registry.slot_count == slot_count
+        {
+            return Ok(registry);
+        }
+        if registry.owner_pid == owner_pid && registry.region_key != region_key {
+            return Err(WorkerAttachError::RegionAlreadyAttached {
+                existing_region_key: registry.region_key,
+                requested_region_key: region_key,
+            });
+        }
+
+        let candidate = Box::new(ProcessWorkerRegistry::new(
+            owner_pid, region_key, slot_count,
+        ));
+        let candidate_ptr = Box::into_raw(candidate);
+        match WORKER_OWNER_REGISTRY.compare_exchange(
+            ptr,
+            candidate_ptr,
+            Ordering::AcqRel,
+            Ordering::Acquire,
+        ) {
+            Ok(_) => {
+                // Intentionally leak the replaced registry. Other threads may
+                // still hold raw references returned before this swap.
+                return Ok(unsafe { &*candidate_ptr });
+            }
+            Err(existing) => {
+                unsafe {
+                    drop(Box::from_raw(candidate_ptr));
+                }
+                ptr = existing;
+            }
+        }
+    }
+}
+
+fn reset_worker_owner_registry(owner_pid: i32, region_key: usize, slot_count: u32) {
+    let mut ptr = WORKER_OWNER_REGISTRY.load(Ordering::Acquire);
+    loop {
+        if ptr.is_null() {
+            return;
+        }
+
+        let registry = unsafe { &*ptr };
+        if registry.owner_pid != owner_pid || registry.region_key != region_key {
+            return;
+        }
+
+        let candidate = Box::new(ProcessWorkerRegistry::new(
+            owner_pid, region_key, slot_count,
+        ));
+        let candidate_ptr = Box::into_raw(candidate);
+        match WORKER_OWNER_REGISTRY.compare_exchange(
+            ptr,
+            candidate_ptr,
+            Ordering::AcqRel,
+            Ordering::Acquire,
+        ) {
+            Ok(_) => {
+                // Intentionally leak the replaced registry. Other threads may
+                // still hold raw references returned before this swap.
+                return;
+            }
+            Err(existing) => {
+                unsafe {
+                    drop(Box::from_raw(candidate_ptr));
+                }
+                ptr = existing;
+            }
+        }
+    }
+}
+
+fn load_worker_owner_registry() -> Option<&'static ProcessWorkerRegistry> {
+    let ptr = WORKER_OWNER_REGISTRY.load(Ordering::Acquire);
+    if ptr.is_null() {
+        None
+    } else {
+        Some(unsafe { &*ptr })
+    }
+}
+
+fn registry_matches(
+    registry: &ProcessWorkerRegistry,
+    owner_pid: i32,
+    region_key: usize,
+    slot_count: u32,
+) -> bool {
+    registry.owner_pid == owner_pid
+        && registry.region_key == region_key
+        && registry.slot_count == slot_count
 }
 
 impl TransportRegion {
     /// # Safety
-    /// `base` must point to a writable shared-memory region with at least `len`
-    /// bytes and alignment matching `layout.align`.
+    /// `base` must point to an initialized writable shared-memory region with
+    /// at least `len` bytes and alignment matching `layout.align`. The mapping
+    /// must be fresh: if it already contains a `control_transport` header, use
+    /// `reinit_in_place()` for a same-layout reset instead.
+    ///
+    /// The bytes must already be initialized because this function reads the
+    /// existing header magic to reject accidental reinitialization.
     pub unsafe fn init_in_place(
         base: NonNull<u8>,
         len: usize,
@@ -58,6 +228,9 @@ impl TransportRegion {
 
         let base_ptr = base.as_ptr();
         let header_ptr = base_ptr.cast::<RegionHeader>();
+        if unsafe { (*header_ptr).magic } == CONTROL_TRANSPORT_MAGIC {
+            return Err(InitError::AlreadyInitialized);
+        }
         std::ptr::write(
             header_ptr,
             RegionHeader {
@@ -74,6 +247,36 @@ impl TransportRegion {
         init_storage(base_ptr, computed, layout.slot_count);
 
         Ok(build_handle(base, layout, computed))
+    }
+
+    /// # Safety
+    /// `base` must point to a previously initialized `control_transport`
+    /// region using the same `layout`. This is a same-layout logical reset
+    /// path: it publishes a newer offline generation, clears reusable free
+    /// slots in place, and retains old leased slots until exact old-incarnation
+    /// release/finalize or later reap.
+    pub unsafe fn reinit_in_place(
+        base: NonNull<u8>,
+        len: usize,
+        layout: TransportRegionLayout,
+    ) -> Result<Self, ReinitError> {
+        let (existing, computed) =
+            validate_attached_header(base, len).map_err(ReinitError::InvalidExistingRegion)?;
+        if existing != layout {
+            return Err(ReinitError::LayoutMismatch {
+                existing,
+                requested: layout,
+            });
+        }
+
+        let region = build_handle(base, layout, computed);
+        let next_generation = region.next_region_generation();
+        region.reset_local_worker_registry_for_reinit();
+        region.worker_pid_cell().store(0, Ordering::Release);
+        region.store_region_meta(RegionMeta::new(next_generation, WORKER_STATE_REINITING));
+        region.reconcile_slots_for_reinit()?;
+        region.store_region_meta(RegionMeta::new(next_generation, WORKER_STATE_OFFLINE));
+        Ok(region)
     }
 
     /// # Safety
@@ -97,66 +300,744 @@ impl TransportRegion {
     }
 
     pub fn region_generation(&self) -> u64 {
-        self.region_generation_cell().load(Ordering::Acquire)
+        self.load_region_meta().generation()
     }
 
-    /// Publishes a fresh worker generation and returns its number.
-    pub fn activate_worker_generation(&self, pid: i32) -> Result<u64, WorkerLifecycleError> {
-        self.ensure_no_live_local_worker_slots()?;
-        let current_generation = self.region_generation();
-        let new_generation = current_generation
-            .checked_add(1)
-            .expect("control_transport region generation overflow");
-
-        self.worker_state_cell()
-            .store(WORKER_STATE_RESTARTING, Ordering::Release);
-        self.worker_pid_cell().store(0, Ordering::Release);
-        self.region_generation_cell()
-            .store(new_generation, Ordering::Release);
-        self.sweep_old_generation_slots(new_generation);
-        self.worker_pid_cell().store(pid, Ordering::Release);
-        self.worker_state_cell()
-            .store(WORKER_STATE_ONLINE, Ordering::Release);
-        Ok(new_generation)
+    pub(super) fn next_lease_epoch_cell(&self) -> &AtomicU64 {
+        unsafe { self.next_lease_epoch.as_ref() }
     }
 
-    /// Invalidates the current generation and leaves the transport offline.
-    pub fn deactivate_worker_generation(&self) -> Result<u64, WorkerLifecycleError> {
-        self.ensure_no_live_local_worker_slots()?;
-        let current_generation = self.region_generation();
-        let new_generation = current_generation
-            .checked_add(1)
-            .expect("control_transport region generation overflow");
-
-        self.worker_state_cell()
-            .store(WORKER_STATE_OFFLINE, Ordering::Release);
-        self.worker_pid_cell().store(0, Ordering::Release);
-        self.region_generation_cell()
-            .store(new_generation, Ordering::Release);
-        Ok(new_generation)
+    pub(super) fn freelist_epoch_cell(&self) -> &AtomicU64 {
+        unsafe { self.freelist_epoch.as_ref() }
     }
 
-    pub(super) fn region_generation_cell(&self) -> &AtomicU64 {
-        unsafe { self.region_generation.as_ref() }
+    pub(super) fn region_meta_cell(&self) -> &AtomicU64 {
+        unsafe { self.region_meta.as_ref() }
     }
 
-    pub(super) fn worker_state_cell(&self) -> &AtomicU32 {
-        unsafe { self.worker_state.as_ref() }
+    pub(super) fn load_region_meta(&self) -> RegionMeta {
+        RegionMeta::from_raw(self.region_meta_cell().load(Ordering::Acquire))
+    }
+
+    pub(super) fn store_region_meta(&self, region_meta: RegionMeta) {
+        self.region_meta_cell()
+            .store(region_meta.raw(), Ordering::Release);
     }
 
     pub(super) fn worker_pid_cell(&self) -> &AtomicI32 {
         unsafe { self.worker_pid.as_ref() }
     }
 
-    pub(super) fn ensure_local_worker_registry(&self) {
-        let mut registry = worker_owner_registry()
-            .lock()
-            .expect("worker owner registry poisoned");
-        let entry = registry
-            .entry(self.region_key())
-            .or_insert_with(|| vec![0; self.slot_count as usize].into_boxed_slice());
-        if entry.len() != self.slot_count as usize {
-            *entry = vec![0; self.slot_count as usize].into_boxed_slice();
+    pub(super) fn allocate_lease_epoch(&self) -> u64 {
+        self.next_lease_epoch_cell()
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |current| {
+                current
+                    .checked_add(1)
+                    .filter(|next| *next <= SLOT_META_MAX_LEASE_EPOCH)
+            })
+            .expect("control_transport lease epoch overflow")
+    }
+
+    pub(super) fn load_freelist_epoch(&self) -> u64 {
+        self.freelist_epoch_cell().load(Ordering::Acquire)
+    }
+
+    fn rotate_freelist_epoch_for_reinit(&self) -> u64 {
+        self.freelist_epoch_cell()
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |current| {
+                current
+                    .checked_add(1)
+                    .filter(|next| *next <= SLOT_META_MAX_LEASE_EPOCH)
+            })
+            .expect("control_transport freelist epoch overflow")
+            + 1
+    }
+
+    pub(super) fn next_region_generation(&self) -> u64 {
+        self.region_generation()
+            .checked_add(1)
+            .filter(|next| *next <= REGION_META_MAX_GENERATION)
+            .expect("control_transport region generation overflow")
+    }
+
+    pub(super) fn attach_worker_registry(&self) -> Result<(), WorkerAttachError> {
+        let _ = install_or_get_worker_owner_registry(
+            Self::current_process_pid(),
+            self.region_key(),
+            self.slot_count,
+        )?;
+        Ok(())
+    }
+
+    fn reset_local_worker_registry_for_reinit(&self) {
+        reset_worker_owner_registry(
+            Self::current_process_pid(),
+            self.region_key(),
+            self.slot_count,
+        );
+    }
+
+    fn reconcile_slots_for_reinit(&self) -> Result<(), ReinitError> {
+        self.quiesce_slots_for_reinit()?;
+        let current_epoch = self.rotate_freelist_epoch_for_reinit();
+        self.reset_freelist_empty_for_reinit();
+        self.rebuild_freelist_for_reinit(current_epoch)?;
+        Ok(())
+    }
+
+    fn reset_freelist_empty_for_reinit(&self) {
+        self.freelist().reset_empty();
+    }
+
+    fn quiesce_slots_for_reinit(&self) -> Result<(), ReinitError> {
+        loop {
+            let mut saw_live_transitional = false;
+            let mut made_progress = false;
+
+            for slot_id in 0..self.slot_count {
+                let slot = unsafe { self.slot_view_unchecked(slot_id) };
+                let slot_meta = SlotMeta::from_raw(slot.slot_meta.load(Ordering::Acquire));
+
+                if slot_meta.is_leased() {
+                    let slot_generation = slot.slot_generation.load(Ordering::Acquire);
+                    if slot_generation == 0 || slot_meta.lease_epoch() == 0 {
+                        if self.adopt_stable_free_slot_for_reinit(slot_id, slot, slot_meta) {
+                            made_progress = true;
+                        }
+                        continue;
+                    }
+
+                    if slot_meta.is_ownerless() {
+                        let incarnation =
+                            LeaseIncarnation::new(slot_generation, slot_meta.lease_epoch());
+                        if self.force_finalize_slot_for_reinit(
+                            slot_id,
+                            incarnation,
+                            slot,
+                            slot_meta,
+                        ) {
+                            made_progress = true;
+                        }
+                    }
+                    continue;
+                }
+
+                if slot_meta.is_free_popped() {
+                    match self.reinit_actor_alive(slot.backend_pid.load(Ordering::Acquire)) {
+                        Ok(true) => saw_live_transitional = true,
+                        Ok(false) => {
+                            if self.adopt_popped_slot_for_reinit(slot_id, slot, slot_meta) {
+                                made_progress = true;
+                            }
+                        }
+                        Err(err) => {
+                            return Err(ReinitError::BackendProbeFailed {
+                                slot_id,
+                                error_kind: err.kind(),
+                                raw_os_error: err.raw_os_error(),
+                            });
+                        }
+                    }
+                    continue;
+                }
+
+                if slot_meta.is_acquire_reserved() {
+                    match self.reinit_actor_alive(slot.backend_pid.load(Ordering::Acquire)) {
+                        Ok(true) => saw_live_transitional = true,
+                        Ok(false) => {
+                            if self.adopt_reserved_slot_for_reinit(slot_id, slot, slot_meta) {
+                                made_progress = true;
+                            }
+                        }
+                        Err(err) => {
+                            return Err(ReinitError::BackendProbeFailed {
+                                slot_id,
+                                error_kind: err.kind(),
+                                raw_os_error: err.raw_os_error(),
+                            });
+                        }
+                    }
+                    continue;
+                }
+
+                if slot_meta.is_free_push_claimed() {
+                    match self.reinit_actor_alive(slot.backend_pid.load(Ordering::Acquire)) {
+                        Ok(true) => saw_live_transitional = true,
+                        Ok(false) => {
+                            if self
+                                .adopt_free_push_claimed_slot_for_reinit(slot_id, slot, slot_meta)
+                            {
+                                made_progress = true;
+                            }
+                        }
+                        Err(err) => {
+                            return Err(ReinitError::BackendProbeFailed {
+                                slot_id,
+                                error_kind: err.kind(),
+                                raw_os_error: err.raw_os_error(),
+                            });
+                        }
+                    }
+                }
+            }
+
+            if !saw_live_transitional {
+                return Ok(());
+            }
+            if !made_progress {
+                std::thread::yield_now();
+            }
+        }
+    }
+
+    fn rebuild_freelist_for_reinit(&self, current_epoch: u64) -> Result<(), ReinitError> {
+        loop {
+            let mut saw_live_transitional = false;
+            let mut saw_unpublished_free = false;
+            let mut made_progress = false;
+
+            for slot_id in 0..self.slot_count {
+                let slot = unsafe { self.slot_view_unchecked(slot_id) };
+                let slot_meta = SlotMeta::from_raw(slot.slot_meta.load(Ordering::Acquire));
+
+                if slot_meta.is_leased() {
+                    let slot_generation = slot.slot_generation.load(Ordering::Acquire);
+                    if slot_generation == 0 || slot_meta.lease_epoch() == 0 {
+                        if self.adopt_stable_free_slot_for_reinit(slot_id, slot, slot_meta) {
+                            made_progress = true;
+                            saw_unpublished_free = true;
+                        }
+                        continue;
+                    }
+
+                    if slot_meta.is_ownerless() {
+                        let incarnation =
+                            LeaseIncarnation::new(slot_generation, slot_meta.lease_epoch());
+                        if self.force_finalize_slot_for_reinit(
+                            slot_id,
+                            incarnation,
+                            slot,
+                            slot_meta,
+                        ) {
+                            made_progress = true;
+                            saw_unpublished_free = true;
+                        }
+                    }
+                    continue;
+                }
+
+                if slot_meta.is_free_popped() {
+                    match self.reinit_actor_alive(slot.backend_pid.load(Ordering::Acquire)) {
+                        Ok(true) => saw_live_transitional = true,
+                        Ok(false) => {
+                            if self.adopt_popped_slot_for_reinit(slot_id, slot, slot_meta) {
+                                made_progress = true;
+                                saw_unpublished_free = true;
+                            }
+                        }
+                        Err(err) => {
+                            return Err(ReinitError::BackendProbeFailed {
+                                slot_id,
+                                error_kind: err.kind(),
+                                raw_os_error: err.raw_os_error(),
+                            });
+                        }
+                    }
+                    continue;
+                }
+
+                if slot_meta.is_acquire_reserved() {
+                    match self.reinit_actor_alive(slot.backend_pid.load(Ordering::Acquire)) {
+                        Ok(true) => saw_live_transitional = true,
+                        Ok(false) => {
+                            if self.adopt_reserved_slot_for_reinit(slot_id, slot, slot_meta) {
+                                made_progress = true;
+                                saw_unpublished_free = true;
+                            }
+                        }
+                        Err(err) => {
+                            return Err(ReinitError::BackendProbeFailed {
+                                slot_id,
+                                error_kind: err.kind(),
+                                raw_os_error: err.raw_os_error(),
+                            });
+                        }
+                    }
+                    continue;
+                }
+
+                if slot_meta.is_free_push_claimed() {
+                    match self.reinit_actor_alive(slot.backend_pid.load(Ordering::Acquire)) {
+                        Ok(true) => saw_live_transitional = true,
+                        Ok(false) => {
+                            if self
+                                .adopt_free_push_claimed_slot_for_reinit(slot_id, slot, slot_meta)
+                            {
+                                made_progress = true;
+                                saw_unpublished_free = true;
+                            }
+                        }
+                        Err(err) => {
+                            return Err(ReinitError::BackendProbeFailed {
+                                slot_id,
+                                error_kind: err.kind(),
+                                raw_os_error: err.raw_os_error(),
+                            });
+                        }
+                    }
+                    continue;
+                }
+
+                if slot_meta.is_current_epoch_published(current_epoch) {
+                    continue;
+                }
+
+                if slot_meta.is_free_pushed() && slot_meta.lease_epoch() == current_epoch {
+                    slot.backend_pid.store(0, Ordering::Release);
+                    let _ = slot.slot_meta.compare_exchange(
+                        slot_meta.raw(),
+                        SlotMeta::free_published(current_epoch).raw(),
+                        Ordering::AcqRel,
+                        Ordering::Acquire,
+                    );
+                    made_progress = true;
+                    continue;
+                }
+
+                if slot_meta.is_republishable_after_reinit(current_epoch) {
+                    saw_unpublished_free = true;
+                    if self.republish_stable_free_slot_for_reinit(
+                        slot_id,
+                        slot,
+                        slot_meta,
+                        current_epoch,
+                    ) {
+                        made_progress = true;
+                    }
+                }
+            }
+
+            #[cfg(test)]
+            if self.run_reinit_rebuild_pass_hook_for_tests() {
+                made_progress = true;
+                saw_unpublished_free = true;
+            }
+
+            if !saw_live_transitional && !saw_unpublished_free {
+                return Ok(());
+            }
+            if !made_progress {
+                std::thread::yield_now();
+            }
+        }
+    }
+
+    pub(super) fn force_finalize_slot_for_reinit(
+        &self,
+        slot_id: u32,
+        incarnation: LeaseIncarnation,
+        slot: SlotView<'_>,
+        expected_meta: SlotMeta,
+    ) -> bool {
+        if slot.slot_generation.load(Ordering::Acquire) != incarnation.generation {
+            return false;
+        }
+        if !expected_meta.is_leased()
+            || expected_meta.lease_epoch() != incarnation.lease_epoch
+            || !expected_meta.is_ownerless()
+        {
+            return false;
+        }
+        if slot
+            .slot_meta
+            .compare_exchange(
+                expected_meta.raw(),
+                SlotMeta::FREE_PENDING.raw(),
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            )
+            .is_err()
+        {
+            return false;
+        }
+
+        self.clear_slot(slot_id);
+        slot.slot_generation.store(0, Ordering::Release);
+        true
+    }
+
+    fn adopt_popped_slot_for_reinit(
+        &self,
+        slot_id: u32,
+        slot: SlotView<'_>,
+        expected_meta: SlotMeta,
+    ) -> bool {
+        if !expected_meta.is_free_popped() {
+            return false;
+        }
+        if slot
+            .slot_meta
+            .compare_exchange(
+                expected_meta.raw(),
+                SlotMeta::FREE_PENDING.raw(),
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            )
+            .is_err()
+        {
+            return false;
+        }
+        self.clear_slot(slot_id);
+        slot.slot_generation.store(0, Ordering::Release);
+        true
+    }
+
+    fn adopt_reserved_slot_for_reinit(
+        &self,
+        slot_id: u32,
+        slot: SlotView<'_>,
+        expected_meta: SlotMeta,
+    ) -> bool {
+        if !expected_meta.is_acquire_reserved() {
+            return false;
+        }
+        if slot
+            .slot_meta
+            .compare_exchange(
+                expected_meta.raw(),
+                SlotMeta::FREE_PENDING.raw(),
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            )
+            .is_err()
+        {
+            return false;
+        }
+        self.clear_slot(slot_id);
+        slot.slot_generation.store(0, Ordering::Release);
+        true
+    }
+
+    fn adopt_free_push_claimed_slot_for_reinit(
+        &self,
+        slot_id: u32,
+        slot: SlotView<'_>,
+        expected_meta: SlotMeta,
+    ) -> bool {
+        if !expected_meta.is_free_push_claimed() {
+            return false;
+        }
+        if slot
+            .slot_meta
+            .compare_exchange(
+                expected_meta.raw(),
+                SlotMeta::FREE_PENDING.raw(),
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            )
+            .is_err()
+        {
+            return false;
+        }
+        self.clear_slot(slot_id);
+        slot.slot_generation.store(0, Ordering::Release);
+        true
+    }
+
+    fn adopt_stable_free_slot_for_reinit(
+        &self,
+        slot_id: u32,
+        slot: SlotView<'_>,
+        current: SlotMeta,
+    ) -> bool {
+        if current.is_leased()
+            || current.is_free_popped()
+            || current.is_acquire_reserved()
+            || current.is_free_push_claimed()
+        {
+            return false;
+        }
+        self.clear_slot(slot_id);
+        slot.slot_generation.store(0, Ordering::Release);
+        slot.slot_meta
+            .store(SlotMeta::FREE_PENDING.raw(), Ordering::Release);
+        true
+    }
+
+    fn republish_stable_free_slot_for_reinit(
+        &self,
+        slot_id: u32,
+        slot: SlotView<'_>,
+        current: SlotMeta,
+        current_epoch: u64,
+    ) -> bool {
+        if current.is_current_epoch_published(current_epoch) {
+            return false;
+        }
+
+        if !current.is_free_pending() {
+            if !current.is_republishable_after_reinit(current_epoch) {
+                return false;
+            }
+            if slot
+                .slot_meta
+                .compare_exchange(
+                    current.raw(),
+                    SlotMeta::FREE_PENDING.raw(),
+                    Ordering::AcqRel,
+                    Ordering::Acquire,
+                )
+                .is_err()
+            {
+                return false;
+            }
+        }
+
+        self.clear_slot(slot_id);
+        slot.slot_generation.store(0, Ordering::Release);
+
+        loop {
+            let pending = SlotMeta::from_raw(slot.slot_meta.load(Ordering::Acquire));
+            if pending.is_current_epoch_published(current_epoch) {
+                slot.backend_pid.store(0, Ordering::Release);
+                return true;
+            }
+            if pending.is_free_pushed() && pending.lease_epoch() == current_epoch {
+                slot.backend_pid.store(0, Ordering::Release);
+                let _ = slot.slot_meta.compare_exchange(
+                    pending.raw(),
+                    SlotMeta::free_published(current_epoch).raw(),
+                    Ordering::AcqRel,
+                    Ordering::Acquire,
+                );
+                return true;
+            }
+            if !pending.is_free_pending() {
+                return false;
+            }
+
+            slot.backend_pid
+                .store(Self::current_process_pid(), Ordering::Release);
+            if slot
+                .slot_meta
+                .compare_exchange(
+                    pending.raw(),
+                    SlotMeta::free_push_claimed(current_epoch).raw(),
+                    Ordering::AcqRel,
+                    Ordering::Acquire,
+                )
+                .is_err()
+            {
+                slot.backend_pid.store(0, Ordering::Release);
+                continue;
+            }
+            if slot
+                .slot_meta
+                .compare_exchange(
+                    SlotMeta::free_push_claimed(current_epoch).raw(),
+                    SlotMeta::free_pushed(current_epoch).raw(),
+                    Ordering::AcqRel,
+                    Ordering::Acquire,
+                )
+                .is_err()
+            {
+                return false;
+            }
+            self.release_slot(slot_id);
+            slot.backend_pid.store(0, Ordering::Release);
+            let _ = slot.slot_meta.compare_exchange(
+                SlotMeta::free_pushed(current_epoch).raw(),
+                SlotMeta::free_published(current_epoch).raw(),
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            );
+            return true;
+        }
+    }
+
+    fn reinit_actor_alive(&self, pid: i32) -> std::io::Result<bool> {
+        if pid == 0 {
+            return Ok(false);
+        }
+        probe_pid_alive(pid)
+    }
+
+    pub(super) fn pop_freelist_token_for_acquire(&self) -> Result<(u32, u64), AcquireError> {
+        loop {
+            let expected_epoch = self.load_freelist_epoch();
+            let slot_id = self.acquire_slot()?;
+            let slot = unsafe { self.slot_view_unchecked(slot_id) };
+            if self.claim_freelist_token_after_pop(slot_id, slot, expected_epoch) {
+                return Ok((slot_id, expected_epoch));
+            }
+        }
+    }
+
+    fn claim_freelist_token_after_pop(
+        &self,
+        slot_id: u32,
+        slot: SlotView<'_>,
+        expected_epoch: u64,
+    ) -> bool {
+        loop {
+            let current = SlotMeta::from_raw(slot.slot_meta.load(Ordering::Acquire));
+            if (current.is_free_published() || current.is_free_pushed())
+                && current.lease_epoch() == expected_epoch
+            {
+                slot.backend_pid
+                    .store(Self::current_process_pid(), Ordering::Release);
+                match slot.slot_meta.compare_exchange(
+                    current.raw(),
+                    SlotMeta::free_popped(expected_epoch).raw(),
+                    Ordering::AcqRel,
+                    Ordering::Acquire,
+                ) {
+                    Ok(_) => {
+                        #[cfg(test)]
+                        self.run_backend_acquire_popped_hook_for_tests();
+                        return true;
+                    }
+                    Err(_) => {
+                        slot.backend_pid.store(0, Ordering::Release);
+                        continue;
+                    }
+                }
+            }
+
+            if current.is_free_pending() {
+                let _ = self.publish_free_slot(slot_id, slot);
+            }
+            return false;
+        }
+    }
+
+    pub(super) fn reserve_popped_slot_for_acquire(
+        &self,
+        slot_id: u32,
+        slot: SlotView<'_>,
+        expected_epoch: u64,
+    ) -> bool {
+        loop {
+            let current = SlotMeta::from_raw(slot.slot_meta.load(Ordering::Acquire));
+            if current.is_free_popped() && current.lease_epoch() == expected_epoch {
+                match slot.slot_meta.compare_exchange(
+                    current.raw(),
+                    SlotMeta::ACQUIRE_RESERVED.raw(),
+                    Ordering::AcqRel,
+                    Ordering::Acquire,
+                ) {
+                    Ok(_) => return true,
+                    Err(_) => continue,
+                }
+            }
+
+            if current.is_free_pending() {
+                let _ = self.publish_free_slot(slot_id, slot);
+            }
+            return false;
+        }
+    }
+
+    pub(super) fn abort_reserved_slot_acquire(&self, slot_id: u32, slot: SlotView<'_>) -> bool {
+        loop {
+            let current = SlotMeta::from_raw(slot.slot_meta.load(Ordering::Acquire));
+            if current.is_free_published()
+                || current.is_free_popped()
+                || current.is_free_pending()
+                || current.is_free_push_claimed()
+                || current.is_free_pushed()
+            {
+                return true;
+            }
+            if !(current.is_acquire_reserved() || current.is_free_popped()) {
+                return false;
+            }
+            match slot.slot_meta.compare_exchange(
+                current.raw(),
+                SlotMeta::FREE_PENDING.raw(),
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            ) {
+                Ok(_) => {
+                    self.clear_slot(slot_id);
+                    slot.slot_generation.store(0, Ordering::Release);
+                    let _ = self.publish_free_slot(slot_id, slot);
+                    return true;
+                }
+                Err(_) => continue,
+            }
+        }
+    }
+
+    pub(super) fn publish_free_slot(&self, slot_id: u32, slot: SlotView<'_>) -> bool {
+        loop {
+            let current = SlotMeta::from_raw(slot.slot_meta.load(Ordering::Acquire));
+            if current.is_free_published() {
+                slot.backend_pid.store(0, Ordering::Release);
+                return true;
+            }
+            if current.is_free_pushed() {
+                slot.backend_pid.store(0, Ordering::Release);
+                let _ = slot.slot_meta.compare_exchange(
+                    current.raw(),
+                    SlotMeta::free_published(current.lease_epoch()).raw(),
+                    Ordering::AcqRel,
+                    Ordering::Acquire,
+                );
+                return true;
+            }
+            if current.is_free_push_claimed() {
+                return false;
+            }
+            if !current.is_free_pending() {
+                return false;
+            }
+            if self.load_region_meta().is_reiniting() {
+                return false;
+            }
+            let current_epoch = self.load_freelist_epoch();
+            slot.backend_pid
+                .store(Self::current_process_pid(), Ordering::Release);
+
+            match slot.slot_meta.compare_exchange(
+                current.raw(),
+                SlotMeta::free_push_claimed(current_epoch).raw(),
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            ) {
+                Ok(_) => {
+                    self.release_slot(slot_id);
+
+                    #[cfg(test)]
+                    self.run_free_slot_pushed_hook_for_tests();
+
+                    if slot
+                        .slot_meta
+                        .compare_exchange(
+                            SlotMeta::free_push_claimed(current_epoch).raw(),
+                            SlotMeta::free_pushed(current_epoch).raw(),
+                            Ordering::AcqRel,
+                            Ordering::Acquire,
+                        )
+                        .is_err()
+                    {
+                        return false;
+                    }
+
+                    slot.backend_pid.store(0, Ordering::Release);
+                    let _ = slot.slot_meta.compare_exchange(
+                        SlotMeta::free_pushed(current_epoch).raw(),
+                        SlotMeta::free_published(current_epoch).raw(),
+                        Ordering::AcqRel,
+                        Ordering::Acquire,
+                    );
+                    return true;
+                }
+                Err(_) => {
+                    slot.backend_pid.store(0, Ordering::Release);
+                    continue;
+                }
+            }
         }
     }
 
@@ -172,225 +1053,13 @@ impl TransportRegion {
         let _ = self.freelist().release(slot_id);
     }
 
-    pub(super) fn clear_slot(&self, slot_id: u32, clear_backend_pid: bool) {
+    pub(super) fn clear_slot(&self, slot_id: u32) {
         let slot = unsafe { self.slot_view_unchecked(slot_id) };
         slot.backend_to_worker.clear();
         slot.worker_to_backend.clear();
         slot.to_worker_ready.store(false, Ordering::Release);
         slot.to_backend_ready.store(false, Ordering::Release);
-        if clear_backend_pid {
-            slot.backend_pid.store(0, Ordering::Release);
-        }
-    }
-
-    pub(super) fn validate_lease(
-        &self,
-        slot_id: u32,
-        generation: u64,
-        active: bool,
-    ) -> Result<SlotView<'_>, LeaseError> {
-        if !active {
-            return Err(LeaseError::Released {
-                slot_id,
-                claimed_generation: generation,
-            });
-        }
-
-        let current_generation = self.region_generation();
-        if current_generation != generation {
-            return Err(LeaseError::StaleGeneration {
-                slot_id,
-                claimed_generation: generation,
-                current_generation,
-            });
-        }
-
-        let slot = unsafe { self.slot_view_unchecked(slot_id) };
-        if slot.lease_state.load(Ordering::Acquire) != LEASE_STATE_LEASED
-            || slot.slot_generation.load(Ordering::Acquire) != generation
-            || slot.owner_mask.load(Ordering::Acquire) & OWNER_BACKEND == 0
-        {
-            return Err(LeaseError::Released {
-                slot_id,
-                claimed_generation: generation,
-            });
-        }
-        Ok(slot)
-    }
-
-    pub(super) fn validate_worker_slot_access(
-        &self,
-        slot_id: u32,
-        generation: u64,
-        attached: bool,
-    ) -> Result<SlotView<'_>, SlotAccessError> {
-        if !attached {
-            return Err(SlotAccessError::Released {
-                slot_id,
-                claimed_generation: generation,
-            });
-        }
-
-        let current_generation = self.region_generation();
-        if current_generation != generation {
-            return Err(SlotAccessError::StaleGeneration {
-                slot_id,
-                claimed_generation: generation,
-                current_generation,
-            });
-        }
-        if current_generation == 0
-            || self.worker_state_cell().load(Ordering::Acquire) != WORKER_STATE_ONLINE
-        {
-            return Err(SlotAccessError::WorkerOffline);
-        }
-
-        let slot = self.slot_view(slot_id)?;
-        let owner_mask = slot.owner_mask.load(Ordering::Acquire);
-        if slot.lease_state.load(Ordering::Acquire) != LEASE_STATE_LEASED
-            || slot.slot_generation.load(Ordering::Acquire) != generation
-            || owner_mask & OWNER_WORKER == 0
-            || owner_mask & OWNER_BACKEND == 0
-        {
-            return Err(SlotAccessError::Released {
-                slot_id,
-                claimed_generation: generation,
-            });
-        }
-        Ok(slot)
-    }
-
-    pub(super) fn claim_worker_slot(&self, slot_id: u32) -> Result<u64, SlotAccessError> {
-        let generation = self.region_generation();
-        if generation == 0
-            || self.worker_state_cell().load(Ordering::Acquire) != WORKER_STATE_ONLINE
-        {
-            return Err(SlotAccessError::WorkerOffline);
-        }
-
-        let slot = self.slot_view(slot_id)?;
-        if slot.lease_state.load(Ordering::Acquire) != LEASE_STATE_LEASED
-            || slot.slot_generation.load(Ordering::Acquire) != generation
-            || slot.owner_mask.load(Ordering::Acquire) & OWNER_BACKEND == 0
-        {
-            return Err(SlotAccessError::Released {
-                slot_id,
-                claimed_generation: generation,
-            });
-        }
-
-        let previous = slot.owner_mask.fetch_or(OWNER_WORKER, Ordering::AcqRel);
-        if previous & OWNER_WORKER != 0 {
-            return Err(SlotAccessError::Busy {
-                slot_id,
-                claimed_generation: generation,
-            });
-        }
-        if previous & OWNER_BACKEND == 0 {
-            self.rollback_worker_claim(slot_id, generation, slot);
-            return Err(SlotAccessError::Released {
-                slot_id,
-                claimed_generation: generation,
-            });
-        }
-
-        #[cfg(test)]
-        self.run_worker_claim_hook_for_tests();
-
-        let current_generation = self.region_generation();
-        let worker_state = self.worker_state_cell().load(Ordering::Acquire);
-        let slot_generation = slot.slot_generation.load(Ordering::Acquire);
-        let lease_state = slot.lease_state.load(Ordering::Acquire);
-        let owner_mask = slot.owner_mask.load(Ordering::Acquire);
-        if current_generation != generation
-            || worker_state != WORKER_STATE_ONLINE
-            || slot_generation != generation
-            || lease_state != LEASE_STATE_LEASED
-            || owner_mask & OWNER_BACKEND == 0
-        {
-            self.rollback_worker_claim(slot_id, generation, slot);
-            if current_generation != generation {
-                return Err(SlotAccessError::StaleGeneration {
-                    slot_id,
-                    claimed_generation: generation,
-                    current_generation,
-                });
-            }
-            if worker_state != WORKER_STATE_ONLINE {
-                return Err(SlotAccessError::WorkerOffline);
-            }
-            return Err(SlotAccessError::Released {
-                slot_id,
-                claimed_generation: generation,
-            });
-        }
-
-        if !self.insert_local_worker_owner(slot_id, generation) {
-            self.rollback_worker_claim(slot_id, generation, slot);
-            return Err(SlotAccessError::Busy {
-                slot_id,
-                claimed_generation: generation,
-            });
-        }
-
-        Ok(generation)
-    }
-
-    pub(super) fn release_worker_slot(&self, slot_id: u32, generation: u64) {
-        let slot = unsafe { self.slot_view_unchecked(slot_id) };
-        if slot.slot_generation.load(Ordering::Acquire) != generation {
-            return;
-        }
-
-        let previous = slot.owner_mask.fetch_and(!OWNER_WORKER, Ordering::AcqRel);
-        if previous & OWNER_WORKER == 0 {
-            return;
-        }
-
-        if previous & !OWNER_WORKER == 0 {
-            let _ = self.try_finalize_slot(slot_id, generation);
-        }
-    }
-
-    fn rollback_worker_claim(&self, slot_id: u32, generation: u64, slot: SlotView<'_>) {
-        let previous = slot.owner_mask.fetch_and(!OWNER_WORKER, Ordering::AcqRel);
-        if previous & !OWNER_WORKER == 0 {
-            let _ = self.try_finalize_slot(slot_id, generation);
-        }
-    }
-
-    pub(super) fn release_owned_worker_slots_for_exit(&self) {
-        for (slot_id, generation) in self.take_local_worker_owners() {
-            self.release_worker_slot(slot_id, generation);
-        }
-    }
-
-    pub(super) fn try_finalize_slot(&self, slot_id: u32, generation: u64) -> bool {
-        let slot = unsafe { self.slot_view_unchecked(slot_id) };
-        if slot.slot_generation.load(Ordering::Acquire) != generation {
-            return false;
-        }
-        if slot.owner_mask.load(Ordering::Acquire) != 0 {
-            return false;
-        }
-        if slot
-            .lease_state
-            .compare_exchange(
-                LEASE_STATE_LEASED,
-                LEASE_STATE_FREE,
-                Ordering::AcqRel,
-                Ordering::Acquire,
-            )
-            .is_err()
-        {
-            return false;
-        }
-
-        self.clear_slot(slot_id, true);
-        slot.slot_generation.store(0, Ordering::Release);
-        slot.owner_mask.store(0, Ordering::Release);
-        self.release_slot(slot_id);
-        true
+        slot.backend_pid.store(0, Ordering::Release);
     }
 
     pub(super) fn slot_view(&self, slot_id: u32) -> Result<SlotView<'_>, SlotAccessError> {
@@ -420,12 +1089,10 @@ impl TransportRegion {
             as *const AtomicBool);
         let to_backend_ready = &*(slot_base.add(self.computed.slot_layout.to_backend_ready_offset)
             as *const AtomicBool);
-        let lease_state =
-            &*(slot_base.add(self.computed.slot_layout.lease_state_offset) as *const AtomicU32);
         let slot_generation =
             &*(slot_base.add(self.computed.slot_layout.slot_generation_offset) as *const AtomicU64);
-        let owner_mask =
-            &*(slot_base.add(self.computed.slot_layout.owner_mask_offset) as *const AtomicU32);
+        let slot_meta =
+            &*(slot_base.add(self.computed.slot_layout.slot_meta_offset) as *const AtomicU64);
         let backend_pid =
             &*(slot_base.add(self.computed.slot_layout.backend_pid_offset) as *const AtomicI32);
 
@@ -434,15 +1101,22 @@ impl TransportRegion {
             worker_to_backend,
             to_worker_ready,
             to_backend_ready,
-            lease_state,
             slot_generation,
-            owner_mask,
+            slot_meta,
             backend_pid,
             worker_pid: self.worker_pid_cell(),
         }
     }
 
     pub(super) fn current_process_pid() -> i32 {
+        #[cfg(test)]
+        {
+            let override_pid = CURRENT_PROCESS_PID_OVERRIDE.load(Ordering::Acquire);
+            if override_pid != 0 {
+                return override_pid;
+            }
+        }
+
         #[cfg(unix)]
         {
             unsafe { libc::getpid() as i32 }
@@ -454,27 +1128,32 @@ impl TransportRegion {
         }
     }
 
-    fn sweep_old_generation_slots(&self, current_generation: u64) {
-        for slot_id in 0..self.slot_count {
-            let slot = unsafe { self.slot_view_unchecked(slot_id) };
-            let slot_generation = slot.slot_generation.load(Ordering::Acquire);
-            if slot_generation == 0 || slot_generation == current_generation {
-                continue;
-            }
-
-            let previous = slot.owner_mask.fetch_and(!OWNER_WORKER, Ordering::AcqRel);
-            let owners_after = previous & !OWNER_WORKER;
-            if owners_after == 0 && slot.lease_state.load(Ordering::Acquire) == LEASE_STATE_LEASED {
-                let _ = self.try_finalize_slot(slot_id, slot_generation);
-            }
-        }
-    }
-
-    fn region_key(&self) -> usize {
+    pub(super) fn region_key(&self) -> usize {
+        // The mapped shared-memory base address is a sufficient process-local
+        // identity for the attached region. It is not a durable cross-process
+        // identifier and is only meaningful together with the current PID.
         self.base.as_ptr() as usize
     }
 
-    fn ensure_no_live_local_worker_slots(&self) -> Result<(), WorkerLifecycleError> {
+    fn worker_owner_registry_if_attached(&self) -> Option<&'static ProcessWorkerRegistry> {
+        let registry = load_worker_owner_registry()?;
+        if !registry_matches(
+            registry,
+            Self::current_process_pid(),
+            self.region_key(),
+            self.slot_count,
+        ) {
+            return None;
+        }
+        Some(registry)
+    }
+
+    fn worker_owner_registry(&self) -> &'static ProcessWorkerRegistry {
+        self.worker_owner_registry_if_attached()
+            .expect("worker owner registry must already be attached for this region")
+    }
+
+    pub(super) fn ensure_no_live_local_worker_slots(&self) -> Result<(), WorkerLifecycleError> {
         let live_slots = self.local_worker_owner_count();
         if live_slots != 0 {
             return Err(WorkerLifecycleError::HandlesAlive { live_slots });
@@ -483,105 +1162,185 @@ impl TransportRegion {
     }
 
     fn local_worker_owner_count(&self) -> usize {
-        let registry = worker_owner_registry()
-            .lock()
-            .expect("worker owner registry poisoned");
+        let Some(registry) = self.worker_owner_registry_if_attached() else {
+            return 0;
+        };
         registry
-            .get(&self.region_key())
-            .map(|entries| {
-                entries
-                    .iter()
-                    .filter(|generation| **generation != 0)
-                    .count()
-            })
-            .unwrap_or(0)
+            .entries
+            .iter()
+            .filter(|entry| entry.load(Ordering::Acquire) != 0)
+            .count()
     }
 
-    fn insert_local_worker_owner(&self, slot_id: u32, generation: u64) -> bool {
-        let mut registry = worker_owner_registry()
-            .lock()
-            .expect("worker owner registry poisoned");
-        let entries = registry
-            .entry(self.region_key())
-            .or_insert_with(|| vec![0; self.slot_count as usize].into_boxed_slice());
-        if entries.len() != self.slot_count as usize {
-            *entries = vec![0; self.slot_count as usize].into_boxed_slice();
-        }
-
-        let entry = &mut entries[slot_id as usize];
-        if *entry != 0 {
-            return false;
-        }
-        *entry = generation;
-        true
+    pub(super) fn insert_local_worker_owner(
+        &self,
+        slot_id: u32,
+        incarnation: LeaseIncarnation,
+    ) -> bool {
+        let entry = self.worker_owner_registry().entry(slot_id);
+        entry
+            .compare_exchange(
+                0,
+                pack_local_owner(incarnation),
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            )
+            .is_ok()
     }
 
-    pub(super) fn remove_local_worker_owner(&self, slot_id: u32, generation: u64) -> bool {
-        let mut registry = worker_owner_registry()
-            .lock()
-            .expect("worker owner registry poisoned");
-        let Some(entries) = registry.get_mut(&self.region_key()) else {
+    pub(super) fn remove_local_worker_owner(
+        &self,
+        slot_id: u32,
+        incarnation: LeaseIncarnation,
+    ) -> bool {
+        let Some(registry) = self.worker_owner_registry_if_attached() else {
             return false;
         };
-        let entry = &mut entries[slot_id as usize];
-        if *entry != generation {
-            return false;
-        }
-        *entry = 0;
-        true
+        let entry = registry.entry(slot_id);
+        entry
+            .compare_exchange(
+                pack_local_owner(incarnation),
+                0,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            )
+            .is_ok()
     }
 
-    fn take_local_worker_owners(&self) -> Vec<(u32, u64)> {
-        let mut registry = worker_owner_registry()
-            .lock()
-            .expect("worker owner registry poisoned");
-        let Some(entries) = registry.get_mut(&self.region_key()) else {
+    pub(super) fn take_local_worker_owners(&self) -> Vec<(u32, LeaseIncarnation)> {
+        let Some(registry) = self.worker_owner_registry_if_attached() else {
             return Vec::new();
         };
-
         let mut owned = Vec::new();
-        for (slot_id, generation) in entries.iter_mut().enumerate() {
-            if *generation == 0 {
+        for (slot_id, entry) in registry.entries.iter().enumerate() {
+            let incarnation = unpack_local_owner(entry.swap(0, Ordering::AcqRel));
+            if incarnation.is_free() {
                 continue;
             }
-            owned.push((slot_id as u32, *generation));
-            *generation = 0;
+            owned.push((slot_id as u32, incarnation));
         }
         owned
     }
 
     #[cfg(test)]
     pub(super) fn forget_local_worker_owners_for_tests(&self) {
-        let mut registry = worker_owner_registry()
-            .lock()
-            .expect("worker owner registry poisoned");
-        if let Some(entries) = registry.get_mut(&self.region_key()) {
-            for generation in entries.iter_mut() {
-                *generation = 0;
-            }
+        let Some(registry) = self.worker_owner_registry_if_attached() else {
+            return;
+        };
+        for entry in registry.entries.iter() {
+            entry.store(0, Ordering::Release);
         }
     }
 
     #[cfg(test)]
-    pub(super) fn set_worker_state_for_tests(&self, state: u32) {
-        self.worker_state_cell().store(state, Ordering::Release);
+    pub(crate) fn clear_all_worker_owner_registry_for_tests() {
+        let ptr = WORKER_OWNER_REGISTRY.swap(ptr::null_mut(), Ordering::AcqRel);
+        if ptr.is_null() {
+            return;
+        }
+        unsafe {
+            drop(Box::from_raw(ptr));
+        }
     }
 
     #[cfg(test)]
-    pub(crate) fn set_worker_claim_hook_for_tests<F>(&self, hook: F)
+    pub(crate) fn set_current_process_pid_for_tests(pid: i32) {
+        CURRENT_PROCESS_PID_OVERRIDE.store(pid, Ordering::Release);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn clear_current_process_pid_for_tests() {
+        CURRENT_PROCESS_PID_OVERRIDE.store(0, Ordering::Release);
+    }
+
+    #[cfg(test)]
+    pub(super) fn set_worker_state_for_tests(&self, state: u32) {
+        let generation = self.region_generation();
+        self.store_region_meta(RegionMeta::new(generation, state));
+    }
+
+    #[cfg(test)]
+    pub(crate) fn is_reiniting_for_tests(&self) -> bool {
+        self.load_region_meta().is_reiniting()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn acquire_slot_without_publish_for_tests(&self) -> u32 {
+        let (slot_id, _) = self.pop_freelist_token_for_acquire().expect("slot reserve");
+        let slot = unsafe { self.slot_view_unchecked(slot_id) };
+        slot.backend_pid.store(0, Ordering::Release);
+        slot_id
+    }
+
+    #[cfg(test)]
+    pub(crate) fn force_slot_free_pending_without_publish_for_tests(&self, slot_id: u32) {
+        let slot = unsafe { self.slot_view_unchecked(slot_id) };
+        self.clear_slot(slot_id);
+        slot.slot_generation.store(0, Ordering::Release);
+        slot.slot_meta
+            .store(SlotMeta::FREE_PENDING.raw(), Ordering::Release);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn set_backend_acquire_popped_hook_for_tests<F>(&self, hook: F)
     where
         F: FnOnce() + 'static,
     {
         let _ = self;
-        WORKER_CLAIM_HOOK.with(|slot| {
+        BACKEND_ACQUIRE_POPPED_HOOK.with(|slot| {
             *slot.borrow_mut() = Some(Box::new(hook));
         });
     }
 
     #[cfg(test)]
-    fn run_worker_claim_hook_for_tests(&self) {
+    fn run_backend_acquire_popped_hook_for_tests(&self) {
         let _ = self;
-        WORKER_CLAIM_HOOK.with(|slot| {
+        BACKEND_ACQUIRE_POPPED_HOOK.with(|slot| {
+            if let Some(hook) = slot.borrow_mut().take() {
+                hook();
+            }
+        });
+    }
+
+    #[cfg(test)]
+    pub(crate) fn set_reinit_rebuild_pass_hook_for_tests<F>(&self, hook: F)
+    where
+        F: FnOnce() + 'static,
+    {
+        let _ = self;
+        REINIT_REBUILD_PASS_HOOK.with(|slot| {
+            *slot.borrow_mut() = Some(Box::new(hook));
+        });
+    }
+
+    #[cfg(test)]
+    fn run_reinit_rebuild_pass_hook_for_tests(&self) -> bool {
+        let _ = self;
+        REINIT_REBUILD_PASS_HOOK.with(|slot| {
+            if let Some(hook) = slot.borrow_mut().take() {
+                hook();
+                true
+            } else {
+                false
+            }
+        })
+    }
+
+    #[cfg(test)]
+    pub(crate) fn set_free_slot_pushed_hook_for_tests<F>(&self, hook: F)
+    where
+        F: FnOnce() + 'static,
+    {
+        let _ = self;
+        FREE_SLOT_PUSHED_HOOK.with(|slot| {
+            *slot.borrow_mut() = Some(Box::new(hook));
+        });
+    }
+
+    #[cfg(test)]
+    fn run_free_slot_pushed_hook_for_tests(&self) {
+        let _ = self;
+        FREE_SLOT_PUSHED_HOOK.with(|slot| {
             if let Some(hook) = slot.borrow_mut().take() {
                 hook();
             }
@@ -596,3 +1355,6 @@ impl TransportRegion {
         }
     }
 }
+
+#[cfg(test)]
+static CURRENT_PROCESS_PID_OVERRIDE: AtomicI32 = AtomicI32::new(0);

@@ -129,6 +129,40 @@ impl TreiberStack {
         Self::attach(header_ptr, next_ptr)
     }
 
+    /// Initialize an empty stack in-place in shared memory and return a
+    /// process-local handle.
+    ///
+    /// # Safety
+    /// Caller must ensure that:
+    /// - `header_ptr` and `next_ptr` point into a valid region described by
+    ///   `treiber_stack_layout(capacity)`.
+    /// - initialization happens exactly once before concurrent access.
+    pub unsafe fn init_empty_in_place(
+        header_ptr: *mut TreiberStackHeader,
+        next_ptr: *mut AtomicU32,
+        capacity: usize,
+    ) -> Self {
+        assert!(
+            capacity <= (u32::MAX as usize),
+            "capacity exceeds u32 range"
+        );
+
+        for i in 0..capacity {
+            (*next_ptr.add(i)).store(Self::NONE, Ordering::Relaxed);
+        }
+
+        std::ptr::write(
+            header_ptr,
+            TreiberStackHeader {
+                head: AtomicU64::new(Self::pack_head(Self::NONE, 0)),
+                capacity,
+                len: AtomicUsize::new(0),
+            },
+        );
+
+        Self::attach(header_ptr, next_ptr)
+    }
+
     /// Attach to an already initialized stack in shared memory.
     ///
     /// # Safety
@@ -197,6 +231,18 @@ impl TreiberStack {
                 return Ok(());
             }
         }
+    }
+
+    /// Atomically reset the stack to empty without reinitializing the shared
+    /// header object in place.
+    pub fn reset_empty(&self) {
+        let cur = self.header().head.load(Ordering::Acquire);
+        let (_, tag) = Self::unpack_head(cur);
+        self.header().head.store(
+            Self::pack_head(Self::NONE, tag.wrapping_add(1)),
+            Ordering::Release,
+        );
+        self.header().len.store(0, Ordering::Release);
     }
 }
 
@@ -283,6 +329,54 @@ mod tests {
 
             let v = stack.allocate().expect("pop after attach");
             assert_eq!(v, 3);
+
+            dealloc(base, layout.layout);
+        }
+    }
+
+    #[test]
+    fn treiber_stack_init_empty_starts_empty_then_accepts_pushes() {
+        let capacity = 3usize;
+        let layout = treiber_stack_layout(capacity).expect("layout");
+
+        unsafe {
+            let base = alloc(layout.layout);
+            assert!(!base.is_null());
+
+            let (hdr_ptr, next_ptr) = treiber_stack_ptrs(base, layout);
+            let stack = TreiberStack::init_empty_in_place(hdr_ptr, next_ptr, capacity);
+
+            assert!(matches!(stack.allocate(), Err(StackError::Empty)));
+
+            stack.release(1).expect("push");
+            stack.release(2).expect("push");
+
+            assert_eq!(stack.allocate().expect("pop"), 2);
+            assert_eq!(stack.allocate().expect("pop"), 1);
+            assert!(matches!(stack.allocate(), Err(StackError::Empty)));
+
+            dealloc(base, layout.layout);
+        }
+    }
+
+    #[test]
+    fn treiber_stack_reset_empty_discards_all_members() {
+        let capacity = 3usize;
+        let layout = treiber_stack_layout(capacity).expect("layout");
+
+        unsafe {
+            let base = alloc(layout.layout);
+            assert!(!base.is_null());
+
+            let (hdr_ptr, next_ptr) = treiber_stack_ptrs(base, layout);
+            let stack = TreiberStack::init_in_place(hdr_ptr, next_ptr, capacity);
+
+            assert_eq!(stack.allocate().expect("pop"), 2);
+            stack.reset_empty();
+            assert!(matches!(stack.allocate(), Err(StackError::Empty)));
+
+            stack.release(1).expect("push after reset");
+            assert_eq!(stack.allocate().expect("pop after reset"), 1);
 
             dealloc(base, layout.layout);
         }

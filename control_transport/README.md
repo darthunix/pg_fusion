@@ -3,6 +3,10 @@
 `control_transport` is the allocation-free shared-memory transport layer for
 the new backend/worker runtime path.
 
+This crate is intentionally Unix-only. It relies on Unix PID probing and
+`SIGUSR1` delivery semantics because it is designed for PostgreSQL child
+processes on Unix-like systems.
+
 Both sides are expected to be PostgreSQL child processes:
 
 - backend leases belong to PostgreSQL backend processes
@@ -18,6 +22,24 @@ It intentionally stays below any session-aware control-plane lifecycle:
 - ready flags and PID-based wakeup hints
 - no message schema
 - no execution/session FSM
+
+The high-level safety contract lives in `spec/`, and
+`spec/IMPLEMENTATION_REFINEMENT.md` records how the multi-step Rust operations
+are reviewed against the atomic TLA+ transitions and reduced-core `loom`
+harnesses.
+
+Same-generation reuse safety is implemented with a packed per-slot metadata
+word that carries the current `lease_epoch`, lease state, and owner bits in
+one authoritative CAS domain. `slot_generation` remains separate for worker
+restart invalidation, but lifecycle mutations are guarded by exact
+`(slot_generation, lease_epoch)` snapshots and mutate ownership only through
+that packed metadata word.
+
+Worker-generation admission safety is implemented the same way at the region
+level: `region_generation` and `worker_state` are published through one packed
+region lifecycle word, so lease admission and worker attach rechecks never
+reconstruct an "online generation" predicate from torn reads of separate
+atomics.
 
 ## Worker restart contract
 
@@ -74,6 +96,9 @@ Worker slot access is raw transport only, so it is intentionally `unsafe`:
 - this crate does not coordinate worker claims across processes or tasks
 - higher layers such as the future session-aware `control_ipc` wrapper are
   expected to provide that coordination
+- dead-backend reaping is conservative: Unix PID reuse can make `kill(pid, 0)`
+  observe an unrelated new process as alive, so PID probes are only a
+  best-effort liveness hint, not a proof of backend identity
 
 ## Typical usage
 
@@ -87,7 +112,7 @@ let region_layout = Layout::from_size_align(layout.size, layout.align)?;
 let base = NonNull::new(unsafe { alloc_zeroed(region_layout) }).unwrap();
 
 let region = unsafe { TransportRegion::init_in_place(base, layout.size, layout) }?;
-let worker = WorkerTransport::attach(&region);
+let worker = WorkerTransport::attach(&region)?;
 let generation = worker.activate_generation(1234)?;
 assert_eq!(generation, 1);
 
@@ -104,6 +129,17 @@ backend.release();
 unsafe { dealloc(base.as_ptr(), region_layout) };
 # Ok::<(), Box<dyn std::error::Error>>(())
 ```
+
+`init_in_place()` is the fresh-mapping path and must only be used once for a
+given initialized shared-memory region. For a logical reset of the same
+mapping and the same layout, use `reinit_in_place()` instead.
+`reinit_in_place()` preserves monotonic lifecycle identity and retains old
+leased slots out of the freelist until exact old-incarnation release/finalize
+or later dead-backend reap, so stale backend handles cannot collide with fresh
+leases after reset. During `reinit_in_place()` the region passes through a
+transient non-online `REINITING` state, rebuilds the freelist from empty, and
+republishes only sanitized free slots. Retained old leased slots remain
+unpublished until their normal retirement path completes.
 
 `send_frame()` publishes the frame before it attempts `SIGUSR1`. A
 notification failure does not roll the frame back and must not be retried as a
@@ -124,7 +160,19 @@ Higher layers should call `deactivate_generation()` or
 stop being usable. Generation changes may cause in-flight reads or writes to
 return `StaleGeneration` after touching old-generation ring state; such traffic
 is considered lost and must be retried at a higher layer if needed. New backend
-lease admission, however, is gated by `worker_state`: once worker shutdown
-begins and the state leaves `ONLINE`, fresh `BackendSlotLease::acquire()` calls
-must fail with `AcquireError::WorkerOffline` even before the generation bump is
-published.
+lease admission, however, is gated by the packed region lifecycle word: once
+worker shutdown begins and the worker leaves `ONLINE`, fresh
+`BackendSlotLease::acquire()` calls must fail with `AcquireError::WorkerOffline`
+even before a later restart publishes a new generation.
+
+Worker-side local ownership tracking is process-local and atomics-only. A
+single worker process may attach multiple `WorkerTransport` handles to the same
+region, but attaching two different `control_transport` regions in the same
+PID lifetime returns `WorkerAttachError::RegionAlreadyAttached`; switching to a
+different region requires a new process. The local registry is keyed by the
+current worker-process PID as well as the region identity, so an inherited
+registry after `fork()` is rebuilt from empty state on the next attach.
+Same-layout `reinit_in_place()` also resets the local registry for that region
+so late stale worker drops become harmless no-ops. Fresh backend lease
+admission after `reinit_in_place()` may therefore remain blocked with
+`AcquireError::Empty` until retained old slots are retired.

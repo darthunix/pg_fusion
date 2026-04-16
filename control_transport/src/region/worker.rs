@@ -1,23 +1,36 @@
 use super::{
-    ControlRx, ControlTx, ReadySlots, WorkerRx, WorkerSlot, WorkerTransport, WorkerTx,
-    LEASE_STATE_LEASED, OWNER_WORKER, WORKER_STATE_ONLINE,
+    ControlRx, ControlTx, ReadySlots, SlotMeta, WorkerRx, WorkerSlot, WorkerTransport, WorkerTx,
+    LEASE_STATE_LEASED, OWNER_ANY_WORKER,
 };
-use crate::error::{SlotAccessError, WorkerLifecycleError, WorkerRxError, WorkerTxError};
+use crate::error::{
+    SlotAccessError, WorkerAttachError, WorkerLifecycleError, WorkerRxError, WorkerTxError,
+};
 use std::sync::atomic::Ordering;
 
 impl WorkerTransport {
     /// Attaches a worker-side process-local handle to the transport region.
-    pub fn attach(region: &super::TransportRegion) -> Self {
-        region.ensure_local_worker_registry();
-        Self { region: *region }
+    ///
+    /// A worker process may attach multiple handles to the same region, but it
+    /// may not attach two different transport regions in the same PID
+    /// lifetime. Switching to another region requires a new process.
+    pub fn attach(region: &super::TransportRegion) -> Result<Self, WorkerAttachError> {
+        region.attach_worker_registry()?;
+        Ok(Self { region: *region })
     }
 
     /// Updates the published worker PID hint without switching generations.
+    ///
+    /// The caller must be the worker process for the currently active
+    /// generation and must only publish its own PID hint. This is not a
+    /// lifecycle transition and must not race `activate_generation()`.
     pub fn set_worker_pid(&mut self, pid: i32) {
         self.region.worker_pid_cell().store(pid, Ordering::Release);
     }
 
     /// Clears the published worker PID hint without changing worker liveness.
+    ///
+    /// The caller must be the current worker process clearing its own hint;
+    /// this is not a detach or generation-deactivation primitive.
     pub fn clear_worker_pid(&mut self) {
         self.region.worker_pid_cell().store(0, Ordering::Release);
     }
@@ -49,16 +62,17 @@ impl WorkerTransport {
         let generation = self.region.claim_worker_slot(slot_id)?;
         Ok(WorkerSlot {
             region: &self.region,
-            generation,
+            incarnation: generation,
             slot_id,
             attached: true,
         })
     }
 
     pub fn ready_slots(&self) -> ReadySlots<'_> {
+        let generation = self.region.load_region_meta().generation();
         ReadySlots {
             transport: self,
-            generation: self.region.region_generation(),
+            generation,
             next: 0,
         }
     }
@@ -73,15 +87,11 @@ impl<'a> Iterator for ReadySlots<'a> {
         }
 
         while self.next < self.transport.region.slot_count {
-            if self.transport.region.region_generation() != self.generation {
-                return None;
-            }
-            if self
+            if !self
                 .transport
                 .region
-                .worker_state_cell()
-                .load(Ordering::Acquire)
-                != WORKER_STATE_ONLINE
+                .load_region_meta()
+                .is_online_generation(self.generation)
             {
                 return None;
             }
@@ -89,13 +99,14 @@ impl<'a> Iterator for ReadySlots<'a> {
             let slot_id = self.next;
             self.next += 1;
             let slot = unsafe { self.transport.region.slot_view_unchecked(slot_id) };
-            if slot.lease_state.load(Ordering::Acquire) != LEASE_STATE_LEASED {
+            let slot_meta = SlotMeta::from_raw(slot.slot_meta.load(Ordering::Acquire));
+            if slot_meta.lease_state() != LEASE_STATE_LEASED {
                 continue;
             }
             if slot.slot_generation.load(Ordering::Acquire) != self.generation {
                 continue;
             }
-            if slot.owner_mask.load(Ordering::Acquire) & OWNER_WORKER != 0 {
+            if slot_meta.owner_mask() & OWNER_ANY_WORKER != 0 {
                 continue;
             }
             if slot.to_worker_ready.load(Ordering::Acquire)
@@ -110,7 +121,7 @@ impl<'a> Iterator for ReadySlots<'a> {
 
 impl<'a> WorkerSlot<'a> {
     pub fn generation(&self) -> u64 {
-        self.generation
+        self.incarnation.generation
     }
 
     pub fn slot_id(&self) -> u32 {
@@ -120,14 +131,6 @@ impl<'a> WorkerSlot<'a> {
     pub fn backend_pid(&self) -> i32 {
         let slot = unsafe { self.region.slot_view_unchecked(self.slot_id) };
         slot.backend_pid.load(Ordering::Acquire)
-    }
-
-    /// Clears both transport rings and ready flags while preserving the lease.
-    pub fn clear_transport(&mut self) -> Result<(), SlotAccessError> {
-        self.validate_current_access()?;
-        self.region.clear_slot(self.slot_id, false);
-        self.validate_current_access()?;
-        Ok(())
     }
 
     pub fn from_backend_rx(&mut self) -> Result<WorkerRx<'_, 'a>, SlotAccessError> {
@@ -155,7 +158,7 @@ impl<'a> WorkerSlot<'a> {
 
     pub(super) fn validate_current_access(&self) -> Result<super::SlotView<'a>, SlotAccessError> {
         self.region
-            .validate_worker_slot_access(self.slot_id, self.generation, self.attached)
+            .validate_worker_slot_access(self.slot_id, self.incarnation, self.attached)
     }
 }
 
@@ -164,10 +167,10 @@ impl Drop for WorkerSlot<'_> {
         if self.attached {
             if self
                 .region
-                .remove_local_worker_owner(self.slot_id, self.generation)
+                .remove_local_worker_owner(self.slot_id, self.incarnation)
             {
                 self.region
-                    .release_worker_slot(self.slot_id, self.generation);
+                    .release_worker_slot(self.slot_id, self.incarnation);
             }
             self.attached = false;
         }

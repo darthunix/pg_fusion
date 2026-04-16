@@ -1,8 +1,8 @@
 use super::{
-    BackendRx, BackendSlotLease, BackendTx, ControlRx, ControlTx, TransportRegion,
-    LEASE_STATE_LEASED, OWNER_BACKEND, WORKER_STATE_ONLINE,
+    BackendRx, BackendSlotLease, BackendTx, ControlRx, ControlTx, LeaseIncarnation, SlotMeta,
+    TransportRegion, LEASE_STATE_LEASED, OWNER_BACKEND,
 };
-use crate::error::{AcquireError, BackendRxError, BackendTxError, LeaseError};
+use crate::error::{AcquireError, BackendRxError, BackendTxError};
 #[cfg(test)]
 use std::cell::RefCell;
 use std::sync::atomic::Ordering;
@@ -12,45 +12,92 @@ thread_local! {
     static BACKEND_ACQUIRE_PUBLISH_HOOK: RefCell<Option<Box<dyn FnOnce()>>> = const { RefCell::new(None) };
 }
 
+fn generation_is_online(region: &TransportRegion, generation: u64) -> bool {
+    region.load_region_meta().is_online_generation(generation)
+}
+
+fn reserve_backend_slot(region: &TransportRegion, generation: u64) -> Result<u32, AcquireError> {
+    loop {
+        let (slot_id, popped_epoch) = match region.pop_freelist_token_for_acquire() {
+            Ok(reserved) => reserved,
+            Err(AcquireError::Empty) => {
+                if let Err((slot_id, err)) = region.reap_current_generation_dead_backend_slots() {
+                    return Err(AcquireError::BackendProbeFailed {
+                        slot_id,
+                        error_kind: err.kind(),
+                        raw_os_error: err.raw_os_error(),
+                    });
+                }
+                region.pop_freelist_token_for_acquire()?
+            }
+            Err(err) => return Err(err),
+        };
+
+        if !generation_is_online(region, generation) {
+            let slot = unsafe { region.slot_view_unchecked(slot_id) };
+            let _ = region.abort_reserved_slot_acquire(slot_id, slot);
+            return Err(AcquireError::WorkerOffline);
+        }
+
+        let slot = unsafe { region.slot_view_unchecked(slot_id) };
+        if region.reserve_popped_slot_for_acquire(slot_id, slot, popped_epoch) {
+            return Ok(slot_id);
+        }
+    }
+}
+
+fn publish_backend_lease(
+    region: &TransportRegion,
+    slot_id: u32,
+    generation: u64,
+) -> Option<LeaseIncarnation> {
+    let lease_epoch = region.allocate_lease_epoch();
+    let slot = unsafe { region.slot_view_unchecked(slot_id) };
+    region.clear_slot(slot_id);
+    slot.slot_generation.store(generation, Ordering::Release);
+    slot.backend_pid
+        .store(TransportRegion::current_process_pid(), Ordering::Release);
+    let leased_meta = SlotMeta::new(LEASE_STATE_LEASED, lease_epoch, OWNER_BACKEND);
+    if slot
+        .slot_meta
+        .compare_exchange(
+            SlotMeta::ACQUIRE_RESERVED.raw(),
+            leased_meta.raw(),
+            Ordering::AcqRel,
+            Ordering::Acquire,
+        )
+        .is_err()
+    {
+        let _ = region.abort_reserved_slot_acquire(slot_id, slot);
+        return None;
+    }
+    Some(LeaseIncarnation::new(generation, lease_epoch))
+}
+
 impl BackendSlotLease {
     /// Acquires one backend slot from the currently active worker generation.
     pub fn acquire(region: &TransportRegion) -> Result<Self, AcquireError> {
-        let generation = region.region_generation();
-        if generation == 0
-            || region.worker_state_cell().load(Ordering::Acquire) != WORKER_STATE_ONLINE
-        {
+        let region_meta = region.load_region_meta();
+        let generation = region_meta.generation();
+        if !region_meta.is_online_generation(generation) {
             return Err(AcquireError::WorkerOffline);
         }
 
-        let slot_id = region.acquire_slot()?;
-        if region.region_generation() != generation
-            || region.worker_state_cell().load(Ordering::Acquire) != WORKER_STATE_ONLINE
-        {
-            region.release_slot(slot_id);
+        let slot_id = reserve_backend_slot(region, generation)?;
+        let Some(incarnation) = publish_backend_lease(region, slot_id, generation) else {
             return Err(AcquireError::WorkerOffline);
-        }
-
-        region.clear_slot(slot_id, true);
-        let slot = unsafe { region.slot_view_unchecked(slot_id) };
-        slot.slot_generation.store(generation, Ordering::Release);
-        slot.owner_mask.store(OWNER_BACKEND, Ordering::Release);
-        slot.backend_pid
-            .store(TransportRegion::current_process_pid(), Ordering::Release);
-        slot.lease_state
-            .store(LEASE_STATE_LEASED, Ordering::Release);
+        };
 
         #[cfg(test)]
         region.run_backend_acquire_publish_hook_for_tests();
 
         let mut lease = Self {
             region: *region,
-            generation,
+            incarnation,
             slot_id,
             active: true,
         };
-        if region.region_generation() != generation
-            || region.worker_state_cell().load(Ordering::Acquire) != WORKER_STATE_ONLINE
-        {
+        if !generation_is_online(region, generation) {
             lease.release();
             return Err(AcquireError::WorkerOffline);
         }
@@ -59,7 +106,7 @@ impl BackendSlotLease {
     }
 
     pub fn generation(&self) -> u64 {
-        self.generation
+        self.incarnation.generation
     }
 
     pub fn slot_id(&self) -> u32 {
@@ -71,14 +118,9 @@ impl BackendSlotLease {
         slot.backend_pid.load(Ordering::Acquire)
     }
 
-    /// Clears both transport rings and ready flags while preserving the lease.
-    pub fn clear_transport(&mut self) -> Result<(), LeaseError> {
-        self.region
-            .validate_lease(self.slot_id, self.generation, self.active)?;
-        self.region.clear_slot(self.slot_id, false);
-        self.region
-            .validate_lease(self.slot_id, self.generation, self.active)?;
-        Ok(())
+    #[cfg(test)]
+    pub(crate) fn lease_epoch_for_tests(&self) -> u64 {
+        self.incarnation.lease_epoch
     }
 
     /// Releases the leased slot. The slot only returns to the freelist after
@@ -89,25 +131,26 @@ impl BackendSlotLease {
         }
 
         let slot = unsafe { self.region.slot_view_unchecked(self.slot_id) };
-        if slot.slot_generation.load(Ordering::Acquire) != self.generation {
+        if slot.slot_generation.load(Ordering::Acquire) != self.incarnation.generation {
             self.active = false;
             return;
         }
-        if slot.owner_mask.load(Ordering::Acquire) & OWNER_BACKEND == 0 {
+        if !SlotMeta::from_raw(slot.slot_meta.load(Ordering::Acquire)).has_backend_owner() {
             self.active = false;
             return;
         }
 
-        let previous = slot.owner_mask.fetch_and(!OWNER_BACKEND, Ordering::AcqRel);
-        if previous & OWNER_BACKEND == 0 {
+        let mutation =
+            self.region
+                .clear_owner_bits_if_matching(slot, self.incarnation, OWNER_BACKEND);
+        if !mutation.changed() {
             self.active = false;
             return;
         }
 
         slot.backend_pid.store(0, Ordering::Release);
-        if previous & !OWNER_BACKEND == 0 {
-            let _ = self.region.try_finalize_slot(self.slot_id, self.generation);
-        }
+        self.region
+            .finalize_if_ownerless(self.slot_id, self.incarnation, mutation);
         self.active = false;
     }
 
@@ -165,10 +208,18 @@ impl TransportRegion {
 
 impl<'lease, 'region> BackendTx<'lease, 'region> {
     /// Copies one frame into the backend-to-worker ring.
+    ///
+    /// A post-send lease validation error does not imply that the frame was
+    /// rolled back; the payload may already be published locally and later be
+    /// treated as lost traffic by higher layers.
     pub fn send_frame(&mut self, payload: &[u8]) -> Result<super::CommitOutcome, BackendTxError> {
         self.lease
             .region
-            .validate_lease(self.lease.slot_id, self.lease.generation, self.lease.active)
+            .validate_lease(
+                self.lease.slot_id,
+                self.lease.incarnation,
+                self.lease.active,
+            )
             .map_err(BackendTxError::Lease)?;
         let outcome = self
             .inner
@@ -176,7 +227,11 @@ impl<'lease, 'region> BackendTx<'lease, 'region> {
             .map_err(BackendTxError::Ring)?;
         self.lease
             .region
-            .validate_lease(self.lease.slot_id, self.lease.generation, self.lease.active)
+            .validate_lease(
+                self.lease.slot_id,
+                self.lease.incarnation,
+                self.lease.active,
+            )
             .map_err(BackendTxError::Lease)?;
         Ok(outcome)
     }
@@ -187,7 +242,11 @@ impl<'lease, 'region> BackendRx<'lease, 'region> {
     pub fn recv_frame_into(&mut self, dst: &mut [u8]) -> Result<Option<usize>, BackendRxError> {
         self.lease
             .region
-            .validate_lease(self.lease.slot_id, self.lease.generation, self.lease.active)
+            .validate_lease(
+                self.lease.slot_id,
+                self.lease.incarnation,
+                self.lease.active,
+            )
             .map_err(BackendRxError::Lease)?;
         let received = self
             .inner
@@ -195,7 +254,11 @@ impl<'lease, 'region> BackendRx<'lease, 'region> {
             .map_err(BackendRxError::Ring)?;
         self.lease
             .region
-            .validate_lease(self.lease.slot_id, self.lease.generation, self.lease.active)
+            .validate_lease(
+                self.lease.slot_id,
+                self.lease.incarnation,
+                self.lease.active,
+            )
             .map_err(BackendRxError::Lease)?;
         Ok(received)
     }

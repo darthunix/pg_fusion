@@ -2,6 +2,8 @@ use std::error::Error;
 use std::fmt;
 use std::io;
 
+use crate::region::TransportRegionLayout;
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ConfigError {
     ZeroSlotCount,
@@ -15,6 +17,21 @@ pub enum InitError {
     InvalidConfig(ConfigError),
     RegionTooSmall { expected: usize, actual: usize },
     BadAlignment { expected: usize, actual: usize },
+    AlreadyInitialized,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ReinitError {
+    InvalidExistingRegion(AttachError),
+    LayoutMismatch {
+        existing: TransportRegionLayout,
+        requested: TransportRegionLayout,
+    },
+    BackendProbeFailed {
+        slot_id: u32,
+        error_kind: io::ErrorKind,
+        raw_os_error: Option<i32>,
+    },
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -30,6 +47,11 @@ pub enum AttachError {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum AcquireError {
     WorkerOffline,
+    BackendProbeFailed {
+        slot_id: u32,
+        error_kind: io::ErrorKind,
+        raw_os_error: Option<i32>,
+    },
     Empty,
 }
 
@@ -39,11 +61,25 @@ pub enum WorkerLifecycleError {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum WorkerAttachError {
+    RegionAlreadyAttached {
+        existing_region_key: usize,
+        requested_region_key: usize,
+    },
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum LeaseError {
     StaleGeneration {
         slot_id: u32,
         claimed_generation: u64,
         current_generation: u64,
+    },
+    StaleLeaseEpoch {
+        slot_id: u32,
+        claimed_generation: u64,
+        claimed_lease_epoch: u64,
+        current_lease_epoch: u64,
     },
     Released {
         slot_id: u32,
@@ -66,6 +102,18 @@ pub enum SlotAccessError {
         slot_id: u32,
         claimed_generation: u64,
         current_generation: u64,
+    },
+    StaleLeaseEpoch {
+        slot_id: u32,
+        claimed_generation: u64,
+        claimed_lease_epoch: u64,
+        current_lease_epoch: u64,
+    },
+    BackendProbeFailed {
+        slot_id: u32,
+        claimed_generation: u64,
+        error_kind: io::ErrorKind,
+        raw_os_error: Option<i32>,
     },
     Released {
         slot_id: u32,
@@ -162,6 +210,10 @@ impl fmt::Display for InitError {
                 f,
                 "control_transport region base 0x{actual:x} is not aligned to {expected} bytes"
             ),
+            Self::AlreadyInitialized => write!(
+                f,
+                "control_transport region is already initialized; use reinit_in_place() for same-layout reset"
+            ),
         }
     }
 }
@@ -171,6 +223,44 @@ impl Error for InitError {
         match self {
             Self::InvalidConfig(err) => Some(err),
             _ => None,
+        }
+    }
+}
+
+impl fmt::Display for ReinitError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::InvalidExistingRegion(err) => {
+                write!(f, "cannot reinitialize invalid control_transport region: {err}")
+            }
+            Self::LayoutMismatch { existing, requested } => write!(
+                f,
+                "control_transport reinit requires the same layout; existing slots={} b2w_cap={} w2b_cap={}, requested slots={} b2w_cap={} w2b_cap={}",
+                existing.slot_count(),
+                existing.backend_to_worker_capacity(),
+                existing.worker_to_backend_capacity(),
+                requested.slot_count(),
+                requested.backend_to_worker_capacity(),
+                requested.worker_to_backend_capacity(),
+            ),
+            Self::BackendProbeFailed {
+                slot_id,
+                error_kind,
+                raw_os_error,
+            } => write!(
+                f,
+                "control_transport reinit backend liveness probe failed for slot {slot_id}: {error_kind} (raw_os_error={raw_os_error:?})"
+            ),
+        }
+    }
+}
+
+impl Error for ReinitError {
+    fn source(&self) -> Option<&(dyn Error + 'static)> {
+        match self {
+            Self::InvalidExistingRegion(err) => Some(err),
+            Self::LayoutMismatch { .. } => None,
+            Self::BackendProbeFailed { .. } => None,
         }
     }
 }
@@ -216,12 +306,36 @@ impl fmt::Display for AcquireError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::WorkerOffline => write!(f, "control worker generation is not active"),
+            Self::BackendProbeFailed {
+                slot_id,
+                error_kind,
+                raw_os_error,
+            } => write!(
+                f,
+                "backend liveness probe failed while reaping slot {slot_id}: kind={error_kind}, raw_os_error={raw_os_error:?}"
+            ),
             Self::Empty => write!(f, "no backend transport slots are currently available"),
         }
     }
 }
 
 impl Error for AcquireError {}
+
+impl fmt::Display for WorkerAttachError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::RegionAlreadyAttached {
+                existing_region_key,
+                requested_region_key,
+            } => write!(
+                f,
+                "worker process already attached control_transport region 0x{existing_region_key:x}, cannot attach region 0x{requested_region_key:x}"
+            ),
+        }
+    }
+}
+
+impl Error for WorkerAttachError {}
 
 impl fmt::Display for WorkerLifecycleError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -246,6 +360,15 @@ impl fmt::Display for LeaseError {
             } => write!(
                 f,
                 "slot {slot_id} belongs to generation {claimed_generation}, but current generation is {current_generation}"
+            ),
+            Self::StaleLeaseEpoch {
+                slot_id,
+                claimed_generation,
+                claimed_lease_epoch,
+                current_lease_epoch,
+            } => write!(
+                f,
+                "slot {slot_id} from generation {claimed_generation} belongs to lease epoch {claimed_lease_epoch}, but current lease epoch is {current_lease_epoch}"
             ),
             Self::Released {
                 slot_id,
@@ -282,6 +405,24 @@ impl fmt::Display for SlotAccessError {
             } => write!(
                 f,
                 "slot {slot_id} handle claimed generation {claimed_generation}, but current generation is {current_generation}"
+            ),
+            Self::StaleLeaseEpoch {
+                slot_id,
+                claimed_generation,
+                claimed_lease_epoch,
+                current_lease_epoch,
+            } => write!(
+                f,
+                "slot {slot_id} handle from generation {claimed_generation} claimed lease epoch {claimed_lease_epoch}, but current lease epoch is {current_lease_epoch}"
+            ),
+            Self::BackendProbeFailed {
+                slot_id,
+                claimed_generation,
+                error_kind,
+                raw_os_error,
+            } => write!(
+                f,
+                "slot {slot_id} from generation {claimed_generation} could not probe backend liveness: kind={error_kind:?} raw_os_error={raw_os_error:?}"
             ),
             Self::Released {
                 slot_id,

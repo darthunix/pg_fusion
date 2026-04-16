@@ -1,11 +1,11 @@
 use crate::error::{NotifyError, RxError, TxError};
+use crate::process::signal_pid_usr1;
 use crate::CommitOutcome;
 use std::marker::PhantomData;
 use std::num::NonZeroU32;
 use std::ptr::NonNull;
 use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU32, Ordering};
 
-pub(crate) const WRAP_SENTINEL: u32 = u32::MAX;
 pub(crate) const FRAME_PREFIX_LEN: usize = std::mem::size_of::<u32>();
 pub(crate) const MIN_RING_CAPACITY: usize = FRAME_PREFIX_LEN + 1;
 
@@ -61,6 +61,46 @@ pub(crate) struct FramedRing<'a> {
     _marker: PhantomData<&'a mut [u8]>,
 }
 
+#[derive(Clone, Copy)]
+struct RingSnapshot {
+    head: u32,
+    tail: u32,
+    capacity: u32,
+}
+
+impl RingSnapshot {
+    fn is_empty(self) -> bool {
+        self.head == self.tail
+    }
+
+    fn used_bytes(self) -> usize {
+        if self.tail >= self.head {
+            (self.tail - self.head) as usize
+        } else {
+            (self.capacity - (self.head - self.tail)) as usize
+        }
+    }
+
+    fn available_bytes(self) -> usize {
+        self.capacity as usize - self.used_bytes() - 1
+    }
+}
+
+#[derive(Clone, Copy)]
+struct PublishPlan {
+    payload_start: u32,
+    publish_tail: u32,
+    prefix_index: u32,
+    prefix_value: u32,
+}
+
+#[derive(Clone, Copy)]
+struct ConsumePlan {
+    len: u32,
+    payload_start: u32,
+    next_head: u32,
+}
+
 impl<'a> FramedRing<'a> {
     pub(crate) unsafe fn init_empty_in_place(base: *mut u8, layout: FramedRingLayout) {
         std::ptr::write(
@@ -104,14 +144,12 @@ impl<'a> FramedRing<'a> {
         self.capacity.get()
     }
 
-    pub(crate) fn send_frame(
-        &mut self,
-        ready_flag: &AtomicBool,
-        peer_pid: &AtomicI32,
-        payload: &[u8],
-    ) -> Result<CommitOutcome, TxError> {
-        let payload_len = payload.len();
-        let max_payload = self.capacity() as usize - FRAME_PREFIX_LEN - 1;
+    fn build_publish_plan(
+        &self,
+        snapshot: RingSnapshot,
+        payload_len: usize,
+    ) -> Result<PublishPlan, TxError> {
+        let max_payload = snapshot.capacity as usize - FRAME_PREFIX_LEN - 1;
         if payload_len > max_payload {
             return Err(TxError::PayloadTooLarge {
                 actual: payload_len,
@@ -119,9 +157,8 @@ impl<'a> FramedRing<'a> {
             });
         }
 
-        let (head, tail) = self.head_tail_checked()?;
         let required = FRAME_PREFIX_LEN + payload_len;
-        let available = self.available_bytes(head, tail);
+        let available = snapshot.available_bytes();
         if required > available {
             return Err(TxError::Full {
                 required,
@@ -129,46 +166,67 @@ impl<'a> FramedRing<'a> {
             });
         }
 
-        let capacity = self.capacity();
-        let payload_len_u32 = payload_len as u32;
-        let publish_tail;
-        let payload_start;
-        let tail_remaining = (capacity - tail) as usize;
+        Ok(PublishPlan {
+            prefix_index: snapshot.tail,
+            prefix_value: payload_len as u32,
+            payload_start: wrap_index(snapshot.tail + FRAME_PREFIX_LEN as u32, snapshot.capacity),
+            publish_tail: wrap_index(snapshot.tail + required as u32, snapshot.capacity),
+        })
+    }
 
-        if head <= tail {
-            if required <= tail_remaining {
-                write_u32(self.data, tail, capacity, payload_len_u32);
-                payload_start = wrap_index(tail + FRAME_PREFIX_LEN as u32, capacity);
-                publish_tail = wrap_index(tail + required as u32, capacity);
-            } else if required <= head.saturating_sub(1) as usize {
-                if tail_remaining >= FRAME_PREFIX_LEN {
-                    write_u32(self.data, tail, capacity, WRAP_SENTINEL);
-                }
-                write_u32(self.data, 0, capacity, payload_len_u32);
-                payload_start = FRAME_PREFIX_LEN as u32;
-                publish_tail = required as u32;
-            } else {
-                return Err(TxError::Full {
-                    required,
+    fn build_consume_plan(
+        &self,
+        snapshot: RingSnapshot,
+        dst_len: usize,
+    ) -> Result<ConsumePlan, RxError> {
+        let len = read_u32_wrapped(self.data, snapshot.head, snapshot.capacity);
+        let available = snapshot.used_bytes();
+        let frame_len =
+            FRAME_PREFIX_LEN
+                .checked_add(len as usize)
+                .ok_or(RxError::CorruptFrameLen {
+                    len,
                     available,
-                });
-            }
-        } else {
-            let contiguous = head - tail - 1;
-            if required > contiguous as usize {
-                return Err(TxError::Full {
-                    required,
-                    available: contiguous as usize,
-                });
-            }
-            write_u32(self.data, tail, capacity, payload_len_u32);
-            payload_start = tail + FRAME_PREFIX_LEN as u32;
-            publish_tail = tail + required as u32;
+                    capacity: snapshot.capacity,
+                })?;
+        if frame_len > available {
+            return Err(RxError::CorruptFrameLen {
+                len,
+                available,
+                capacity: snapshot.capacity,
+            });
         }
 
-        copy_into_ring(self.data, payload_start, payload);
-        self.tail
-            .store(wrap_index(publish_tail, capacity), Ordering::Release);
+        if len as usize > dst_len {
+            return Err(RxError::BufferTooSmall {
+                required: len as usize,
+                available: dst_len,
+            });
+        }
+
+        Ok(ConsumePlan {
+            len,
+            payload_start: wrap_index(snapshot.head + FRAME_PREFIX_LEN as u32, snapshot.capacity),
+            next_head: wrap_index(snapshot.head + frame_len as u32, snapshot.capacity),
+        })
+    }
+
+    pub(crate) fn send_frame(
+        &mut self,
+        ready_flag: &AtomicBool,
+        peer_pid: &AtomicI32,
+        payload: &[u8],
+    ) -> Result<CommitOutcome, TxError> {
+        let snapshot = self.head_tail_checked()?;
+        let plan = self.build_publish_plan(snapshot, payload.len())?;
+        write_u32_wrapped(
+            self.data,
+            plan.prefix_index,
+            snapshot.capacity,
+            plan.prefix_value,
+        );
+        write_bytes_wrapped(self.data, plan.payload_start, snapshot.capacity, payload);
+        self.tail.store(plan.publish_tail, Ordering::Release);
         ready_flag.store(true, Ordering::Release);
 
         let outcome = match signal_peer(peer_pid) {
@@ -184,71 +242,24 @@ impl<'a> FramedRing<'a> {
         ready_flag: &AtomicBool,
         dst: &mut [u8],
     ) -> Result<Option<usize>, RxError> {
-        let capacity = self.capacity();
-        let (mut head, tail) = self.head_tail_checked_rx()?;
-        if head == tail {
+        let snapshot = self.head_tail_checked_rx()?;
+        if snapshot.is_empty() {
             return Ok(None);
         }
 
-        if tail < head {
-            let tail_remaining = capacity - head;
-            let needs_wrap = tail_remaining < FRAME_PREFIX_LEN as u32
-                || read_u32(self.data, head, capacity) == WRAP_SENTINEL;
-            if needs_wrap {
-                head = 0;
-                self.head.store(0, Ordering::Release);
-            }
-        } else if read_u32(self.data, head, capacity) == WRAP_SENTINEL {
-            head = 0;
-            self.head.store(0, Ordering::Release);
-        }
+        let plan = self.build_consume_plan(snapshot, dst.len())?;
+        read_bytes_wrapped(
+            self.data,
+            plan.payload_start,
+            snapshot.capacity,
+            &mut dst[..plan.len as usize],
+        );
 
-        let len = read_u32(self.data, head, capacity);
-        if len == WRAP_SENTINEL {
-            return Err(RxError::CorruptFrameLen {
-                len,
-                available: 0,
-                capacity,
-            });
+        self.head.store(plan.next_head, Ordering::Release);
+        if plan.next_head == snapshot.tail {
+            self.update_ready_after_consume(plan.next_head, ready_flag);
         }
-
-        let available = if tail >= head {
-            (tail - head) as usize
-        } else {
-            (capacity - head) as usize
-        };
-        let frame_len =
-            FRAME_PREFIX_LEN
-                .checked_add(len as usize)
-                .ok_or(RxError::CorruptFrameLen {
-                    len,
-                    available,
-                    capacity,
-                })?;
-        if frame_len > available {
-            return Err(RxError::CorruptFrameLen {
-                len,
-                available,
-                capacity,
-            });
-        }
-
-        if len as usize > dst.len() {
-            return Err(RxError::BufferTooSmall {
-                required: len as usize,
-                available: dst.len(),
-            });
-        }
-
-        let payload_start = head + FRAME_PREFIX_LEN as u32;
-        copy_from_ring(self.data, payload_start, &mut dst[..len as usize]);
-
-        let next_head = wrap_index(head + frame_len as u32, capacity);
-        self.head.store(next_head, Ordering::Release);
-        if next_head == tail {
-            self.update_ready_after_consume(next_head, ready_flag);
-        }
-        Ok(Some(len as usize))
+        Ok(Some(plan.len as usize))
     }
 
     fn update_ready_after_consume(&self, next_head: u32, ready_flag: &AtomicBool) {
@@ -266,7 +277,7 @@ impl<'a> FramedRing<'a> {
     }
 
     #[inline]
-    fn head_tail_checked(&self) -> Result<(u32, u32), TxError> {
+    fn head_tail_checked(&self) -> Result<RingSnapshot, TxError> {
         let head = self.head.load(Ordering::Acquire);
         let tail = self.tail.load(Ordering::Acquire);
         let capacity = self.capacity();
@@ -277,11 +288,15 @@ impl<'a> FramedRing<'a> {
                 capacity,
             });
         }
-        Ok((head, tail))
+        Ok(RingSnapshot {
+            head,
+            tail,
+            capacity,
+        })
     }
 
     #[inline]
-    fn head_tail_checked_rx(&self) -> Result<(u32, u32), RxError> {
+    fn head_tail_checked_rx(&self) -> Result<RingSnapshot, RxError> {
         let head = self.head.load(Ordering::Acquire);
         let tail = self.tail.load(Ordering::Acquire);
         let capacity = self.capacity();
@@ -292,44 +307,16 @@ impl<'a> FramedRing<'a> {
                 capacity,
             });
         }
-        Ok((head, tail))
-    }
-
-    #[inline]
-    fn available_bytes(&self, head: u32, tail: u32) -> usize {
-        let capacity = self.capacity();
-        let used = if tail >= head {
-            tail - head
-        } else {
-            capacity - (head - tail)
-        };
-        (capacity - used - 1) as usize
+        Ok(RingSnapshot {
+            head,
+            tail,
+            capacity,
+        })
     }
 }
 
 pub(crate) fn signal_peer(peer_pid: &AtomicI32) -> Result<bool, NotifyError> {
-    let pid = peer_pid.load(Ordering::Acquire);
-    if pid <= 0 {
-        return Ok(false);
-    }
-
-    #[cfg(unix)]
-    {
-        let rc = unsafe { libc::kill(pid as libc::pid_t, libc::SIGUSR1) };
-        if rc == -1 {
-            return Err(NotifyError::Signal(std::io::Error::last_os_error()));
-        }
-        Ok(true)
-    }
-
-    #[cfg(not(unix))]
-    {
-        let _ = pid;
-        Err(NotifyError::Signal(std::io::Error::new(
-            std::io::ErrorKind::Unsupported,
-            "signals are unsupported on this platform",
-        )))
-    }
+    signal_pid_usr1(peer_pid.load(Ordering::Acquire))
 }
 
 #[inline]
@@ -341,49 +328,53 @@ fn wrap_index(idx: u32, capacity: u32) -> u32 {
     }
 }
 
-fn write_u32(data: NonNull<u8>, index: u32, capacity: u32, value: u32) {
+fn write_u32_wrapped(data: NonNull<u8>, index: u32, capacity: u32, value: u32) {
     debug_assert!(index < capacity);
-    debug_assert!((capacity - index) as usize >= FRAME_PREFIX_LEN);
     let bytes = value.to_ne_bytes();
-    unsafe {
-        std::ptr::copy_nonoverlapping(
-            bytes.as_ptr(),
-            data.as_ptr().add(index as usize),
-            FRAME_PREFIX_LEN,
-        );
-    }
+    write_bytes_wrapped(data, index, capacity, &bytes);
 }
 
-fn read_u32(data: NonNull<u8>, index: u32, capacity: u32) -> u32 {
+fn read_u32_wrapped(data: NonNull<u8>, index: u32, capacity: u32) -> u32 {
     debug_assert!(index < capacity);
-    debug_assert!((capacity - index) as usize >= FRAME_PREFIX_LEN);
     let mut bytes = [0u8; FRAME_PREFIX_LEN];
-    unsafe {
-        std::ptr::copy_nonoverlapping(
-            data.as_ptr().add(index as usize),
-            bytes.as_mut_ptr(),
-            FRAME_PREFIX_LEN,
-        );
-    }
+    read_bytes_wrapped(data, index, capacity, &mut bytes);
     u32::from_ne_bytes(bytes)
 }
 
-fn copy_into_ring(data: NonNull<u8>, start: u32, payload: &[u8]) {
+fn write_bytes_wrapped(data: NonNull<u8>, start: u32, capacity: u32, src: &[u8]) {
+    debug_assert!(start < capacity);
+    if src.is_empty() {
+        return;
+    }
+
+    let first = src.len().min((capacity - start) as usize);
     unsafe {
-        std::ptr::copy_nonoverlapping(
-            payload.as_ptr(),
-            data.as_ptr().add(start as usize),
-            payload.len(),
-        );
+        std::ptr::copy_nonoverlapping(src.as_ptr(), data.as_ptr().add(start as usize), first);
+        if src.len() > first {
+            std::ptr::copy_nonoverlapping(
+                src.as_ptr().add(first),
+                data.as_ptr(),
+                src.len() - first,
+            );
+        }
     }
 }
 
-fn copy_from_ring(data: NonNull<u8>, start: u32, dst: &mut [u8]) {
+fn read_bytes_wrapped(data: NonNull<u8>, start: u32, capacity: u32, dst: &mut [u8]) {
+    debug_assert!(start < capacity);
+    if dst.is_empty() {
+        return;
+    }
+
+    let first = dst.len().min((capacity - start) as usize);
     unsafe {
-        std::ptr::copy_nonoverlapping(
-            data.as_ptr().add(start as usize),
-            dst.as_mut_ptr(),
-            dst.len(),
-        );
+        std::ptr::copy_nonoverlapping(data.as_ptr().add(start as usize), dst.as_mut_ptr(), first);
+        if dst.len() > first {
+            std::ptr::copy_nonoverlapping(
+                data.as_ptr(),
+                dst.as_mut_ptr().add(first),
+                dst.len() - first,
+            );
+        }
     }
 }

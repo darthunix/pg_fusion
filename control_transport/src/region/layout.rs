@@ -1,13 +1,13 @@
 use super::{
-    TransportRegion, TransportRegionLayout, CONTROL_TRANSPORT_MAGIC, CONTROL_TRANSPORT_VERSION,
-    LEASE_STATE_FREE, WORKER_STATE_OFFLINE,
+    RegionMeta, SlotMeta, TransportRegion, TransportRegionLayout, CONTROL_TRANSPORT_MAGIC,
+    CONTROL_TRANSPORT_VERSION,
 };
 use crate::error::{AttachError, ConfigError};
 use crate::ring::{framed_ring_layout, FramedRing, FramedRingLayout};
 use lockfree::{treiber_stack_layout, treiber_stack_ptrs, StackLayout, TreiberStack};
 use std::alloc::Layout;
 use std::ptr::NonNull;
-use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU32, AtomicU64};
+use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU64};
 
 #[repr(C)]
 pub(super) struct RegionHeader {
@@ -26,9 +26,8 @@ pub(super) struct SlotComputedLayout {
     pub(super) worker_to_backend_offset: usize,
     pub(super) to_worker_ready_offset: usize,
     pub(super) to_backend_ready_offset: usize,
-    pub(super) lease_state_offset: usize,
     pub(super) slot_generation_offset: usize,
-    pub(super) owner_mask_offset: usize,
+    pub(super) slot_meta_offset: usize,
     pub(super) backend_pid_offset: usize,
     pub(super) backend_to_worker_layout: FramedRingLayout,
     pub(super) worker_to_backend_layout: FramedRingLayout,
@@ -37,8 +36,9 @@ pub(super) struct SlotComputedLayout {
 #[derive(Clone, Copy, Debug)]
 pub(super) struct ComputedLayout {
     pub(super) region: Layout,
-    pub(super) region_generation_offset: usize,
-    pub(super) worker_state_offset: usize,
+    pub(super) region_meta_offset: usize,
+    pub(super) next_lease_epoch_offset: usize,
+    pub(super) freelist_epoch_offset: usize,
     pub(super) worker_pid_offset: usize,
     pub(super) freelist_offset: usize,
     pub(super) slots_offset: usize,
@@ -55,18 +55,25 @@ pub(super) fn build_handle(
     let base_ptr = base.as_ptr();
     TransportRegion {
         base,
-        region_generation: unsafe {
+        region_meta: unsafe {
             NonNull::new_unchecked(
                 base_ptr
-                    .add(computed.region_generation_offset)
+                    .add(computed.region_meta_offset)
                     .cast::<AtomicU64>(),
             )
         },
-        worker_state: unsafe {
+        next_lease_epoch: unsafe {
             NonNull::new_unchecked(
                 base_ptr
-                    .add(computed.worker_state_offset)
-                    .cast::<AtomicU32>(),
+                    .add(computed.next_lease_epoch_offset)
+                    .cast::<AtomicU64>(),
+            )
+        },
+        freelist_epoch: unsafe {
+            NonNull::new_unchecked(
+                base_ptr
+                    .add(computed.freelist_epoch_offset)
+                    .cast::<AtomicU64>(),
             )
         },
         worker_pid: unsafe {
@@ -117,16 +124,12 @@ fn init_slot(base: *mut u8, layout: SlotComputedLayout) {
             AtomicBool::new(false),
         );
         std::ptr::write(
-            base.add(layout.lease_state_offset).cast::<AtomicU32>(),
-            AtomicU32::new(LEASE_STATE_FREE),
-        );
-        std::ptr::write(
             base.add(layout.slot_generation_offset).cast::<AtomicU64>(),
             AtomicU64::new(0),
         );
         std::ptr::write(
-            base.add(layout.owner_mask_offset).cast::<AtomicU32>(),
-            AtomicU32::new(0),
+            base.add(layout.slot_meta_offset).cast::<AtomicU64>(),
+            AtomicU64::new(SlotMeta::free_published(1).raw()),
         );
         std::ptr::write(
             base.add(layout.backend_pid_offset).cast::<AtomicI32>(),
@@ -151,17 +154,21 @@ pub(super) fn compute_layout(
         treiber_stack_layout(slot_count as usize).map_err(|_| ConfigError::LayoutOverflow)?;
 
     let header = Layout::new::<RegionHeader>();
-    let region_generation = Layout::new::<AtomicU64>();
-    let worker_state = Layout::new::<AtomicU32>();
+    let region_meta = Layout::new::<AtomicU64>();
+    let next_lease_epoch = Layout::new::<AtomicU64>();
+    let freelist_epoch = Layout::new::<AtomicU64>();
     let worker_pid = Layout::new::<AtomicI32>();
 
-    let (hg, region_generation_offset) = header
-        .extend(region_generation)
+    let (hg, region_meta_offset) = header
+        .extend(region_meta)
         .map_err(|_| ConfigError::LayoutOverflow)?;
-    let (hgs, worker_state_offset) = hg
-        .extend(worker_state)
+    let (hgn, next_lease_epoch_offset) = hg
+        .extend(next_lease_epoch)
         .map_err(|_| ConfigError::LayoutOverflow)?;
-    let (hgsp, worker_pid_offset) = hgs
+    let (hgne, freelist_epoch_offset) = hgn
+        .extend(freelist_epoch)
+        .map_err(|_| ConfigError::LayoutOverflow)?;
+    let (hgsp, worker_pid_offset) = hgne
         .extend(worker_pid)
         .map_err(|_| ConfigError::LayoutOverflow)?;
     let (hgspf, freelist_offset) = hgsp
@@ -173,8 +180,9 @@ pub(super) fn compute_layout(
 
     Ok(ComputedLayout {
         region: region.pad_to_align(),
-        region_generation_offset,
-        worker_state_offset,
+        region_meta_offset,
+        next_lease_epoch_offset,
+        freelist_epoch_offset,
         worker_pid_offset,
         freelist_offset,
         slots_offset,
@@ -191,9 +199,8 @@ fn compute_slot_layout(
     let backend_to_worker_layout = framed_ring_layout(backend_to_worker_cap)?;
     let worker_to_backend_layout = framed_ring_layout(worker_to_backend_cap)?;
     let ready = Layout::new::<AtomicBool>();
-    let lease_state = Layout::new::<AtomicU32>();
     let slot_generation = Layout::new::<AtomicU64>();
-    let owner_mask = Layout::new::<AtomicU32>();
+    let slot_meta = Layout::new::<AtomicU64>();
     let backend_pid = Layout::new::<AtomicI32>();
 
     let (rings, worker_to_backend_offset) = backend_to_worker_layout
@@ -206,16 +213,13 @@ fn compute_slot_layout(
     let (rings_ready2, to_backend_ready_offset) = rings_ready1
         .extend(ready)
         .map_err(|_| ConfigError::LayoutOverflow)?;
-    let (with_state, lease_state_offset) = rings_ready2
-        .extend(lease_state)
-        .map_err(|_| ConfigError::LayoutOverflow)?;
-    let (with_generation, slot_generation_offset) = with_state
+    let (with_generation, slot_generation_offset) = rings_ready2
         .extend(slot_generation)
         .map_err(|_| ConfigError::LayoutOverflow)?;
-    let (with_owner, owner_mask_offset) = with_generation
-        .extend(owner_mask)
+    let (with_meta, slot_meta_offset) = with_generation
+        .extend(slot_meta)
         .map_err(|_| ConfigError::LayoutOverflow)?;
-    let (layout, backend_pid_offset) = with_owner
+    let (layout, backend_pid_offset) = with_meta
         .extend(backend_pid)
         .map_err(|_| ConfigError::LayoutOverflow)?;
 
@@ -225,9 +229,8 @@ fn compute_slot_layout(
         worker_to_backend_offset,
         to_worker_ready_offset,
         to_backend_ready_offset,
-        lease_state_offset,
         slot_generation_offset,
-        owner_mask_offset,
+        slot_meta_offset,
         backend_pid_offset,
         backend_to_worker_layout,
         worker_to_backend_layout,
@@ -317,13 +320,17 @@ pub(super) fn validate_attached_header(
 pub(super) fn init_global_cells(base: *mut u8, computed: ComputedLayout) {
     unsafe {
         std::ptr::write(
-            base.add(computed.region_generation_offset)
-                .cast::<AtomicU64>(),
-            AtomicU64::new(0),
+            base.add(computed.region_meta_offset).cast::<AtomicU64>(),
+            AtomicU64::new(RegionMeta::OFFLINE.raw()),
         );
         std::ptr::write(
-            base.add(computed.worker_state_offset).cast::<AtomicU32>(),
-            AtomicU32::new(WORKER_STATE_OFFLINE),
+            base.add(computed.next_lease_epoch_offset)
+                .cast::<AtomicU64>(),
+            AtomicU64::new(1),
+        );
+        std::ptr::write(
+            base.add(computed.freelist_epoch_offset).cast::<AtomicU64>(),
+            AtomicU64::new(1),
         );
         std::ptr::write(
             base.add(computed.worker_pid_offset).cast::<AtomicI32>(),
