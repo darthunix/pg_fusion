@@ -36,6 +36,8 @@ slot_encoder = { path = "../../pg/slot_encoder", version = "25.0" }
 slot_import = { path = "../../pg/slot_import", version = "25.0" }
 scan_sql = { path = "../../pg/scan_sql", version = "25.0" }
 slot_scan = { path = "../../pg/slot_scan", version = "25.0" }
+row_estimator = { path = "../../page/row_estimator", version = "25.0" }
+row_estimator_seed = { path = "../../pg/row_estimator_seed", version = "25.0" }
 arrow-array = { workspace = true }
 arrow-schema = { workspace = true }
 serde_json = "1.0"

@@ -12,6 +12,8 @@ mod plan_builder;
 #[cfg(any(test, feature = "pg_test"))]
 mod plan_codec;
 #[cfg(any(test, feature = "pg_test"))]
+mod row_estimator_seed;
+#[cfg(any(test, feature = "pg_test"))]
 mod slot_deform_bench;
 #[cfg(any(test, feature = "pg_test"))]
 mod slot_import;
@@ -316,6 +318,46 @@ mod tests {
     #[pg_test]
     fn df_catalog_rejects_timetz_columns() {
         super::df_catalog::df_catalog_rejects_timetz_columns();
+    }
+
+    #[pg_test]
+    fn row_estimator_seed_uses_sum_of_text_and_bytea_widths() {
+        super::row_estimator_seed::row_estimator_seed_uses_sum_of_text_and_bytea_widths();
+    }
+
+    #[pg_test]
+    fn row_estimator_seed_ignores_fixed_width_columns() {
+        super::row_estimator_seed::row_estimator_seed_ignores_fixed_width_columns();
+    }
+
+    #[pg_test]
+    fn row_estimator_seed_preserves_default_without_stats() {
+        super::row_estimator_seed::row_estimator_seed_preserves_default_without_stats();
+    }
+
+    #[pg_test]
+    fn row_estimator_seed_preserves_default_for_synthetic_columns() {
+        super::row_estimator_seed::row_estimator_seed_preserves_default_for_synthetic_columns();
+    }
+
+    #[pg_test]
+    fn row_estimator_seed_name_columns_preserve_default() {
+        super::row_estimator_seed::row_estimator_seed_name_columns_preserve_default();
+    }
+
+    #[pg_test]
+    fn row_estimator_seed_partitioned_parent_uses_inherited_stats() {
+        super::row_estimator_seed::row_estimator_seed_prefers_inherited_stats_for_partitioned_parent();
+    }
+
+    #[pg_test]
+    fn row_estimator_seed_reports_missing_attribute() {
+        super::row_estimator_seed::row_estimator_seed_reports_missing_attribute();
+    }
+
+    #[pg_test]
+    fn row_estimator_seed_reports_type_mismatch() {
+        super::row_estimator_seed::row_estimator_seed_reports_type_mismatch();
     }
 
     #[pg_test]

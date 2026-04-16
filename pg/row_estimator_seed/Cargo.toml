@@ -1,0 +1,20 @@
+[package]
+name = "row_estimator_seed"
+version = "25.0.0"
+edition = "2021"
+description = "PostgreSQL statistics seed bridge for row_estimator"
+readme = "README.md"
+
+[lib]
+crate-type = ["lib"]
+doctest = false
+
+[features]
+default = ["pg17"]
+pg17 = ["pgrx/pg17"]
+
+[dependencies]
+arrow_layout = { path = "../../page/arrow_layout", version = "25.0" }
+pgrx = { workspace = true }
+row_estimator = { path = "../../page/row_estimator", version = "25.0" }
+thiserror = "2.0"

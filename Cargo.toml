@@ -15,6 +15,7 @@ members = [
   "page/scan_flow",
   "pg/df_catalog",
   "pg/plan_builder",
+  "pg/row_estimator_seed",
   "pg/scan_node",
   "pg/scan_sql",
   "pg/slot_scan",
