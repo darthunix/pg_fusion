@@ -1,0 +1,147 @@
+# `backend_service`
+
+`backend_service` is the PostgreSQL backend-side execution bridge for the new
+runtime stack.
+
+It owns the backend-local execution lifecycle:
+
+- build one logical plan with `plan_builder`
+- publish that plan to the worker through `plan_flow`
+- capture and hold the current PostgreSQL snapshot for the execution lifetime
+- precompute reusable `slot_scan::PreparedScan` handles for every leaf
+  `PgScanSpec`
+- seed one `PageRowEstimator` per scan with `row_estimator_seed`
+- serve worker `OpenScan` requests by running `slot_scan`, encoding rows with
+  `slot_encoder`, and streaming pages through `scan_flow`
+
+`backend_service` relies on `slot_scan`'s incremental cursor contract: a scan
+keeps a PostgreSQL portal alive across retries, but each page-building drain
+step reconnects to SPI only for that step. A `ScanStreamStep::Blocked` retry
+therefore does not strand a live `SPI_connect()` frame in the backend.
+
+The crate is intentionally backend-local:
+
+- it does not own shared-memory transport
+- it does not decode or execute plans on the worker
+- it does not expose a general-purpose SQL service
+- it does not implement explain via worker round-trips
+
+`backend_service` expects trusted execution inputs from higher layers. In
+particular, the SQL passed into `begin_execution()` is compiled and planned by
+the backend itself, and `scan_id` lookups are resolved only against the active
+execution registered in the current PostgreSQL backend process.
+
+## Lifecycle
+
+One execution moves through a narrow FSM:
+
+- `Idle`
+- `Starting`: plan publication is still in progress
+- `Running`: worker may open scans and terminal execution messages are accepted
+- `Terminal`: cleanup-only transition before returning to `Idle`
+
+The key contracts are:
+
+- only one active execution exists per backend process
+- every execution has an `ExecutionKey { slot_id, session_epoch }`
+- stale control messages are ignored by comparing `session_epoch` against the
+  current backend session
+- `FailExecution` and `CancelExecution` are accepted both while the execution
+  is still `Starting` and after it reaches `Running`
+- `CompleteExecution` is accepted only after plan publication has completed
+- a backend-observed fatal scan producer failure tears down the whole execution
+  immediately, so late worker `CompleteExecution` messages for that
+  `session_epoch` are ignored rather than overriding the failure
+
+## Snapshot Contract
+
+`ExecutionSnapshot` registers the current PostgreSQL active snapshot on the
+current resource owner and unregisters it on drop.
+
+This means:
+
+- `begin_execution()` requires an active PostgreSQL snapshot
+- the surrounding backend code must keep the matching resource-owner lifetime
+  valid for the whole execution
+- scan streaming runs under the saved snapshot, so worker `OpenScan` traffic
+  sees the same MVCC snapshot as execution start
+
+## Main API
+
+Typical backend flow:
+
+```rust,ignore
+use backend_service::{BackendService, StartExecutionInput};
+
+let begin = BackendService::begin_execution(StartExecutionInput {
+    slot_id,
+    sql,
+    params,
+    plan_tx,
+    config,
+})?;
+
+send_control(begin.control)?;
+
+loop {
+    match BackendService::step_execution_start()? {
+        plan_flow::BackendPlanStep::OutboundPage { outbound, .. } => {
+            send_plan_page(outbound)?;
+        }
+        plan_flow::BackendPlanStep::CloseFrame { frame, .. } => {
+            send_plan_close(frame)?;
+            break;
+        }
+        plan_flow::BackendPlanStep::Blocked { .. } => retry_later(),
+        plan_flow::BackendPlanStep::LogicalError { message, .. } => {
+            return Err(anyhow::anyhow!(message));
+        }
+    }
+}
+
+let key = BackendService::finalize_execution_start()?;
+assert_eq!(key, begin.key);
+```
+
+Typical worker-driven scan open:
+
+```rust,ignore
+use backend_service::{BackendService, OpenScanInput, ScanStreamStep};
+
+if BackendService::open_scan(OpenScanInput {
+    slot_id,
+    session_epoch,
+    scan_id,
+    scan,
+    scan_tx,
+})? {
+    loop {
+        match BackendService::step_scan()? {
+            ScanStreamStep::OutboundPage { outbound, .. } => send_scan_page(outbound)?,
+            ScanStreamStep::Blocked { .. } => retry_later(),
+            ScanStreamStep::Finished { .. } => break,
+            ScanStreamStep::Failed { message, .. } => {
+                // The execution has already been failed and cleaned up before
+                // this step is returned.
+                return Err(anyhow::anyhow!(message));
+            }
+        }
+    }
+}
+```
+
+Explain stays backend-local:
+
+- `BackendService::render_explain()` builds and renders the logical plan
+  directly in the backend
+- no active execution is registered
+- no worker or `plan_flow` / `scan_flow` interaction is involved
+
+## Non-goals
+
+- multiple concurrent executions in one backend process
+- multiple simultaneously streaming scans in one execution
+- worker-side snapshot ownership
+- general-purpose cancellation registry beyond the current process-local active
+  execution
+- integration with the legacy executor FSM

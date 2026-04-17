@@ -20,6 +20,10 @@ pub enum ScanError {
     /// scan.
     #[error("PostgreSQL error: {0}")]
     Postgres(String),
+    /// The caller attempted to drive a cursor after it had already been
+    /// closed.
+    #[error("scan cursor is already closed")]
+    CursorClosed,
     /// The user-provided slot sink returned an error.
     #[error("slot sink error: {0}")]
     Sink(#[from] SinkError),

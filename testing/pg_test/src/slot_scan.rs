@@ -1,8 +1,8 @@
 use pgrx::prelude::*;
 use scan_sql::{compile_scan, CompileScanInput, LimitLowering, PgRelation};
 use slot_scan::{
-    prepare_scan, ScanError, ScanOptions, ScanPlanKind, SinkError, SlotSink, SlotSinkAction,
-    SlotSinkContext, SlotSinkMethods,
+    prepare_scan, CursorDrainOutcome, CursorRowAction, ScanError, ScanOptions, ScanPlanKind,
+    SinkError, SlotSink, SlotSinkAction, SlotSinkContext, SlotSinkMethods,
 };
 use std::ffi::{c_void, CString};
 
@@ -23,11 +23,31 @@ struct CountSink {
     init_plan_kind: Option<ScanPlanKind>,
 }
 
+#[derive(Default)]
+struct FailingSink {
+    init_called: usize,
+    consume_called: usize,
+    finish_called: usize,
+    abort_called: usize,
+    fail_init_with_pg_error: bool,
+    fail_consume_with_pg_error_at: Option<usize>,
+    fail_consume_with_sink_error_at: Option<usize>,
+    fail_finish_with_pg_error: bool,
+    fail_abort_with_pg_error: bool,
+}
+
 static COUNT_SINK_METHODS: SlotSinkMethods = SlotSinkMethods {
     init: Some(count_sink_init),
     consume_slot: count_sink_consume_slot,
     finish: Some(count_sink_finish),
     abort: Some(count_sink_abort),
+};
+
+static FAILING_SINK_METHODS: SlotSinkMethods = SlotSinkMethods {
+    init: Some(failing_sink_init),
+    consume_slot: failing_sink_consume_slot,
+    finish: Some(failing_sink_finish),
+    abort: Some(failing_sink_abort),
 };
 
 unsafe fn count_sink_init(
@@ -72,6 +92,55 @@ unsafe fn count_sink_finish(
 unsafe fn count_sink_abort(_ctx: &mut SlotSinkContext, private: *mut c_void) {
     let state = &mut *(private as *mut CountSink);
     state.abort_called = true;
+}
+
+unsafe fn failing_sink_init(
+    _ctx: &mut SlotSinkContext,
+    private: *mut c_void,
+    _tuple_desc: pg_sys::TupleDesc,
+) -> Result<(), SinkError> {
+    let state = &mut *(private as *mut FailingSink);
+    state.init_called += 1;
+    if state.fail_init_with_pg_error {
+        pgrx::error!("slot_scan failing sink init pg error");
+    }
+    Ok(())
+}
+
+unsafe fn failing_sink_consume_slot(
+    _ctx: &mut SlotSinkContext,
+    private: *mut c_void,
+    _slot: *mut pg_sys::TupleTableSlot,
+) -> Result<SlotSinkAction, SinkError> {
+    let state = &mut *(private as *mut FailingSink);
+    state.consume_called += 1;
+    if state.fail_consume_with_pg_error_at == Some(state.consume_called) {
+        pgrx::error!("slot_scan failing sink consume pg error");
+    }
+    if state.fail_consume_with_sink_error_at == Some(state.consume_called) {
+        return Err(SinkError::new("slot_scan failing sink consume error"));
+    }
+    Ok(SlotSinkAction::Continue)
+}
+
+unsafe fn failing_sink_finish(
+    _ctx: &mut SlotSinkContext,
+    private: *mut c_void,
+) -> Result<(), SinkError> {
+    let state = &mut *(private as *mut FailingSink);
+    state.finish_called += 1;
+    if state.fail_finish_with_pg_error {
+        pgrx::error!("slot_scan failing sink finish pg error");
+    }
+    Ok(())
+}
+
+unsafe fn failing_sink_abort(_ctx: &mut SlotSinkContext, private: *mut c_void) {
+    let state = &mut *(private as *mut FailingSink);
+    state.abort_called += 1;
+    if state.fail_abort_with_pg_error {
+        pgrx::error!("slot_scan failing sink abort pg error");
+    }
 }
 
 fn reset_slot_scan_table(rows: usize) {
@@ -199,6 +268,19 @@ impl Drop for RegisteredSnapshot {
             pg_sys::UnregisterSnapshot(self.0);
         }
     }
+}
+
+unsafe fn read_int4_from_slot(slot: *mut pg_sys::TupleTableSlot, attr_index: usize) -> i32 {
+    pg_sys::slot_getallattrs(slot);
+    let values = (*slot).tts_values;
+    let isnull = (*slot).tts_isnull;
+    assert!(!values.is_null(), "slot values must exist");
+    assert!(!isnull.is_null(), "slot null flags must exist");
+    assert!(
+        !*isnull.add(attr_index),
+        "slot attribute {attr_index} unexpectedly NULL"
+    );
+    pg_sys::DatumGetInt32(*values.add(attr_index))
 }
 
 fn count_rows_with_snapshot(qualified: &str, snapshot: pg_sys::Snapshot) -> i64 {
@@ -488,6 +570,144 @@ pub fn slot_scan_run_uses_saved_plan_and_aborts_on_error() {
     assert!(sink.abort_called);
 }
 
+pub fn slot_scan_run_converts_init_pg_error_and_aborts_once() {
+    reset_slot_scan_table(8);
+    let _snapshot = unsafe { LatestSnapshotGuard::acquire() };
+
+    let prepared = prepare_scan(
+        &format!("SELECT id FROM {SLOT_SCAN_TABLE}"),
+        ScanOptions::default(),
+    )
+    .expect("prepare_scan");
+
+    let mut sink = FailingSink {
+        fail_init_with_pg_error: true,
+        ..Default::default()
+    };
+    let err = prepared
+        .run(SlotSink::new(&FAILING_SINK_METHODS, &mut sink))
+        .expect_err("init callback pg error should surface as ScanError");
+
+    match err {
+        ScanError::Postgres(message) => {
+            assert!(
+                message.contains("slot_scan failing sink init pg error"),
+                "unexpected message: {message}"
+            );
+        }
+        other => panic!("unexpected error: {other:?}"),
+    }
+
+    assert_eq!(sink.init_called, 1);
+    assert_eq!(sink.consume_called, 0);
+    assert_eq!(sink.finish_called, 0);
+    assert_eq!(sink.abort_called, 1);
+}
+
+pub fn slot_scan_run_converts_consume_pg_error_and_aborts_once() {
+    reset_slot_scan_table(8);
+    let _snapshot = unsafe { LatestSnapshotGuard::acquire() };
+
+    let prepared = prepare_scan(
+        &format!("SELECT id FROM {SLOT_SCAN_TABLE}"),
+        ScanOptions::default(),
+    )
+    .expect("prepare_scan");
+
+    let mut sink = FailingSink {
+        fail_consume_with_pg_error_at: Some(1),
+        ..Default::default()
+    };
+    let err = prepared
+        .run(SlotSink::new(&FAILING_SINK_METHODS, &mut sink))
+        .expect_err("consume callback pg error should surface as ScanError");
+
+    match err {
+        ScanError::Postgres(message) => {
+            assert!(
+                message.contains("slot_scan failing sink consume pg error"),
+                "unexpected message: {message}"
+            );
+        }
+        other => panic!("unexpected error: {other:?}"),
+    }
+
+    assert_eq!(sink.init_called, 1);
+    assert_eq!(sink.consume_called, 1);
+    assert_eq!(sink.finish_called, 0);
+    assert_eq!(sink.abort_called, 1);
+}
+
+pub fn slot_scan_run_converts_finish_pg_error_and_aborts_once() {
+    reset_slot_scan_table(8);
+    let _snapshot = unsafe { LatestSnapshotGuard::acquire() };
+
+    let prepared = prepare_scan(
+        &format!("SELECT id FROM {SLOT_SCAN_TABLE}"),
+        ScanOptions::default(),
+    )
+    .expect("prepare_scan");
+
+    let mut sink = FailingSink {
+        fail_finish_with_pg_error: true,
+        ..Default::default()
+    };
+    let err = prepared
+        .run(SlotSink::new(&FAILING_SINK_METHODS, &mut sink))
+        .expect_err("finish callback pg error should surface as ScanError");
+
+    match err {
+        ScanError::Postgres(message) => {
+            assert!(
+                message.contains("slot_scan failing sink finish pg error"),
+                "unexpected message: {message}"
+            );
+        }
+        other => panic!("unexpected error: {other:?}"),
+    }
+
+    assert_eq!(sink.init_called, 1);
+    assert!(sink.consume_called > 0);
+    assert_eq!(sink.finish_called, 1);
+    assert_eq!(sink.abort_called, 1);
+}
+
+pub fn slot_scan_run_preserves_primary_error_when_abort_raises_pg_error() {
+    reset_slot_scan_table(8);
+    let _snapshot = unsafe { LatestSnapshotGuard::acquire() };
+
+    let prepared = prepare_scan(
+        &format!("SELECT id FROM {SLOT_SCAN_TABLE}"),
+        ScanOptions::default(),
+    )
+    .expect("prepare_scan");
+
+    let mut sink = FailingSink {
+        fail_consume_with_sink_error_at: Some(1),
+        fail_abort_with_pg_error: true,
+        ..Default::default()
+    };
+    let err = prepared
+        .run(SlotSink::new(&FAILING_SINK_METHODS, &mut sink))
+        .expect_err("primary sink error should survive abort pg error");
+
+    match err {
+        ScanError::Sink(message) => {
+            assert_eq!(
+                message.to_string(),
+                "slot_scan failing sink consume error",
+                "abort pg error must not replace the primary sink error"
+            );
+        }
+        other => panic!("unexpected error: {other:?}"),
+    }
+
+    assert_eq!(sink.init_called, 1);
+    assert_eq!(sink.consume_called, 1);
+    assert_eq!(sink.finish_called, 0);
+    assert_eq!(sink.abort_called, 1);
+}
+
 pub fn slot_scan_run_revalidates_across_search_path_changes() {
     Spi::run("DROP SCHEMA IF EXISTS slot_scan_a CASCADE").unwrap();
     Spi::run("DROP SCHEMA IF EXISTS slot_scan_b CASCADE").unwrap();
@@ -580,6 +800,86 @@ pub fn slot_scan_reuses_active_snapshot_for_read_only_cursor() {
 
     assert_eq!(stats.rows_seen as i64, expected_rows);
     assert_eq!(sink.rows_seen as i64, expected_rows);
+}
+
+pub fn slot_scan_cursor_allows_spi_between_drain_steps() {
+    reset_slot_scan_table(3);
+    let _snapshot = unsafe { LatestSnapshotGuard::acquire() };
+
+    let prepared = prepare_scan(
+        &format!("SELECT id FROM {SLOT_SCAN_TABLE}"),
+        ScanOptions::default(),
+    )
+    .expect("prepare_scan");
+
+    let mut cursor = prepared.open_cursor().expect("open cursor");
+    let mut rows = Vec::new();
+    let first = cursor
+        .drain_rows::<ScanError, _>(|slot| {
+            rows.push(unsafe { read_int4_from_slot(slot, 0) });
+            Ok::<CursorRowAction, ScanError>(CursorRowAction::Stop)
+        })
+        .expect("drain first row");
+    assert_eq!(first, CursorDrainOutcome::Stopped);
+    assert_eq!(rows, vec![1]);
+
+    Spi::run("SELECT 1").unwrap();
+
+    let second = cursor
+        .drain_rows::<ScanError, _>(|slot| {
+            rows.push(unsafe { read_int4_from_slot(slot, 0) });
+            Ok::<CursorRowAction, ScanError>(CursorRowAction::Continue)
+        })
+        .expect("drain remaining rows");
+    assert_eq!(second, CursorDrainOutcome::Eof);
+    assert_eq!(rows, vec![1, 2, 3]);
+
+    let stats = cursor.close().expect("close cursor");
+    assert_eq!(stats.rows_seen, 3);
+}
+
+pub fn slot_scan_cursor_replays_unconsumed_row_between_drains() {
+    reset_slot_scan_table(3);
+    let _snapshot = unsafe { LatestSnapshotGuard::acquire() };
+
+    let prepared = prepare_scan(
+        &format!("SELECT id FROM {SLOT_SCAN_TABLE}"),
+        ScanOptions::default(),
+    )
+    .expect("prepare_scan");
+
+    let mut cursor = prepared.open_cursor().expect("open cursor");
+    let replay = cursor
+        .drain_rows::<ScanError, _>(|slot| {
+            assert_eq!(unsafe { read_int4_from_slot(slot, 0) }, 1);
+            Ok::<CursorRowAction, ScanError>(CursorRowAction::ReplayCurrentAndStop)
+        })
+        .expect("request replay");
+    assert_eq!(replay, CursorDrainOutcome::Stopped);
+    assert_eq!(cursor.rows_seen(), 0);
+
+    let mut consumed = Vec::new();
+    let second = cursor
+        .drain_rows::<ScanError, _>(|slot| {
+            consumed.push(unsafe { read_int4_from_slot(slot, 0) });
+            Ok::<CursorRowAction, ScanError>(CursorRowAction::Stop)
+        })
+        .expect("consume replayed row");
+    assert_eq!(second, CursorDrainOutcome::Stopped);
+    assert_eq!(consumed, vec![1]);
+    assert_eq!(cursor.rows_seen(), 1);
+
+    let final_outcome = cursor
+        .drain_rows::<ScanError, _>(|slot| {
+            consumed.push(unsafe { read_int4_from_slot(slot, 0) });
+            Ok::<CursorRowAction, ScanError>(CursorRowAction::Continue)
+        })
+        .expect("consume remaining rows");
+    assert_eq!(final_outcome, CursorDrainOutcome::Eof);
+    assert_eq!(consumed, vec![1, 2, 3]);
+
+    let stats = cursor.close().expect("close cursor");
+    assert_eq!(stats.rows_seen, 3);
 }
 
 pub fn slot_scan_planner_fetch_hint_reports_plan_kind() {

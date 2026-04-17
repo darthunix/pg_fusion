@@ -4,6 +4,8 @@ use pgrx::pg_schema;
 ::pgrx::pg_module_magic!();
 
 #[cfg(any(test, feature = "pg_test"))]
+mod backend_service;
+#[cfg(any(test, feature = "pg_test"))]
 mod df_catalog;
 #[cfg(any(test, feature = "pg_test"))]
 mod page_arrow_pipeline;
@@ -223,6 +225,36 @@ mod tests {
         rows: default!(i32, "100000"),
     ) -> pgrx::JsonB {
         super::slot_deform_bench::slot_deform_bench_prepare(profile, rows)
+    }
+
+    #[pg_test]
+    fn backend_service_streams_scan_under_saved_snapshot() {
+        super::backend_service::backend_service_streams_scan_under_saved_snapshot();
+    }
+
+    #[pg_test]
+    fn backend_service_blocked_retry_allows_spi_between_steps() {
+        super::backend_service::backend_service_blocked_retry_allows_spi_between_steps();
+    }
+
+    #[pg_test]
+    fn backend_service_stale_cancel_is_ignored_after_new_execution() {
+        super::backend_service::backend_service_stale_cancel_is_ignored_after_new_execution();
+    }
+
+    #[pg_test]
+    fn backend_service_cancel_during_stream_marks_scan_used() {
+        super::backend_service::backend_service_cancel_during_stream_marks_scan_used();
+    }
+
+    #[pg_test]
+    fn backend_service_rejects_descriptor_mismatch_cleanly() {
+        super::backend_service::backend_service_rejects_descriptor_mismatch_without_poisoning_execution();
+    }
+
+    #[pg_test]
+    fn backend_service_local_scan_failure_dominates_late_complete() {
+        super::backend_service::backend_service_local_scan_failure_dominates_late_complete();
     }
 
     #[pg_test]
@@ -509,6 +541,26 @@ mod tests {
     }
 
     #[pg_test]
+    fn slot_scan_run_converts_init_pg_error_and_aborts_once() {
+        super::slot_scan::slot_scan_run_converts_init_pg_error_and_aborts_once();
+    }
+
+    #[pg_test]
+    fn slot_scan_run_converts_consume_pg_error_and_aborts_once() {
+        super::slot_scan::slot_scan_run_converts_consume_pg_error_and_aborts_once();
+    }
+
+    #[pg_test]
+    fn slot_scan_run_converts_finish_pg_error_and_aborts_once() {
+        super::slot_scan::slot_scan_run_converts_finish_pg_error_and_aborts_once();
+    }
+
+    #[pg_test]
+    fn slot_scan_abort_pg_error_keeps_primary_error() {
+        super::slot_scan::slot_scan_run_preserves_primary_error_when_abort_raises_pg_error();
+    }
+
+    #[pg_test]
     fn slot_scan_run_revalidates_across_search_path_changes() {
         super::slot_scan::slot_scan_run_revalidates_across_search_path_changes();
     }
@@ -521,6 +573,16 @@ mod tests {
     #[pg_test]
     fn slot_scan_reuses_active_snapshot_for_read_only_cursor() {
         super::slot_scan::slot_scan_reuses_active_snapshot_for_read_only_cursor();
+    }
+
+    #[pg_test]
+    fn slot_scan_cursor_allows_spi_between_drain_steps() {
+        super::slot_scan::slot_scan_cursor_allows_spi_between_drain_steps();
+    }
+
+    #[pg_test]
+    fn slot_scan_cursor_replays_unconsumed_row_between_drains() {
+        super::slot_scan::slot_scan_cursor_replays_unconsumed_row_between_drains();
     }
 
     #[pg_test]

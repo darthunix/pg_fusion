@@ -1,0 +1,38 @@
+[package]
+name = "backend_service"
+version = "25.0.0"
+edition = "2021"
+description = "Backend-side execution service for the new PostgreSQL runtime"
+readme = "README.md"
+
+[lib]
+crate-type = ["lib"]
+doctest = false
+
+[features]
+default = ["pg17"]
+pg17 = ["pgrx/pg17"]
+
+[dependencies]
+arrow-schema = { workspace = true }
+arrow_layout = { path = "../../page/arrow_layout", version = "25.0" }
+datafusion-common = { workspace = true }
+datafusion-expr = { workspace = true }
+import = { path = "../../page/import", version = "25.0" }
+issuance = { path = "../../page/issuance", version = "25.0" }
+pgrx = { workspace = true }
+plan_builder = { path = "../plan_builder", version = "25.0" }
+plan_flow = { path = "../../page/plan_flow", version = "25.0" }
+row_estimator = { path = "../../page/row_estimator", version = "25.0" }
+row_estimator_seed = { path = "../row_estimator_seed", version = "25.0" }
+runtime_protocol = { path = "../../runtime_protocol", version = "25.0" }
+rust-fsm = { version = "0.7", features = ["diagram"] }
+scan_flow = { path = "../../page/scan_flow", version = "25.0" }
+scan_node = { path = "../scan_node", version = "25.0" }
+slot_encoder = { path = "../slot_encoder", version = "25.0" }
+slot_scan = { path = "../slot_scan", version = "25.0" }
+thiserror = "2.0"
+
+[dev-dependencies]
+pool = { path = "../../page/pool", version = "25.0" }
+transfer = { path = "../../page/transfer", version = "25.0" }

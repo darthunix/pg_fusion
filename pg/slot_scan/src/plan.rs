@@ -6,6 +6,7 @@ use pgrx::PgTryBuilder;
 use std::cell::Cell;
 use std::ffi::{CStr, CString};
 use std::panic::AssertUnwindSafe;
+use std::sync::Arc;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct PlanMetadata {
@@ -52,7 +53,7 @@ pub fn prepare_scan(sql: &str, options: ScanOptions) -> Result<PreparedScan, Sca
         Ok(PreparedScan {
             sql: sql.to_string(),
             options,
-            plan: OwnedSpiPlan::from_spi_plan(plan),
+            plan: Arc::new(OwnedSpiPlan::from_spi_plan(plan)),
         })
     })
 }

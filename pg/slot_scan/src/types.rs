@@ -1,7 +1,8 @@
 use crate::error::SinkError;
 use pgrx::pg_sys;
-use std::ffi::c_void;
+use std::ffi::{c_void, CString};
 use std::marker::PhantomData;
+use std::sync::Arc;
 
 /// Options that affect one `slot_scan` execution.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -61,6 +62,28 @@ pub enum SlotSinkAction {
     Continue,
     /// Stop the local scan loop early.
     Stop,
+}
+
+/// Cursor visitor decision for one delivered row.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CursorRowAction {
+    /// Consume the current row and continue draining more rows.
+    Continue,
+    /// Consume the current row and stop the current drain step.
+    Stop,
+    /// Do not consume the current row. The cursor must retain it and replay it
+    /// first on the next [`PreparedScanCursor::drain_rows`] call.
+    ReplayCurrentAndStop,
+}
+
+/// Terminal outcome of one [`PreparedScanCursor::drain_rows`] step.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CursorDrainOutcome {
+    /// The cursor reached EOF or exhausted the local row cap.
+    Eof,
+    /// The cursor stopped early because the visitor asked it to stop or replay
+    /// the current row.
+    Stopped,
 }
 
 /// Mutable run-time context shared across sink callbacks during one
@@ -136,6 +159,11 @@ impl SlotSinkContext {
 /// 1. `init`
 /// 2. zero or more `consume_slot`
 /// 3. `finish` on success, or `abort` on failure
+///
+/// `PreparedScan::run()` executes every callback behind a PostgreSQL exception
+/// boundary. PostgreSQL errors and panics raised by `init`, `consume_slot`, or
+/// `finish` are converted into ordinary `ScanError::Postgres` failures. On any
+/// non-success exit, `abort` is invoked best-effort exactly once.
 ///
 /// `init` receives the current run-time `TupleDesc`. That descriptor is valid
 /// only for the lifetime of the current [`PreparedScan::run`](crate::PreparedScan::run)
@@ -231,11 +259,11 @@ impl Drop for OwnedSpiPlan {
 /// `PreparedScan` stores trusted scan SQL together with a saved SPI plan. The
 /// current result schema and plan metadata are determined at [`run`](Self::run)
 /// time from the revalidated portal, not frozen at prepare time.
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 pub struct PreparedScan {
     pub(crate) sql: String,
     pub(crate) options: ScanOptions,
-    pub(crate) plan: OwnedSpiPlan,
+    pub(crate) plan: Arc<OwnedSpiPlan>,
 }
 
 impl PreparedScan {
@@ -247,5 +275,64 @@ impl PreparedScan {
     /// Returns the execution options that will be applied by [`run`](Self::run).
     pub fn options(&self) -> &ScanOptions {
         &self.options
+    }
+}
+
+/// Incremental read-only cursor opened from a [`PreparedScan`].
+///
+/// The cursor keeps one revalidated PostgreSQL `Portal` alive across drain
+/// steps, but it does not keep a SPI connection open between calls. Each
+/// [`drain_rows`](Self::drain_rows) step reconnects to SPI only for the
+/// duration of that step and closes SPI again before returning.
+#[derive(Debug)]
+pub struct PreparedScanCursor {
+    pub(crate) prepared: PreparedScan,
+    pub(crate) portal_name: CString,
+    pub(crate) memory_context: pg_sys::MemoryContext,
+    pub(crate) slot: *mut pg_sys::TupleTableSlot,
+    pub(crate) fetch_slot: *mut pg_sys::TupleTableSlot,
+    pub(crate) current_tuple: pg_sys::MinimalTuple,
+    pub(crate) spill_tuple: pg_sys::MinimalTuple,
+    pub(crate) tuple_desc: pg_sys::TupleDesc,
+    pub(crate) rows_seen: usize,
+    pub(crate) remaining: usize,
+    pub(crate) parallel_capable: bool,
+    pub(crate) planned_workers: usize,
+    pub(crate) plan_kind: ScanPlanKind,
+    pub(crate) closed: bool,
+}
+
+impl PreparedScanCursor {
+    /// Current run-time tuple descriptor for this cursor.
+    pub fn tuple_desc(&self) -> pg_sys::TupleDesc {
+        self.tuple_desc
+    }
+
+    /// Whether the current portal plan is parallel-capable.
+    pub fn parallel_capable(&self) -> bool {
+        self.parallel_capable
+    }
+
+    /// Number of workers requested by the current portal plan.
+    pub fn planned_workers(&self) -> usize {
+        self.planned_workers
+    }
+
+    /// Leaf scan shape chosen by the current portal plan.
+    pub fn plan_kind(&self) -> ScanPlanKind {
+        self.plan_kind
+    }
+
+    /// Number of rows already yielded by this cursor.
+    pub fn rows_seen(&self) -> usize {
+        self.rows_seen
+    }
+
+    /// Whether this cursor has already reached the configured local row cap.
+    pub fn hit_local_row_cap(&self) -> bool {
+        self.prepared
+            .options
+            .local_row_cap
+            .is_some_and(|cap| self.rows_seen >= cap)
     }
 }
