@@ -5,6 +5,8 @@ use thiserror::Error;
 pub enum BackendServiceError {
     #[error("a backend execution is already active in this process")]
     ExecutionAlreadyActive,
+    #[error("cannot {action} while scan driver for scan_id {scan_id} is active")]
+    ScanDriverActive { action: &'static str, scan_id: u64 },
     #[error("no active backend execution")]
     NoActiveExecution,
     #[error("no active backend scan stream")]

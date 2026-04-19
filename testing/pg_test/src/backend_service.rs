@@ -1,8 +1,9 @@
 use arrow_array::{Int32Array, StringViewArray};
 use arrow_schema::{DataType, Field, Schema, SchemaRef};
 use backend_service::{
-    BackendService, BackendServiceConfig, BackendServiceError, BeginExecutionOutput, ExecutionKey,
-    OpenScanInput, ScanStreamStep, StartExecutionInput,
+    ActiveScanDriver, BackendService, BackendServiceConfig, BackendServiceError,
+    BeginExecutionOutput, ExecutionKey, OpenScanInput, ScanStreamStep, ScanYieldReason,
+    StartExecutionInput,
 };
 use datafusion_common::ScalarValue;
 use import::{ArrowPageDecoder, ARROW_LAYOUT_BATCH_KIND};
@@ -13,8 +14,8 @@ use plan_flow::{FlowId as PlanFlowId, PlanOpen, WorkerPlanRole, WorkerStep};
 use pool::{PagePool, PagePoolConfig};
 use runtime_protocol::{
     decode_worker_to_backend, encode_worker_to_backend_into, encoded_len_worker_to_backend,
-    BackendToWorker, ProducerDescriptorWire, ProducerRole, ScanFlowDescriptor, WorkerToBackend,
-    WorkerToBackendRef,
+    BackendToWorker, ExecutionFailureCode, ProducerDescriptorWire, ProducerRole,
+    ScanFlowDescriptor, WorkerToBackend, WorkerToBackendRef,
 };
 use std::alloc::{alloc_zeroed, dealloc, Layout};
 use std::ptr::NonNull;
@@ -269,7 +270,7 @@ fn try_open_scan_with_runtime_protocol<'a>(
     scan_id: u64,
     config: BackendServiceConfig,
     scan_tx: IssuedTx,
-) -> Result<bool, BackendServiceError> {
+) -> Result<Option<ActiveScanDriver>, BackendServiceError> {
     let producers = [ProducerDescriptorWire {
         producer_id: 0,
         role: ProducerRole::Leader,
@@ -312,11 +313,11 @@ fn open_scan_with_runtime_protocol<'a>(
     scan_id: u64,
     config: BackendServiceConfig,
     scan_tx: IssuedTx,
-) {
+) -> ActiveScanDriver {
     let opened =
         try_open_scan_with_runtime_protocol(slot_id, session_epoch, scan_id, config, scan_tx)
             .expect("open scan");
-    assert!(opened, "fresh scan open must be accepted");
+    opened.expect("fresh scan open must be accepted")
 }
 
 pub fn backend_service_streams_scan_under_saved_snapshot() {
@@ -329,6 +330,7 @@ pub fn backend_service_streams_scan_under_saved_snapshot() {
     config.scan_payload_block_size =
         u32::try_from(scan_transport.payload_capacity(ARROW_LAYOUT_BATCH_KIND, 0))
             .expect("scan payload capacity must fit into u32");
+    config.scan_fetch_batch_rows = 2;
     let _snapshot = unsafe { LatestSnapshotGuard::acquire() };
     let begin = begin_and_finalize_execution(TEST_SLOT_ID, &query, config);
     let mut execution_guard = ActiveExecutionGuard::new(begin.key);
@@ -349,7 +351,7 @@ pub fn backend_service_streams_scan_under_saved_snapshot() {
     let schema = transport_schema(spec.arrow_schema());
 
     let scan_rx = scan_transport.rx();
-    open_scan_with_runtime_protocol(
+    let mut driver = open_scan_with_runtime_protocol(
         TEST_SLOT_ID,
         begin.key.session_epoch,
         spec.scan_id.get(),
@@ -360,7 +362,7 @@ pub fn backend_service_streams_scan_under_saved_snapshot() {
     let decoder = ArrowPageDecoder::new(schema).expect("scan decoder");
     let mut rows = Vec::<(i32, String)>::new();
     loop {
-        match BackendService::step_scan().expect("step scan") {
+        match driver.step().expect("step scan") {
             ScanStreamStep::OutboundPage { outbound, .. } => {
                 let frame = outbound.frame();
                 outbound.mark_sent();
@@ -383,8 +385,8 @@ pub fn backend_service_streams_scan_under_saved_snapshot() {
                     rows.push((ids.value(index), payloads.value(index).to_string()));
                 }
             }
-            ScanStreamStep::Blocked { .. } => {
-                panic!("unexpected scan-flow backpressure in backend_service test")
+            ScanStreamStep::YieldForControl { reason } => {
+                panic!("unexpected scan yield during happy path: {reason:?}")
             }
             ScanStreamStep::Finished { .. } => break,
             ScanStreamStep::Failed { message, .. } => {
@@ -405,14 +407,13 @@ pub fn backend_service_streams_scan_under_saved_snapshot() {
     scan_transport.assert_drained();
 
     assert!(
-        BackendService::accept_complete_execution(TEST_SLOT_ID, begin.key.session_epoch)
-            .expect("complete execution"),
+        driver.complete_execution().expect("complete execution"),
         "fresh complete message must be accepted"
     );
     execution_guard.disarm();
 }
 
-pub fn backend_service_blocked_retry_allows_spi_between_steps() {
+pub fn backend_service_yields_for_control_on_permit_backpressure() {
     reset_backend_service_table();
     Spi::run("SET LOCAL max_parallel_workers_per_gather = 0").unwrap();
 
@@ -436,7 +437,7 @@ pub fn backend_service_blocked_retry_allows_spi_between_steps() {
     let spec = &built.scans[0];
 
     let scan_rx = scan_transport.rx();
-    open_scan_with_runtime_protocol(
+    let mut driver = open_scan_with_runtime_protocol(
         TEST_SLOT_ID,
         begin.key.session_epoch,
         spec.scan_id.get(),
@@ -444,7 +445,7 @@ pub fn backend_service_blocked_retry_allows_spi_between_steps() {
         scan_transport.tx(),
     );
 
-    let held_page = match BackendService::step_scan().expect("first scan step") {
+    let held_page = match driver.step().expect("first scan step") {
         ScanStreamStep::OutboundPage { outbound, .. } => {
             let frame = outbound.frame();
             outbound.mark_sent();
@@ -456,44 +457,194 @@ pub fn backend_service_blocked_retry_allows_spi_between_steps() {
         other => panic!("expected first outbound page, got {other:?}"),
     };
 
+    match driver.step().expect("step scan while permit is held") {
+        ScanStreamStep::YieldForControl {
+            reason: ScanYieldReason::PermitBackpressure,
+        } => {}
+        other => panic!("expected control yield on held permit, got {other:?}"),
+    }
+
     assert!(matches!(
-        BackendService::step_scan().expect("blocked retry step"),
-        ScanStreamStep::Blocked { .. }
+        BackendService::accept_complete_execution(TEST_SLOT_ID, begin.key.session_epoch),
+        Err(BackendServiceError::ScanDriverActive { .. })
     ));
 
-    Spi::run("SELECT 1").unwrap();
     drop(held_page);
 
     loop {
-        match BackendService::step_scan().expect("step scan after unblock") {
+        match driver.step().expect("step scan after control yield") {
             ScanStreamStep::OutboundPage { outbound, .. } => {
                 let frame = outbound.frame();
                 outbound.mark_sent();
                 match scan_rx
                     .accept(&frame)
-                    .expect("accept scan frame after unblock")
+                    .expect("accept scan frame after yield")
                 {
                     IssueEvent::Page(page) => drop(page),
                     IssueEvent::Closed => panic!("unexpected close frame"),
                 }
             }
-            ScanStreamStep::Blocked { .. } => {
-                panic!("unexpected repeated backpressure after permit release")
+            ScanStreamStep::YieldForControl { reason } => {
+                panic!("unexpected repeated control yield after permit release: {reason:?}")
             }
             ScanStreamStep::Finished { .. } => break,
             ScanStreamStep::Failed { message, .. } => {
-                panic!("unexpected scan failure after unblock: {message}")
+                panic!("unexpected scan failure after yield: {message}")
             }
         }
     }
 
     scan_transport.assert_drained();
     assert!(
-        BackendService::accept_complete_execution(TEST_SLOT_ID, begin.key.session_epoch)
-            .expect("complete execution after blocked retry"),
+        driver
+            .complete_execution()
+            .expect("complete execution after control yield"),
         "fresh complete message must be accepted"
     );
     execution_guard.disarm();
+}
+
+pub fn backend_service_driver_fail_execution_from_control_yield() {
+    reset_backend_service_table();
+    Spi::run("SET LOCAL max_parallel_workers_per_gather = 0").unwrap();
+
+    let query = test_query();
+    let scan_transport = IssuedTransportHarness::with_counts(1, 1);
+    let mut config = BackendServiceConfig::default();
+    config.scan_payload_block_size =
+        u32::try_from(scan_transport.payload_capacity(ARROW_LAYOUT_BATCH_KIND, 0))
+            .expect("scan payload capacity must fit into u32");
+    let _snapshot = unsafe { LatestSnapshotGuard::acquire() };
+    let begin = begin_and_finalize_execution(TEST_SLOT_ID, &query, config);
+    let mut execution_guard = ActiveExecutionGuard::new(begin.key);
+
+    let built = PlanBuilder::new()
+        .build(PlanBuildInput {
+            sql: &query,
+            params: Vec::<ScalarValue>::new(),
+        })
+        .expect("build scan metadata");
+    assert_eq!(built.scans.len(), 1, "expected exactly one leaf scan");
+    let spec = &built.scans[0];
+
+    let scan_rx = scan_transport.rx();
+    let mut driver = open_scan_with_runtime_protocol(
+        TEST_SLOT_ID,
+        begin.key.session_epoch,
+        spec.scan_id.get(),
+        config,
+        scan_transport.tx(),
+    );
+
+    let held_page = match driver.step().expect("first scan step") {
+        ScanStreamStep::OutboundPage { outbound, .. } => {
+            let frame = outbound.frame();
+            outbound.mark_sent();
+            match scan_rx.accept(&frame).expect("accept first scan frame") {
+                IssueEvent::Page(page) => page,
+                IssueEvent::Closed => panic!("unexpected close frame"),
+            }
+        }
+        other => panic!("expected first outbound page, got {other:?}"),
+    };
+
+    match driver.step().expect("step scan while permit is held") {
+        ScanStreamStep::YieldForControl {
+            reason: ScanYieldReason::PermitBackpressure,
+        } => {}
+        other => panic!("expected control yield on held permit, got {other:?}"),
+    }
+
+    assert!(
+        driver
+            .fail_execution(ExecutionFailureCode::Internal, Some(7))
+            .expect("driver fail execution from control yield"),
+        "driver fail should terminate the active execution"
+    );
+
+    drop(held_page);
+    scan_transport.assert_drained();
+    assert!(
+        !BackendService::accept_complete_execution(TEST_SLOT_ID, begin.key.session_epoch)
+            .expect("late complete should be ignored after driver fail"),
+        "late complete must not revive an execution failed by the driver"
+    );
+    execution_guard.disarm();
+}
+
+pub fn backend_service_wait_interrupt_cleans_up_active_execution() {
+    reset_backend_service_table();
+    Spi::run("SET LOCAL max_parallel_workers_per_gather = 0").unwrap();
+
+    let query = test_query();
+    let scan_transport = IssuedTransportHarness::with_counts(1, 1);
+    let mut config = BackendServiceConfig::default();
+    config.scan_payload_block_size =
+        u32::try_from(scan_transport.payload_capacity(ARROW_LAYOUT_BATCH_KIND, 0))
+            .expect("scan payload capacity must fit into u32");
+    let _snapshot = unsafe { LatestSnapshotGuard::acquire() };
+    let begin = begin_and_finalize_execution(TEST_SLOT_ID, &query, config);
+    let mut execution_guard = ActiveExecutionGuard::new(begin.key);
+
+    let built = PlanBuilder::new()
+        .build(PlanBuildInput {
+            sql: &query,
+            params: Vec::<ScalarValue>::new(),
+        })
+        .expect("build scan metadata");
+    assert_eq!(built.scans.len(), 1, "expected exactly one leaf scan");
+    let spec = &built.scans[0];
+
+    let scan_rx = scan_transport.rx();
+    let mut driver = open_scan_with_runtime_protocol(
+        TEST_SLOT_ID,
+        begin.key.session_epoch,
+        spec.scan_id.get(),
+        config,
+        scan_transport.tx(),
+    );
+
+    let held_page = match driver.step().expect("first scan step") {
+        ScanStreamStep::OutboundPage { outbound, .. } => {
+            let frame = outbound.frame();
+            outbound.mark_sent();
+            match scan_rx.accept(&frame).expect("accept first scan frame") {
+                IssueEvent::Page(page) => page,
+                IssueEvent::Closed => panic!("unexpected close frame"),
+            }
+        }
+        other => panic!("expected first outbound page, got {other:?}"),
+    };
+
+    BackendService::inject_wait_for_scan_backpressure_error_for_tests("synthetic wait interrupt");
+    let err = driver
+        .step()
+        .expect_err("synthetic wait interrupt must fail the active execution");
+    assert!(
+        matches!(err, BackendServiceError::Postgres(message) if message.contains("synthetic wait interrupt"))
+    );
+    BackendService::clear_wait_for_scan_backpressure_error_for_tests();
+
+    drop(held_page);
+    scan_transport.assert_drained();
+
+    assert!(
+        !BackendService::accept_complete_execution(TEST_SLOT_ID, begin.key.session_epoch)
+            .expect("late complete should be ignored after wait interrupt cleanup"),
+        "late complete must not revive an execution cleaned up after wait interrupt",
+    );
+    execution_guard.disarm();
+
+    let restarted = begin_and_finalize_execution(TEST_SLOT_ID, &query, config);
+    assert!(
+        restarted.key.session_epoch > begin.key.session_epoch,
+        "a fresh execution should start after wait-interrupt cleanup"
+    );
+    assert!(
+        BackendService::accept_cancel_execution(TEST_SLOT_ID, restarted.key.session_epoch)
+            .expect("cancel restarted execution"),
+        "restarted execution should be cancellable after cleanup"
+    );
 }
 
 pub fn backend_service_stale_cancel_is_ignored_after_new_execution() {
@@ -549,7 +700,7 @@ pub fn backend_service_cancel_during_stream_marks_scan_used() {
     let spec = &built.scans[0];
 
     let scan_rx = scan_transport.rx();
-    open_scan_with_runtime_protocol(
+    let mut driver = open_scan_with_runtime_protocol(
         TEST_SLOT_ID,
         begin.key.session_epoch,
         spec.scan_id.get(),
@@ -557,7 +708,7 @@ pub fn backend_service_cancel_during_stream_marks_scan_used() {
         scan_transport.tx(),
     );
 
-    match BackendService::step_scan().expect("step scan before cancel") {
+    match driver.step().expect("step scan before cancel") {
         ScanStreamStep::OutboundPage { outbound, .. } => {
             let frame = outbound.frame();
             outbound.mark_sent();
@@ -571,8 +722,7 @@ pub fn backend_service_cancel_during_stream_marks_scan_used() {
     }
 
     assert!(
-        BackendService::cancel_scan(TEST_SLOT_ID, begin.key.session_epoch, spec.scan_id.get())
-            .expect("cancel active scan"),
+        driver.cancel_scan().expect("cancel active scan"),
         "cancel should be accepted for the active scan"
     );
     assert!(matches!(
@@ -629,17 +779,16 @@ pub fn backend_service_rejects_descriptor_mismatch_without_poisoning_execution()
             if message.contains("scan descriptor mismatch")
     ));
 
-    open_scan_with_runtime_protocol(
+    let mut driver = open_scan_with_runtime_protocol(
         TEST_SLOT_ID,
         begin.key.session_epoch,
         spec.scan_id.get(),
         config,
         scan_transport.tx(),
     );
-    assert!(
-        BackendService::cancel_scan(TEST_SLOT_ID, begin.key.session_epoch, spec.scan_id.get())
-            .expect("cancel scan after successful retry")
-    );
+    assert!(driver
+        .cancel_scan()
+        .expect("cancel scan after successful retry"));
     scan_transport.assert_drained();
 
     assert!(
@@ -674,7 +823,7 @@ pub fn backend_service_local_scan_failure_dominates_late_complete() {
     assert_eq!(built.scans.len(), 1, "expected exactly one leaf scan");
     let spec = &built.scans[0];
 
-    open_scan_with_runtime_protocol(
+    let mut driver = open_scan_with_runtime_protocol(
         TEST_SLOT_ID,
         begin.key.session_epoch,
         spec.scan_id.get(),
@@ -682,7 +831,7 @@ pub fn backend_service_local_scan_failure_dominates_late_complete() {
         scan_transport.tx(),
     );
 
-    match BackendService::step_scan().expect("step scan local failure") {
+    match driver.step().expect("step scan local failure") {
         ScanStreamStep::Failed { message, .. } => {
             assert!(
                 message.contains("scan payload block size mismatch"),

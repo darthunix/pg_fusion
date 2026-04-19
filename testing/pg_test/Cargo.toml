@@ -32,7 +32,7 @@ transfer = { path = "../../page/transfer", version = "25.0" }
 arrow_layout = { path = "../../page/arrow_layout", version = "25.0" }
 import = { path = "../../page/import", version = "25.0" }
 issuance = { path = "../../page/issuance", version = "25.0" }
-backend_service = { path = "../../pg/backend_service", version = "25.0" }
+backend_service = { path = "../../pg/backend_service", version = "25.0", features = ["pg_test"] }
 plan_flow = { path = "../../page/plan_flow", version = "25.0" }
 runtime_protocol = { path = "../../runtime_protocol", version = "25.0" }
 slot_encoder = { path = "../../pg/slot_encoder", version = "25.0" }

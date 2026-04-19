@@ -1,6 +1,6 @@
 use crate::{
     scan_descriptor_matches, BackendExecutionState, BackendService, BackendServiceConfig,
-    BackendServiceError,
+    BackendServiceError, ExplainInput,
 };
 use datafusion_expr::logical_plan::{EmptyRelation, LogicalPlan};
 use issuance::{IssuanceConfig, IssuancePool, IssuedTx};
@@ -171,6 +171,50 @@ fn cancel_execution_is_accepted_while_starting() {
     assert!(handled);
     assert_eq!(BackendService::current_session_epoch_for_tests(), 5);
     assert!(!BackendService::accept_complete_execution(3, 5).unwrap());
+}
+
+#[test]
+fn complete_execution_is_rejected_while_scan_driver_is_active() {
+    BackendService::reset_for_tests();
+    BackendService::install_fake_execution_with_driver_for_tests(
+        3,
+        5,
+        BackendExecutionState::Running,
+        42,
+    );
+
+    let err = BackendService::accept_complete_execution(3, 5).unwrap_err();
+    assert!(matches!(
+        err,
+        BackendServiceError::ScanDriverActive {
+            action: "complete execution",
+            scan_id: 42
+        }
+    ));
+}
+
+#[test]
+fn render_explain_is_rejected_while_scan_driver_is_active() {
+    BackendService::reset_for_tests();
+    BackendService::install_fake_execution_with_driver_for_tests(
+        3,
+        5,
+        BackendExecutionState::Running,
+        42,
+    );
+
+    let err = BackendService::render_explain(ExplainInput {
+        sql: "SELECT 1",
+        params: Vec::new(),
+    })
+    .unwrap_err();
+    assert!(matches!(
+        err,
+        BackendServiceError::ScanDriverActive {
+            action: "render explain",
+            scan_id: 42
+        }
+    ));
 }
 
 #[test]

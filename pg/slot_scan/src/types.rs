@@ -1,6 +1,6 @@
 use crate::error::SinkError;
 use pgrx::pg_sys;
-use std::ffi::{c_void, CString};
+use std::ffi::c_void;
 use std::marker::PhantomData;
 use std::sync::Arc;
 
@@ -62,28 +62,6 @@ pub enum SlotSinkAction {
     Continue,
     /// Stop the local scan loop early.
     Stop,
-}
-
-/// Cursor visitor decision for one delivered row.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum CursorRowAction {
-    /// Consume the current row and continue draining more rows.
-    Continue,
-    /// Consume the current row and stop the current drain step.
-    Stop,
-    /// Do not consume the current row. The cursor must retain it and replay it
-    /// first on the next [`PreparedScanCursor::drain_rows`] call.
-    ReplayCurrentAndStop,
-}
-
-/// Terminal outcome of one [`PreparedScanCursor::drain_rows`] step.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum CursorDrainOutcome {
-    /// The cursor reached EOF or exhausted the local row cap.
-    Eof,
-    /// The cursor stopped early because the visitor asked it to stop or replay
-    /// the current row.
-    Stopped,
 }
 
 /// Mutable run-time context shared across sink callbacks during one
@@ -278,21 +256,24 @@ impl PreparedScan {
     }
 }
 
-/// Incremental read-only cursor opened from a [`PreparedScan`].
+/// Internal stackful scan session used by backend-side page streaming.
 ///
-/// The cursor keeps one revalidated PostgreSQL `Portal` alive across drain
-/// steps, but it does not keep a SPI connection open between calls. Each
-/// [`drain_rows`](Self::drain_rows) step reconnects to SPI only for the
-/// duration of that step and closes SPI again before returning.
+/// This type is intentionally hidden from normal crate docs. It is not a
+/// durable resumable cursor: it keeps one SPI connection, one portal, and the
+/// current fetched batch alive across calls. Callers must not interleave other
+/// SPI or planning work while a session is active.
+#[doc(hidden)]
 #[derive(Debug)]
-pub struct PreparedScanCursor {
+pub struct StreamingScanSession {
     pub(crate) prepared: PreparedScan,
-    pub(crate) portal_name: CString,
-    pub(crate) memory_context: pg_sys::MemoryContext,
+    pub(crate) portal: pg_sys::Portal,
+    pub(crate) spi_connected: bool,
     pub(crate) slot: *mut pg_sys::TupleTableSlot,
-    pub(crate) fetch_slot: *mut pg_sys::TupleTableSlot,
-    pub(crate) current_tuple: pg_sys::MinimalTuple,
-    pub(crate) spill_tuple: pg_sys::MinimalTuple,
+    pub(crate) fetch_batch_rows: usize,
+    pub(crate) batch: *mut pg_sys::SPITupleTable,
+    pub(crate) batch_processed: usize,
+    pub(crate) batch_index: usize,
+    pub(crate) row_loaded: bool,
     pub(crate) tuple_desc: pg_sys::TupleDesc,
     pub(crate) rows_seen: usize,
     pub(crate) remaining: usize,
@@ -302,7 +283,7 @@ pub struct PreparedScanCursor {
     pub(crate) closed: bool,
 }
 
-impl PreparedScanCursor {
+impl StreamingScanSession {
     /// Current run-time tuple descriptor for this cursor.
     pub fn tuple_desc(&self) -> pg_sys::TupleDesc {
         self.tuple_desc

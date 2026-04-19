@@ -12,6 +12,7 @@ doctest = false
 [features]
 default = ["pg17"]
 pg17 = ["pgrx/pg17"]
+pg_test = []
 
 [dependencies]
 arrow-schema = { workspace = true }

@@ -4,15 +4,16 @@ use arrow_schema::SchemaRef;
 use row_estimator::PageRowEstimator;
 use scan_flow::{BackendPageSource, FlowId, SourcePageStatus};
 use slot_encoder::{AppendStatus, PageBatchEncoder};
-use slot_scan::{CursorDrainOutcome, CursorRowAction, PreparedScan, PreparedScanCursor};
+use slot_scan::{PreparedScan, StreamingScanSession};
 
 pub(crate) struct SlotScanPageSource {
     snapshot: pgrx::pg_sys::Snapshot,
     prepared: PreparedScan,
     schema: SchemaRef,
     block_size: u32,
+    fetch_batch_rows: usize,
     estimator: PageRowEstimator,
-    cursor: Option<PreparedScanCursor>,
+    session: Option<StreamingScanSession>,
 }
 
 impl SlotScanPageSource {
@@ -21,6 +22,7 @@ impl SlotScanPageSource {
         prepared: PreparedScan,
         schema: SchemaRef,
         block_size: u32,
+        fetch_batch_rows: usize,
         estimator: PageRowEstimator,
     ) -> Self {
         Self {
@@ -28,8 +30,9 @@ impl SlotScanPageSource {
             prepared,
             schema,
             block_size,
+            fetch_batch_rows,
             estimator,
-            cursor: None,
+            session: None,
         }
     }
 
@@ -37,7 +40,7 @@ impl SlotScanPageSource {
         &mut self,
         payload: &mut [u8],
     ) -> Result<SourcePageStatus, BackendServiceError> {
-        let cursor = self.cursor.as_mut().ok_or_else(|| {
+        let session = self.session.as_mut().ok_or_else(|| {
             BackendServiceError::PageSource("slot scan page source is not open".into())
         })?;
 
@@ -50,22 +53,11 @@ impl SlotScanPageSource {
             )?;
             init_block(payload, &layout)?;
 
-            let mut encoder = unsafe { PageBatchEncoder::new(cursor.tuple_desc(), payload) }?;
+            let mut encoder = unsafe { PageBatchEncoder::new(session.tuple_desc(), payload) }?;
             let mut rows_written = 0usize;
-            let outcome = cursor.drain_rows::<BackendServiceError, _>(|slot| {
-                match encoder.append_slot(slot)? {
-                    AppendStatus::Appended => {
-                        rows_written += 1;
-                        Ok::<CursorRowAction, BackendServiceError>(CursorRowAction::Continue)
-                    }
-                    AppendStatus::Full => Ok::<CursorRowAction, BackendServiceError>(
-                        CursorRowAction::ReplayCurrentAndStop,
-                    ),
-                }
-            })?;
 
-            match outcome {
-                CursorDrainOutcome::Eof => {
+            loop {
+                let Some(slot) = session.current_slot()? else {
                     if rows_written == 0 {
                         return Ok(SourcePageStatus::Eof);
                     }
@@ -76,9 +68,14 @@ impl SlotScanPageSource {
                     return Ok(SourcePageStatus::Page {
                         payload_len: encoded.payload_len,
                     });
-                }
-                CursorDrainOutcome::Stopped => {
-                    if rows_written > 0 {
+                };
+
+                match encoder.append_slot(slot)? {
+                    AppendStatus::Appended => {
+                        rows_written += 1;
+                        session.consume_current_row()?;
+                    }
+                    AppendStatus::Full if rows_written > 0 => {
                         let encoded = encoder.finish()?;
                         self.estimator
                             .observe_encoded_block(&payload[..encoded.payload_len])?;
@@ -86,10 +83,11 @@ impl SlotScanPageSource {
                             payload_len: encoded.payload_len,
                         });
                     }
-
-                    self.estimator
-                        .observe_empty_full_page(estimate.rows_per_page)?;
-                    continue;
+                    AppendStatus::Full => {
+                        self.estimator
+                            .observe_empty_full_page(estimate.rows_per_page)?;
+                        break;
+                    }
                 }
             }
         }
@@ -100,12 +98,12 @@ impl BackendPageSource for SlotScanPageSource {
     type Error = BackendServiceError;
 
     fn open(&mut self, _flow: FlowId) -> Result<(), Self::Error> {
-        let cursor = with_registered_snapshot(self.snapshot, || {
+        let session = with_registered_snapshot(self.snapshot, || {
             self.prepared
-                .open_cursor()
+                .open_streaming_session(self.fetch_batch_rows)
                 .map_err(BackendServiceError::PrepareScan)
         })?;
-        self.cursor = Some(cursor);
+        self.session = Some(session);
         Ok(())
     }
 
@@ -128,9 +126,9 @@ impl BackendPageSource for SlotScanPageSource {
     }
 
     fn close(&mut self) -> Result<(), Self::Error> {
-        if let Some(cursor) = self.cursor.take() {
+        if let Some(session) = self.session.take() {
             with_registered_snapshot(self.snapshot, || {
-                cursor
+                session
                     .close()
                     .map(|_| ())
                     .map_err(BackendServiceError::PrepareScan)

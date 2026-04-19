@@ -33,6 +33,7 @@ use slot_scan::{prepare_scan, PreparedScan, ScanOptions};
 use std::cell::{Cell, RefCell};
 use std::panic::AssertUnwindSafe;
 use std::sync::Arc;
+use std::time::Duration;
 
 pub use error::BackendServiceError;
 
@@ -44,9 +45,15 @@ thread_local! {
     static ACTIVE_EXECUTION: RefCell<Option<ActiveExecution>> = const { RefCell::new(None) };
 }
 
+#[cfg(any(test, feature = "pg_test"))]
+thread_local! {
+    static WAIT_FOR_SCAN_BACKPRESSURE_ERROR_FOR_TESTS: RefCell<Option<String>> = const { RefCell::new(None) };
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct BackendServiceConfig {
     pub scan_payload_block_size: u32,
+    pub scan_fetch_batch_rows: u32,
     pub estimator_default: EstimatorConfig,
     pub plan_page_kind: u16,
     pub plan_page_flags: u16,
@@ -58,6 +65,7 @@ impl Default for BackendServiceConfig {
     fn default() -> Self {
         Self {
             scan_payload_block_size: 4096,
+            scan_fetch_batch_rows: 1024,
             estimator_default: EstimatorConfig::default(),
             plan_page_kind: 0x504c,
             plan_page_flags: 0,
@@ -148,9 +156,8 @@ pub enum ScanStreamStep {
         producer_id: u16,
         outbound: issuance::IssuedOutboundPage,
     },
-    Blocked {
-        flow: ScanFlowId,
-        producer_id: u16,
+    YieldForControl {
+        reason: ScanYieldReason,
     },
     Finished {
         flow: ScanFlowId,
@@ -162,6 +169,11 @@ pub enum ScanStreamStep {
     },
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ScanYieldReason {
+    PermitBackpressure,
+}
+
 pub struct ExplainInput<'a> {
     pub sql: &'a str,
     pub params: Vec<ScalarValue>,
@@ -169,6 +181,20 @@ pub struct ExplainInput<'a> {
 
 #[derive(Default)]
 pub struct BackendService;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ActiveScanDriverState {
+    Streaming,
+    AwaitingExecutionTerminal,
+    Released,
+}
+
+#[derive(Debug)]
+pub struct ActiveScanDriver {
+    key: ExecutionKey,
+    scan_id: u64,
+    state: ActiveScanDriverState,
+}
 
 struct StartingRuntime {
     plan_role: BackendPlanRole,
@@ -200,6 +226,7 @@ struct ActiveScanStream {
 
 enum ScanDriveOutcome {
     Continue(ScanStreamStep),
+    Blocked,
     Terminal(ScanStreamStep),
     FatalExecution(ScanStreamStep),
 }
@@ -213,6 +240,120 @@ struct ActiveExecution {
     starting: Option<StartingRuntime>,
     scans: Vec<PreparedScanEntry>,
     active_scan: Option<ActiveScanStream>,
+    driver_scan_id: Option<u64>,
+}
+
+impl ActiveScanDriver {
+    pub fn key(&self) -> ExecutionKey {
+        self.key
+    }
+
+    pub fn scan_id(&self) -> u64 {
+        self.scan_id
+    }
+
+    pub fn step(&mut self) -> Result<ScanStreamStep, BackendServiceError> {
+        match self.state {
+            ActiveScanDriverState::Streaming => {
+                let step = step_scan_with_driver(self.key, self.scan_id)?;
+                match step {
+                    ScanStreamStep::Finished { .. } => {
+                        self.state = ActiveScanDriverState::AwaitingExecutionTerminal;
+                    }
+                    ScanStreamStep::Failed { .. } => {
+                        self.state = ActiveScanDriverState::Released;
+                    }
+                    ScanStreamStep::OutboundPage { .. }
+                    | ScanStreamStep::YieldForControl { .. } => {}
+                }
+                Ok(step)
+            }
+            ActiveScanDriverState::AwaitingExecutionTerminal => {
+                Err(BackendServiceError::ProtocolViolation(
+                    "scan driver is awaiting execution terminal control after scan completion"
+                        .into(),
+                ))
+            }
+            ActiveScanDriverState::Released => Err(BackendServiceError::ProtocolViolation(
+                "scan driver has already been released".into(),
+            )),
+        }
+    }
+
+    pub fn cancel_scan(&mut self) -> Result<bool, BackendServiceError> {
+        if self.state != ActiveScanDriverState::Streaming {
+            return Err(BackendServiceError::ProtocolViolation(
+                "scan driver cannot cancel a scan after the stream has already terminated".into(),
+            ));
+        }
+        let handled = cancel_scan_from_driver(self.key, self.scan_id)?;
+        self.state = ActiveScanDriverState::Released;
+        Ok(handled)
+    }
+
+    pub fn complete_execution(&mut self) -> Result<bool, BackendServiceError> {
+        if self.state == ActiveScanDriverState::Released {
+            return Err(BackendServiceError::ProtocolViolation(
+                "scan driver has already been released".into(),
+            ));
+        }
+        let handled = terminate_current_execution_from_driver(
+            self.key,
+            self.scan_id,
+            BackendExecutionEvent::CompleteExecution,
+        )?;
+        self.state = ActiveScanDriverState::Released;
+        Ok(handled)
+    }
+
+    pub fn fail_execution(
+        &mut self,
+        code: ExecutionFailureCode,
+        detail: Option<u64>,
+    ) -> Result<bool, BackendServiceError> {
+        if self.state == ActiveScanDriverState::Released {
+            return Err(BackendServiceError::ProtocolViolation(
+                "scan driver has already been released".into(),
+            ));
+        }
+        let _ = (code, detail);
+        let handled = terminate_current_execution_from_driver(
+            self.key,
+            self.scan_id,
+            BackendExecutionEvent::FailExecution,
+        )?;
+        self.state = ActiveScanDriverState::Released;
+        Ok(handled)
+    }
+
+    pub fn cancel_execution(&mut self) -> Result<bool, BackendServiceError> {
+        if self.state == ActiveScanDriverState::Released {
+            return Err(BackendServiceError::ProtocolViolation(
+                "scan driver has already been released".into(),
+            ));
+        }
+        let handled = terminate_current_execution_from_driver(
+            self.key,
+            self.scan_id,
+            BackendExecutionEvent::CancelExecution,
+        )?;
+        self.state = ActiveScanDriverState::Released;
+        Ok(handled)
+    }
+}
+
+impl Drop for ActiveScanDriver {
+    fn drop(&mut self) {
+        if self.state == ActiveScanDriverState::Released {
+            return;
+        }
+        let _ = terminate_current_execution_from_driver(
+            self.key,
+            self.scan_id,
+            BackendExecutionEvent::CancelExecution,
+        );
+        self.state = ActiveScanDriverState::Released;
+    }
 }
 
 impl BackendService {
@@ -220,7 +361,13 @@ impl BackendService {
         input: StartExecutionInput<'_>,
     ) -> Result<BeginExecutionOutput, BackendServiceError> {
         ACTIVE_EXECUTION.with(|slot| {
-            if slot.borrow().is_some() {
+            if let Some(execution) = slot.borrow().as_ref() {
+                if let Some(scan_id) = execution.driver_scan_id {
+                    return Err(BackendServiceError::ScanDriverActive {
+                        action: "begin execution",
+                        scan_id,
+                    });
+                }
                 return Err(BackendServiceError::ExecutionAlreadyActive);
             }
 
@@ -276,6 +423,7 @@ impl BackendService {
                 starting: Some(StartingRuntime { plan_role }),
                 scans,
                 active_scan: None,
+                driver_scan_id: None,
             });
 
             Ok(BeginExecutionOutput { key, control })
@@ -344,17 +492,26 @@ impl BackendService {
         })
     }
 
-    pub fn open_scan(input: OpenScanInput<'_>) -> Result<bool, BackendServiceError> {
+    pub fn open_scan(
+        input: OpenScanInput<'_>,
+    ) -> Result<Option<ActiveScanDriver>, BackendServiceError> {
         ACTIVE_EXECUTION.with(|slot| {
             let mut active = slot.borrow_mut();
             let Some(execution) = active.as_mut() else {
-                return classify_missing_execution(input.slot_id, input.session_epoch);
+                return classify_missing_execution(input.slot_id, input.session_epoch)
+                    .map(|_| None);
             };
 
             if should_ignore_message(execution, input.slot_id, input.session_epoch)? {
-                return Ok(false);
+                return Ok(None);
             }
             ensure_execution_state(execution, BackendExecutionState::Running, "open scan")?;
+            if let Some(scan_id) = execution.driver_scan_id {
+                return Err(BackendServiceError::ScanDriverActive {
+                    action: "open scan",
+                    scan_id,
+                });
+            }
             if execution.active_scan.is_some() {
                 return Err(BackendServiceError::ProtocolViolation(
                     "only one backend scan may stream at a time".into(),
@@ -370,6 +527,8 @@ impl BackendService {
                 })?;
             let snapshot = execution.snapshot.snapshot;
             let block_size = execution.config.scan_payload_block_size;
+            let fetch_batch_rows =
+                normalize_scan_fetch_batch_rows(execution.config.scan_fetch_batch_rows);
             let (prepared_scan, schema, estimator, canonical_open) = {
                 let entry = &mut execution.scans[scan_index];
                 match entry.state {
@@ -406,6 +565,7 @@ impl BackendService {
                 prepared_scan,
                 schema,
                 block_size,
+                fetch_batch_rows,
                 estimator,
             );
 
@@ -422,100 +582,13 @@ impl BackendService {
                 producer,
                 coordinator,
             });
+            execution.driver_scan_id = Some(input.scan_id);
 
-            Ok(true)
-        })
-    }
-
-    pub fn step_scan() -> Result<ScanStreamStep, BackendServiceError> {
-        ACTIVE_EXECUTION.with(|slot| {
-            let mut active = slot.borrow_mut();
-            let mut active_scan = {
-                let execution = active
-                    .as_mut()
-                    .ok_or(BackendServiceError::NoActiveExecution)?;
-                ensure_execution_state(execution, BackendExecutionState::Running, "step scan")?;
-                execution
-                    .active_scan
-                    .take()
-                    .ok_or(BackendServiceError::NoActiveScan)?
-            };
-
-            let outcome = {
-                let execution = active
-                    .as_mut()
-                    .expect("active execution must remain installed during step_scan");
-                drive_scan_step(execution, &mut active_scan)
-            };
-
-            match outcome {
-                Ok(ScanDriveOutcome::Continue(step)) => {
-                    active
-                        .as_mut()
-                        .expect("active execution must exist for continuing scan")
-                        .active_scan = Some(active_scan);
-                    Ok(step)
-                }
-                Ok(ScanDriveOutcome::Terminal(step)) => Ok(step),
-                Ok(ScanDriveOutcome::FatalExecution(step)) => {
-                    finish_current_execution_after_fatal_scan_step(&mut active, active_scan, step)
-                }
-                Err(err) => Err(fail_current_execution_after_scan_error(
-                    &mut active,
-                    active_scan,
-                    err,
-                )),
-            }
-        })
-    }
-
-    pub fn cancel_scan(
-        slot_id: u32,
-        session_epoch: u64,
-        scan_id: u64,
-    ) -> Result<bool, BackendServiceError> {
-        ACTIVE_EXECUTION.with(|slot| {
-            let mut active = slot.borrow_mut();
-            {
-                let Some(execution) = active.as_mut() else {
-                    return classify_missing_execution(slot_id, session_epoch);
-                };
-
-                if should_ignore_message(execution, slot_id, session_epoch)? {
-                    return Ok(false);
-                }
-                ensure_execution_state(execution, BackendExecutionState::Running, "cancel scan")?;
-            }
-
-            let mut active_scan = active
-                .as_mut()
-                .expect("active execution must remain installed during cancel_scan")
-                .active_scan
-                .take()
-                .ok_or(BackendServiceError::ScanNotActive { scan_id })?;
-            if active_scan.scan_id != scan_id {
-                active
-                    .as_mut()
-                    .expect("active execution must exist for mismatched cancel")
-                    .active_scan = Some(active_scan);
-                return Err(BackendServiceError::ScanNotActive { scan_id });
-            }
-
-            let cancel_result = {
-                let execution = active
-                    .as_mut()
-                    .expect("active execution must remain installed during cancel_scan");
-                cancel_detached_scan(execution, &mut active_scan)
-            };
-
-            match cancel_result {
-                Ok(()) => Ok(true),
-                Err(err) => Err(fail_current_execution_after_scan_error(
-                    &mut active,
-                    active_scan,
-                    err,
-                )),
-            }
+            Ok(Some(ActiveScanDriver {
+                key: execution.key,
+                scan_id: input.scan_id,
+                state: ActiveScanDriverState::Streaming,
+            }))
         })
     }
 
@@ -553,12 +626,29 @@ impl BackendService {
     }
 
     pub fn render_explain(input: ExplainInput<'_>) -> Result<String, BackendServiceError> {
+        ensure_no_scan_driver_active("render explain")?;
         let built = PlanBuilder::new().build(PlanBuildInput {
             sql: input.sql,
             params: input.params,
         })?;
         let rendered = built.logical_plan.display_indent().to_string();
         Ok(rendered)
+    }
+
+    #[cfg(any(test, feature = "pg_test"))]
+    #[doc(hidden)]
+    pub fn inject_wait_for_scan_backpressure_error_for_tests(message: impl Into<String>) {
+        WAIT_FOR_SCAN_BACKPRESSURE_ERROR_FOR_TESTS.with(|slot| {
+            *slot.borrow_mut() = Some(message.into());
+        });
+    }
+
+    #[cfg(any(test, feature = "pg_test"))]
+    #[doc(hidden)]
+    pub fn clear_wait_for_scan_backpressure_error_for_tests() {
+        WAIT_FOR_SCAN_BACKPRESSURE_ERROR_FOR_TESTS.with(|slot| {
+            slot.borrow_mut().take();
+        });
     }
 
     #[cfg(test)]
@@ -572,6 +662,7 @@ impl BackendService {
         ACTIVE_EXECUTION.with(|slot| {
             slot.borrow_mut().take();
         });
+        BackendService::clear_wait_for_scan_backpressure_error_for_tests();
     }
 
     #[cfg(test)]
@@ -610,6 +701,7 @@ impl BackendService {
                 starting: None,
                 scans: Vec::new(),
                 active_scan: None,
+                driver_scan_id: None,
             });
         });
     }
@@ -641,6 +733,45 @@ impl BackendService {
                 starting: Some(StartingRuntime { plan_role }),
                 scans: Vec::new(),
                 active_scan: None,
+                driver_scan_id: None,
+            });
+        });
+    }
+
+    #[cfg(test)]
+    pub(crate) fn install_fake_execution_with_driver_for_tests(
+        slot_id: u32,
+        session_epoch: u64,
+        state: BackendExecutionState,
+        scan_id: u64,
+    ) {
+        CURRENT_SESSION_EPOCH.with(|epoch| epoch.set(session_epoch));
+        ACTIVE_EXECUTION.with(|slot| {
+            let mut machine = BackendExecutionMachine::new();
+            if state != BackendExecutionState::Idle {
+                let _ = machine.consume(&BackendExecutionEvent::BeginExecution);
+            }
+            if state == BackendExecutionState::Running {
+                let _ = machine.consume(&BackendExecutionEvent::PlanPublished);
+            }
+            *slot.borrow_mut() = Some(ActiveExecution {
+                key: ExecutionKey {
+                    slot_id,
+                    session_epoch,
+                },
+                snapshot: ExecutionSnapshot::unregistered_for_tests(),
+                _logical_plan: datafusion_expr::logical_plan::LogicalPlan::EmptyRelation(
+                    datafusion_expr::logical_plan::EmptyRelation {
+                        produce_one_row: false,
+                        schema: Arc::new(datafusion_common::DFSchema::empty()),
+                    },
+                ),
+                machine,
+                config: BackendServiceConfig::default(),
+                starting: None,
+                scans: Vec::new(),
+                active_scan: None,
+                driver_scan_id: Some(scan_id),
             });
         });
     }
@@ -681,6 +812,58 @@ fn bump_current_session_epoch() -> u64 {
     })
 }
 
+fn wait_for_scan_backpressure(blocked_loops: u32) -> Result<bool, BackendServiceError> {
+    #[cfg(any(test, feature = "pg_test"))]
+    if let Some(err) = take_wait_for_scan_backpressure_error_for_tests() {
+        return Err(err);
+    }
+
+    PgTryBuilder::new(AssertUnwindSafe(|| {
+        if blocked_loops < 8 {
+            for _ in 0..64 {
+                std::hint::spin_loop();
+            }
+            pgrx::pg_sys::check_for_interrupts!();
+            return Ok(true);
+        }
+
+        if blocked_loops == 8 {
+            wait_latch(Some(Duration::from_millis(1)));
+            return Ok(true);
+        }
+
+        Ok(false)
+    }))
+    .catch_others(|error| Err(backend_error_from_caught_error(error)))
+    .execute()
+}
+
+fn wait_latch(timeout: Option<Duration>) {
+    let timeout_ms: std::ffi::c_long = timeout
+        .map(|t| t.as_millis().try_into().unwrap())
+        .unwrap_or(-1);
+    let events = if timeout.is_some() {
+        pg_sys::WL_LATCH_SET | pg_sys::WL_TIMEOUT | pg_sys::WL_POSTMASTER_DEATH
+    } else {
+        pg_sys::WL_LATCH_SET | pg_sys::WL_POSTMASTER_DEATH
+    };
+
+    let rc = unsafe {
+        let rc = pg_sys::WaitLatch(
+            pg_sys::MyLatch,
+            events as i32,
+            timeout_ms,
+            pg_sys::PG_WAIT_EXTENSION,
+        );
+        pg_sys::ResetLatch(pg_sys::MyLatch);
+        rc
+    };
+    pgrx::pg_sys::check_for_interrupts!();
+    if rc & pg_sys::WL_POSTMASTER_DEATH as i32 != 0 {
+        panic!("postmaster is dead");
+    }
+}
+
 fn classify_missing_execution(
     _slot_id: u32,
     session_epoch: u64,
@@ -692,6 +875,18 @@ fn classify_missing_execution(
             incoming: session_epoch,
         }),
     }
+}
+
+fn ensure_no_scan_driver_active(action: &'static str) -> Result<(), BackendServiceError> {
+    ACTIVE_EXECUTION.with(|slot| {
+        let active = slot.borrow();
+        if let Some(execution) = active.as_ref() {
+            if let Some(scan_id) = execution.driver_scan_id {
+                return Err(BackendServiceError::ScanDriverActive { action, scan_id });
+            }
+        }
+        Ok(())
+    })
 }
 
 fn should_ignore_message(
@@ -710,6 +905,27 @@ fn should_ignore_message(
     }
 }
 
+fn ensure_driver_matches_execution(
+    execution: &ActiveExecution,
+    key: ExecutionKey,
+    scan_id: u64,
+    action: &'static str,
+) -> Result<(), BackendServiceError> {
+    if execution.key != key {
+        return Err(BackendServiceError::ProtocolViolation(format!(
+            "scan driver key mismatch during {}: driver {:?}, execution {:?}",
+            action, key, execution.key
+        )));
+    }
+    if execution.driver_scan_id != Some(scan_id) {
+        return Err(BackendServiceError::ProtocolViolation(format!(
+            "scan driver for scan_id {} is not active during {}",
+            scan_id, action
+        )));
+    }
+    Ok(())
+}
+
 fn ensure_execution_state(
     execution: &ActiveExecution,
     expected: BackendExecutionState,
@@ -721,6 +937,96 @@ fn ensure_execution_state(
     } else {
         Err(BackendServiceError::InvalidExecutionState { action, state })
     }
+}
+
+fn step_scan_with_driver(
+    key: ExecutionKey,
+    scan_id: u64,
+) -> Result<ScanStreamStep, BackendServiceError> {
+    ACTIVE_EXECUTION.with(|slot| {
+        let mut active = slot.borrow_mut();
+        let mut active_scan = {
+            let execution = active
+                .as_mut()
+                .ok_or(BackendServiceError::NoActiveExecution)?;
+            ensure_driver_matches_execution(execution, key, scan_id, "step scan")?;
+            ensure_execution_state(execution, BackendExecutionState::Running, "step scan")?;
+            execution.active_scan.take().ok_or_else(|| {
+                BackendServiceError::ProtocolViolation(format!(
+                    "scan driver for scan_id {} lost its active scan stream during step scan",
+                    scan_id
+                ))
+            })?
+        };
+
+        let mut blocked_loops = 0u32;
+        loop {
+            let outcome = {
+                let execution = active
+                    .as_mut()
+                    .expect("active execution must remain installed during step scan");
+                drive_scan_step(execution, &mut active_scan)
+            };
+
+            match outcome {
+                Ok(ScanDriveOutcome::Continue(step)) => {
+                    active
+                        .as_mut()
+                        .expect("active execution must exist for continuing scan")
+                        .active_scan = Some(active_scan);
+                    return Ok(step);
+                }
+                Ok(ScanDriveOutcome::Blocked) => {
+                    // During the bounded internal wait, the stackful scan
+                    // session stays detached in `active_scan`. It must be
+                    // reinstalled only when we yield control back to the host
+                    // loop, or handed straight to fatal cleanup on error.
+                    match wait_for_scan_backpressure(blocked_loops) {
+                        Ok(true) => {
+                            blocked_loops = blocked_loops.saturating_add(1);
+                        }
+                        Ok(false) => {
+                            active
+                                .as_mut()
+                                .expect("active execution must exist while yielding scan control")
+                                .active_scan = Some(active_scan);
+                            return Ok(ScanStreamStep::YieldForControl {
+                                reason: ScanYieldReason::PermitBackpressure,
+                            });
+                        }
+                        Err(err) => {
+                            return Err(fail_current_execution_after_scan_error(
+                                &mut active,
+                                active_scan,
+                                err,
+                            ));
+                        }
+                    }
+                }
+                Ok(ScanDriveOutcome::Terminal(step)) => return Ok(step),
+                Ok(ScanDriveOutcome::FatalExecution(step)) => {
+                    return finish_current_execution_after_fatal_scan_step(
+                        &mut active,
+                        active_scan,
+                        step,
+                    );
+                }
+                Err(err) => {
+                    return Err(fail_current_execution_after_scan_error(
+                        &mut active,
+                        active_scan,
+                        err,
+                    ));
+                }
+            }
+        }
+    })
+}
+
+#[cfg(any(test, feature = "pg_test"))]
+fn take_wait_for_scan_backpressure_error_for_tests() -> Option<BackendServiceError> {
+    WAIT_FOR_SCAN_BACKPRESSURE_ERROR_FOR_TESTS
+        .with(|slot| slot.borrow_mut().take().map(BackendServiceError::Postgres))
 }
 
 fn prepare_scan_entry(
@@ -813,6 +1119,10 @@ fn normalize_transport_field(
     ))
 }
 
+fn normalize_scan_fetch_batch_rows(fetch_batch_rows: u32) -> usize {
+    usize::try_from(fetch_batch_rows.max(1)).expect("scan fetch batch size must fit into usize")
+}
+
 fn drive_scan_step(
     execution: &mut ActiveExecution,
     active_scan: &mut ActiveScanStream,
@@ -827,12 +1137,7 @@ fn drive_scan_step(
             producer_id,
             outbound,
         })),
-        BackendProducerStep::Blocked { flow, producer_id } => {
-            Ok(ScanDriveOutcome::Continue(ScanStreamStep::Blocked {
-                flow,
-                producer_id,
-            }))
-        }
+        BackendProducerStep::Blocked { .. } => Ok(ScanDriveOutcome::Blocked),
         BackendProducerStep::ProducerEof { flow, producer_id } => {
             let terminal = active_scan
                 .coordinator
@@ -973,6 +1278,64 @@ fn mark_scan_terminal(
     Ok(())
 }
 
+fn cancel_scan_from_driver(key: ExecutionKey, scan_id: u64) -> Result<bool, BackendServiceError> {
+    ACTIVE_EXECUTION.with(|slot| {
+        let mut active = slot.borrow_mut();
+        {
+            let Some(execution) = active.as_mut() else {
+                return classify_missing_execution(key.slot_id, key.session_epoch);
+            };
+
+            if should_ignore_message(execution, key.slot_id, key.session_epoch)? {
+                return Ok(false);
+            }
+            ensure_driver_matches_execution(execution, key, scan_id, "cancel scan")?;
+            ensure_execution_state(execution, BackendExecutionState::Running, "cancel scan")?;
+        }
+
+        let mut active_scan = active
+            .as_mut()
+            .expect("active execution must remain installed during cancel_scan")
+            .active_scan
+            .take()
+            .ok_or_else(|| {
+                BackendServiceError::ProtocolViolation(format!(
+                    "scan driver for scan_id {} lost its active scan stream during cancel scan",
+                    scan_id
+                ))
+            })?;
+        if active_scan.scan_id != scan_id {
+            active
+                .as_mut()
+                .expect("active execution must exist for mismatched cancel")
+                .active_scan = Some(active_scan);
+            return Err(BackendServiceError::ScanNotActive { scan_id });
+        }
+
+        let cancel_result = {
+            let execution = active
+                .as_mut()
+                .expect("active execution must remain installed during cancel_scan");
+            cancel_detached_scan(execution, &mut active_scan)
+        };
+
+        match cancel_result {
+            Ok(()) => {
+                let execution = active
+                    .as_mut()
+                    .expect("active execution must remain installed after cancel_scan");
+                execution.driver_scan_id = None;
+                Ok(true)
+            }
+            Err(err) => Err(fail_current_execution_after_scan_error(
+                &mut active,
+                active_scan,
+                err,
+            )),
+        }
+    })
+}
+
 fn terminate_current_execution(
     slot_id: u32,
     session_epoch: u64,
@@ -987,6 +1350,40 @@ fn terminate_current_execution(
         if should_ignore_message(current, slot_id, session_epoch)? {
             return Ok(false);
         }
+        if let Some(scan_id) = current.driver_scan_id {
+            return Err(BackendServiceError::ScanDriverActive {
+                action: terminal_event_action(event),
+                scan_id,
+            });
+        }
+        if !terminal_event_allowed(*current.machine.state(), event) {
+            return Err(BackendServiceError::InvalidExecutionState {
+                action: terminal_event_action(event),
+                state: *current.machine.state(),
+            });
+        }
+
+        let execution = active.take().expect("checked above");
+        cleanup_execution(execution, Some(event))?;
+        Ok(true)
+    })
+}
+
+fn terminate_current_execution_from_driver(
+    key: ExecutionKey,
+    scan_id: u64,
+    event: BackendExecutionEvent,
+) -> Result<bool, BackendServiceError> {
+    ACTIVE_EXECUTION.with(|slot| {
+        let mut active = slot.borrow_mut();
+        let Some(current) = active.as_ref() else {
+            return classify_missing_execution(key.slot_id, key.session_epoch);
+        };
+
+        if should_ignore_message(current, key.slot_id, key.session_epoch)? {
+            return Ok(false);
+        }
+        ensure_driver_matches_execution(current, key, scan_id, terminal_event_action(event))?;
         if !terminal_event_allowed(*current.machine.state(), event) {
             return Err(BackendServiceError::InvalidExecutionState {
                 action: terminal_event_action(event),
@@ -1034,6 +1431,7 @@ fn cleanup_execution(
     terminal_event: Option<BackendExecutionEvent>,
 ) -> Result<(), BackendServiceError> {
     let mut cleanup_error = None;
+    execution.driver_scan_id = None;
 
     if let Some(event) = terminal_event {
         if let Err(err) = consume_execution_event(&mut execution.machine, event) {
@@ -1142,10 +1540,9 @@ fn fatal_scan_step_detail(step: &ScanStreamStep) -> String {
             "scan flow {:?} producer_id {} emitted a page on fatal path",
             flow, producer_id
         ),
-        ScanStreamStep::Blocked { flow, producer_id } => format!(
-            "scan flow {:?} producer_id {} blocked on fatal path",
-            flow, producer_id
-        ),
+        ScanStreamStep::YieldForControl { reason } => {
+            format!("scan yielded for control on fatal path: {:?}", reason)
+        }
     }
 }
 

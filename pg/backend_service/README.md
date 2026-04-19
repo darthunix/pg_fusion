@@ -14,10 +14,29 @@ It owns the backend-local execution lifecycle:
 - serve worker `OpenScan` requests by running `slot_scan`, encoding rows with
   `slot_encoder`, and streaming pages through `scan_flow`
 
-`backend_service` relies on `slot_scan`'s incremental cursor contract: a scan
-keeps a PostgreSQL portal alive across retries, but each page-building drain
-step reconnects to SPI only for that step. A `ScanStreamStep::Blocked` retry
-therefore does not strand a live `SPI_connect()` frame in the backend.
+`backend_service` uses a stackful scan-streaming contract for the hot path:
+
+- one backend scan session keeps a PostgreSQL portal, one `SPI_connect()` frame,
+  and the current fetched batch alive until that scan reaches a terminal state
+- rows are encoded straight from PostgreSQL slots into `slot_encoder` pages
+  without per-row materialization into retry buffers
+- lower layers such as `issuance` and `scan_flow` remain non-blocking; when
+  page permits are exhausted the scan driver yields explicit control back to
+  the host loop with `ScanStreamStep::YieldForControl { PermitBackpressure }`
+
+This is intentionally a strong invariant: once scan streaming starts, the
+backend must keep driving that scan through its `ActiveScanDriver` and must
+not interleave unrelated SPI or planning work in the same backend process.
+
+`BackendServiceConfig` also exposes a backend-local tuning knob for scan
+streaming:
+
+- `scan_fetch_batch_rows` controls how many rows one stackful `slot_scan`
+  session asks PostgreSQL to fetch per cursor batch
+- the default is `1024`
+- `0` is normalized to `1`
+- public `slot_scan::ScanOptions` stay unchanged; this knob only affects the
+  internal backend-service streaming path
 
 The crate is intentionally backend-local:
 
@@ -49,6 +68,8 @@ The key contracts are:
 - `FailExecution` and `CancelExecution` are accepted both while the execution
   is still `Starting` and after it reaches `Running`
 - `CompleteExecution` is accepted only after plan publication has completed
+- once `open_scan()` returns an `ActiveScanDriver`, that driver owns all scan
+  progress and terminal control until it is released
 - a backend-observed fatal scan producer failure tears down the whole execution
   immediately, so late worker `CompleteExecution` messages for that
   `session_epoch` are ignored rather than overriding the failure
@@ -106,9 +127,11 @@ assert_eq!(key, begin.key);
 Typical worker-driven scan open:
 
 ```rust,ignore
-use backend_service::{BackendService, OpenScanInput, ScanStreamStep};
+use backend_service::{
+    BackendService, OpenScanInput, ScanStreamStep, ScanYieldReason,
+};
 
-if BackendService::open_scan(OpenScanInput {
+if let Some(mut driver) = BackendService::open_scan(OpenScanInput {
     slot_id,
     session_epoch,
     scan_id,
@@ -116,9 +139,26 @@ if BackendService::open_scan(OpenScanInput {
     scan_tx,
 })? {
     loop {
-        match BackendService::step_scan()? {
+        match driver.step()? {
             ScanStreamStep::OutboundPage { outbound, .. } => send_scan_page(outbound)?,
-            ScanStreamStep::Blocked { .. } => retry_later(),
+            ScanStreamStep::YieldForControl {
+                reason: ScanYieldReason::PermitBackpressure,
+            } => {
+                if let Some(msg) = try_poll_control()? {
+                    match msg {
+                        WorkerControl::Fail(code, detail) => {
+                            driver.fail_execution(code, detail)?;
+                            break;
+                        }
+                        WorkerControl::Cancel => {
+                            driver.cancel_execution()?;
+                            break;
+                        }
+                        _ => {}
+                    }
+                }
+                continue;
+            }
             ScanStreamStep::Finished { .. } => break,
             ScanStreamStep::Failed { message, .. } => {
                 // The execution has already been failed and cleaned up before
@@ -127,6 +167,8 @@ if BackendService::open_scan(OpenScanInput {
             }
         }
     }
+
+    driver.complete_execution()?;
 }
 ```
 
@@ -141,6 +183,8 @@ Explain stays backend-local:
 
 - multiple concurrent executions in one backend process
 - multiple simultaneously streaming scans in one execution
+- doing unrelated SPI/planning work while an `ActiveScanDriver` is alive
+- resumable public scan cursors that survive arbitrary retry-later boundaries
 - worker-side snapshot ownership
 - general-purpose cancellation registry beyond the current process-local active
   execution

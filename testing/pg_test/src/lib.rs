@@ -233,8 +233,18 @@ mod tests {
     }
 
     #[pg_test]
-    fn backend_service_blocked_retry_allows_spi_between_steps() {
-        super::backend_service::backend_service_blocked_retry_allows_spi_between_steps();
+    fn backend_service_yields_for_control_on_permit_backpressure() {
+        super::backend_service::backend_service_yields_for_control_on_permit_backpressure();
+    }
+
+    #[pg_test]
+    fn backend_service_driver_fail_execution_from_control_yield() {
+        super::backend_service::backend_service_driver_fail_execution_from_control_yield();
+    }
+
+    #[pg_test]
+    fn backend_service_wait_interrupt_cleans_up_active_execution() {
+        super::backend_service::backend_service_wait_interrupt_cleans_up_active_execution();
     }
 
     #[pg_test]
@@ -573,16 +583,6 @@ mod tests {
     #[pg_test]
     fn slot_scan_reuses_active_snapshot_for_read_only_cursor() {
         super::slot_scan::slot_scan_reuses_active_snapshot_for_read_only_cursor();
-    }
-
-    #[pg_test]
-    fn slot_scan_cursor_allows_spi_between_drain_steps() {
-        super::slot_scan::slot_scan_cursor_allows_spi_between_drain_steps();
-    }
-
-    #[pg_test]
-    fn slot_scan_cursor_replays_unconsumed_row_between_drains() {
-        super::slot_scan::slot_scan_cursor_replays_unconsumed_row_between_drains();
     }
 
     #[pg_test]

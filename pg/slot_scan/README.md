@@ -46,14 +46,6 @@ side PostgreSQL errors and panics surface as ordinary `ScanError` values.
 If `run()` exits unsuccessfully after sink construction, `abort` is invoked
 best-effort exactly once.
 
-For retryable incremental execution, callers can instead open a
-`PreparedScanCursor` with `PreparedScan::open_cursor()` and drive it with
-`PreparedScanCursor::drain_rows(...)`. The cursor keeps the revalidated portal
-alive across drain steps, but each drain step reconnects to SPI only for the
-duration of that call and closes SPI again before returning. This makes
-backpressure-style `Blocked` / retry loops safe for higher layers such as
-`backend_service`: between drain steps there is no live `SPI_connect()` frame.
-
 The important contract boundary is:
 
 - upstream compiler/caller: responsible for producing trusted side-effect-free
@@ -157,21 +149,6 @@ Important callback rules:
 - return `SlotSinkAction::Stop` from `consume_slot` to stop the local scan loop
   early
 
-## Incremental Cursor Contract
-
-`PreparedScan::open_cursor()` exposes the same trusted read-only portal through
-an explicit incremental API:
-
-- `PreparedScanCursor::drain_rows(visitor)` drains rows until EOF or until the
-  visitor returns `CursorRowAction::Stop` / `ReplayCurrentAndStop`
-- the slot passed to the visitor is valid only for the duration of that
-  callback
-- `CursorRowAction::ReplayCurrentAndStop` keeps the current row inside the
-  cursor and replays it first on the next `drain_rows()` call
-- `CursorDrainOutcome::Stopped` means only "this drain step stopped early";
-  the cursor remains open and later calls continue from the same portal
-- `PreparedScanCursor::close()` closes the portal and returns final `ScanStats`
-
 ## Important Semantics
 
 - `slot_scan` is not a SQL sandbox; it expects trusted compiler-generated SQL,
@@ -191,3 +168,17 @@ an explicit incremental API:
   captured during `prepare_scan()`
 - structural validation lives here; expression-level safety policy belongs to
   the upstream SQL compiler or caller contract
+
+## Internal Streaming Session
+
+`backend_service` also uses a hidden stackful streaming session inside this
+crate. That path is intentionally not part of the public contract:
+
+- it keeps one `SPI_connect()` frame, one portal, and the current fetched batch
+  alive across page-building steps
+- it exists to minimize PostgreSQL calls, `palloc` churn, and row copies when
+  streaming directly from PostgreSQL slots into `slot_encoder`
+- callers must not interleave other SPI or planning work while such a session
+  is active
+
+External users should treat `PreparedScan::run()` as the supported API.
