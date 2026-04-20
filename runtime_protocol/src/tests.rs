@@ -56,8 +56,11 @@ fn encode_raw_open_scan(
 
 fn encode_raw_producer_set(entries: &[(u16, u8)]) -> Vec<u8> {
     let mut buf = Vec::new();
-    write_array_len_to(&mut buf, u32::try_from(entries.len()).expect("producer len"))
-        .expect("producer set len");
+    write_array_len_to(
+        &mut buf,
+        u32::try_from(entries.len()).expect("producer len"),
+    )
+    .expect("producer set len");
     for &(producer_id, role) in entries {
         write_array_len_to(&mut buf, PRODUCER_DESCRIPTOR_LEN).expect("producer len");
         write_u16_to(&mut buf, producer_id).expect("producer id");
@@ -297,7 +300,10 @@ fn scan_descriptor_reconstructs_scan_open() {
 #[test]
 fn decode_rejects_bad_magic() {
     let mut encoded = encode_backend(BackendToWorker::CancelExecution { session_epoch: 1 });
-    let magic_index = encoded.iter().position(|&byte| byte == b'P').expect("magic byte");
+    let magic_index = encoded
+        .iter()
+        .position(|&byte| byte == b'P')
+        .expect("magic byte");
     encoded[magic_index] = b'X';
     let err = decode_backend_to_worker(&encoded).expect_err("bad magic");
     assert!(matches!(err, DecodeError::InvalidMagic { .. }));
@@ -306,7 +312,10 @@ fn decode_rejects_bad_magic() {
 #[test]
 fn decode_rejects_bad_version() {
     let mut encoded = encode_backend(BackendToWorker::CancelExecution { session_epoch: 1 });
-    let magic_index = encoded.iter().position(|&byte| byte == b'P').expect("magic byte");
+    let magic_index = encoded
+        .iter()
+        .position(|&byte| byte == b'P')
+        .expect("magic byte");
     let version_index = magic_index + RUNTIME_PROTOCOL_MAGIC.len() + 1;
     encoded[version_index] = 2;
     let err = decode_backend_to_worker(&encoded).expect_err("bad version");
@@ -335,7 +344,10 @@ fn decode_rejects_duplicate_producer_id() {
         3,
         0x0101,
         0,
-        &encode_raw_producer_set(&[(7, ProducerRole::Leader as u8), (7, ProducerRole::Worker as u8)]),
+        &encode_raw_producer_set(&[
+            (7, ProducerRole::Leader as u8),
+            (7, ProducerRole::Worker as u8),
+        ]),
     );
     let err = decode_worker_to_backend(&encoded).expect_err("duplicate producer");
     assert_eq!(err, DecodeError::DuplicateProducerId { producer_id: 7 });
@@ -348,7 +360,10 @@ fn decode_rejects_multiple_leaders() {
         3,
         0x0101,
         0,
-        &encode_raw_producer_set(&[(1, ProducerRole::Leader as u8), (2, ProducerRole::Leader as u8)]),
+        &encode_raw_producer_set(&[
+            (1, ProducerRole::Leader as u8),
+            (2, ProducerRole::Leader as u8),
+        ]),
     );
     let err = decode_worker_to_backend(&encoded).expect_err("multiple leaders");
     assert_eq!(err, DecodeError::MultipleLeaders);
@@ -407,9 +422,11 @@ fn scan_descriptor_constructor_rejects_duplicate_producer_id() {
             role: ProducerRole::Worker,
         },
     ];
-    let err =
-        ScanFlowDescriptor::new(0x0101, 0, &producers).expect_err("duplicate producer id");
-    assert_eq!(err, ProducerSetError::DuplicateProducerId { producer_id: 5 });
+    let err = ScanFlowDescriptor::new(0x0101, 0, &producers).expect_err("duplicate producer id");
+    assert_eq!(
+        err,
+        ProducerSetError::DuplicateProducerId { producer_id: 5 }
+    );
 }
 
 #[test]
@@ -431,8 +448,7 @@ fn scan_descriptor_constructor_rejects_multiple_leaders() {
 #[test]
 fn scan_descriptor_constructor_accepts_valid_producer_set() {
     let producers = producer_descriptors();
-    let descriptor =
-        ScanFlowDescriptor::new(0x0101, 0, &producers).expect("valid producer set");
+    let descriptor = ScanFlowDescriptor::new(0x0101, 0, &producers).expect("valid producer set");
     assert_eq!(descriptor.page_kind, 0x0101);
     assert_eq!(descriptor.page_flags, 0);
     assert_eq!(descriptor.producers(), &producers);

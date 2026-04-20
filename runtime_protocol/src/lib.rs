@@ -12,7 +12,9 @@
 //! reconstructing concrete `plan_flow` / `scan_flow` descriptors from the
 //! values returned here.
 
-use rmp::decode::{read_array_len, read_marker, read_str_len, read_u16, read_u64, read_u8, RmpRead};
+use rmp::decode::{
+    read_array_len, read_marker, read_str_len, read_u16, read_u64, read_u8, RmpRead,
+};
 use rmp::encode::{write_array_len, write_nil, write_str, write_u16, write_u64, write_u8};
 use rmp::Marker;
 use std::fmt;
@@ -224,7 +226,9 @@ impl Iterator for ProducerIter<'_> {
             return None;
         }
         self.remaining -= 1;
-        Some(read_producer_descriptor_from(&mut self.source).expect("validated producer descriptor"))
+        Some(
+            read_producer_descriptor_from(&mut self.source).expect("validated producer descriptor"),
+        )
     }
 }
 
@@ -779,7 +783,9 @@ fn map_invariant_error_to_encode(error: ProducerSetInvariantError) -> ProducerSe
     }
 }
 
-fn read_producer_descriptor_from(source: &mut &[u8]) -> Result<ProducerDescriptorWire, DecodeError> {
+fn read_producer_descriptor_from(
+    source: &mut &[u8],
+) -> Result<ProducerDescriptorWire, DecodeError> {
     expect_message_len(read_array_len_from(source)?, PRODUCER_DESCRIPTOR_LEN)?;
     Ok(ProducerDescriptorWire {
         producer_id: read_u16_from(source)?,
@@ -791,8 +797,9 @@ fn write_producer_slice_to<W: Write>(
     sink: &mut W,
     producers: &[ProducerDescriptorWire],
 ) -> Result<(), EncodeError> {
-    let len = u32::try_from(producers.len())
-        .map_err(|_| EncodeError::TooManyProducers { count: producers.len() })?;
+    let len = u32::try_from(producers.len()).map_err(|_| EncodeError::TooManyProducers {
+        count: producers.len(),
+    })?;
     write_array_len_to(sink, len)?;
     for producer in producers {
         write_array_len_to(sink, PRODUCER_DESCRIPTOR_LEN)?;
@@ -904,10 +911,7 @@ fn read_u64_from(source: &mut &[u8]) -> Result<u64, DecodeError> {
     read_u64(source).map_err(|error| DecodeError::MsgPack(error.to_string()))
 }
 
-fn read_string_bytes_from<'a>(
-    source: &mut &'a [u8],
-    what: &str,
-) -> Result<&'a [u8], DecodeError> {
+fn read_string_bytes_from<'a>(source: &mut &'a [u8], what: &str) -> Result<&'a [u8], DecodeError> {
     let len = read_str_len_from(source)? as usize;
     if source.len() < len {
         return Err(DecodeError::MsgPack(format!(
