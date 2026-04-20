@@ -31,7 +31,9 @@ use scan_flow::{
 use scan_node::PgScanSpec;
 use slot_scan::{prepare_scan, PreparedScan, ScanOptions};
 use std::cell::{Cell, RefCell};
+use std::marker::PhantomData;
 use std::panic::AssertUnwindSafe;
+use std::rc::Rc;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -194,6 +196,10 @@ pub struct ActiveScanDriver {
     key: ExecutionKey,
     scan_id: u64,
     state: ActiveScanDriverState,
+    // This handle drives process-local PostgreSQL backend state stored in
+    // `ACTIVE_EXECUTION`. Keep it on the creating backend thread so `step()`
+    // and `Drop` cannot accidentally consult another thread's empty TLS slot.
+    _thread_bound: PhantomData<Rc<()>>,
 }
 
 struct StartingRuntime {
@@ -588,6 +594,7 @@ impl BackendService {
                 key: execution.key,
                 scan_id: input.scan_id,
                 state: ActiveScanDriverState::Streaming,
+                _thread_bound: PhantomData,
             }))
         })
     }
