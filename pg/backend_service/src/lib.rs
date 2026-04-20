@@ -298,10 +298,19 @@ impl ActiveScanDriver {
     }
 
     pub fn complete_execution(&mut self) -> Result<bool, BackendServiceError> {
-        if self.state == ActiveScanDriverState::Released {
-            return Err(BackendServiceError::ProtocolViolation(
-                "scan driver has already been released".into(),
-            ));
+        match self.state {
+            ActiveScanDriverState::AwaitingExecutionTerminal => {}
+            ActiveScanDriverState::Streaming => {
+                return Err(BackendServiceError::ProtocolViolation(
+                    "scan driver cannot complete execution before scan stream reaches Finished"
+                        .into(),
+                ));
+            }
+            ActiveScanDriverState::Released => {
+                return Err(BackendServiceError::ProtocolViolation(
+                    "scan driver has already been released".into(),
+                ));
+            }
         }
         let handled = terminate_current_execution_from_driver(
             self.key,

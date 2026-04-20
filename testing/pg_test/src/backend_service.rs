@@ -468,6 +468,11 @@ pub fn backend_service_yields_for_control_on_permit_backpressure() {
         BackendService::accept_complete_execution(TEST_SLOT_ID, begin.key.session_epoch),
         Err(BackendServiceError::ScanDriverActive { .. })
     ));
+    assert!(matches!(
+        driver.complete_execution(),
+        Err(BackendServiceError::ProtocolViolation(message))
+            if message.contains("before scan stream reaches Finished")
+    ));
 
     drop(held_page);
 
