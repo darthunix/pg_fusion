@@ -21,16 +21,40 @@ fn producer_descriptors() -> [ProducerDescriptorWire; 2] {
     ]
 }
 
-fn encode_backend(message: BackendToWorker) -> Vec<u8> {
-    let mut buf = vec![0u8; encoded_len_backend_to_worker(message)];
-    let len = encode_backend_to_worker_into(message, &mut buf).expect("encode");
+fn backend_peer(slot_id: u32, generation: u64, lease_epoch: u64) -> BackendLeaseSlotWire {
+    BackendLeaseSlotWire::new(slot_id, generation, lease_epoch)
+}
+
+fn scan_channels() -> [ScanChannelDescriptorWire; 2] {
+    [
+        ScanChannelDescriptorWire {
+            scan_id: 7,
+            peer: backend_peer(11, 22, 33),
+        },
+        ScanChannelDescriptorWire {
+            scan_id: 8,
+            peer: backend_peer(12, 22, 34),
+        },
+    ]
+}
+
+fn encode_backend(message: BackendExecutionToWorker<'_>) -> Vec<u8> {
+    let mut buf = vec![0u8; encoded_len_backend_execution_to_worker(message)];
+    let len = encode_backend_execution_to_worker_into(message, &mut buf).expect("encode");
     assert_eq!(len, buf.len());
     buf
 }
 
-fn encode_worker(message: WorkerToBackend<'_>) -> Vec<u8> {
-    let mut buf = vec![0u8; encoded_len_worker_to_backend(message)];
-    let len = encode_worker_to_backend_into(message, &mut buf).expect("encode");
+fn encode_worker_execution(message: WorkerExecutionToBackend) -> Vec<u8> {
+    let mut buf = vec![0u8; encoded_len_worker_execution_to_backend(message)];
+    let len = encode_worker_execution_to_backend_into(message, &mut buf).expect("encode");
+    assert_eq!(len, buf.len());
+    buf
+}
+
+fn encode_worker_scan(message: WorkerScanToBackend<'_>) -> Vec<u8> {
+    let mut buf = vec![0u8; encoded_len_worker_scan_to_backend(message)];
+    let len = encode_worker_scan_to_backend_into(message, &mut buf).expect("encode");
     assert_eq!(len, buf.len());
     buf
 }
@@ -43,9 +67,12 @@ fn encode_raw_open_scan(
     producer_bytes: &[u8],
 ) -> Vec<u8> {
     let mut buf = Vec::new();
-    write_array_len_to(&mut buf, WORKER_TO_BACKEND_OPEN_SCAN_LEN).expect("array len");
-    write_magic_and_version_to(&mut buf).expect("magic+version");
-    write_u8_to(&mut buf, WORKER_TO_BACKEND_OPEN_SCAN_TAG).expect("tag");
+    write_runtime_header_to(
+        &mut buf,
+        RuntimeMessageFamily::WorkerScanToBackend,
+        WORKER_SCAN_OPEN_TAG,
+    )
+    .expect("runtime header");
     write_u64_to(&mut buf, session_epoch).expect("session");
     write_u64_to(&mut buf, scan_id).expect("scan id");
     write_u16_to(&mut buf, page_kind).expect("page kind");
@@ -95,9 +122,9 @@ fn encode_raw_producer_set_array32(entries: &[(u16, u8)]) -> Vec<u8> {
     buf
 }
 
-fn decode_open_scan(message: WorkerToBackendRef<'_>) -> (u64, u64, ScanFlowDescriptorRef<'_>) {
+fn decode_open_scan(message: WorkerScanToBackendRef<'_>) -> (u64, u64, ScanFlowDescriptorRef<'_>) {
     match message {
-        WorkerToBackendRef::OpenScan {
+        WorkerScanToBackendRef::OpenScan {
             session_epoch,
             scan_id,
             scan,
@@ -154,65 +181,93 @@ fn classify_session_orders_epochs() {
 }
 
 #[test]
-fn backend_start_execution_round_trips() {
-    let message = BackendToWorker::StartExecution {
+fn backend_start_execution_round_trips_with_empty_scan_map() {
+    let message = BackendExecutionToWorker::StartExecution {
         session_epoch: 9,
         plan: plan_descriptor(),
+        scans: ScanChannelSet::empty(),
     };
     let encoded = encode_backend(message);
-    let decoded = decode_backend_to_worker(&encoded).expect("decode");
-    assert_eq!(decoded, message);
+    let decoded = decode_backend_execution_to_worker(&encoded).expect("decode");
+    assert_eq!(
+        decoded,
+        BackendExecutionToWorkerRef::StartExecution {
+            session_epoch: 9,
+            plan: plan_descriptor(),
+            scans: ScanChannelSetRef::empty(),
+        }
+    );
+}
+
+#[test]
+fn backend_start_execution_round_trips_with_scan_channels() {
+    let channels = scan_channels();
+    let message = BackendExecutionToWorker::StartExecution {
+        session_epoch: 9,
+        plan: plan_descriptor(),
+        scans: ScanChannelSet::new(&channels).expect("valid scan set"),
+    };
+    let encoded = encode_backend(message);
+    let decoded = decode_backend_execution_to_worker(&encoded).expect("decode");
+    let BackendExecutionToWorkerRef::StartExecution {
+        session_epoch,
+        plan,
+        scans,
+    } = decoded
+    else {
+        panic!("expected start execution");
+    };
+    assert_eq!(session_epoch, 9);
+    assert_eq!(plan, plan_descriptor());
+    let decoded_channels: Vec<_> = scans.iter().collect();
+    assert_eq!(decoded_channels.as_slice(), &channels);
+}
+
+#[test]
+fn scan_channel_set_rejects_duplicate_scan_id() {
+    let channels = [
+        ScanChannelDescriptorWire {
+            scan_id: 7,
+            peer: backend_peer(1, 2, 3),
+        },
+        ScanChannelDescriptorWire {
+            scan_id: 7,
+            peer: backend_peer(4, 5, 6),
+        },
+    ];
+    let err = ScanChannelSet::new(&channels).expect_err("duplicate scan id");
+    assert_eq!(err, ScanChannelSetError::DuplicateScanId { scan_id: 7 });
 }
 
 #[test]
 fn backend_fail_execution_round_trips_with_detail() {
-    let message = BackendToWorker::FailExecution {
+    let message = BackendExecutionToWorker::FailExecution {
         session_epoch: 9,
         code: ExecutionFailureCode::ProtocolViolation,
         detail: Some(123),
     };
     let encoded = encode_backend(message);
-    let decoded = decode_backend_to_worker(&encoded).expect("decode");
-    assert_eq!(decoded, message);
-}
-
-#[test]
-fn backend_to_worker_max_encoded_len_covers_all_current_messages() {
-    let max_encoded = [
-        encoded_len_backend_to_worker(BackendToWorker::StartExecution {
-            session_epoch: u64::MAX,
-            plan: PlanFlowDescriptor {
-                plan_id: u64::MAX,
-                page_kind: u16::MAX,
-                page_flags: u16::MAX,
-            },
-        }),
-        encoded_len_backend_to_worker(BackendToWorker::CancelExecution {
-            session_epoch: u64::MAX,
-        }),
-        encoded_len_backend_to_worker(BackendToWorker::FailExecution {
-            session_epoch: u64::MAX,
-            code: ExecutionFailureCode::Internal,
-            detail: Some(u64::MAX),
-        }),
-    ]
-    .into_iter()
-    .max()
-    .expect("backend message lengths");
-
-    assert_eq!(max_encoded, MAX_BACKEND_TO_WORKER_ENCODED_LEN);
+    let decoded = decode_backend_execution_to_worker(&encoded).expect("decode");
+    assert_eq!(
+        decoded,
+        BackendExecutionToWorkerRef::FailExecution {
+            session_epoch: 9,
+            code: ExecutionFailureCode::ProtocolViolation,
+            detail: Some(123),
+        }
+    );
 }
 
 #[test]
 fn worker_open_scan_round_trips_with_borrowed_producers() {
     let producers = producer_descriptors();
-    let message = WorkerToBackend::OpenScan {
+    let message = WorkerScanToBackend::OpenScan {
         session_epoch: 5,
         scan_id: 77,
         scan: ScanFlowDescriptor::new(0x4411, 9, &producers).expect("valid scan descriptor"),
     };
-    let encoded = encode_worker(message);
-    let decoded = decode_worker_to_backend(&encoded).expect("decode");
+    let encoded = encode_worker_scan(message);
+    let decoded = decode_worker_scan_to_backend(&encoded).expect("decode");
     let (session_epoch, scan_id, scan) = decode_open_scan(decoded);
     assert_eq!(session_epoch, 5);
     assert_eq!(scan_id, 77);
@@ -236,13 +291,13 @@ fn worker_open_scan_round_trips_many_producers() {
         });
     }
 
-    let message = WorkerToBackend::OpenScan {
+    let message = WorkerScanToBackend::OpenScan {
         session_epoch: 21,
         scan_id: 301,
         scan: ScanFlowDescriptor::new(0x5001, 2, &producers).expect("valid scan descriptor"),
     };
-    let encoded = encode_worker(message);
-    let decoded = decode_worker_to_backend(&encoded).expect("decode");
+    let encoded = encode_worker_scan(message);
+    let decoded = decode_worker_scan_to_backend(&encoded).expect("decode");
     let (session_epoch, scan_id, scan) = decode_open_scan(decoded);
     assert_eq!(session_epoch, 21);
     assert_eq!(scan_id, 301);
@@ -253,16 +308,16 @@ fn worker_open_scan_round_trips_many_producers() {
 
 #[test]
 fn worker_fail_execution_round_trips_without_detail() {
-    let message = WorkerToBackend::FailExecution {
+    let message = WorkerExecutionToBackend::FailExecution {
         session_epoch: 12,
         code: ExecutionFailureCode::TransportRestarted,
         detail: None,
     };
-    let encoded = encode_worker(message);
-    let decoded = decode_worker_to_backend(&encoded).expect("decode");
+    let encoded = encode_worker_execution(message);
+    let decoded = decode_worker_execution_to_backend(&encoded).expect("decode");
     assert_eq!(
         decoded,
-        WorkerToBackendRef::FailExecution {
+        WorkerExecutionToBackend::FailExecution {
             session_epoch: 12,
             code: ExecutionFailureCode::TransportRestarted,
             detail: None,
@@ -272,24 +327,33 @@ fn worker_fail_execution_round_trips_without_detail() {
 
 #[test]
 fn encoded_len_matches_written_backend_message() {
-    let message = BackendToWorker::CancelExecution { session_epoch: 3 };
-    let expected = encoded_len_backend_to_worker(message);
+    let message = BackendExecutionToWorker::CancelExecution { session_epoch: 3 };
+    let expected = encoded_len_backend_execution_to_worker(message);
     let mut buf = vec![0u8; expected];
-    let actual = encode_backend_to_worker_into(message, &mut buf).expect("encode");
+    let actual = encode_backend_execution_to_worker_into(message, &mut buf).expect("encode");
     assert_eq!(actual, expected);
 }
 
 #[test]
-fn encoded_len_matches_written_worker_message() {
+fn encoded_len_matches_written_worker_execution_message() {
+    let message = WorkerExecutionToBackend::CompleteExecution { session_epoch: 5 };
+    let expected = encoded_len_worker_execution_to_backend(message);
+    let mut buf = vec![0u8; expected];
+    let actual = encode_worker_execution_to_backend_into(message, &mut buf).expect("encode");
+    assert_eq!(actual, expected);
+}
+
+#[test]
+fn encoded_len_matches_written_worker_scan_message() {
     let producers = producer_descriptors();
-    let message = WorkerToBackend::OpenScan {
+    let message = WorkerScanToBackend::OpenScan {
         session_epoch: 5,
         scan_id: 17,
         scan: ScanFlowDescriptor::new(0x2001, 1, &producers).expect("valid scan descriptor"),
     };
-    let expected = encoded_len_worker_to_backend(message);
+    let expected = encoded_len_worker_scan_to_backend(message);
     let mut buf = vec![0u8; expected];
-    let actual = encode_worker_to_backend_into(message, &mut buf).expect("encode");
+    let actual = encode_worker_scan_to_backend_into(message, &mut buf).expect("encode");
     assert_eq!(actual, expected);
 }
 
@@ -307,12 +371,12 @@ fn plan_descriptor_reconstructs_plan_open() {
 #[test]
 fn scan_descriptor_reconstructs_scan_open() {
     let producers = producer_descriptors();
-    let encoded = encode_worker(WorkerToBackend::OpenScan {
+    let encoded = encode_worker_scan(WorkerScanToBackend::OpenScan {
         session_epoch: 8,
         scan_id: 99,
         scan: ScanFlowDescriptor::new(0x0202, 7, &producers).expect("valid scan descriptor"),
     });
-    let decoded = decode_worker_to_backend(&encoded).expect("decode");
+    let decoded = decode_worker_scan_to_backend(&encoded).expect("decode");
     let (session_epoch, scan_id, scan) = decode_open_scan(decoded);
     let open = to_scan_open(session_epoch, scan_id, scan);
     assert_eq!(open.flow.session_epoch, session_epoch);
@@ -326,41 +390,45 @@ fn scan_descriptor_reconstructs_scan_open() {
 
 #[test]
 fn decode_rejects_bad_magic() {
-    let mut encoded = encode_backend(BackendToWorker::CancelExecution { session_epoch: 1 });
-    let magic_index = encoded
-        .iter()
-        .position(|&byte| byte == b'P')
-        .expect("magic byte");
-    encoded[magic_index] = b'X';
-    let err = decode_backend_to_worker(&encoded).expect_err("bad magic");
+    let mut encoded =
+        encode_backend(BackendExecutionToWorker::CancelExecution { session_epoch: 1 });
+    encoded[0] ^= 0x01;
+    let err = decode_backend_execution_to_worker(&encoded).expect_err("bad magic");
     assert!(matches!(err, DecodeError::InvalidMagic { .. }));
 }
 
 #[test]
 fn decode_rejects_bad_version() {
-    let mut encoded = encode_backend(BackendToWorker::CancelExecution { session_epoch: 1 });
-    let magic_index = encoded
-        .iter()
-        .position(|&byte| byte == b'P')
-        .expect("magic byte");
-    let version_index = magic_index + RUNTIME_PROTOCOL_MAGIC.len() + 1;
-    encoded[version_index] = 2;
-    let err = decode_backend_to_worker(&encoded).expect_err("bad version");
+    let mut encoded =
+        encode_backend(BackendExecutionToWorker::CancelExecution { session_epoch: 1 });
+    encoded[4] ^= 0x01;
+    let err = decode_backend_execution_to_worker(&encoded).expect_err("bad version");
     assert!(matches!(err, DecodeError::UnsupportedVersion { .. }));
 }
 
 #[test]
 fn decode_rejects_trailing_bytes() {
-    let mut encoded = encode_backend(BackendToWorker::CancelExecution { session_epoch: 1 });
+    let mut encoded =
+        encode_backend(BackendExecutionToWorker::CancelExecution { session_epoch: 1 });
     encoded.push(0);
-    let err = decode_backend_to_worker(&encoded).expect_err("trailing");
+    let err = decode_backend_execution_to_worker(&encoded).expect_err("trailing");
     assert!(matches!(err, DecodeError::TrailingBytes { remaining: 1 }));
+}
+
+#[test]
+fn decode_rejects_wrong_message_family() {
+    let encoded = encode_worker_scan(WorkerScanToBackend::CancelScan {
+        session_epoch: 2,
+        scan_id: 3,
+    });
+    let err = decode_backend_execution_to_worker(&encoded).expect_err("wrong family");
+    assert!(matches!(err, DecodeError::UnexpectedMessageFamily { .. }));
 }
 
 #[test]
 fn decode_rejects_empty_producer_set() {
     let encoded = encode_raw_open_scan(2, 3, 0x0101, 0, &encode_raw_producer_set(&[]));
-    let err = decode_worker_to_backend(&encoded).expect_err("empty producers");
+    let err = decode_worker_scan_to_backend(&encoded).expect_err("empty producers");
     assert_eq!(err, DecodeError::EmptyProducerSet);
 }
 
@@ -376,7 +444,7 @@ fn decode_rejects_duplicate_producer_id() {
             (7, ProducerRole::Worker as u8),
         ]),
     );
-    let err = decode_worker_to_backend(&encoded).expect_err("duplicate producer");
+    let err = decode_worker_scan_to_backend(&encoded).expect_err("duplicate producer");
     assert_eq!(err, DecodeError::DuplicateProducerId { producer_id: 7 });
 }
 
@@ -392,14 +460,14 @@ fn decode_rejects_multiple_leaders() {
             (2, ProducerRole::Leader as u8),
         ]),
     );
-    let err = decode_worker_to_backend(&encoded).expect_err("multiple leaders");
+    let err = decode_worker_scan_to_backend(&encoded).expect_err("multiple leaders");
     assert_eq!(err, DecodeError::MultipleLeaders);
 }
 
 #[test]
 fn decode_rejects_invalid_producer_role() {
     let encoded = encode_raw_open_scan(2, 3, 0x0101, 0, &encode_raw_producer_set(&[(1, 9)]));
-    let err = decode_worker_to_backend(&encoded).expect_err("invalid role");
+    let err = decode_worker_scan_to_backend(&encoded).expect_err("invalid role");
     assert_eq!(err, DecodeError::InvalidProducerRole { actual: 9 });
 }
 
@@ -410,7 +478,7 @@ fn decode_preserves_nonminimal_array16_producer_header() {
         (12, ProducerRole::Worker as u8),
     ]);
     let encoded = encode_raw_open_scan(2, 3, 0x0101, 0, &producer_bytes);
-    let decoded = decode_worker_to_backend(&encoded).expect("decode");
+    let decoded = decode_worker_scan_to_backend(&encoded).expect("decode");
     let (_, _, scan) = decode_open_scan(decoded);
     let decoded_producers: Vec<_> = scan.producers().iter().collect();
     assert_eq!(decoded_producers.as_slice(), &producer_descriptors());
@@ -424,7 +492,7 @@ fn decode_preserves_nonminimal_array32_producer_header() {
         (12, ProducerRole::Worker as u8),
     ]);
     let encoded = encode_raw_open_scan(2, 3, 0x0101, 0, &producer_bytes);
-    let decoded = decode_worker_to_backend(&encoded).expect("decode");
+    let decoded = decode_worker_scan_to_backend(&encoded).expect("decode");
     let (_, _, scan) = decode_open_scan(decoded);
     let decoded_producers: Vec<_> = scan.producers().iter().collect();
     assert_eq!(decoded_producers.as_slice(), &producer_descriptors());

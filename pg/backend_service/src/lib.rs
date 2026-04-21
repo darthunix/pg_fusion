@@ -22,7 +22,8 @@ use plan_flow::{BackendPlanRole, BackendPlanStep, PlanOpen};
 use row_estimator::{EstimatorConfig, PageRowEstimator};
 use row_estimator_seed::{seed_estimator_config, ProjectedColumnRef};
 use runtime_protocol::{
-    BackendToWorker, ExecutionFailureCode, PlanFlowDescriptor, ProducerRole, ScanFlowDescriptorRef,
+    BackendExecutionToWorker, ExecutionFailureCode, PlanFlowDescriptor, ProducerRole,
+    ScanChannelSet, ScanFlowDescriptorRef,
 };
 use scan_flow::{
     BackendProducerRole, BackendProducerStep, BackendScanCoordinator, FlowId as ScanFlowId,
@@ -138,7 +139,7 @@ pub struct StartExecutionInput<'a> {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct BeginExecutionOutput {
     pub key: ExecutionKey,
-    pub control: BackendToWorker,
+    pub control: BackendExecutionToWorker<'static>,
 }
 
 pub type ExecutionStartStep = BackendPlanStep;
@@ -420,13 +421,14 @@ impl BackendService {
             let mut machine = BackendExecutionMachine::new();
             consume_execution_event(&mut machine, BackendExecutionEvent::BeginExecution)?;
 
-            let control = BackendToWorker::StartExecution {
+            let control = BackendExecutionToWorker::StartExecution {
                 session_epoch,
                 plan: PlanFlowDescriptor {
                     plan_id: PLAN_ID,
                     page_kind: input.config.plan_page_kind,
                     page_flags: input.config.plan_page_flags,
                 },
+                scans: ScanChannelSet::empty(),
             };
 
             *slot.borrow_mut() = Some(ActiveExecution {

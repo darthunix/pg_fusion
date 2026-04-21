@@ -10,9 +10,10 @@ use datafusion_expr::logical_plan::LogicalPlan;
 use issuance::{decode_issued_frame, IssuedOwnedFrame, IssuedRx};
 use plan_flow::{FlowId as PlanFlowId, PlanOpen, WorkerPlanRole, WorkerStep as WorkerPlanStep};
 use runtime_protocol::{
-    classify_session, decode_backend_to_worker, encode_worker_to_backend_into,
-    encoded_len_worker_to_backend, BackendToWorker, ExecutionFailureCode, SessionDisposition,
-    WorkerToBackend,
+    classify_session, decode_backend_execution_to_worker, decode_runtime_message_family,
+    encode_worker_execution_to_backend_into, encoded_len_worker_execution_to_backend,
+    BackendExecutionToWorkerRef as BackendToWorkerRef, ExecutionFailureCode, RuntimeMessageFamily,
+    SessionDisposition, WorkerExecutionToBackend as WorkerToBackend,
 };
 use scan_node::PgScanExtensionPlanner;
 
@@ -44,9 +45,9 @@ impl Default for WorkerRuntimeConfig {
 
 /// One decoded inbound payload delivered to [`WorkerRuntimeCore`].
 #[derive(Debug)]
-pub enum DecodedInbound {
+pub enum DecodedInbound<'a> {
     /// One worker control-plane message decoded from `runtime_protocol`.
-    Control(BackendToWorker),
+    Control(BackendToWorkerRef<'a>),
     /// One issued frame decoded from the fixed-size `issuance` header.
     IssuedFrame(IssuedOwnedFrame),
 }
@@ -194,36 +195,49 @@ impl WorkerRuntimeCore {
     /// - exact `issuance::ISSUED_HEADER_LEN` => decode as issuance
     /// - shorter framed payloads within the runtime bound => decode as runtime
     /// - longer malformed payloads => reject as issuance traffic
-    pub fn decode_inbound(bytes: &[u8]) -> Result<DecodedInbound, WorkerRuntimeError> {
-        if bytes.len() == issuance::ISSUED_HEADER_LEN {
-            let frame = decode_issued_frame(bytes)?;
-            return Ok(DecodedInbound::IssuedFrame(frame));
+    pub fn decode_inbound(bytes: &[u8]) -> Result<DecodedInbound<'_>, WorkerRuntimeError> {
+        match decode_runtime_message_family(bytes) {
+            Ok(RuntimeMessageFamily::BackendExecutionToWorker) => {
+                let message = decode_backend_execution_to_worker(bytes)?;
+                Ok(DecodedInbound::Control(message))
+            }
+            Ok(other) => Err(runtime_protocol::DecodeError::UnexpectedMessageFamily {
+                actual: other as u8,
+            }
+            .into()),
+            Err(runtime_error)
+                if matches!(
+                    runtime_error,
+                    runtime_protocol::DecodeError::InvalidMagic { .. }
+                        | runtime_protocol::DecodeError::UnsupportedVersion { .. }
+                        | runtime_protocol::DecodeError::TruncatedEnvelope { .. }
+                ) =>
+            {
+                match decode_issued_frame(bytes) {
+                    Ok(frame) => Ok(DecodedInbound::IssuedFrame(frame)),
+                    Err(_) => Err(runtime_error.into()),
+                }
+            }
+            Err(runtime_error) => Err(runtime_error.into()),
         }
-
-        if bytes.len() <= runtime_protocol::MAX_BACKEND_TO_WORKER_ENCODED_LEN {
-            let message = decode_backend_to_worker(bytes)?;
-            return Ok(DecodedInbound::Control(message));
-        }
-
-        let frame = decode_issued_frame(bytes)?;
-        Ok(DecodedInbound::IssuedFrame(frame))
     }
 
     /// Accept one decoded backend control message from the current backend peer.
     pub fn accept_backend_control(
         &mut self,
         peer: BackendLeaseSlot,
-        message: BackendToWorker,
+        message: BackendToWorkerRef<'_>,
     ) -> Result<WorkerRuntimeStep, WorkerRuntimeError> {
         match message {
-            BackendToWorker::StartExecution {
+            BackendToWorkerRef::StartExecution {
                 session_epoch,
                 plan,
+                scans: _,
             } => self.start_execution(peer, session_epoch, plan),
-            BackendToWorker::CancelExecution { session_epoch } => {
+            BackendToWorkerRef::CancelExecution { session_epoch } => {
                 self.cancel_execution(peer, session_epoch)
             }
-            BackendToWorker::FailExecution {
+            BackendToWorkerRef::FailExecution {
                 session_epoch,
                 code,
                 detail,
@@ -726,13 +740,13 @@ impl TransportWorkerRuntime {
     pub fn send_peer_message(
         &mut self,
         peer: BackendLeaseSlot,
-        message: WorkerToBackend<'_>,
+        message: WorkerToBackend,
     ) -> Result<CommitOutcome, WorkerRuntimeError> {
-        let written = encoded_len_worker_to_backend(message);
+        let written = encoded_len_worker_execution_to_backend(message);
         if written > self.scratch.len() {
             return Err(WorkerRuntimeError::ControlFrameTooLarge);
         }
-        let written = encode_worker_to_backend_into(message, &mut self.scratch)?;
+        let written = encode_worker_execution_to_backend_into(message, &mut self.scratch)?;
         let mut slot = self.transport.slot_for_backend_lease(peer)?;
         let mut tx = slot.to_backend_tx()?;
         Ok(tx.send_frame(&self.scratch[..written])?)
@@ -779,7 +793,9 @@ mod tests {
     use futures::executor::block_on;
     use issuance::{IssuanceConfig, IssuancePool, IssuedTx};
     use pool::{PagePool, PagePoolConfig};
-    use runtime_protocol::PlanFlowDescriptor;
+    use runtime_protocol::{
+        BackendExecutionToWorker as BackendToWorker, PlanFlowDescriptor, ScanChannelSet,
+    };
     use transfer::{PageRx, PageTx};
 
     #[derive(Debug, Default)]
@@ -866,11 +882,26 @@ mod tests {
         BackendLeaseSlot::new(1, BackendLeaseId::new(1, 2))
     }
 
+    fn accept_from_peer(
+        core: &mut WorkerRuntimeCore,
+        peer: BackendLeaseSlot,
+        message: BackendToWorker<'static>,
+    ) -> Result<WorkerRuntimeStep, WorkerRuntimeError> {
+        let mut encoded =
+            vec![0_u8; runtime_protocol::encoded_len_backend_execution_to_worker(message)];
+        let written =
+            runtime_protocol::encode_backend_execution_to_worker_into(message, &mut encoded)
+                .expect("encode backend control");
+        let decoded =
+            runtime_protocol::decode_backend_execution_to_worker(&encoded[..written]).unwrap();
+        core.accept_backend_control(peer, decoded)
+    }
+
     fn accept(
         core: &mut WorkerRuntimeCore,
-        message: BackendToWorker,
+        message: BackendToWorker<'static>,
     ) -> Result<WorkerRuntimeStep, WorkerRuntimeError> {
-        core.accept_backend_control(peer_a(), message)
+        accept_from_peer(core, peer_a(), message)
     }
 
     fn plan_descriptor(plan_id: u64) -> PlanFlowDescriptor {
@@ -970,6 +1001,7 @@ mod tests {
             BackendToWorker::StartExecution {
                 session_epoch: 10,
                 plan: plan_descriptor(20),
+                scans: ScanChannelSet::empty(),
             },
         )
         .unwrap();
@@ -993,6 +1025,7 @@ mod tests {
             BackendToWorker::StartExecution {
                 session_epoch: 10,
                 plan: plan_descriptor(20),
+                scans: ScanChannelSet::empty(),
             },
         )
         .unwrap();
@@ -1021,6 +1054,7 @@ mod tests {
             BackendToWorker::StartExecution {
                 session_epoch: 10,
                 plan: plan_descriptor(20),
+                scans: ScanChannelSet::empty(),
             },
         )
         .unwrap();
@@ -1050,6 +1084,7 @@ mod tests {
             BackendToWorker::StartExecution {
                 session_epoch: 10,
                 plan: plan_descriptor(20),
+                scans: ScanChannelSet::empty(),
             },
         )
         .unwrap();
@@ -1080,6 +1115,7 @@ mod tests {
             BackendToWorker::StartExecution {
                 session_epoch: 11,
                 plan: plan_descriptor(21),
+                scans: ScanChannelSet::empty(),
             },
         )
         .unwrap();
@@ -1100,6 +1136,7 @@ mod tests {
             BackendToWorker::StartExecution {
                 session_epoch: 10,
                 plan: plan_descriptor(20),
+                scans: ScanChannelSet::empty(),
             },
         )
         .unwrap();
@@ -1155,6 +1192,7 @@ mod tests {
             BackendToWorker::StartExecution {
                 session_epoch: 10,
                 plan: plan_descriptor(20),
+                scans: ScanChannelSet::empty(),
             },
         )
         .unwrap();
@@ -1190,6 +1228,7 @@ mod tests {
             BackendToWorker::StartExecution {
                 session_epoch: 10,
                 plan: plan_descriptor(20),
+                scans: ScanChannelSet::empty(),
             },
         )
         .unwrap();
@@ -1233,6 +1272,7 @@ mod tests {
             BackendToWorker::StartExecution {
                 session_epoch: 10,
                 plan: plan_descriptor(20),
+                scans: ScanChannelSet::empty(),
             },
         )
         .unwrap();
@@ -1260,6 +1300,7 @@ mod tests {
             BackendToWorker::StartExecution {
                 session_epoch: 10,
                 plan: plan_descriptor(20),
+                scans: ScanChannelSet::empty(),
             },
         )
         .unwrap();
@@ -1295,6 +1336,7 @@ mod tests {
             BackendToWorker::StartExecution {
                 session_epoch: 10,
                 plan: plan_descriptor(20),
+                scans: ScanChannelSet::empty(),
             },
         )
         .unwrap();
@@ -1310,6 +1352,7 @@ mod tests {
             BackendToWorker::StartExecution {
                 session_epoch: 10,
                 plan: plan_descriptor(21),
+                scans: ScanChannelSet::empty(),
             },
         )
         .unwrap();
@@ -1327,6 +1370,7 @@ mod tests {
             BackendToWorker::StartExecution {
                 session_epoch: 9,
                 plan: plan_descriptor(22),
+                scans: ScanChannelSet::empty(),
             },
         )
         .unwrap();
@@ -1344,6 +1388,7 @@ mod tests {
             BackendToWorker::StartExecution {
                 session_epoch: 11,
                 plan: plan_descriptor(23),
+                scans: ScanChannelSet::empty(),
             },
         )
         .unwrap();
@@ -1361,14 +1406,16 @@ mod tests {
     #[test]
     fn decode_inbound_prefers_runtime_protocol_control() {
         let message = BackendToWorker::CancelExecution { session_epoch: 7 };
-        let mut encoded = vec![0_u8; runtime_protocol::encoded_len_backend_to_worker(message)];
+        let mut encoded =
+            vec![0_u8; runtime_protocol::encoded_len_backend_execution_to_worker(message)];
         let written =
-            runtime_protocol::encode_backend_to_worker_into(message, &mut encoded).unwrap();
+            runtime_protocol::encode_backend_execution_to_worker_into(message, &mut encoded)
+                .unwrap();
 
         let decoded = WorkerRuntimeCore::decode_inbound(&encoded[..written]).unwrap();
         assert!(matches!(
             decoded,
-            DecodedInbound::Control(BackendToWorker::CancelExecution { session_epoch: 7 })
+            DecodedInbound::Control(BackendToWorkerRef::CancelExecution { session_epoch: 7 })
         ));
     }
 
@@ -1393,13 +1440,15 @@ mod tests {
         assert!(err.is_err());
 
         let message = BackendToWorker::CancelExecution { session_epoch: 7 };
-        let mut encoded = vec![0_u8; runtime_protocol::encoded_len_backend_to_worker(message)];
+        let mut encoded =
+            vec![0_u8; runtime_protocol::encoded_len_backend_execution_to_worker(message)];
         let written =
-            runtime_protocol::encode_backend_to_worker_into(message, &mut encoded).unwrap();
+            runtime_protocol::encode_backend_execution_to_worker_into(message, &mut encoded)
+                .unwrap();
 
         assert!(matches!(
             WorkerRuntimeCore::decode_inbound(&encoded[..written]).unwrap(),
-            DecodedInbound::Control(BackendToWorker::CancelExecution { session_epoch: 7 })
+            DecodedInbound::Control(BackendToWorkerRef::CancelExecution { session_epoch: 7 })
         ));
     }
 
@@ -1424,9 +1473,11 @@ mod tests {
     #[test]
     fn decode_inbound_preserves_runtime_decode_error_for_truncated_control() {
         let message = BackendToWorker::CancelExecution { session_epoch: 7 };
-        let mut encoded = vec![0_u8; runtime_protocol::encoded_len_backend_to_worker(message)];
+        let mut encoded =
+            vec![0_u8; runtime_protocol::encoded_len_backend_execution_to_worker(message)];
         let written =
-            runtime_protocol::encode_backend_to_worker_into(message, &mut encoded).unwrap();
+            runtime_protocol::encode_backend_execution_to_worker_into(message, &mut encoded)
+                .unwrap();
 
         let err = WorkerRuntimeCore::decode_inbound(&encoded[..written - 1]);
         assert!(matches!(err, Err(WorkerRuntimeError::RuntimeDecode(_))));
@@ -1435,9 +1486,11 @@ mod tests {
     #[test]
     fn decode_inbound_preserves_runtime_decode_error_for_corrupted_control_envelope() {
         let message = BackendToWorker::CancelExecution { session_epoch: 7 };
-        let mut encoded = vec![0_u8; runtime_protocol::encoded_len_backend_to_worker(message)];
+        let mut encoded =
+            vec![0_u8; runtime_protocol::encoded_len_backend_execution_to_worker(message)];
         let written =
-            runtime_protocol::encode_backend_to_worker_into(message, &mut encoded).unwrap();
+            runtime_protocol::encode_backend_execution_to_worker_into(message, &mut encoded)
+                .unwrap();
         encoded[0] = 0x95;
 
         let err = WorkerRuntimeCore::decode_inbound(&encoded[..written]);
@@ -1452,6 +1505,7 @@ mod tests {
             BackendToWorker::StartExecution {
                 session_epoch: 10,
                 plan: plan_descriptor(20),
+                scans: ScanChannelSet::empty(),
             },
         )
         .unwrap();
@@ -1504,6 +1558,7 @@ mod tests {
             BackendToWorker::StartExecution {
                 session_epoch: 11,
                 plan: plan_descriptor(21),
+                scans: ScanChannelSet::empty(),
             },
         )
         .unwrap();
@@ -1524,6 +1579,7 @@ mod tests {
             BackendToWorker::StartExecution {
                 session_epoch: 10,
                 plan: plan_descriptor(20),
+                scans: ScanChannelSet::empty(),
             },
         )
         .unwrap();
@@ -1564,6 +1620,7 @@ mod tests {
             BackendToWorker::StartExecution {
                 session_epoch: 11,
                 plan: plan_descriptor(21),
+                scans: ScanChannelSet::empty(),
             },
         )
         .unwrap();
@@ -1584,6 +1641,7 @@ mod tests {
             BackendToWorker::StartExecution {
                 session_epoch: 10,
                 plan: plan_descriptor(20),
+                scans: ScanChannelSet::empty(),
             },
         )
         .unwrap();
@@ -1628,6 +1686,7 @@ mod tests {
             BackendToWorker::StartExecution {
                 session_epoch: 11,
                 plan: plan_descriptor(21),
+                scans: ScanChannelSet::empty(),
             },
         )
         .unwrap();
@@ -1648,6 +1707,7 @@ mod tests {
             BackendToWorker::StartExecution {
                 session_epoch: 10,
                 plan: plan_descriptor(20),
+                scans: ScanChannelSet::empty(),
             },
         )
         .unwrap();
@@ -1669,6 +1729,7 @@ mod tests {
             BackendToWorker::StartExecution {
                 session_epoch: 10,
                 plan: plan_descriptor(20),
+                scans: ScanChannelSet::empty(),
             },
         )
         .unwrap();
@@ -1711,6 +1772,7 @@ mod tests {
             BackendToWorker::StartExecution {
                 session_epoch: 10,
                 plan: plan_descriptor(20),
+                scans: ScanChannelSet::empty(),
             },
         )
         .unwrap();
@@ -1745,16 +1807,17 @@ mod tests {
             BackendToWorker::StartExecution {
                 session_epoch: 10,
                 plan: plan_descriptor(20),
+                scans: ScanChannelSet::empty(),
             },
         )
         .unwrap();
 
-        let err = core
-            .accept_backend_control(
-                peer_b(),
-                BackendToWorker::CancelExecution { session_epoch: 10 },
-            )
-            .unwrap_err();
+        let err = accept_from_peer(
+            &mut core,
+            peer_b(),
+            BackendToWorker::CancelExecution { session_epoch: 10 },
+        )
+        .unwrap_err();
         assert!(matches!(
             err,
             WorkerRuntimeError::BackendPeerMismatch {
@@ -1772,6 +1835,7 @@ mod tests {
             BackendToWorker::StartExecution {
                 session_epoch: 10,
                 plan: plan_descriptor(20),
+                scans: ScanChannelSet::empty(),
             },
         )
         .unwrap();
@@ -1809,10 +1873,13 @@ mod tests {
         let start_a = BackendToWorker::StartExecution {
             session_epoch: 5,
             plan: plan_descriptor(20),
+            scans: ScanChannelSet::empty(),
         };
-        let mut encoded_a = vec![0_u8; runtime_protocol::encoded_len_backend_to_worker(start_a)];
+        let mut encoded_a =
+            vec![0_u8; runtime_protocol::encoded_len_backend_execution_to_worker(start_a)];
         let written_a =
-            runtime_protocol::encode_backend_to_worker_into(start_a, &mut encoded_a).unwrap();
+            runtime_protocol::encode_backend_execution_to_worker_into(start_a, &mut encoded_a)
+                .unwrap();
         backend_a
             .to_worker_tx()
             .send_frame(&encoded_a[..written_a])
@@ -1842,12 +1909,12 @@ mod tests {
             .expect("recv start a");
         assert_eq!(worker.next_ready_backend_lease(&mut ready_cursor), None);
 
-        let cancelled = core
-            .accept_backend_control(
-                actual_peer_a,
-                BackendToWorker::CancelExecution { session_epoch: 5 },
-            )
-            .unwrap();
+        let cancelled = accept_from_peer(
+            &mut core,
+            actual_peer_a,
+            BackendToWorker::CancelExecution { session_epoch: 5 },
+        )
+        .unwrap();
         assert!(matches!(
             cancelled,
             WorkerRuntimeStep::ExecutionCancelled { session_epoch: 5 }
@@ -1878,10 +1945,13 @@ mod tests {
         let start_b = BackendToWorker::StartExecution {
             session_epoch: 1,
             plan: plan_descriptor(21),
+            scans: ScanChannelSet::empty(),
         };
-        let mut encoded_b = vec![0_u8; runtime_protocol::encoded_len_backend_to_worker(start_b)];
+        let mut encoded_b =
+            vec![0_u8; runtime_protocol::encoded_len_backend_execution_to_worker(start_b)];
         let written_b =
-            runtime_protocol::encode_backend_to_worker_into(start_b, &mut encoded_b).unwrap();
+            runtime_protocol::encode_backend_execution_to_worker_into(start_b, &mut encoded_b)
+                .unwrap();
         backend_b
             .to_worker_tx()
             .send_frame(&encoded_b[..written_b])

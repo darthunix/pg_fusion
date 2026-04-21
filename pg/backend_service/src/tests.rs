@@ -7,9 +7,9 @@ use issuance::{IssuanceConfig, IssuancePool, IssuedTx};
 use plan_flow::{BackendPlanError, BackendPlanRole, FlowId as PlanFlowId, PlanOpen};
 use pool::{PagePool, PagePoolConfig};
 use runtime_protocol::{
-    decode_worker_to_backend, encode_worker_to_backend_into, encoded_len_worker_to_backend,
-    ExecutionFailureCode, ProducerDescriptorWire, ProducerRole, ScanFlowDescriptor,
-    WorkerToBackend, WorkerToBackendRef,
+    decode_worker_scan_to_backend, encode_worker_scan_to_backend_into,
+    encoded_len_worker_scan_to_backend, ExecutionFailureCode, ProducerDescriptorWire, ProducerRole,
+    ScanFlowDescriptor, WorkerScanToBackend, WorkerScanToBackendRef,
 };
 use scan_flow::{FlowId, ProducerDescriptor, ScanOpen};
 use std::alloc::{alloc_zeroed, dealloc, Layout};
@@ -99,16 +99,17 @@ fn assert_scan_descriptor_match(
     expected: bool,
 ) {
     let scan = ScanFlowDescriptor::new(page_kind, page_flags, producers).expect("scan descriptor");
-    let message = WorkerToBackend::OpenScan {
+    let message = WorkerScanToBackend::OpenScan {
         session_epoch: canonical.flow.session_epoch,
         scan_id: canonical.flow.scan_id,
         scan,
     };
-    let mut encoded = vec![0u8; encoded_len_worker_to_backend(message)];
-    let written =
-        encode_worker_to_backend_into(message, &mut encoded).expect("encode open scan message");
-    let decoded = decode_worker_to_backend(&encoded[..written]).expect("decode open scan message");
-    let WorkerToBackendRef::OpenScan { scan, .. } = decoded else {
+    let mut encoded = vec![0u8; encoded_len_worker_scan_to_backend(message)];
+    let written = encode_worker_scan_to_backend_into(message, &mut encoded)
+        .expect("encode open scan message");
+    let decoded =
+        decode_worker_scan_to_backend(&encoded[..written]).expect("decode open scan message");
+    let WorkerScanToBackendRef::OpenScan { scan, .. } = decoded else {
         panic!("expected open scan message");
     };
 

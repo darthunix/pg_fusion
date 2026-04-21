@@ -13,9 +13,10 @@ use plan_builder::{PlanBuildInput, PlanBuilder};
 use plan_flow::{FlowId as PlanFlowId, PlanOpen, WorkerPlanRole, WorkerStep};
 use pool::{PagePool, PagePoolConfig};
 use runtime_protocol::{
-    decode_worker_to_backend, encode_worker_to_backend_into, encoded_len_worker_to_backend,
-    BackendToWorker, ExecutionFailureCode, ProducerDescriptorWire, ProducerRole,
-    ScanFlowDescriptor, WorkerToBackend, WorkerToBackendRef,
+    decode_worker_scan_to_backend, encode_worker_scan_to_backend_into,
+    encoded_len_worker_scan_to_backend, BackendExecutionToWorker as BackendToWorker,
+    ExecutionFailureCode, ProducerDescriptorWire, ProducerRole, ScanFlowDescriptor,
+    WorkerScanToBackend, WorkerScanToBackendRef,
 };
 use std::alloc::{alloc_zeroed, dealloc, Layout};
 use std::ptr::NonNull;
@@ -201,6 +202,7 @@ fn begin_and_finalize_execution(
     let BackendToWorker::StartExecution {
         session_epoch,
         plan,
+        scans: _,
     } = begin.control
     else {
         panic!("begin execution must emit StartExecution");
@@ -278,16 +280,17 @@ fn try_open_scan_with_runtime_protocol<'a>(
     let descriptor =
         ScanFlowDescriptor::new(config.scan_page_kind, config.scan_page_flags, &producers)
             .expect("scan descriptor");
-    let message = WorkerToBackend::OpenScan {
+    let message = WorkerScanToBackend::OpenScan {
         session_epoch,
         scan_id,
         scan: descriptor,
     };
-    let mut encoded = vec![0u8; encoded_len_worker_to_backend(message)];
-    let written = encode_worker_to_backend_into(message, &mut encoded).expect("encode open scan");
-    let decoded = decode_worker_to_backend(&encoded[..written]).expect("decode open scan");
+    let mut encoded = vec![0u8; encoded_len_worker_scan_to_backend(message)];
+    let written =
+        encode_worker_scan_to_backend_into(message, &mut encoded).expect("encode open scan");
+    let decoded = decode_worker_scan_to_backend(&encoded[..written]).expect("decode open scan");
 
-    let WorkerToBackendRef::OpenScan {
+    let WorkerScanToBackendRef::OpenScan {
         session_epoch: decoded_epoch,
         scan_id: decoded_scan_id,
         scan,

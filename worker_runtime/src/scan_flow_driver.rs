@@ -3,8 +3,8 @@ use arrow_schema::SchemaRef;
 use import::ArrowPageDecoder;
 use issuance::{IssuedOwnedFrame, IssuedRx};
 use runtime_protocol::{
-    encode_worker_to_backend_into, encoded_len_worker_to_backend, ProducerDescriptorWire,
-    ProducerRole, ScanFlowDescriptor, WorkerToBackend,
+    encode_worker_scan_to_backend_into, encoded_len_worker_scan_to_backend, ProducerDescriptorWire,
+    ProducerRole, ScanFlowDescriptor, WorkerScanToBackend,
 };
 use scan_flow::{FlowId, ProducerDescriptor, ProducerId, ScanOpen, WorkerScanRole, WorkerStep};
 
@@ -257,16 +257,16 @@ impl SingleLeaderOpenScanControl {
             role: ProducerRole::Leader,
         }];
         let scan = ScanFlowDescriptor::new(self.page_kind, self.page_flags, &producers)?;
-        let message = WorkerToBackend::OpenScan {
+        let message = WorkerScanToBackend::OpenScan {
             session_epoch: self.session_epoch,
             scan_id: self.scan_id,
             scan,
         };
-        let needed = encoded_len_worker_to_backend(message);
+        let needed = encoded_len_worker_scan_to_backend(message);
         if needed > dst.len() {
             return Err(WorkerRuntimeError::ControlFrameTooLarge);
         }
-        Ok(encode_worker_to_backend_into(message, dst)?)
+        Ok(encode_worker_scan_to_backend_into(message, dst)?)
     }
 }
 
@@ -274,7 +274,7 @@ impl SingleLeaderOpenScanControl {
 mod tests {
     use super::*;
 
-    use runtime_protocol::{decode_worker_to_backend, WorkerToBackendRef};
+    use runtime_protocol::{decode_worker_scan_to_backend, WorkerScanToBackendRef};
 
     #[test]
     fn open_scan_control_payload_uses_single_leader_producer() {
@@ -287,9 +287,9 @@ mod tests {
         };
         let mut encoded = [0_u8; 128];
         let written = control.encode_into(&mut encoded).unwrap();
-        let decoded = decode_worker_to_backend(&encoded[..written]).unwrap();
+        let decoded = decode_worker_scan_to_backend(&encoded[..written]).unwrap();
 
-        let WorkerToBackendRef::OpenScan {
+        let WorkerScanToBackendRef::OpenScan {
             session_epoch,
             scan_id,
             scan,

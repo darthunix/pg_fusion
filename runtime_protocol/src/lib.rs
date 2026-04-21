@@ -12,55 +12,36 @@
 //! reconstructing concrete `plan_flow` / `scan_flow` descriptors from the
 //! values returned here.
 
-use rmp::decode::{
-    read_array_len, read_marker, read_str_len, read_u16, read_u64, read_u8, RmpRead,
-};
-use rmp::encode::{write_array_len, write_nil, write_str, write_u16, write_u64, write_u8};
+use rmp::decode::{read_array_len, read_marker, read_u16, read_u64, read_u8, RmpRead};
+use rmp::encode::{write_array_len, write_nil, write_u16, write_u64, write_u8};
 use rmp::Marker;
+use std::collections::BTreeSet;
 use std::fmt;
 use std::io::{self, Write};
 use thiserror::Error;
 use transfer::MessageKind;
 
-const RUNTIME_PROTOCOL_MAGIC: &str = "PFRP";
-const RUNTIME_PROTOCOL_VERSION: u8 = 1;
+const RUNTIME_PROTOCOL_MAGIC: u32 = 0x5046_5232;
+const RUNTIME_PROTOCOL_VERSION: u16 = 2;
+pub const RUNTIME_ENVELOPE_HEADER_LEN: usize = 8;
 
-const BACKEND_TO_WORKER_START_EXECUTION_TAG: u8 = 1;
-const BACKEND_TO_WORKER_CANCEL_EXECUTION_TAG: u8 = 2;
-const BACKEND_TO_WORKER_FAIL_EXECUTION_TAG: u8 = 3;
+const BACKEND_EXECUTION_START_TAG: u8 = 1;
+const BACKEND_EXECUTION_CANCEL_TAG: u8 = 2;
+const BACKEND_EXECUTION_FAIL_TAG: u8 = 3;
 
-const WORKER_TO_BACKEND_COMPLETE_EXECUTION_TAG: u8 = 1;
-const WORKER_TO_BACKEND_FAIL_EXECUTION_TAG: u8 = 2;
-const WORKER_TO_BACKEND_OPEN_SCAN_TAG: u8 = 3;
-const WORKER_TO_BACKEND_CANCEL_SCAN_TAG: u8 = 4;
-
-const BACKEND_TO_WORKER_MIN_LEN: u32 = 4;
-const BACKEND_TO_WORKER_START_EXECUTION_LEN: u32 = 7;
-const BACKEND_TO_WORKER_CANCEL_EXECUTION_LEN: u32 = 4;
-const BACKEND_TO_WORKER_FAIL_EXECUTION_LEN: u32 = 6;
-
-const WORKER_TO_BACKEND_MIN_LEN: u32 = 4;
-const WORKER_TO_BACKEND_COMPLETE_EXECUTION_LEN: u32 = 4;
-const WORKER_TO_BACKEND_FAIL_EXECUTION_LEN: u32 = 6;
-const WORKER_TO_BACKEND_OPEN_SCAN_LEN: u32 = 8;
-const WORKER_TO_BACKEND_CANCEL_SCAN_LEN: u32 = 5;
+const WORKER_EXECUTION_COMPLETE_TAG: u8 = 1;
+const WORKER_EXECUTION_FAIL_TAG: u8 = 2;
+const WORKER_SCAN_OPEN_TAG: u8 = 1;
+const WORKER_SCAN_CANCEL_TAG: u8 = 2;
 
 const PRODUCER_DESCRIPTOR_LEN: u32 = 2;
+const SCAN_CHANNEL_DESCRIPTOR_LEN: u32 = 4;
 const PRODUCER_ID_BITMAP_WORD_BITS: usize = u64::BITS as usize;
 const PRODUCER_ID_BITMAP_WORDS: usize = (u16::MAX as usize + 1) / PRODUCER_ID_BITMAP_WORD_BITS;
 
 /// Bytes unavailable for `control_transport` payload data because framed rings
 /// reserve a four-byte prefix plus one extra byte to distinguish empty from full.
 pub const CONTROL_TRANSPORT_PAYLOAD_OVERHEAD: usize = 5;
-
-/// Maximum encoded size of any current backend-to-worker control payload.
-///
-/// This bound is intentionally tied to the current wire format so framed
-/// transports can demultiplex backend control payloads from other fixed-size
-/// payload families by length before attempting a full decode. If the
-/// backend-to-worker protocol grows, this constant and its unit test must be
-/// updated together.
-pub const MAX_BACKEND_TO_WORKER_ENCODED_LEN: usize = 34;
 
 /// Maximum protocol payload size that can fit into one `control_transport`
 /// ring with the given raw data capacity.
@@ -83,6 +64,165 @@ pub fn classify_session(current: u64, incoming: u64) -> SessionDisposition {
         std::cmp::Ordering::Equal => SessionDisposition::Current,
         std::cmp::Ordering::Less => SessionDisposition::Stale,
         std::cmp::Ordering::Greater => SessionDisposition::Future,
+    }
+}
+
+/// Runtime wire-message family carried in the fixed binary envelope header.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[repr(u8)]
+pub enum RuntimeMessageFamily {
+    BackendExecutionToWorker = 1,
+    WorkerExecutionToBackend = 2,
+    WorkerScanToBackend = 3,
+}
+
+impl TryFrom<u8> for RuntimeMessageFamily {
+    type Error = DecodeError;
+
+    fn try_from(value: u8) -> Result<Self, Self::Error> {
+        match value {
+            1 => Ok(Self::BackendExecutionToWorker),
+            2 => Ok(Self::WorkerExecutionToBackend),
+            3 => Ok(Self::WorkerScanToBackend),
+            actual => Err(DecodeError::UnexpectedMessageFamily { actual }),
+        }
+    }
+}
+
+/// Transport-agnostic wire identity of one backend lease slot.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct BackendLeaseSlotWire {
+    slot_id: u32,
+    generation: u64,
+    lease_epoch: u64,
+}
+
+impl BackendLeaseSlotWire {
+    pub const fn new(slot_id: u32, generation: u64, lease_epoch: u64) -> Self {
+        Self {
+            slot_id,
+            generation,
+            lease_epoch,
+        }
+    }
+
+    pub const fn slot_id(self) -> u32 {
+        self.slot_id
+    }
+
+    pub const fn generation(self) -> u64 {
+        self.generation
+    }
+
+    pub const fn lease_epoch(self) -> u64 {
+        self.lease_epoch
+    }
+}
+
+/// One execution scan channel published up front in `StartExecution`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ScanChannelDescriptorWire {
+    pub scan_id: u64,
+    pub peer: BackendLeaseSlotWire,
+}
+
+/// Validation errors for one encode-side scan channel set.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Error)]
+pub enum ScanChannelSetError {
+    #[error("duplicate scan_id {scan_id} in scan channel set")]
+    DuplicateScanId { scan_id: u64 },
+}
+
+/// Encode-side borrowed execution scan-channel set.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ScanChannelSet<'a> {
+    channels: &'a [ScanChannelDescriptorWire],
+}
+
+impl<'a> ScanChannelSet<'a> {
+    pub const fn empty() -> Self {
+        Self { channels: &[] }
+    }
+
+    pub fn new(channels: &'a [ScanChannelDescriptorWire]) -> Result<Self, ScanChannelSetError> {
+        validate_scan_channel_slice(channels)?;
+        Ok(Self { channels })
+    }
+
+    pub fn len(self) -> usize {
+        self.channels.len()
+    }
+
+    pub fn is_empty(self) -> bool {
+        self.channels.is_empty()
+    }
+
+    pub fn channels(self) -> &'a [ScanChannelDescriptorWire] {
+        self.channels
+    }
+}
+
+/// Borrowed decode-side view of one encoded scan-channel set.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ScanChannelSetRef<'a> {
+    bytes: &'a [u8],
+    len: u32,
+}
+
+impl<'a> ScanChannelSetRef<'a> {
+    pub const fn empty() -> Self {
+        Self {
+            bytes: &[0x90],
+            len: 0,
+        }
+    }
+
+    pub fn len(self) -> usize {
+        self.len as usize
+    }
+
+    pub fn is_empty(self) -> bool {
+        self.len == 0
+    }
+
+    pub fn as_encoded(self) -> &'a [u8] {
+        self.bytes
+    }
+
+    pub fn iter(self) -> ScanChannelIter<'a> {
+        let mut source = self.bytes;
+        let len = read_array_len_from(&mut source).expect("validated scan-channel array");
+        debug_assert_eq!(len, self.len);
+        ScanChannelIter {
+            source,
+            remaining: len,
+        }
+    }
+}
+
+/// Iterator over one borrowed decode-side scan-channel set.
+pub struct ScanChannelIter<'a> {
+    source: &'a [u8],
+    remaining: u32,
+}
+
+impl Iterator for ScanChannelIter<'_> {
+    type Item = ScanChannelDescriptorWire;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        if self.remaining == 0 {
+            return None;
+        }
+        self.remaining -= 1;
+        Some(read_scan_channel_descriptor_from(&mut self.source).expect("validated descriptor"))
+    }
+}
+
+impl fmt::Debug for ScanChannelIter<'_> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("ScanChannelIter")
+            .field("remaining", &self.remaining)
+            .finish()
     }
 }
 
@@ -271,12 +411,13 @@ impl<'a> ScanFlowDescriptorRef<'a> {
     }
 }
 
-/// Backend-to-worker runtime control messages.
+/// Encode-side backend execution control messages carried on the primary slot.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum BackendToWorker {
+pub enum BackendExecutionToWorker<'a> {
     StartExecution {
         session_epoch: u64,
         plan: PlanFlowDescriptor,
+        scans: ScanChannelSet<'a>,
     },
     CancelExecution {
         session_epoch: u64,
@@ -288,7 +429,7 @@ pub enum BackendToWorker {
     },
 }
 
-impl BackendToWorker {
+impl BackendExecutionToWorker<'_> {
     pub fn session_epoch(self) -> u64 {
         match self {
             Self::StartExecution { session_epoch, .. }
@@ -298,9 +439,37 @@ impl BackendToWorker {
     }
 }
 
-/// Encode-side worker-to-backend runtime control messages.
+/// Decode-side borrowed backend execution control messages.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum WorkerToBackend<'a> {
+pub enum BackendExecutionToWorkerRef<'a> {
+    StartExecution {
+        session_epoch: u64,
+        plan: PlanFlowDescriptor,
+        scans: ScanChannelSetRef<'a>,
+    },
+    CancelExecution {
+        session_epoch: u64,
+    },
+    FailExecution {
+        session_epoch: u64,
+        code: ExecutionFailureCode,
+        detail: Option<u64>,
+    },
+}
+
+impl BackendExecutionToWorkerRef<'_> {
+    pub fn session_epoch(self) -> u64 {
+        match self {
+            Self::StartExecution { session_epoch, .. }
+            | Self::CancelExecution { session_epoch }
+            | Self::FailExecution { session_epoch, .. } => session_epoch,
+        }
+    }
+}
+
+/// Execution-level worker-to-backend control sent only on the primary slot.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum WorkerExecutionToBackend {
     CompleteExecution {
         session_epoch: u64,
     },
@@ -309,6 +478,20 @@ pub enum WorkerToBackend<'a> {
         code: ExecutionFailureCode,
         detail: Option<u64>,
     },
+}
+
+impl WorkerExecutionToBackend {
+    pub fn session_epoch(self) -> u64 {
+        match self {
+            Self::CompleteExecution { session_epoch }
+            | Self::FailExecution { session_epoch, .. } => session_epoch,
+        }
+    }
+}
+
+/// Scan-level worker-to-backend control sent only on dedicated scan slots.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum WorkerScanToBackend<'a> {
     OpenScan {
         session_epoch: u64,
         scan_id: u64,
@@ -320,28 +503,19 @@ pub enum WorkerToBackend<'a> {
     },
 }
 
-impl WorkerToBackend<'_> {
+impl WorkerScanToBackend<'_> {
     pub fn session_epoch(self) -> u64 {
         match self {
-            Self::CompleteExecution { session_epoch }
-            | Self::FailExecution { session_epoch, .. }
-            | Self::OpenScan { session_epoch, .. }
-            | Self::CancelScan { session_epoch, .. } => session_epoch,
+            Self::OpenScan { session_epoch, .. } | Self::CancelScan { session_epoch, .. } => {
+                session_epoch
+            }
         }
     }
 }
 
-/// Decode-side borrowed worker-to-backend runtime control messages.
+/// Borrowed decode-side scan-level worker-to-backend control.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum WorkerToBackendRef<'a> {
-    CompleteExecution {
-        session_epoch: u64,
-    },
-    FailExecution {
-        session_epoch: u64,
-        code: ExecutionFailureCode,
-        detail: Option<u64>,
-    },
+pub enum WorkerScanToBackendRef<'a> {
     OpenScan {
         session_epoch: u64,
         scan_id: u64,
@@ -353,13 +527,12 @@ pub enum WorkerToBackendRef<'a> {
     },
 }
 
-impl WorkerToBackendRef<'_> {
+impl WorkerScanToBackendRef<'_> {
     pub fn session_epoch(self) -> u64 {
         match self {
-            Self::CompleteExecution { session_epoch }
-            | Self::FailExecution { session_epoch, .. }
-            | Self::OpenScan { session_epoch, .. }
-            | Self::CancelScan { session_epoch, .. } => session_epoch,
+            Self::OpenScan { session_epoch, .. } | Self::CancelScan { session_epoch, .. } => {
+                session_epoch
+            }
         }
     }
 }
@@ -370,27 +543,36 @@ pub enum EncodeError {
     BufferTooSmall { expected: usize, actual: usize },
     #[error("too many scan producers to encode: {count}")]
     TooManyProducers { count: usize },
+    #[error("too many scan channels to encode: {count}")]
+    TooManyScanChannels { count: usize },
     #[error("MsgPack encoding failed: {0}")]
     MsgPack(String),
+    #[error("runtime envelope encoding failed: {0}")]
+    Envelope(String),
+    #[error(transparent)]
+    ScanChannels(#[from] ScanChannelSetError),
 }
 
 #[derive(Debug, Error, PartialEq, Eq)]
 pub enum DecodeError {
-    #[error("protocol envelope expected MsgPack array of length {expected}, got {actual}")]
-    InvalidEnvelope { expected: u32, actual: u32 },
-    #[error("invalid protocol magic: expected {expected:?}, got {actual:?}")]
-    InvalidMagic {
-        expected: &'static str,
-        actual: String,
-    },
-    #[error("unsupported protocol version: expected {expected}, got {actual}")]
-    UnsupportedVersion { expected: u8, actual: u8 },
+    #[error("protocol array expected length {expected}, got {actual}")]
+    InvalidArrayLen { expected: u32, actual: u32 },
+    #[error("runtime envelope is truncated: expected at least {expected} bytes, got {actual}")]
+    TruncatedEnvelope { expected: usize, actual: usize },
+    #[error("invalid runtime magic: expected 0x{expected:08x}, got 0x{actual:08x}")]
+    InvalidMagic { expected: u32, actual: u32 },
+    #[error("unsupported runtime protocol version: expected {expected}, got {actual}")]
+    UnsupportedVersion { expected: u16, actual: u16 },
+    #[error("unexpected runtime message family {actual}")]
+    UnexpectedMessageFamily { actual: u8 },
     #[error("unexpected message tag {actual}")]
     UnexpectedTag { actual: u8 },
     #[error("invalid failure code {actual}")]
     InvalidFailureCode { actual: u8 },
     #[error("invalid producer role {actual}")]
     InvalidProducerRole { actual: u8 },
+    #[error("duplicate scan_id {scan_id} in scan channel set")]
+    DuplicateScanId { scan_id: u64 },
     #[error("scan open must declare at least one producer")]
     EmptyProducerSet,
     #[error("duplicate producer id {producer_id} in scan open")]
@@ -403,92 +585,94 @@ pub enum DecodeError {
     MsgPack(String),
 }
 
-pub fn encoded_len_backend_to_worker(message: BackendToWorker) -> usize {
-    try_encoded_len_backend_to_worker(message)
-        .expect("runtime_protocol backend message length must fit into usize")
+pub fn encoded_len_backend_execution_to_worker(message: BackendExecutionToWorker<'_>) -> usize {
+    try_encoded_len_backend_execution_to_worker(message)
+        .expect("runtime_protocol backend execution length must fit into usize")
 }
 
-pub fn encoded_len_worker_to_backend(message: WorkerToBackend<'_>) -> usize {
-    try_encoded_len_worker_to_backend(message)
-        .expect("runtime_protocol worker message length must fit into usize")
+pub fn encoded_len_worker_execution_to_backend(message: WorkerExecutionToBackend) -> usize {
+    try_encoded_len_worker_execution_to_backend(message)
+        .expect("runtime_protocol worker execution length must fit into usize")
 }
 
-pub fn encode_backend_to_worker_into(
-    message: BackendToWorker,
+pub fn encoded_len_worker_scan_to_backend(message: WorkerScanToBackend<'_>) -> usize {
+    try_encoded_len_worker_scan_to_backend(message)
+        .expect("runtime_protocol worker scan length must fit into usize")
+}
+
+pub fn encode_backend_execution_to_worker_into(
+    message: BackendExecutionToWorker<'_>,
     out: &mut [u8],
 ) -> Result<usize, EncodeError> {
-    let expected = try_encoded_len_backend_to_worker(message)?;
-    if out.len() < expected {
-        return Err(EncodeError::BufferTooSmall {
-            expected,
-            actual: out.len(),
-        });
-    }
-
-    let mut writer = &mut out[..expected];
-    encode_backend_to_worker_to(message, &mut writer)
-        .expect("encoding into a pre-sized slice must succeed");
-    Ok(expected)
+    encode_into_with_len(
+        try_encoded_len_backend_execution_to_worker(message)?,
+        out,
+        |mut writer| encode_backend_execution_to_worker_to(message, &mut writer),
+    )
 }
 
-pub fn encode_worker_to_backend_into(
-    message: WorkerToBackend<'_>,
+pub fn encode_worker_execution_to_backend_into(
+    message: WorkerExecutionToBackend,
     out: &mut [u8],
 ) -> Result<usize, EncodeError> {
-    let expected = try_encoded_len_worker_to_backend(message)?;
-    if out.len() < expected {
-        return Err(EncodeError::BufferTooSmall {
-            expected,
-            actual: out.len(),
-        });
-    }
-
-    let mut writer = &mut out[..expected];
-    encode_worker_to_backend_to(message, &mut writer)
-        .expect("encoding into a pre-sized slice must succeed");
-    Ok(expected)
+    encode_into_with_len(
+        try_encoded_len_worker_execution_to_backend(message)?,
+        out,
+        |mut writer| encode_worker_execution_to_backend_to(message, &mut writer),
+    )
 }
 
-pub fn decode_backend_to_worker(bytes: &[u8]) -> Result<BackendToWorker, DecodeError> {
+pub fn encode_worker_scan_to_backend_into(
+    message: WorkerScanToBackend<'_>,
+    out: &mut [u8],
+) -> Result<usize, EncodeError> {
+    encode_into_with_len(
+        try_encoded_len_worker_scan_to_backend(message)?,
+        out,
+        |mut writer| encode_worker_scan_to_backend_to(message, &mut writer),
+    )
+}
+
+pub fn decode_runtime_message_family(bytes: &[u8]) -> Result<RuntimeMessageFamily, DecodeError> {
+    let mut source = bytes;
+    let header = decode_runtime_header(&mut source)?;
+    Ok(header.family)
+}
+
+pub fn decode_backend_execution_to_worker(
+    bytes: &[u8],
+) -> Result<BackendExecutionToWorkerRef<'_>, DecodeError> {
     let original = bytes;
     let mut source = bytes;
+    let header = decode_runtime_header(&mut source)?;
+    expect_runtime_family(
+        header.family,
+        RuntimeMessageFamily::BackendExecutionToWorker,
+    )?;
 
-    let actual_len = read_array_len_from(&mut source)?;
-    if actual_len < BACKEND_TO_WORKER_MIN_LEN {
-        return Err(DecodeError::InvalidEnvelope {
-            expected: BACKEND_TO_WORKER_MIN_LEN,
-            actual: actual_len,
-        });
-    }
-
-    decode_magic_and_version(&mut source)?;
-    let tag = read_u8_from(&mut source)?;
     let session_epoch = read_u64_from(&mut source)?;
-
-    let message = match tag {
-        BACKEND_TO_WORKER_START_EXECUTION_TAG => {
-            expect_message_len(actual_len, BACKEND_TO_WORKER_START_EXECUTION_LEN)?;
-            BackendToWorker::StartExecution {
+    let message = match header.tag {
+        BACKEND_EXECUTION_START_TAG => {
+            let plan = PlanFlowDescriptor {
+                plan_id: read_u64_from(&mut source)?,
+                page_kind: read_u16_from(&mut source)?,
+                page_flags: read_u16_from(&mut source)?,
+            };
+            let scans = decode_scan_channel_set_ref(original, &mut source)?;
+            BackendExecutionToWorkerRef::StartExecution {
                 session_epoch,
-                plan: PlanFlowDescriptor {
-                    plan_id: read_u64_from(&mut source)?,
-                    page_kind: read_u16_from(&mut source)?,
-                    page_flags: read_u16_from(&mut source)?,
-                },
+                plan,
+                scans,
             }
         }
-        BACKEND_TO_WORKER_CANCEL_EXECUTION_TAG => {
-            expect_message_len(actual_len, BACKEND_TO_WORKER_CANCEL_EXECUTION_LEN)?;
-            BackendToWorker::CancelExecution { session_epoch }
+        BACKEND_EXECUTION_CANCEL_TAG => {
+            BackendExecutionToWorkerRef::CancelExecution { session_epoch }
         }
-        BACKEND_TO_WORKER_FAIL_EXECUTION_TAG => {
-            expect_message_len(actual_len, BACKEND_TO_WORKER_FAIL_EXECUTION_LEN)?;
-            BackendToWorker::FailExecution {
-                session_epoch,
-                code: ExecutionFailureCode::try_from(read_u8_from(&mut source)?)?,
-                detail: read_optional_u64_from(&mut source)?,
-            }
-        }
+        BACKEND_EXECUTION_FAIL_TAG => BackendExecutionToWorkerRef::FailExecution {
+            session_epoch,
+            code: ExecutionFailureCode::try_from(read_u8_from(&mut source)?)?,
+            detail: read_optional_u64_from(&mut source)?,
+        },
         actual => return Err(DecodeError::UnexpectedTag { actual }),
     };
 
@@ -496,54 +680,59 @@ pub fn decode_backend_to_worker(bytes: &[u8]) -> Result<BackendToWorker, DecodeE
     Ok(message)
 }
 
-pub fn decode_worker_to_backend(bytes: &[u8]) -> Result<WorkerToBackendRef<'_>, DecodeError> {
+pub fn decode_worker_execution_to_backend(
+    bytes: &[u8],
+) -> Result<WorkerExecutionToBackend, DecodeError> {
     let original = bytes;
     let mut source = bytes;
+    let header = decode_runtime_header(&mut source)?;
+    expect_runtime_family(
+        header.family,
+        RuntimeMessageFamily::WorkerExecutionToBackend,
+    )?;
 
-    let actual_len = read_array_len_from(&mut source)?;
-    if actual_len < WORKER_TO_BACKEND_MIN_LEN {
-        return Err(DecodeError::InvalidEnvelope {
-            expected: WORKER_TO_BACKEND_MIN_LEN,
-            actual: actual_len,
-        });
-    }
-
-    decode_magic_and_version(&mut source)?;
-    let tag = read_u8_from(&mut source)?;
     let session_epoch = read_u64_from(&mut source)?;
+    let message = match header.tag {
+        WORKER_EXECUTION_COMPLETE_TAG => {
+            WorkerExecutionToBackend::CompleteExecution { session_epoch }
+        }
+        WORKER_EXECUTION_FAIL_TAG => WorkerExecutionToBackend::FailExecution {
+            session_epoch,
+            code: ExecutionFailureCode::try_from(read_u8_from(&mut source)?)?,
+            detail: read_optional_u64_from(&mut source)?,
+        },
+        actual => return Err(DecodeError::UnexpectedTag { actual }),
+    };
 
-    let message = match tag {
-        WORKER_TO_BACKEND_COMPLETE_EXECUTION_TAG => {
-            expect_message_len(actual_len, WORKER_TO_BACKEND_COMPLETE_EXECUTION_LEN)?;
-            WorkerToBackendRef::CompleteExecution { session_epoch }
-        }
-        WORKER_TO_BACKEND_FAIL_EXECUTION_TAG => {
-            expect_message_len(actual_len, WORKER_TO_BACKEND_FAIL_EXECUTION_LEN)?;
-            WorkerToBackendRef::FailExecution {
-                session_epoch,
-                code: ExecutionFailureCode::try_from(read_u8_from(&mut source)?)?,
-                detail: read_optional_u64_from(&mut source)?,
-            }
-        }
-        WORKER_TO_BACKEND_OPEN_SCAN_TAG => {
-            expect_message_len(actual_len, WORKER_TO_BACKEND_OPEN_SCAN_LEN)?;
+    ensure_no_trailing_bytes(original, source)?;
+    Ok(message)
+}
+
+pub fn decode_worker_scan_to_backend(
+    bytes: &[u8],
+) -> Result<WorkerScanToBackendRef<'_>, DecodeError> {
+    let original = bytes;
+    let mut source = bytes;
+    let header = decode_runtime_header(&mut source)?;
+    expect_runtime_family(header.family, RuntimeMessageFamily::WorkerScanToBackend)?;
+
+    let session_epoch = read_u64_from(&mut source)?;
+    let message = match header.tag {
+        WORKER_SCAN_OPEN_TAG => {
             let scan_id = read_u64_from(&mut source)?;
             let page_kind = read_u16_from(&mut source)?;
             let page_flags = read_u16_from(&mut source)?;
             let producers = decode_producer_set_ref(original, &mut source)?;
-            WorkerToBackendRef::OpenScan {
+            WorkerScanToBackendRef::OpenScan {
                 session_epoch,
                 scan_id,
                 scan: ScanFlowDescriptorRef::new(page_kind, page_flags, producers),
             }
         }
-        WORKER_TO_BACKEND_CANCEL_SCAN_TAG => {
-            expect_message_len(actual_len, WORKER_TO_BACKEND_CANCEL_SCAN_LEN)?;
-            WorkerToBackendRef::CancelScan {
-                session_epoch,
-                scan_id: read_u64_from(&mut source)?,
-            }
-        }
+        WORKER_SCAN_CANCEL_TAG => WorkerScanToBackendRef::CancelScan {
+            session_epoch,
+            scan_id: read_u64_from(&mut source)?,
+        },
         actual => return Err(DecodeError::UnexpectedTag { actual }),
     };
 
@@ -551,45 +740,63 @@ pub fn decode_worker_to_backend(bytes: &[u8]) -> Result<WorkerToBackendRef<'_>, 
     Ok(message)
 }
 
-fn try_encoded_len_backend_to_worker(message: BackendToWorker) -> Result<usize, EncodeError> {
-    encoded_len_with(|sink| encode_backend_to_worker_to(message, sink))
+fn try_encoded_len_backend_execution_to_worker(
+    message: BackendExecutionToWorker<'_>,
+) -> Result<usize, EncodeError> {
+    encoded_len_with(|sink| encode_backend_execution_to_worker_to(message, sink))
 }
 
-fn try_encoded_len_worker_to_backend(message: WorkerToBackend<'_>) -> Result<usize, EncodeError> {
-    encoded_len_with(|sink| encode_worker_to_backend_to(message, sink))
+fn try_encoded_len_worker_execution_to_backend(
+    message: WorkerExecutionToBackend,
+) -> Result<usize, EncodeError> {
+    encoded_len_with(|sink| encode_worker_execution_to_backend_to(message, sink))
 }
 
-fn encode_backend_to_worker_to<W: Write>(
-    message: BackendToWorker,
+fn try_encoded_len_worker_scan_to_backend(
+    message: WorkerScanToBackend<'_>,
+) -> Result<usize, EncodeError> {
+    encoded_len_with(|sink| encode_worker_scan_to_backend_to(message, sink))
+}
+
+fn encode_backend_execution_to_worker_to<W: Write>(
+    message: BackendExecutionToWorker<'_>,
     sink: &mut W,
 ) -> Result<(), EncodeError> {
     match message {
-        BackendToWorker::StartExecution {
+        BackendExecutionToWorker::StartExecution {
             session_epoch,
             plan,
+            scans,
         } => {
-            write_array_len_to(sink, BACKEND_TO_WORKER_START_EXECUTION_LEN)?;
-            write_magic_and_version_to(sink)?;
-            write_u8_to(sink, BACKEND_TO_WORKER_START_EXECUTION_TAG)?;
+            write_runtime_header_to(
+                sink,
+                RuntimeMessageFamily::BackendExecutionToWorker,
+                BACKEND_EXECUTION_START_TAG,
+            )?;
             write_u64_to(sink, session_epoch)?;
             write_u64_to(sink, plan.plan_id)?;
             write_u16_to(sink, plan.page_kind)?;
             write_u16_to(sink, plan.page_flags)?;
+            write_scan_channel_slice_to(sink, scans.channels())?;
         }
-        BackendToWorker::CancelExecution { session_epoch } => {
-            write_array_len_to(sink, BACKEND_TO_WORKER_CANCEL_EXECUTION_LEN)?;
-            write_magic_and_version_to(sink)?;
-            write_u8_to(sink, BACKEND_TO_WORKER_CANCEL_EXECUTION_TAG)?;
+        BackendExecutionToWorker::CancelExecution { session_epoch } => {
+            write_runtime_header_to(
+                sink,
+                RuntimeMessageFamily::BackendExecutionToWorker,
+                BACKEND_EXECUTION_CANCEL_TAG,
+            )?;
             write_u64_to(sink, session_epoch)?;
         }
-        BackendToWorker::FailExecution {
+        BackendExecutionToWorker::FailExecution {
             session_epoch,
             code,
             detail,
         } => {
-            write_array_len_to(sink, BACKEND_TO_WORKER_FAIL_EXECUTION_LEN)?;
-            write_magic_and_version_to(sink)?;
-            write_u8_to(sink, BACKEND_TO_WORKER_FAIL_EXECUTION_TAG)?;
+            write_runtime_header_to(
+                sink,
+                RuntimeMessageFamily::BackendExecutionToWorker,
+                BACKEND_EXECUTION_FAIL_TAG,
+            )?;
             write_u64_to(sink, session_epoch)?;
             write_u8_to(sink, code as u8)?;
             write_optional_u64_to(sink, detail)?;
@@ -598,74 +805,71 @@ fn encode_backend_to_worker_to<W: Write>(
     Ok(())
 }
 
-fn encode_worker_to_backend_to<W: Write>(
-    message: WorkerToBackend<'_>,
+fn encode_worker_execution_to_backend_to<W: Write>(
+    message: WorkerExecutionToBackend,
     sink: &mut W,
 ) -> Result<(), EncodeError> {
     match message {
-        WorkerToBackend::CompleteExecution { session_epoch } => {
-            write_array_len_to(sink, WORKER_TO_BACKEND_COMPLETE_EXECUTION_LEN)?;
-            write_magic_and_version_to(sink)?;
-            write_u8_to(sink, WORKER_TO_BACKEND_COMPLETE_EXECUTION_TAG)?;
+        WorkerExecutionToBackend::CompleteExecution { session_epoch } => {
+            write_runtime_header_to(
+                sink,
+                RuntimeMessageFamily::WorkerExecutionToBackend,
+                WORKER_EXECUTION_COMPLETE_TAG,
+            )?;
             write_u64_to(sink, session_epoch)?;
         }
-        WorkerToBackend::FailExecution {
+        WorkerExecutionToBackend::FailExecution {
             session_epoch,
             code,
             detail,
         } => {
-            write_array_len_to(sink, WORKER_TO_BACKEND_FAIL_EXECUTION_LEN)?;
-            write_magic_and_version_to(sink)?;
-            write_u8_to(sink, WORKER_TO_BACKEND_FAIL_EXECUTION_TAG)?;
+            write_runtime_header_to(
+                sink,
+                RuntimeMessageFamily::WorkerExecutionToBackend,
+                WORKER_EXECUTION_FAIL_TAG,
+            )?;
             write_u64_to(sink, session_epoch)?;
             write_u8_to(sink, code as u8)?;
             write_optional_u64_to(sink, detail)?;
         }
-        WorkerToBackend::OpenScan {
+    }
+    Ok(())
+}
+
+fn encode_worker_scan_to_backend_to<W: Write>(
+    message: WorkerScanToBackend<'_>,
+    sink: &mut W,
+) -> Result<(), EncodeError> {
+    match message {
+        WorkerScanToBackend::OpenScan {
             session_epoch,
             scan_id,
             scan,
         } => {
-            write_array_len_to(sink, WORKER_TO_BACKEND_OPEN_SCAN_LEN)?;
-            write_magic_and_version_to(sink)?;
-            write_u8_to(sink, WORKER_TO_BACKEND_OPEN_SCAN_TAG)?;
+            write_runtime_header_to(
+                sink,
+                RuntimeMessageFamily::WorkerScanToBackend,
+                WORKER_SCAN_OPEN_TAG,
+            )?;
             write_u64_to(sink, session_epoch)?;
             write_u64_to(sink, scan_id)?;
             write_u16_to(sink, scan.page_kind)?;
             write_u16_to(sink, scan.page_flags)?;
             write_producer_slice_to(sink, scan.producers())?;
         }
-        WorkerToBackend::CancelScan {
+        WorkerScanToBackend::CancelScan {
             session_epoch,
             scan_id,
         } => {
-            write_array_len_to(sink, WORKER_TO_BACKEND_CANCEL_SCAN_LEN)?;
-            write_magic_and_version_to(sink)?;
-            write_u8_to(sink, WORKER_TO_BACKEND_CANCEL_SCAN_TAG)?;
+            write_runtime_header_to(
+                sink,
+                RuntimeMessageFamily::WorkerScanToBackend,
+                WORKER_SCAN_CANCEL_TAG,
+            )?;
             write_u64_to(sink, session_epoch)?;
             write_u64_to(sink, scan_id)?;
         }
     }
-    Ok(())
-}
-
-fn decode_magic_and_version(source: &mut &[u8]) -> Result<(), DecodeError> {
-    let actual_magic = read_string_bytes_from(source, "protocol magic")?;
-    if actual_magic != RUNTIME_PROTOCOL_MAGIC.as_bytes() {
-        return Err(DecodeError::InvalidMagic {
-            expected: RUNTIME_PROTOCOL_MAGIC,
-            actual: String::from_utf8_lossy(actual_magic).into_owned(),
-        });
-    }
-
-    let actual_version = read_u8_from(source)?;
-    if actual_version != RUNTIME_PROTOCOL_VERSION {
-        return Err(DecodeError::UnsupportedVersion {
-            expected: RUNTIME_PROTOCOL_VERSION,
-            actual: actual_version,
-        });
-    }
-
     Ok(())
 }
 
@@ -700,6 +904,30 @@ fn decode_producer_set_ref<'a>(
     })
 }
 
+fn decode_scan_channel_set_ref<'a>(
+    original: &'a [u8],
+    source: &mut &'a [u8],
+) -> Result<ScanChannelSetRef<'a>, DecodeError> {
+    let start = original.len() - source.len();
+    let count = read_array_len_from(source)?;
+    let mut seen_ids = BTreeSet::new();
+
+    for _ in 0..count {
+        let descriptor = read_scan_channel_descriptor_from(source)?;
+        if !seen_ids.insert(descriptor.scan_id) {
+            return Err(DecodeError::DuplicateScanId {
+                scan_id: descriptor.scan_id,
+            });
+        }
+    }
+
+    let end = original.len() - source.len();
+    Ok(ScanChannelSetRef {
+        bytes: &original[start..end],
+        len: count,
+    })
+}
+
 fn validate_encode_producer_slice(
     producers: &[ProducerDescriptorWire],
 ) -> Result<(), ProducerSetError> {
@@ -721,6 +949,20 @@ fn validate_encode_producer_slice(
         }
     }
 
+    Ok(())
+}
+
+fn validate_scan_channel_slice(
+    channels: &[ScanChannelDescriptorWire],
+) -> Result<(), ScanChannelSetError> {
+    let mut seen_ids = BTreeSet::new();
+    for channel in channels {
+        if !seen_ids.insert(channel.scan_id) {
+            return Err(ScanChannelSetError::DuplicateScanId {
+                scan_id: channel.scan_id,
+            });
+        }
+    }
     Ok(())
 }
 
@@ -802,6 +1044,20 @@ fn read_producer_descriptor_from(
     })
 }
 
+fn read_scan_channel_descriptor_from(
+    source: &mut &[u8],
+) -> Result<ScanChannelDescriptorWire, DecodeError> {
+    expect_message_len(read_array_len_from(source)?, SCAN_CHANNEL_DESCRIPTOR_LEN)?;
+    Ok(ScanChannelDescriptorWire {
+        scan_id: read_u64_from(source)?,
+        peer: BackendLeaseSlotWire::new(
+            read_u32_from(source)?,
+            read_u64_from(source)?,
+            read_u64_from(source)?,
+        ),
+    })
+}
+
 fn write_producer_slice_to<W: Write>(
     sink: &mut W,
     producers: &[ProducerDescriptorWire],
@@ -818,10 +1074,89 @@ fn write_producer_slice_to<W: Write>(
     Ok(())
 }
 
-fn write_magic_and_version_to<W: Write>(sink: &mut W) -> Result<(), EncodeError> {
-    write_string_to(sink, RUNTIME_PROTOCOL_MAGIC)?;
-    write_u8_to(sink, RUNTIME_PROTOCOL_VERSION)?;
+fn write_scan_channel_slice_to<W: Write>(
+    sink: &mut W,
+    channels: &[ScanChannelDescriptorWire],
+) -> Result<(), EncodeError> {
+    validate_scan_channel_slice(channels)?;
+    let len = u32::try_from(channels.len()).map_err(|_| EncodeError::TooManyScanChannels {
+        count: channels.len(),
+    })?;
+    write_array_len_to(sink, len)?;
+    for channel in channels {
+        write_array_len_to(sink, SCAN_CHANNEL_DESCRIPTOR_LEN)?;
+        write_u64_to(sink, channel.scan_id)?;
+        write_u32_to(sink, channel.peer.slot_id())?;
+        write_u64_to(sink, channel.peer.generation())?;
+        write_u64_to(sink, channel.peer.lease_epoch())?;
+    }
     Ok(())
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct RuntimeEnvelopeHeader {
+    family: RuntimeMessageFamily,
+    tag: u8,
+}
+
+fn decode_runtime_header(source: &mut &[u8]) -> Result<RuntimeEnvelopeHeader, DecodeError> {
+    if source.len() < RUNTIME_ENVELOPE_HEADER_LEN {
+        return Err(DecodeError::TruncatedEnvelope {
+            expected: RUNTIME_ENVELOPE_HEADER_LEN,
+            actual: source.len(),
+        });
+    }
+
+    let (header, tail) = source.split_at(RUNTIME_ENVELOPE_HEADER_LEN);
+    *source = tail;
+
+    let magic = u32::from_be_bytes([header[0], header[1], header[2], header[3]]);
+    if magic != RUNTIME_PROTOCOL_MAGIC {
+        return Err(DecodeError::InvalidMagic {
+            expected: RUNTIME_PROTOCOL_MAGIC,
+            actual: magic,
+        });
+    }
+
+    let version = u16::from_be_bytes([header[4], header[5]]);
+    if version != RUNTIME_PROTOCOL_VERSION {
+        return Err(DecodeError::UnsupportedVersion {
+            expected: RUNTIME_PROTOCOL_VERSION,
+            actual: version,
+        });
+    }
+
+    Ok(RuntimeEnvelopeHeader {
+        family: RuntimeMessageFamily::try_from(header[6])?,
+        tag: header[7],
+    })
+}
+
+fn write_runtime_header_to<W: Write>(
+    sink: &mut W,
+    family: RuntimeMessageFamily,
+    tag: u8,
+) -> Result<(), EncodeError> {
+    sink.write_all(&RUNTIME_PROTOCOL_MAGIC.to_be_bytes())
+        .map_err(|error| EncodeError::Envelope(error.to_string()))?;
+    sink.write_all(&RUNTIME_PROTOCOL_VERSION.to_be_bytes())
+        .map_err(|error| EncodeError::Envelope(error.to_string()))?;
+    sink.write_all(&[family as u8, tag])
+        .map_err(|error| EncodeError::Envelope(error.to_string()))?;
+    Ok(())
+}
+
+fn expect_runtime_family(
+    actual: RuntimeMessageFamily,
+    expected: RuntimeMessageFamily,
+) -> Result<(), DecodeError> {
+    if actual == expected {
+        Ok(())
+    } else {
+        Err(DecodeError::UnexpectedMessageFamily {
+            actual: actual as u8,
+        })
+    }
 }
 
 fn write_optional_u64_to<W: Write>(sink: &mut W, value: Option<u64>) -> Result<(), EncodeError> {
@@ -870,7 +1205,7 @@ fn ensure_no_trailing_bytes(original: &[u8], remaining: &[u8]) -> Result<(), Dec
 
 fn expect_message_len(actual: u32, expected: u32) -> Result<(), DecodeError> {
     if actual != expected {
-        return Err(DecodeError::InvalidEnvelope { expected, actual });
+        return Err(DecodeError::InvalidArrayLen { expected, actual });
     }
     Ok(())
 }
@@ -882,6 +1217,22 @@ where
     let mut sink = CountingWriter::default();
     encode(&mut sink)?;
     Ok(sink.written)
+}
+
+fn encode_into_with_len<F>(expected: usize, out: &mut [u8], encode: F) -> Result<usize, EncodeError>
+where
+    F: FnOnce(&mut [u8]) -> Result<(), EncodeError>,
+{
+    if out.len() < expected {
+        return Err(EncodeError::BufferTooSmall {
+            expected,
+            actual: out.len(),
+        });
+    }
+
+    let writer = &mut out[..expected];
+    encode(writer)?;
+    Ok(expected)
 }
 
 #[derive(Default)]
@@ -904,12 +1255,12 @@ fn read_array_len_from(source: &mut &[u8]) -> Result<u32, DecodeError> {
     read_array_len(source).map_err(|error| DecodeError::MsgPack(error.to_string()))
 }
 
-fn read_str_len_from(source: &mut &[u8]) -> Result<u32, DecodeError> {
-    read_str_len(source).map_err(|error| DecodeError::MsgPack(error.to_string()))
-}
-
 fn read_u8_from(source: &mut &[u8]) -> Result<u8, DecodeError> {
     read_u8(source).map_err(|error| DecodeError::MsgPack(error.to_string()))
+}
+
+fn read_u32_from(source: &mut &[u8]) -> Result<u32, DecodeError> {
+    rmp::decode::read_u32(source).map_err(|error| DecodeError::MsgPack(error.to_string()))
 }
 
 fn read_u16_from(source: &mut &[u8]) -> Result<u16, DecodeError> {
@@ -920,31 +1271,18 @@ fn read_u64_from(source: &mut &[u8]) -> Result<u64, DecodeError> {
     read_u64(source).map_err(|error| DecodeError::MsgPack(error.to_string()))
 }
 
-fn read_string_bytes_from<'a>(source: &mut &'a [u8], what: &str) -> Result<&'a [u8], DecodeError> {
-    let len = read_str_len_from(source)? as usize;
-    if source.len() < len {
-        return Err(DecodeError::MsgPack(format!(
-            "{what} is truncated: need {len} bytes, have {}",
-            source.len()
-        )));
-    }
-    let (head, tail) = source.split_at(len);
-    *source = tail;
-    Ok(head)
-}
-
 fn write_array_len_to<W: Write>(sink: &mut W, len: u32) -> Result<(), EncodeError> {
     write_array_len(sink, len)
         .map(|_| ())
         .map_err(|error| EncodeError::MsgPack(error.to_string()))
 }
 
-fn write_string_to<W: Write>(sink: &mut W, value: &str) -> Result<(), EncodeError> {
-    write_str(sink, value).map_err(|error| EncodeError::MsgPack(error.to_string()))
-}
-
 fn write_u8_to<W: Write>(sink: &mut W, value: u8) -> Result<(), EncodeError> {
     write_u8(sink, value).map_err(|error| EncodeError::MsgPack(error.to_string()))
+}
+
+fn write_u32_to<W: Write>(sink: &mut W, value: u32) -> Result<(), EncodeError> {
+    rmp::encode::write_u32(sink, value).map_err(|error| EncodeError::MsgPack(error.to_string()))
 }
 
 fn write_u16_to<W: Write>(sink: &mut W, value: u16) -> Result<(), EncodeError> {

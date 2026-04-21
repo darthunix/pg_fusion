@@ -28,9 +28,10 @@ pub struct OpenScanRequest {
 
 /// Runtime-specific source of scan batches.
 ///
-/// Production implementations are expected to send `WorkerToBackend::OpenScan`
-/// over the active control slot, drive `scan_flow::WorkerScanRole`, and import
-/// pages with `ArrowPageDecoder`. Tests can provide an in-memory source.
+/// Production implementations are expected to send
+/// `runtime_protocol::WorkerScanToBackend::OpenScan` over the dedicated scan
+/// slot, drive `scan_flow::WorkerScanRole`, and import pages with
+/// `ArrowPageDecoder`. Tests can provide an in-memory source.
 pub trait ScanBatchSource: std::fmt::Debug + Send + Sync {
     fn open_scan(&self, request: OpenScanRequest) -> DFResult<SendableRecordBatchStream>;
 }
