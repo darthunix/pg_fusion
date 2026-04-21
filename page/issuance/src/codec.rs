@@ -18,6 +18,20 @@ pub fn encode_issued_frame(
     Ok(buf)
 }
 
+/// Decode exactly one framed issued header.
+///
+/// This helper is intended for transports that already preserve message
+/// boundaries. Callers must pass exactly one full issued header payload.
+pub fn decode_issued_frame(bytes: &[u8]) -> Result<IssuedOwnedFrame, DecodeError> {
+    if bytes.len() != ISSUED_HEADER_LEN {
+        return Err(DecodeError::TrailingBytes {
+            expected: ISSUED_HEADER_LEN,
+            actual: bytes.len(),
+        });
+    }
+    decode_issued_owned_frame(bytes)
+}
+
 pub struct IssuedFrameDecoder {
     header: [u8; ISSUED_HEADER_LEN],
     filled: usize,

@@ -1,0 +1,34 @@
+[package]
+name = "worker_runtime"
+version = "25.0.0"
+edition = "2021"
+description = "Worker-side runtime for the new PostgreSQL execution path"
+readme = "README.md"
+
+[lib]
+crate-type = ["lib"]
+doctest = false
+
+[dependencies]
+arrow-array = { workspace = true }
+arrow-schema = { workspace = true }
+control_transport = { path = "../control_transport", version = "25.0" }
+datafusion = { workspace = true }
+datafusion-common = { workspace = true }
+datafusion-execution = { workspace = true }
+datafusion-expr = { workspace = true }
+datafusion-physical-expr = { workspace = true }
+futures = "0.3"
+import = { path = "../page/import", version = "25.0" }
+issuance = { path = "../page/issuance", version = "25.0" }
+plan_flow = { path = "../page/plan_flow", version = "25.0" }
+runtime_protocol = { path = "../runtime_protocol", version = "25.0" }
+rust-fsm = { version = "0.7", features = ["diagram"] }
+scan_flow = { path = "../page/scan_flow", version = "25.0" }
+scan_node = { path = "../pg/scan_node", version = "25.0" }
+thiserror = "2.0"
+transfer = { path = "../page/transfer", version = "25.0" }
+
+[dev-dependencies]
+pool = { path = "../page/pool", version = "25.0" }
+scan_sql = { path = "../pg/scan_sql", version = "25.0" }

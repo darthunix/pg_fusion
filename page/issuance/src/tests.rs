@@ -1,6 +1,6 @@
 use crate::{
-    encode_issued_frame, IssuanceConfig, IssuancePool, IssueEvent, IssuedFrameDecoder, IssuedRx,
-    IssuedTx,
+    decode_issued_frame, encode_issued_frame, IssuanceConfig, IssuancePool, IssueEvent,
+    IssuedFrameDecoder, IssuedRx, IssuedTx,
 };
 use arrow_array::{ArrayRef, Int32Array, RecordBatch};
 use arrow_layout::init_block;
@@ -303,4 +303,37 @@ fn retryable_accept_errors_keep_permit_attached_to_frame() {
     assert_eq!(issuance_pool.snapshot().leased_permits, 1);
     drop(page2);
     assert_eq!(issuance_pool.snapshot().leased_permits, 0);
+}
+
+#[test]
+fn decode_issued_frame_requires_exact_header_length() {
+    let (_page_region, page_pool) = init_page_pool(4096, 1);
+    let (_issuance_region, issuance_pool) = init_issuance_pool(1);
+    let tx = IssuedTx::new(PageTx::new(page_pool), issuance_pool);
+
+    let mut writer = tx.begin(7, 0).expect("begin");
+    writer.payload_mut()[..4].copy_from_slice(b"ping");
+    let outbound = writer.finish_with_payload_len(4).expect("finish");
+    let frame = encode_issued_frame(outbound.frame()).expect("encode");
+
+    let decoded = decode_issued_frame(&frame).expect("decode exact frame");
+    assert_eq!(decoded.transfer_id(), outbound.frame().transfer_id());
+
+    assert!(matches!(
+        decode_issued_frame(&frame[..frame.len() - 1]),
+        Err(crate::DecodeError::TrailingBytes {
+            expected: crate::wire::ISSUED_HEADER_LEN,
+            actual
+        }) if actual == crate::wire::ISSUED_HEADER_LEN - 1
+    ));
+
+    let mut extended = frame.to_vec();
+    extended.push(0);
+    assert!(matches!(
+        decode_issued_frame(&extended),
+        Err(crate::DecodeError::TrailingBytes {
+            expected: crate::wire::ISSUED_HEADER_LEN,
+            actual
+        }) if actual == crate::wire::ISSUED_HEADER_LEN + 1
+    ));
 }

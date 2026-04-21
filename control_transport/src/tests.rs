@@ -1563,6 +1563,38 @@ fn same_generation_reuse_makes_old_worker_handle_stale_epoch() {
 }
 
 #[test]
+fn exact_lease_claim_stales_after_same_generation_reuse() {
+    let layout = TransportRegionLayout::new(1, 64, 64).expect("layout");
+    let (_mem, region) = TestRegion::new(layout);
+    let worker = attach_worker(&region);
+    let mut backend = BackendSlotLease::acquire(&region).expect("backend");
+    let peer = backend.backend_lease_slot();
+
+    {
+        let _slot = worker
+            .slot_for_backend_lease(peer)
+            .expect("claim exact backend lease");
+    }
+
+    backend.release();
+    let fresh_backend = BackendSlotLease::acquire(&region).expect("fresh backend");
+    assert_eq!(fresh_backend.slot_id(), peer.slot_id());
+
+    let err = match worker.slot_for_backend_lease(peer) {
+        Ok(_) => panic!("old backend lease must stale out after same-generation reuse"),
+        Err(err) => err,
+    };
+    assert!(matches!(
+        err,
+        SlotAccessError::StaleLeaseEpoch {
+            slot_id: 0,
+            claimed_generation: 1,
+            ..
+        }
+    ));
+}
+
+#[test]
 fn old_worker_drop_does_not_detach_new_same_generation_incarnation() {
     let layout = TransportRegionLayout::new(1, 64, 64).expect("layout");
     let (_mem, region) = TestRegion::new(layout);

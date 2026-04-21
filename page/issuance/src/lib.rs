@@ -51,7 +51,7 @@ mod wire;
 #[cfg(test)]
 mod tests;
 
-pub use codec::{encode_issued_frame, IssuedFrameDecoder, IssuedFrameIter};
+pub use codec::{decode_issued_frame, encode_issued_frame, IssuedFrameDecoder, IssuedFrameIter};
 pub use error::{
     AcquireError, AttachError, ConfigError, DecodeError, EncodeError, InitError, IssuedRxError,
     IssuedTxError, ReleaseError,
@@ -59,4 +59,4 @@ pub use error::{
 pub use pool::{IssuanceConfig, IssuancePool, IssuanceSnapshot, PermitLease, RegionLayout};
 pub use rx::{IssueEvent, IssuedReceivedPage, IssuedRx};
 pub use tx::{IssuedOutboundPage, IssuedTx, IssuedWriter};
-pub use wire::{IssuedOwnedFrame, IssuedPageFrame};
+pub use wire::{IssuedOwnedFrame, IssuedPageFrame, ISSUED_HEADER_LEN};

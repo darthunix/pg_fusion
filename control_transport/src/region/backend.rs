@@ -109,6 +109,14 @@ impl BackendSlotLease {
         self.incarnation.generation
     }
 
+    pub fn backend_lease_id(&self) -> super::BackendLeaseId {
+        self.incarnation.into()
+    }
+
+    pub fn backend_lease_slot(&self) -> super::BackendLeaseSlot {
+        super::BackendLeaseSlot::new(self.slot_id, self.backend_lease_id())
+    }
+
     pub fn slot_id(&self) -> u32 {
         self.slot_id
     }

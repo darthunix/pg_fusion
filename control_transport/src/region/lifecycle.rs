@@ -557,6 +557,188 @@ impl TransportRegion {
         Ok(incarnation)
     }
 
+    pub(super) fn claim_worker_slot_for_backend_lease(
+        &self,
+        peer: crate::BackendLeaseSlot,
+    ) -> Result<LeaseIncarnation, SlotAccessError> {
+        let claimed = peer.lease_id();
+        let region_snapshot = self.load_region_snapshot();
+        if !region_snapshot.is_online() {
+            return Err(SlotAccessError::WorkerOffline);
+        }
+        if region_snapshot.generation != claimed.generation() {
+            return Err(SlotAccessError::StaleGeneration {
+                slot_id: peer.slot_id(),
+                claimed_generation: claimed.generation(),
+                current_generation: region_snapshot.generation,
+            });
+        }
+
+        let slot = self.slot_view(peer.slot_id())?;
+        let slot_snapshot = self.load_slot_snapshot(slot);
+        if !slot_snapshot.is_leased()
+            || slot_snapshot.slot_generation != claimed.generation()
+            || slot_snapshot.lease_epoch() == 0
+        {
+            return Err(SlotAccessError::Released {
+                slot_id: peer.slot_id(),
+                claimed_generation: claimed.generation(),
+            });
+        }
+        if slot_snapshot.lease_epoch() != claimed.lease_epoch() {
+            return Err(SlotAccessError::StaleLeaseEpoch {
+                slot_id: peer.slot_id(),
+                claimed_generation: claimed.generation(),
+                claimed_lease_epoch: claimed.lease_epoch(),
+                current_lease_epoch: slot_snapshot.lease_epoch(),
+            });
+        }
+        if !slot_snapshot.has_backend_owner() {
+            return Err(SlotAccessError::Released {
+                slot_id: peer.slot_id(),
+                claimed_generation: claimed.generation(),
+            });
+        }
+        if slot_snapshot.has_any_worker_owner() {
+            return Err(SlotAccessError::Busy {
+                slot_id: peer.slot_id(),
+                claimed_generation: claimed.generation(),
+            });
+        }
+
+        let incarnation = LeaseIncarnation::new(claimed.generation(), claimed.lease_epoch());
+        match self.reap_dead_backend_owner(peer.slot_id(), incarnation, slot) {
+            Ok(true) => {
+                return Err(SlotAccessError::Released {
+                    slot_id: peer.slot_id(),
+                    claimed_generation: claimed.generation(),
+                });
+            }
+            Ok(false) => {}
+            Err(err) => {
+                return Err(SlotAccessError::BackendProbeFailed {
+                    slot_id: peer.slot_id(),
+                    claimed_generation: claimed.generation(),
+                    error_kind: err.kind(),
+                    raw_os_error: err.raw_os_error(),
+                });
+            }
+        }
+
+        let local_owner = WorkerOwnerReservation::reserve(self, peer.slot_id(), incarnation)
+            .ok_or(SlotAccessError::Busy {
+                slot_id: peer.slot_id(),
+                claimed_generation: claimed.generation(),
+            })?;
+
+        let pending_mask = OWNER_BACKEND | OWNER_WORKER_PENDING;
+        let expected_meta =
+            SlotMeta::new(LEASE_STATE_LEASED, incarnation.lease_epoch, OWNER_BACKEND);
+        let pending_meta = SlotMeta::new(LEASE_STATE_LEASED, incarnation.lease_epoch, pending_mask);
+        if slot
+            .slot_meta
+            .compare_exchange(
+                expected_meta.raw(),
+                pending_meta.raw(),
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            )
+            .is_err()
+        {
+            return Err(self.classify_worker_claim_failure(
+                peer.slot_id(),
+                claimed.generation(),
+                incarnation,
+                slot,
+            ));
+        }
+
+        #[cfg(test)]
+        self.run_worker_claim_hook_for_tests();
+
+        let recheck_region = self.load_region_snapshot();
+        let recheck_slot = self.load_slot_snapshot(slot);
+        if recheck_region.generation != claimed.generation()
+            || recheck_region.worker_state != WORKER_STATE_ONLINE
+            || recheck_slot.slot_generation != claimed.generation()
+            || recheck_slot.lease_epoch() != incarnation.lease_epoch
+            || !recheck_slot.is_leased()
+            || recheck_slot.owner_mask() != pending_mask
+        {
+            self.rollback_worker_claim(peer.slot_id(), incarnation, slot);
+            if recheck_region.generation != claimed.generation() {
+                return Err(SlotAccessError::StaleGeneration {
+                    slot_id: peer.slot_id(),
+                    claimed_generation: claimed.generation(),
+                    current_generation: recheck_region.generation,
+                });
+            }
+            if recheck_region.worker_state != WORKER_STATE_ONLINE {
+                return Err(SlotAccessError::WorkerOffline);
+            }
+            if recheck_slot.lease_epoch() != incarnation.lease_epoch {
+                return Err(SlotAccessError::StaleLeaseEpoch {
+                    slot_id: peer.slot_id(),
+                    claimed_generation: claimed.generation(),
+                    claimed_lease_epoch: incarnation.lease_epoch,
+                    current_lease_epoch: recheck_slot.lease_epoch(),
+                });
+            }
+            return Err(SlotAccessError::Released {
+                slot_id: peer.slot_id(),
+                claimed_generation: claimed.generation(),
+            });
+        }
+
+        match self.backend_owner_alive(recheck_slot.backend_pid) {
+            Ok(true) => {}
+            Ok(false) => {
+                self.rollback_worker_claim(peer.slot_id(), incarnation, slot);
+                let _ = self.reap_dead_backend_owner(peer.slot_id(), incarnation, slot);
+                return Err(SlotAccessError::Released {
+                    slot_id: peer.slot_id(),
+                    claimed_generation: claimed.generation(),
+                });
+            }
+            Err(err) => {
+                self.rollback_worker_claim(peer.slot_id(), incarnation, slot);
+                return Err(SlotAccessError::BackendProbeFailed {
+                    slot_id: peer.slot_id(),
+                    claimed_generation: claimed.generation(),
+                    error_kind: err.kind(),
+                    raw_os_error: err.raw_os_error(),
+                });
+            }
+        }
+
+        let committed_meta = SlotMeta::new(
+            LEASE_STATE_LEASED,
+            incarnation.lease_epoch,
+            OWNER_BACKEND | OWNER_WORKER,
+        );
+        if slot
+            .slot_meta
+            .compare_exchange(
+                pending_meta.raw(),
+                committed_meta.raw(),
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            )
+            .is_err()
+        {
+            self.rollback_worker_claim(peer.slot_id(), incarnation, slot);
+            return Err(self.classify_worker_claim_failure(
+                peer.slot_id(),
+                claimed.generation(),
+                incarnation,
+                slot,
+            ));
+        }
+
+        local_owner.keep();
+        Ok(incarnation)
+    }
+
     pub(super) fn release_worker_slot(&self, slot_id: u32, incarnation: LeaseIncarnation) {
         let slot = unsafe { self.slot_view_unchecked(slot_id) };
         let mutation = self.clear_owner_bits_if_matching(slot, incarnation, OWNER_WORKER);

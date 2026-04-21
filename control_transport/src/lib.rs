@@ -58,6 +58,7 @@ pub use error::{
     NotifyError, ReinitError, RxError, SlotAccessError, TxError, WorkerAttachError,
     WorkerLifecycleError, WorkerRxError, WorkerTxError,
 };
+pub use region::{BackendLeaseId, BackendLeaseSlot};
 pub use region::{BackendRx, BackendSlotLease, BackendTx, ControlRx, ControlTx};
 pub use region::{CommitOutcome, TransportRegion, TransportRegionLayout};
-pub use region::{ReadySlots, WorkerRx, WorkerSlot, WorkerTransport, WorkerTx};
+pub use region::{ReadyBackendLeases, ReadySlots, WorkerRx, WorkerSlot, WorkerTransport, WorkerTx};

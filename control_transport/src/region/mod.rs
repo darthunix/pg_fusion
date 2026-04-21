@@ -116,6 +116,59 @@ pub struct BackendSlotLease {
     active: bool,
 }
 
+/// Stable identity for one leased backend slot incarnation.
+///
+/// A `slot_id` may be reused by a different backend after release, so higher
+/// layers that retain state across cleanup boundaries must key that state by
+/// `BackendLeaseId`, not by `slot_id` alone.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct BackendLeaseId {
+    generation: u64,
+    lease_epoch: u64,
+}
+
+impl BackendLeaseId {
+    pub const fn new(generation: u64, lease_epoch: u64) -> Self {
+        Self {
+            generation,
+            lease_epoch,
+        }
+    }
+
+    pub const fn generation(self) -> u64 {
+        self.generation
+    }
+
+    pub const fn lease_epoch(self) -> u64 {
+        self.lease_epoch
+    }
+}
+
+/// Stable peer key for one backend slot lease incarnation.
+///
+/// This combines the physical slot address with the lease incarnation that
+/// currently owns it. Higher layers must retain this full key, not just
+/// `slot_id`, whenever work can outlive the original backend lease.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct BackendLeaseSlot {
+    slot_id: u32,
+    lease_id: BackendLeaseId,
+}
+
+impl BackendLeaseSlot {
+    pub const fn new(slot_id: u32, lease_id: BackendLeaseId) -> Self {
+        Self { slot_id, lease_id }
+    }
+
+    pub const fn slot_id(self) -> u32 {
+        self.slot_id
+    }
+
+    pub const fn lease_id(self) -> BackendLeaseId {
+        self.lease_id
+    }
+}
+
 /// Worker-side process-local attachment to the transport region.
 pub struct WorkerTransport {
     region: TransportRegion,
@@ -138,6 +191,20 @@ pub struct ReadySlots<'a> {
     transport: &'a WorkerTransport,
     generation: u64,
     next: u32,
+}
+
+/// Iterator over backend lease peers that currently have pending
+/// backend-to-worker traffic in the current generation.
+pub struct ReadyBackendLeases<'a> {
+    transport: &'a WorkerTransport,
+    generation: u64,
+    next: u32,
+}
+
+impl From<LeaseIncarnation> for BackendLeaseId {
+    fn from(value: LeaseIncarnation) -> Self {
+        Self::new(value.generation, value.lease_epoch)
+    }
 }
 
 /// Low-level framed transport sender for one ring direction.

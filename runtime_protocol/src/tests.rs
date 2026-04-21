@@ -177,6 +177,33 @@ fn backend_fail_execution_round_trips_with_detail() {
 }
 
 #[test]
+fn backend_to_worker_max_encoded_len_covers_all_current_messages() {
+    let max_encoded = [
+        encoded_len_backend_to_worker(BackendToWorker::StartExecution {
+            session_epoch: u64::MAX,
+            plan: PlanFlowDescriptor {
+                plan_id: u64::MAX,
+                page_kind: u16::MAX,
+                page_flags: u16::MAX,
+            },
+        }),
+        encoded_len_backend_to_worker(BackendToWorker::CancelExecution {
+            session_epoch: u64::MAX,
+        }),
+        encoded_len_backend_to_worker(BackendToWorker::FailExecution {
+            session_epoch: u64::MAX,
+            code: ExecutionFailureCode::Internal,
+            detail: Some(u64::MAX),
+        }),
+    ]
+    .into_iter()
+    .max()
+    .expect("backend message lengths");
+
+    assert_eq!(max_encoded, MAX_BACKEND_TO_WORKER_ENCODED_LEN);
+}
+
+#[test]
 fn worker_open_scan_round_trips_with_borrowed_producers() {
     let producers = producer_descriptors();
     let message = WorkerToBackend::OpenScan {

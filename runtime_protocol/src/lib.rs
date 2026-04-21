@@ -53,6 +53,15 @@ const PRODUCER_ID_BITMAP_WORDS: usize = (u16::MAX as usize + 1) / PRODUCER_ID_BI
 /// reserve a four-byte prefix plus one extra byte to distinguish empty from full.
 pub const CONTROL_TRANSPORT_PAYLOAD_OVERHEAD: usize = 5;
 
+/// Maximum encoded size of any current backend-to-worker control payload.
+///
+/// This bound is intentionally tied to the current wire format so framed
+/// transports can demultiplex backend control payloads from other fixed-size
+/// payload families by length before attempting a full decode. If the
+/// backend-to-worker protocol grows, this constant and its unit test must be
+/// updated together.
+pub const MAX_BACKEND_TO_WORKER_ENCODED_LEN: usize = 34;
+
 /// Maximum protocol payload size that can fit into one `control_transport`
 /// ring with the given raw data capacity.
 pub fn max_message_len_for_ring_capacity(capacity: usize) -> usize {

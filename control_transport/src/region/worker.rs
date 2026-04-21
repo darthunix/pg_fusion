@@ -76,6 +76,74 @@ impl WorkerTransport {
             next: 0,
         }
     }
+
+    pub fn ready_backend_leases(&self) -> super::ReadyBackendLeases<'_> {
+        let generation = self.region.load_region_meta().generation();
+        super::ReadyBackendLeases {
+            transport: self,
+            generation,
+            next: 0,
+        }
+    }
+
+    /// Return the next backend lease peer with pending inbound traffic.
+    ///
+    /// The caller owns `cursor` and resets it to `0` for each new poll pass.
+    /// This avoids holding an iterator borrow across loop bodies that need
+    /// mutable transport access.
+    pub fn next_ready_backend_lease(&self, cursor: &mut u32) -> Option<super::BackendLeaseSlot> {
+        let generation = self.region.load_region_meta().generation();
+        if generation == 0 {
+            return None;
+        }
+
+        while *cursor < self.region.slot_count {
+            if !self
+                .region
+                .load_region_meta()
+                .is_online_generation(generation)
+            {
+                return None;
+            }
+
+            let slot_id = *cursor;
+            *cursor += 1;
+            let slot = unsafe { self.region.slot_view_unchecked(slot_id) };
+            let slot_meta = SlotMeta::from_raw(slot.slot_meta.load(Ordering::Acquire));
+            if slot_meta.lease_state() != LEASE_STATE_LEASED {
+                continue;
+            }
+            if slot.slot_generation.load(Ordering::Acquire) != generation {
+                continue;
+            }
+            if slot_meta.owner_mask() & OWNER_ANY_WORKER != 0 {
+                continue;
+            }
+            if slot.to_worker_ready.load(Ordering::Acquire)
+                || slot.backend_to_worker.has_pending_frame()
+            {
+                return Some(super::BackendLeaseSlot::new(
+                    slot_id,
+                    super::BackendLeaseId::new(generation, slot_meta.lease_epoch()),
+                ));
+            }
+        }
+
+        None
+    }
+
+    pub fn slot_for_backend_lease(
+        &self,
+        peer: super::BackendLeaseSlot,
+    ) -> Result<WorkerSlot<'_>, SlotAccessError> {
+        let incarnation = self.region.claim_worker_slot_for_backend_lease(peer)?;
+        Ok(WorkerSlot {
+            region: &self.region,
+            incarnation,
+            slot_id: peer.slot_id(),
+            attached: true,
+        })
+    }
 }
 
 impl<'a> Iterator for ReadySlots<'a> {
@@ -119,7 +187,59 @@ impl<'a> Iterator for ReadySlots<'a> {
     }
 }
 
+impl<'a> Iterator for super::ReadyBackendLeases<'a> {
+    type Item = super::BackendLeaseSlot;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        if self.generation == 0 {
+            return None;
+        }
+
+        while self.next < self.transport.region.slot_count {
+            if !self
+                .transport
+                .region
+                .load_region_meta()
+                .is_online_generation(self.generation)
+            {
+                return None;
+            }
+
+            let slot_id = self.next;
+            self.next += 1;
+            let slot = unsafe { self.transport.region.slot_view_unchecked(slot_id) };
+            let slot_meta = SlotMeta::from_raw(slot.slot_meta.load(Ordering::Acquire));
+            if slot_meta.lease_state() != LEASE_STATE_LEASED {
+                continue;
+            }
+            if slot.slot_generation.load(Ordering::Acquire) != self.generation {
+                continue;
+            }
+            if slot_meta.owner_mask() & OWNER_ANY_WORKER != 0 {
+                continue;
+            }
+            if slot.to_worker_ready.load(Ordering::Acquire)
+                || slot.backend_to_worker.has_pending_frame()
+            {
+                return Some(super::BackendLeaseSlot::new(
+                    slot_id,
+                    super::BackendLeaseId::new(self.generation, slot_meta.lease_epoch()),
+                ));
+            }
+        }
+        None
+    }
+}
+
 impl<'a> WorkerSlot<'a> {
+    pub fn backend_lease_id(&self) -> super::BackendLeaseId {
+        self.incarnation.into()
+    }
+
+    pub fn backend_lease_slot(&self) -> super::BackendLeaseSlot {
+        super::BackendLeaseSlot::new(self.slot_id, self.backend_lease_id())
+    }
+
     pub fn generation(&self) -> u64 {
         self.incarnation.generation
     }
