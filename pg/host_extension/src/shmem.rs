@@ -2,9 +2,9 @@ use std::ptr::NonNull;
 
 use control_transport::{TransportRegion, TransportRegionLayout};
 use issuance::{IssuanceConfig, IssuancePool};
-use pool::{PagePool, PagePoolConfig};
 use pgrx::pg_sys::AsPgCStr;
 use pgrx::prelude::*;
+use pool::{PagePool, PagePoolConfig};
 
 use crate::guc::host_config;
 
@@ -44,10 +44,9 @@ unsafe extern "C-unwind" fn pg_fusion_shmem_request_hook() {
     let page_layout =
         PagePool::layout(PagePoolConfig::new(config.page_size, config.page_count).expect("cfg"))
             .expect("page pool layout");
-    let issuance_layout = IssuancePool::layout(
-        IssuanceConfig::new(config.permit_count).expect("issuance config"),
-    )
-    .expect("issuance pool layout");
+    let issuance_layout =
+        IssuancePool::layout(IssuanceConfig::new(config.permit_count).expect("issuance config"))
+            .expect("issuance pool layout");
 
     let total = control_layout
         .size
@@ -119,9 +118,12 @@ fn init_control_region(
     backend_to_worker_capacity: usize,
     worker_to_backend_capacity: usize,
 ) {
-    let layout =
-        TransportRegionLayout::new(slot_count, backend_to_worker_capacity, worker_to_backend_capacity)
-            .expect("control transport layout");
+    let layout = TransportRegionLayout::new(
+        slot_count,
+        backend_to_worker_capacity,
+        worker_to_backend_capacity,
+    )
+    .expect("control transport layout");
     let mut found = false;
     let base = unsafe {
         pgrx::pg_sys::ShmemInitStruct(name.as_pg_cstr(), layout.size, &mut found) as *mut u8
@@ -141,8 +143,9 @@ fn init_page_pool(name: &str, page_size: usize, page_count: u32) {
     let cfg = PagePoolConfig::new(page_size, page_count).expect("page pool config");
     let layout = PagePool::layout(cfg).expect("page pool layout");
     let mut found = false;
-    let base =
-        unsafe { pgrx::pg_sys::ShmemInitStruct(name.as_pg_cstr(), layout.size, &mut found) as *mut u8 };
+    let base = unsafe {
+        pgrx::pg_sys::ShmemInitStruct(name.as_pg_cstr(), layout.size, &mut found) as *mut u8
+    };
     let base = NonNull::new(base).expect("page pool shmem");
     let pool = unsafe {
         if found {
@@ -158,8 +161,9 @@ fn init_issuance_pool(name: &str, permit_count: u32) {
     let cfg = IssuanceConfig::new(permit_count).expect("issuance config");
     let layout = IssuancePool::layout(cfg).expect("issuance layout");
     let mut found = false;
-    let base =
-        unsafe { pgrx::pg_sys::ShmemInitStruct(name.as_pg_cstr(), layout.size, &mut found) as *mut u8 };
+    let base = unsafe {
+        pgrx::pg_sys::ShmemInitStruct(name.as_pg_cstr(), layout.size, &mut found) as *mut u8
+    };
     let base = NonNull::new(base).expect("issuance pool shmem");
     let pool = unsafe {
         if found {
@@ -178,7 +182,11 @@ fn attach_control_region_named(name: &str, layout: TransportRegionLayout) -> Tra
 
 fn lookup_shmem(name: &str, size: usize) -> NonNull<u8> {
     let mut found = false;
-    let base = unsafe { pgrx::pg_sys::ShmemInitStruct(name.as_pg_cstr(), size, &mut found) as *mut u8 };
-    assert!(found, "shared memory object {name} must already be initialized");
+    let base =
+        unsafe { pgrx::pg_sys::ShmemInitStruct(name.as_pg_cstr(), size, &mut found) as *mut u8 };
+    assert!(
+        found,
+        "shared memory object {name} must already be initialized"
+    );
     NonNull::new(base).expect("shared memory base must be non-null")
 }

@@ -1,7 +1,7 @@
 use std::collections::VecDeque;
 
 use arrow_schema::SchemaRef;
-use issuance::{IssueEvent, IssuancePool, IssuedOwnedFrame, IssuedRx};
+use issuance::{IssuancePool, IssueEvent, IssuedOwnedFrame, IssuedRx};
 use pgrx::pg_sys;
 use pgrx::PgMemoryContexts;
 use pool::PagePool;

@@ -237,7 +237,9 @@ pub fn host_config() -> Result<HostConfig, HostConfigError> {
 }
 
 impl HostConfig {
-    pub fn control_transport_layout(&self) -> Result<TransportRegionLayout, control_transport::ConfigError> {
+    pub fn control_transport_layout(
+        &self,
+    ) -> Result<TransportRegionLayout, control_transport::ConfigError> {
         TransportRegionLayout::new(
             self.control_slot_count,
             self.control_backend_to_worker_capacity,
@@ -245,7 +247,9 @@ impl HostConfig {
         )
     }
 
-    pub fn scan_transport_layout(&self) -> Result<TransportRegionLayout, control_transport::ConfigError> {
+    pub fn scan_transport_layout(
+        &self,
+    ) -> Result<TransportRegionLayout, control_transport::ConfigError> {
         TransportRegionLayout::new(
             self.scan_slot_count,
             self.scan_backend_to_worker_capacity,

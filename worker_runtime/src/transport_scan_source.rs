@@ -15,7 +15,9 @@ use futures::channel::mpsc::{channel, Receiver, Sender};
 use futures::{SinkExt, Stream};
 use issuance::{decode_issued_frame, IssuedOwnedFrame, IssuedRx};
 use runtime_protocol::codec::{decode_backend_scan_to_worker, decode_runtime_message_family};
-use runtime_protocol::message::{BackendScanToWorkerRef, RuntimeMessageFamily, WorkerScanToBackend};
+use runtime_protocol::message::{
+    BackendScanToWorkerRef, RuntimeMessageFamily, WorkerScanToBackend,
+};
 use runtime_protocol::session::{
     MIN_SCAN_BACKEND_TO_WORKER_RING_CAPACITY, MIN_SCAN_WORKER_TO_BACKEND_RING_CAPACITY,
 };

@@ -369,9 +369,13 @@ mod tests {
         let tx = IssuedTx::new(page_tx, issuance_pool);
         let rx = IssuedRx::new(PageRx::new(page_pool), issuance_pool);
 
-        let mut producer =
-            ResultPageProducer::new(stream, tx, payload_capacity, ResultPageProducerConfig::default())
-                .expect("producer");
+        let mut producer = ResultPageProducer::new(
+            stream,
+            tx,
+            payload_capacity,
+            ResultPageProducerConfig::default(),
+        )
+        .expect("producer");
         let decoder = import::ArrowPageDecoder::new(producer.transport_schema()).expect("decoder");
 
         let mut saw_close = false;
