@@ -15,8 +15,9 @@ use crate::process::probe_pid_alive;
 use crate::ring::FramedRing;
 use lockfree::{treiber_stack_ptrs, StackError, TreiberStack};
 use portable_atomic::AtomicU128;
-use std::ptr::{self, NonNull};
-use std::sync::atomic::{AtomicBool, AtomicI32, AtomicPtr, AtomicU64, Ordering};
+use std::ptr::NonNull;
+use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU64, Ordering};
+use std::sync::{Mutex, OnceLock};
 
 #[cfg(test)]
 use std::cell::RefCell;
@@ -35,10 +36,14 @@ struct ProcessWorkerRegistry {
     entries: Box<[AtomicU128]>,
 }
 
-// This process-local mirror is replaced atomically on PID/region/slot-count
-// changes. Replaced registries are intentionally leaked because concurrent
-// threads may still hold raw references returned before the swap.
-static WORKER_OWNER_REGISTRY: AtomicPtr<ProcessWorkerRegistry> = AtomicPtr::new(ptr::null_mut());
+// These process-local mirrors are append-only for the process lifetime. Each
+// registry is keyed by `(owner_pid, region_key, slot_count)`. Matching
+// registries are reused, while same-PID attachments to distinct regions install
+// additional registries so one worker process can own both the primary control
+// region and the dedicated scan region. Registries are intentionally leaked
+// until test-only cleanup because concurrent threads may still hold raw
+// references returned before later inserts.
+static WORKER_OWNER_REGISTRIES: OnceLock<Mutex<Vec<usize>>> = OnceLock::new();
 
 impl ProcessWorkerRegistry {
     fn new(owner_pid: i32, region_key: usize, slot_count: u32) -> Self {
@@ -75,114 +80,64 @@ fn install_or_get_worker_owner_registry(
     region_key: usize,
     slot_count: u32,
 ) -> Result<&'static ProcessWorkerRegistry, WorkerAttachError> {
-    let mut ptr = WORKER_OWNER_REGISTRY.load(Ordering::Acquire);
-    loop {
-        if ptr.is_null() {
-            let candidate = Box::new(ProcessWorkerRegistry::new(
-                owner_pid, region_key, slot_count,
-            ));
-            let candidate_ptr = Box::into_raw(candidate);
-            match WORKER_OWNER_REGISTRY.compare_exchange(
-                ptr::null_mut(),
-                candidate_ptr,
-                Ordering::AcqRel,
-                Ordering::Acquire,
-            ) {
-                Ok(_) => return Ok(unsafe { &*candidate_ptr }),
-                Err(existing) => {
-                    unsafe {
-                        drop(Box::from_raw(candidate_ptr));
-                    }
-                    ptr = existing;
-                    continue;
-                }
-            }
-        }
-
-        debug_assert!(!ptr.is_null());
-        let registry = unsafe { &*ptr };
-        if registry.owner_pid == owner_pid
-            && registry.region_key == region_key
-            && registry.slot_count == slot_count
-        {
-            return Ok(registry);
-        }
-        if registry.owner_pid == owner_pid && registry.region_key != region_key {
-            return Err(WorkerAttachError::RegionAlreadyAttached {
-                existing_region_key: registry.region_key,
-                requested_region_key: region_key,
-            });
-        }
-
-        let candidate = Box::new(ProcessWorkerRegistry::new(
-            owner_pid, region_key, slot_count,
-        ));
-        let candidate_ptr = Box::into_raw(candidate);
-        match WORKER_OWNER_REGISTRY.compare_exchange(
-            ptr,
-            candidate_ptr,
-            Ordering::AcqRel,
-            Ordering::Acquire,
-        ) {
-            Ok(_) => {
-                // Intentionally leak the replaced registry. Other threads may
-                // still hold raw references returned before this swap.
-                return Ok(unsafe { &*candidate_ptr });
-            }
-            Err(existing) => {
-                unsafe {
-                    drop(Box::from_raw(candidate_ptr));
-                }
-                ptr = existing;
-            }
-        }
+    if let Some(registry) = find_worker_owner_registry(owner_pid, region_key, slot_count) {
+        return Ok(registry);
     }
+
+    let mut registries = worker_owner_registries()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    if let Some(existing) =
+        find_worker_owner_registry_in(&registries, owner_pid, region_key, slot_count)
+    {
+        return Ok(existing);
+    }
+
+    let candidate = Box::new(ProcessWorkerRegistry::new(
+        owner_pid, region_key, slot_count,
+    ));
+    let candidate_ptr = Box::into_raw(candidate);
+    registries.push(candidate_ptr as usize);
+    Ok(unsafe { &*candidate_ptr })
 }
 
 fn reset_worker_owner_registry(owner_pid: i32, region_key: usize, slot_count: u32) {
-    let mut ptr = WORKER_OWNER_REGISTRY.load(Ordering::Acquire);
-    loop {
-        if ptr.is_null() {
-            return;
-        }
-
-        let registry = unsafe { &*ptr };
-        if registry.owner_pid != owner_pid || registry.region_key != region_key {
-            return;
-        }
-
-        let candidate = Box::new(ProcessWorkerRegistry::new(
-            owner_pid, region_key, slot_count,
-        ));
-        let candidate_ptr = Box::into_raw(candidate);
-        match WORKER_OWNER_REGISTRY.compare_exchange(
-            ptr,
-            candidate_ptr,
-            Ordering::AcqRel,
-            Ordering::Acquire,
-        ) {
-            Ok(_) => {
-                // Intentionally leak the replaced registry. Other threads may
-                // still hold raw references returned before this swap.
-                return;
-            }
-            Err(existing) => {
-                unsafe {
-                    drop(Box::from_raw(candidate_ptr));
-                }
-                ptr = existing;
-            }
-        }
-    }
+    let mut registries = worker_owner_registries()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let candidate = Box::new(ProcessWorkerRegistry::new(
+        owner_pid, region_key, slot_count,
+    ));
+    registries.push(Box::into_raw(candidate) as usize);
 }
 
-fn load_worker_owner_registry() -> Option<&'static ProcessWorkerRegistry> {
-    let ptr = WORKER_OWNER_REGISTRY.load(Ordering::Acquire);
-    if ptr.is_null() {
-        None
-    } else {
-        Some(unsafe { &*ptr })
-    }
+fn worker_owner_registries() -> &'static Mutex<Vec<usize>> {
+    WORKER_OWNER_REGISTRIES.get_or_init(|| Mutex::new(Vec::new()))
+}
+
+fn find_worker_owner_registry(
+    owner_pid: i32,
+    region_key: usize,
+    slot_count: u32,
+) -> Option<&'static ProcessWorkerRegistry> {
+    let registries = worker_owner_registries()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    find_worker_owner_registry_in(&registries, owner_pid, region_key, slot_count)
+}
+
+fn find_worker_owner_registry_in(
+    registries: &[usize],
+    owner_pid: i32,
+    region_key: usize,
+    slot_count: u32,
+) -> Option<&'static ProcessWorkerRegistry> {
+    registries
+        .iter()
+        .rev()
+        .copied()
+        .map(|ptr| unsafe { &*(ptr as *const ProcessWorkerRegistry) })
+        .find(|registry| registry_matches(registry, owner_pid, region_key, slot_count))
 }
 
 fn registry_matches(
@@ -1136,16 +1091,11 @@ impl TransportRegion {
     }
 
     fn worker_owner_registry_if_attached(&self) -> Option<&'static ProcessWorkerRegistry> {
-        let registry = load_worker_owner_registry()?;
-        if !registry_matches(
-            registry,
+        find_worker_owner_registry(
             Self::current_process_pid(),
             self.region_key(),
             self.slot_count,
-        ) {
-            return None;
-        }
-        Some(registry)
+        )
     }
 
     fn worker_owner_registry(&self) -> &'static ProcessWorkerRegistry {
@@ -1234,12 +1184,13 @@ impl TransportRegion {
 
     #[cfg(test)]
     pub(crate) fn clear_all_worker_owner_registry_for_tests() {
-        let ptr = WORKER_OWNER_REGISTRY.swap(ptr::null_mut(), Ordering::AcqRel);
-        if ptr.is_null() {
-            return;
-        }
-        unsafe {
-            drop(Box::from_raw(ptr));
+        let mut registries = worker_owner_registries()
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        for ptr in registries.drain(..) {
+            unsafe {
+                drop(Box::from_raw(ptr as *mut ProcessWorkerRegistry));
+            }
         }
     }
 

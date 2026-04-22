@@ -420,24 +420,16 @@ fn worker_attach_allows_same_region_multiple_times() {
 }
 
 #[test]
-fn worker_attach_rejects_different_region_in_same_process() {
+fn worker_attach_allows_different_regions_in_same_process() {
     let layout = TransportRegionLayout::new(1, 64, 64).expect("layout");
-    let (mem1, region1) = TestRegion::new(layout);
-    let (mem2, region2) = TestRegion::new(layout);
+    let (_mem1, region1) = TestRegion::new(layout);
+    let (_mem2, region2) = TestRegion::new(layout);
 
-    let _attached = WorkerTransport::attach(&region1).expect("first attach");
-    let err = match WorkerTransport::attach(&region2) {
-        Ok(_) => panic!("different region must be rejected"),
-        Err(err) => err,
-    };
-    assert!(matches!(
-        err,
-        WorkerAttachError::RegionAlreadyAttached {
-            existing_region_key,
-            requested_region_key,
-        } if existing_region_key == mem1.base.as_ptr() as usize
-            && requested_region_key == mem2.base.as_ptr() as usize
-    ));
+    let first = WorkerTransport::attach(&region1).expect("first attach");
+    let second = WorkerTransport::attach(&region2).expect("second attach");
+
+    assert_eq!(first.ready_slots().next(), None);
+    assert_eq!(second.ready_slots().next(), None);
 }
 
 #[test]

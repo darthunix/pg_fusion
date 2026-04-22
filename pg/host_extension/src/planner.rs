@@ -113,12 +113,14 @@ unsafe fn select_sql_from_query(parse: *mut Query, query_string: *const c_char) 
         return sql.to_owned();
     }
 
-    let deparsed = pgrx::pg_sys::pg_get_querydef(parse, false);
-    if !deparsed.is_null() {
-        return CStr::from_ptr(deparsed)
-            .to_str()
-            .expect("deparsed query text must be valid UTF-8")
-            .to_owned();
+    if sql.trim_start().to_ascii_uppercase().starts_with("EXPLAIN") {
+        let deparsed = pgrx::pg_sys::pg_get_querydef(parse, false);
+        if !deparsed.is_null() {
+            return CStr::from_ptr(deparsed)
+                .to_str()
+                .expect("deparsed query text must be valid UTF-8")
+                .to_owned();
+        }
     }
 
     sql.to_owned()
@@ -128,7 +130,7 @@ unsafe fn pack_custom_scan(sql: &str, target_list: *mut List) -> *mut CustomScan
     let sql_copy = palloc0(sql.len() + 1) as *mut u8;
     std::ptr::copy_nonoverlapping(sql.as_ptr(), sql_copy, sql.len());
     let query = ListCell {
-        ptr_value: sql_copy as *mut c_void,
+        ptr_value: pgrx::pg_sys::makeString(sql_copy.cast()) as *mut c_void,
     };
 
     let mut custom_scan = CustomScan::default();

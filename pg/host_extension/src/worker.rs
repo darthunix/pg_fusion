@@ -2,6 +2,7 @@ use std::collections::VecDeque;
 use std::sync::Arc;
 use std::time::Duration;
 
+use control_transport::WorkerTransport;
 use datafusion_execution::TaskContext;
 use futures::executor::block_on;
 use issuance::{encode_issued_frame, IssuancePool, IssuedRx, IssuedTx};
@@ -50,8 +51,11 @@ fn run_worker_main() -> Result<(), WorkerRuntimeError> {
     let issuance_pool = attach_issuance_pool();
 
     let worker_config = config.worker_runtime_config();
+    let scan_transport = WorkerTransport::attach(&scan_region)?;
+    let worker_pid = std::process::id() as i32;
+    scan_transport.activate_generation(worker_pid)?;
     let mut transport = TransportWorkerRuntime::attach(&control_region, &worker_config)?;
-    transport.activate_generation(std::process::id() as i32)?;
+    transport.activate_generation(worker_pid)?;
 
     let scan_source = Arc::new(TransportScanBatchSource::new(
         scan_region,
@@ -106,6 +110,7 @@ fn run_worker_main() -> Result<(), WorkerRuntimeError> {
     }
 
     transport.deactivate_generation()?;
+    scan_transport.deactivate_generation()?;
     Ok(())
 }
 

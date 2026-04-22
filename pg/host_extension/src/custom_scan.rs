@@ -34,6 +34,7 @@ use crate::result_ingress::ResultIngress;
 use crate::shmem::{
     attach_control_region, attach_issuance_pool, attach_page_pool, attach_scan_region,
 };
+use crate::utility_hook::PlannerBypassGuard;
 
 thread_local! {
     static SCAN_METHODS: CustomScanMethods = CustomScanMethods {
@@ -69,6 +70,7 @@ struct HostScanState {
     execution_key: Option<ExecutionKey>,
     scan_peers: BTreeMap<u64, BackendLeaseSlot>,
     active_drivers: BTreeMap<u64, ActiveScanDriver>,
+    pending_complete_session_epoch: Option<u64>,
     page_pool: Option<PagePool>,
     issuance_pool: Option<IssuancePool>,
     result_ingress: Option<ResultIngress>,
@@ -105,6 +107,7 @@ unsafe extern "C-unwind" fn create_pg_fusion_scan_state(cscan: *mut CustomScan) 
         execution_key: None,
         scan_peers: BTreeMap::new(),
         active_drivers: BTreeMap::new(),
+        pending_complete_session_epoch: None,
         page_pool: None,
         issuance_pool: None,
         result_ingress: None,
@@ -148,6 +151,7 @@ unsafe extern "C-unwind" fn begin_pg_fusion_scan(
         state.execution_key = None;
         state.scan_peers.clear();
         state.active_drivers.clear();
+        state.pending_complete_session_epoch = None;
         state.result_ingress = None;
         state.terminal_error = None;
         return;
@@ -165,14 +169,17 @@ unsafe extern "C-unwind" fn begin_pg_fusion_scan(
         .unwrap_or_else(|err| error!("pg_fusion failed to acquire primary control slot: {err}"));
 
     let plan_tx = IssuedTx::new(PageTx::new(page_pool), issuance_pool);
-    let begin = BackendService::begin_execution(StartExecutionInput {
-        slot_id: control_lease.slot_id(),
-        sql: &state.sql,
-        params: Vec::new(),
-        plan_tx,
-        scan_slot_region: &scan_region,
-        config: backend_config,
-    })
+    let begin = {
+        let _planner_bypass = PlannerBypassGuard::enter();
+        BackendService::begin_execution(StartExecutionInput {
+            slot_id: control_lease.slot_id(),
+            sql: &state.sql,
+            params: Vec::new(),
+            plan_tx,
+            scan_slot_region: &scan_region,
+            config: backend_config,
+        })
+    }
     .unwrap_or_else(|err| error!("pg_fusion begin execution failed: {err}"));
 
     let mut control_lease = control_lease;
@@ -208,6 +215,7 @@ unsafe extern "C-unwind" fn begin_pg_fusion_scan(
     state.page_pool = Some(page_pool);
     state.issuance_pool = Some(issuance_pool);
     state.scan_peers = scan_peers_from_begin(&begin);
+    state.pending_complete_session_epoch = None;
     state.primary_scratch = vec![
         0_u8;
         config
@@ -295,6 +303,7 @@ unsafe extern "C-unwind" fn end_pg_fusion_scan(node: *mut CustomScanState) {
         let _ = BackendService::accept_cancel_execution(key.slot_id, key.session_epoch);
     }
     state.active_drivers.clear();
+    state.pending_complete_session_epoch = None;
     state.result_ingress.take();
     state.control_lease.take();
     let result_slot = (*node).ss.ps.ps_ResultTupleSlot;
@@ -316,10 +325,13 @@ unsafe extern "C-unwind" fn explain_pg_fusion_scan(
     es: *mut pg_sys::ExplainState,
 ) {
     let state = host_state_ref(node);
-    let rendered = BackendService::render_explain(ExplainInput {
-        sql: &state.sql,
-        params: Vec::new(),
-    })
+    let rendered = {
+        let _planner_bypass = PlannerBypassGuard::enter();
+        BackendService::render_explain(ExplainInput {
+            sql: &state.sql,
+            params: Vec::new(),
+        })
+    }
     .unwrap_or_else(|err| error!("pg_fusion explain failed: {err}"));
     let rendered = CString::new(rendered).expect("explain text must not contain NUL bytes");
     pg_sys::ExplainPropertyText(c"pg_fusion".as_ptr(), rendered.as_ptr(), es);
@@ -372,12 +384,10 @@ fn handle_primary_control(
         .ok_or(BackendServiceError::NoActiveExecution)?;
     match message {
         WorkerExecutionToBackend::CompleteExecution { session_epoch } => {
-            let _ = BackendService::accept_complete_execution(slot_id, session_epoch)?;
             if let Some(ingress) = state.result_ingress.as_mut() {
                 ingress.mark_execution_complete();
             }
-            state.execution_key = None;
-            state.active_drivers.clear();
+            state.pending_complete_session_epoch = Some(session_epoch);
         }
         WorkerExecutionToBackend::FailExecution {
             session_epoch,
@@ -387,6 +397,7 @@ fn handle_primary_control(
             let _ = BackendService::accept_fail_execution(slot_id, session_epoch, code, detail)?;
             state.execution_key = None;
             state.active_drivers.clear();
+            state.pending_complete_session_epoch = None;
             state.terminal_error = Some(format!(
                 "worker failed execution session_epoch={session_epoch} code={code:?} detail={detail:?}"
             ));
@@ -417,13 +428,16 @@ fn poll_scan_peers(state: &mut HostScanState) -> Result<bool, BackendServiceErro
                 } => {
                     let page_pool = state.page_pool.expect("page pool");
                     let issuance_pool = state.issuance_pool.expect("issuance pool");
-                    let opened = BackendService::open_scan(OpenScanInput {
-                        peer,
-                        session_epoch,
-                        scan_id,
-                        scan,
-                        scan_tx: IssuedTx::new(PageTx::new(page_pool), issuance_pool),
-                    })?;
+                    let opened = {
+                        let _planner_bypass = PlannerBypassGuard::enter();
+                        BackendService::open_scan(OpenScanInput {
+                            peer,
+                            session_epoch,
+                            scan_id,
+                            scan,
+                            scan_tx: IssuedTx::new(PageTx::new(page_pool), issuance_pool),
+                        })
+                    }?;
                     if let Some(driver) = opened {
                         state.active_drivers.insert(scan_id, driver);
                     }
@@ -500,7 +514,31 @@ fn drive_active_scans(state: &mut HostScanState) -> Result<bool, BackendServiceE
             }
         }
     }
+    if state.active_drivers.is_empty() && result_ingress_complete(state) {
+        progressed |= flush_pending_complete(state)?;
+    }
     Ok(progressed)
+}
+
+fn result_ingress_complete(state: &HostScanState) -> bool {
+    state
+        .result_ingress
+        .as_ref()
+        .is_none_or(ResultIngress::is_complete)
+}
+
+fn flush_pending_complete(state: &mut HostScanState) -> Result<bool, BackendServiceError> {
+    let Some(session_epoch) = state.pending_complete_session_epoch.take() else {
+        return Ok(false);
+    };
+    let slot_id = state
+        .control_lease
+        .as_ref()
+        .map(|lease| lease.slot_id())
+        .ok_or(BackendServiceError::NoActiveExecution)?;
+    let _ = BackendService::accept_complete_execution(slot_id, session_epoch)?;
+    state.execution_key = None;
+    Ok(true)
 }
 
 fn send_scan_terminal(
@@ -643,7 +681,9 @@ fn truncate_scan_failure_message(message: &str) -> String {
 
 unsafe fn sql_from_custom_private(list: *mut List) -> String {
     let cell = list_nth(list, 0);
-    let ptr = (*cell).ptr_value as *const i8;
+    let node = (*cell).ptr_value as *const pg_sys::String;
+    assert!(!node.is_null(), "custom private SQL node must be present");
+    let ptr = (*node).sval as *const i8;
     CStr::from_ptr(ptr)
         .to_str()
         .expect("custom private SQL must be valid UTF-8")

@@ -10,9 +10,10 @@ use std::sync::atomic::Ordering;
 impl WorkerTransport {
     /// Attaches a worker-side process-local handle to the transport region.
     ///
-    /// A worker process may attach multiple handles to the same region, but it
-    /// may not attach two different transport regions in the same PID
-    /// lifetime. Switching to another region requires a new process.
+    /// A worker process may attach multiple handles to the same region and may
+    /// also attach multiple distinct transport regions in the same PID
+    /// lifetime. Each attached region gets its own process-local owner
+    /// registry keyed by region identity.
     pub fn attach(region: &super::TransportRegion) -> Result<Self, WorkerAttachError> {
         region.attach_worker_registry()?;
         Ok(Self { region: *region })

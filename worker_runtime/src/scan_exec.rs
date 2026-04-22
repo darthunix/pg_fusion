@@ -90,10 +90,14 @@ impl PgScanExecFactory for WorkerPgScanExecFactory {
                     scan_id: spec.scan_id.get(),
                 }))
             })?;
+        let output_schema = crate::normalize_result_transport_schema(&spec.arrow_schema())
+            .map(|(schema, _)| schema)
+            .map_err(|err| DataFusionError::External(Box::new(err)))?;
         Ok(Arc::new(WorkerPgScanExec::new(
             peer,
             self.session_epoch,
             spec,
+            output_schema,
             Arc::clone(&self.source),
             self.page_kind,
             self.page_flags,
@@ -118,11 +122,11 @@ impl WorkerPgScanExec {
         peer: BackendLeaseSlot,
         session_epoch: u64,
         spec: Arc<PgScanSpec>,
+        output_schema: SchemaRef,
         source: Arc<dyn ScanBatchSource>,
         page_kind: transfer::MessageKind,
         page_flags: u16,
     ) -> Self {
-        let output_schema = spec.arrow_schema();
         let props = PlanProperties::new(
             EquivalenceProperties::new(Arc::clone(&output_schema)),
             Partitioning::UnknownPartitioning(1),
@@ -353,7 +357,19 @@ mod tests {
     fn execute_uses_scan_id_and_schema_from_spec() {
         let source = Arc::new(RecordingSource::new());
         let peer = BackendLeaseSlot::new(2, control_transport::BackendLeaseId::new(1, 3));
-        let exec = WorkerPgScanExec::new(peer, 100, spec(8), source.clone(), 0x4152, 0);
+        let scan_spec = spec(8);
+        let output_schema = crate::normalize_result_transport_schema(&scan_spec.arrow_schema())
+            .expect("transport schema")
+            .0;
+        let exec = WorkerPgScanExec::new(
+            peer,
+            100,
+            scan_spec,
+            output_schema,
+            source.clone(),
+            0x4152,
+            0,
+        );
         let ctx = Arc::new(TaskContext::default());
         let stream = exec.execute(0, ctx).unwrap();
 
@@ -370,10 +386,15 @@ mod tests {
     #[test]
     fn execute_rejects_nonzero_partition() {
         let source = Arc::new(RecordingSource::new());
+        let scan_spec = spec(9);
+        let output_schema = crate::normalize_result_transport_schema(&scan_spec.arrow_schema())
+            .expect("transport schema")
+            .0;
         let exec = WorkerPgScanExec::new(
             BackendLeaseSlot::new(3, control_transport::BackendLeaseId::new(1, 4)),
             100,
-            spec(9),
+            scan_spec,
+            output_schema,
             source,
             0x4152,
             0,

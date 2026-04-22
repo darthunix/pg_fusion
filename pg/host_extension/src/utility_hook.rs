@@ -9,11 +9,30 @@ use std::ffi::c_char;
 static mut PREV_PROCESS_UTILITY_HOOK: ProcessUtility_hook_type = None;
 
 thread_local! {
-    static SKIP_PLANNER_GUARD: Cell<bool> = const { Cell::new(false) };
+    static SKIP_PLANNER_GUARD_DEPTH: Cell<usize> = const { Cell::new(0) };
 }
 
 pub(crate) fn skip_planner() -> bool {
-    SKIP_PLANNER_GUARD.with(|guard| guard.get())
+    SKIP_PLANNER_GUARD_DEPTH.with(|guard| guard.get() != 0)
+}
+
+pub(crate) struct PlannerBypassGuard;
+
+impl PlannerBypassGuard {
+    pub(crate) fn enter() -> Self {
+        SKIP_PLANNER_GUARD_DEPTH.with(|guard| guard.set(guard.get() + 1));
+        Self
+    }
+}
+
+impl Drop for PlannerBypassGuard {
+    fn drop(&mut self) {
+        SKIP_PLANNER_GUARD_DEPTH.with(|guard| {
+            let current = guard.get();
+            assert!(current > 0, "planner bypass guard underflow");
+            guard.set(current - 1);
+        });
+    }
 }
 
 pub(crate) fn register_hook() {
@@ -42,9 +61,7 @@ unsafe extern "C-unwind" fn pg_fusion_process_utility_hook(
         }
     }
 
-    if guarded {
-        SKIP_PLANNER_GUARD.with(|guard| guard.set(true));
-    }
+    let _guard = guarded.then(PlannerBypassGuard::enter);
 
     if let Some(prev) = PREV_PROCESS_UTILITY_HOOK {
         prev(
@@ -68,9 +85,5 @@ unsafe extern "C-unwind" fn pg_fusion_process_utility_hook(
             dest,
             qc,
         );
-    }
-
-    if guarded {
-        SKIP_PLANNER_GUARD.with(|guard| guard.set(false));
     }
 }

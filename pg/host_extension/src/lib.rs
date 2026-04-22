@@ -49,6 +49,16 @@ mod tests {
     fn pg_fusion_host_explain_smoke() {
         super::smoke_tests::explain_smoke();
     }
+
+    #[pg_test]
+    fn pg_fusion_host_heap_select_single_row_smoke() {
+        super::smoke_tests::heap_select_single_row_smoke();
+    }
+
+    #[pg_test]
+    fn pg_fusion_host_heap_select_filtered_row_smoke() {
+        super::smoke_tests::heap_select_filtered_row_smoke();
+    }
 }
 
 #[cfg(test)]
