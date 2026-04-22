@@ -152,6 +152,16 @@ impl PageTx {
         }
     }
 
+    /// Return the fixed page size of the attached pool.
+    pub fn page_size(&self) -> usize {
+        self.inner.pool.page_size()
+    }
+
+    /// Return the writable payload capacity after the in-page transfer header.
+    pub fn payload_capacity(&self) -> usize {
+        self.inner.pool.page_size() - PAGE_HEADER_LEN
+    }
+
     /// Acquire one writable page and start a new in-page message.
     ///
     /// The returned [`PageWriter`] owns the lease and may be moved across

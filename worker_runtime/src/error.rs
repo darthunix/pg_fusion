@@ -22,6 +22,16 @@ pub enum WorkerRuntimeError {
     ProducerSet(#[from] runtime_protocol::ProducerSetError),
     #[error("issued frame decode failed: {0}")]
     IssuedDecode(#[from] issuance::DecodeError),
+    #[error("issued page transmission failed: {0}")]
+    IssuedTx(#[from] issuance::IssuedTxError),
+    #[error("arrow layout failed: {0}")]
+    ArrowLayout(#[from] arrow_layout::LayoutError),
+    #[error("result page encoder configuration failed: {0}")]
+    ResultEncodeConfig(#[from] batch_encoder::ConfigError),
+    #[error("result page encoding failed: {0}")]
+    ResultEncode(#[from] batch_encoder::EncodeError),
+    #[error("result page row estimator failed: {0}")]
+    ResultEstimate(#[from] row_estimator::EstimateError),
     #[error("plan flow failed: {0}")]
     PlanFlow(#[from] plan_flow::WorkerPlanError),
     #[error("scan flow failed: {0}")]
@@ -54,6 +64,10 @@ pub enum WorkerRuntimeError {
     FutureSession { current: u64, incoming: u64 },
     #[error("no dedicated scan peer was published for scan_id {scan_id}")]
     MissingScanPeer { scan_id: u64 },
+    #[error("result transport schema column {index} uses unsupported Arrow type {data_type}")]
+    UnsupportedResultColumnType { index: usize, data_type: String },
+    #[error("result transport schema requires at least one output column")]
+    EmptyResultSchema,
     #[error(
         "no issued scan ingress is configured for session_epoch={session_epoch}, scan_id={scan_id}"
     )]

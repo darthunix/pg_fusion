@@ -9,7 +9,7 @@ mod tests;
 
 use arrow_layout::{ColumnSpec, TypeTag};
 use arrow_schema::{DataType, Field, Schema, SchemaRef};
-use control_transport::{BackendLeaseSlot, BackendSlotLease, TransportRegion};
+use control_transport::{BackendLeaseSlot, BackendSlotLease, CommitOutcome, TransportRegion};
 use datafusion_common::ScalarValue;
 use datafusion_expr::logical_plan::LogicalPlan;
 use fsm::backend_execution_flow::StateMachine as BackendExecutionMachine;
@@ -699,6 +699,81 @@ impl BackendService {
         })?;
         let rendered = built.logical_plan.display_indent().to_string();
         Ok(rendered)
+    }
+
+    pub fn scan_peers() -> Result<Box<[BackendLeaseSlot]>, BackendServiceError> {
+        ACTIVE_EXECUTION.with(|slot| {
+            let active = slot.borrow();
+            let execution = active
+                .as_ref()
+                .ok_or(BackendServiceError::NoActiveExecution)?;
+            Ok(execution
+                .scans
+                .values()
+                .map(|entry| entry.scan_peer)
+                .collect::<Vec<_>>()
+                .into_boxed_slice())
+        })
+    }
+
+    pub fn recv_scan_peer_frame(
+        peer: BackendLeaseSlot,
+        scratch: &mut [u8],
+    ) -> Result<Option<usize>, BackendServiceError> {
+        ACTIVE_EXECUTION.with(|slot| {
+            let mut active = slot.borrow_mut();
+            let execution = active
+                .as_mut()
+                .ok_or(BackendServiceError::NoActiveExecution)?;
+            let entry = execution
+                .scans
+                .values_mut()
+                .find(|entry| entry.scan_peer == peer)
+                .ok_or_else(|| {
+                    BackendServiceError::ProtocolViolation(format!(
+                        "unknown dedicated scan peer {:?}",
+                        peer
+                    ))
+                })?;
+            let lease = entry.scan_lease.as_mut().ok_or_else(|| {
+                BackendServiceError::ProtocolViolation(format!(
+                    "scan peer {:?} has no live backend lease",
+                    peer
+                ))
+            })?;
+            let mut rx = lease.from_worker_rx();
+            Ok(rx.recv_frame_into(scratch)?)
+        })
+    }
+
+    pub fn send_scan_peer_bytes(
+        peer: BackendLeaseSlot,
+        payload: &[u8],
+    ) -> Result<CommitOutcome, BackendServiceError> {
+        ACTIVE_EXECUTION.with(|slot| {
+            let mut active = slot.borrow_mut();
+            let execution = active
+                .as_mut()
+                .ok_or(BackendServiceError::NoActiveExecution)?;
+            let entry = execution
+                .scans
+                .values_mut()
+                .find(|entry| entry.scan_peer == peer)
+                .ok_or_else(|| {
+                    BackendServiceError::ProtocolViolation(format!(
+                        "unknown dedicated scan peer {:?}",
+                        peer
+                    ))
+                })?;
+            let lease = entry.scan_lease.as_mut().ok_or_else(|| {
+                BackendServiceError::ProtocolViolation(format!(
+                    "scan peer {:?} has no live backend lease",
+                    peer
+                ))
+            })?;
+            let mut tx = lease.to_worker_tx();
+            Ok(tx.send_frame(payload)?)
+        })
     }
 
     #[cfg(any(test, feature = "pg_test"))]

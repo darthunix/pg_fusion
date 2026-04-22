@@ -1,5 +1,5 @@
 use crate::fsm::BackendExecutionState;
-use control_transport::{AcquireError, BackendLeaseSlot};
+use control_transport::{AcquireError, BackendLeaseSlot, BackendRxError, BackendTxError};
 use thiserror::Error;
 
 #[derive(Debug, Error)]
@@ -87,6 +87,10 @@ pub enum BackendServiceError {
     SlotEncode(#[from] slot_encoder::EncodeError),
     #[error("scan slot acquisition failed: {0}")]
     ScanSlotAcquire(#[from] AcquireError),
+    #[error("backend scan control receive failed: {0}")]
+    ScanControlRx(#[from] BackendRxError),
+    #[error("backend scan control send failed: {0}")]
+    ScanControlTx(#[from] BackendTxError),
     #[error("backend scan page source failed: {0}")]
     PageSource(String),
     #[error("PostgreSQL error: {0}")]

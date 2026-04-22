@@ -10,8 +10,10 @@ crate-type = ["lib"]
 doctest = false
 
 [dependencies]
+arrow_layout = { path = "../page/arrow_layout", version = "25.0" }
 arrow-array = { workspace = true }
 arrow-schema = { workspace = true }
+batch_encoder = { path = "../page/batch_encoder", version = "25.0" }
 control_transport = { path = "../control_transport", version = "25.0" }
 datafusion = { workspace = true }
 datafusion-common = { workspace = true }
@@ -22,6 +24,7 @@ futures = "0.3"
 import = { path = "../page/import", version = "25.0" }
 issuance = { path = "../page/issuance", version = "25.0" }
 plan_flow = { path = "../page/plan_flow", version = "25.0" }
+row_estimator = { path = "../page/row_estimator", version = "25.0" }
 runtime_protocol = { path = "../runtime_protocol", version = "25.0" }
 rust-fsm = { version = "0.7", features = ["diagram"] }
 scan_flow = { path = "../page/scan_flow", version = "25.0" }
