@@ -21,6 +21,7 @@ use runtime_protocol::message::{
 use runtime_protocol::session::{
     MIN_SCAN_BACKEND_TO_WORKER_RING_CAPACITY, MIN_SCAN_WORKER_TO_BACKEND_RING_CAPACITY,
 };
+use tracing::{info, warn};
 
 use crate::error::WorkerRuntimeError;
 use crate::scan_exec::{OpenScanRequest, ScanBatchSource};
@@ -112,6 +113,12 @@ impl ScanBatchSource for TransportScanBatchSource {
         // only after the scan thread starts polling.
         WorkerTransport::attach(&self.region)
             .map_err(|err| DataFusionError::External(Box::new(WorkerRuntimeError::from(err))))?;
+        info!(
+            session_epoch = request.session_epoch,
+            scan_id = request.scan_id.get(),
+            peer = ?request.peer,
+            "opening transport-backed scan stream"
+        );
 
         let issued_rx = self
             .ingress
@@ -198,6 +205,13 @@ fn run_transport_scan_thread(
         &mut tx,
         &stop,
     ) {
+        warn!(
+            session_epoch = request.session_epoch,
+            scan_id = request.scan_id.get(),
+            peer = ?request.peer,
+            error = %err,
+            "transport scan thread failed"
+        );
         let _ = futures::executor::block_on(tx.send(Err(df_external(err))));
     }
 }
@@ -223,11 +237,29 @@ fn run_transport_scan_thread_inner(
         issued_rx,
     )?;
     let mut scratch = vec![0_u8; control_frame_capacity];
+    info!(
+        session_epoch = request.session_epoch,
+        scan_id = request.scan_id.get(),
+        peer = ?request.peer,
+        "transport scan thread sending OpenScan"
+    );
     send_open_scan(&mut slot, open_scan, &mut scratch)?;
+    info!(
+        session_epoch = request.session_epoch,
+        scan_id = request.scan_id.get(),
+        peer = ?request.peer,
+        "transport scan thread entered receive loop"
+    );
 
     let mut terminal = false;
     let loop_result: Result<(), WorkerRuntimeError> = loop {
         if stop.load(Ordering::Acquire) {
+            info!(
+                session_epoch = request.session_epoch,
+                scan_id = request.scan_id.get(),
+                peer = ?request.peer,
+                "transport scan stream was dropped; terminating scan thread"
+            );
             break Ok(());
         }
 
@@ -245,6 +277,12 @@ fn run_transport_scan_thread_inner(
                 let step = driver.accept_page_frame(SINGLE_SCAN_PRODUCER_ID, &frame)?;
                 if forward_driver_step(&mut driver, step, tx, stop)? {
                     terminal = true;
+                    info!(
+                        session_epoch = request.session_epoch,
+                        scan_id = request.scan_id.get(),
+                        peer = ?request.peer,
+                        "transport scan thread reached terminal state from issued page path"
+                    );
                     break Ok(());
                 }
             }
@@ -252,6 +290,12 @@ fn run_transport_scan_thread_inner(
                 let step = control_to_driver_step(request, &mut driver, control)?;
                 if forward_driver_step(&mut driver, step, tx, stop)? {
                     terminal = true;
+                    info!(
+                        session_epoch = request.session_epoch,
+                        scan_id = request.scan_id.get(),
+                        peer = ?request.peer,
+                        "transport scan thread reached terminal state from control path"
+                    );
                     break Ok(());
                 }
             }
@@ -259,6 +303,12 @@ fn run_transport_scan_thread_inner(
     };
 
     if !terminal {
+        info!(
+            session_epoch = request.session_epoch,
+            scan_id = request.scan_id.get(),
+            peer = ?request.peer,
+            "transport scan thread sending CancelScan during teardown"
+        );
         let _ = send_cancel_scan(
             &mut slot,
             request.session_epoch,
@@ -307,6 +357,10 @@ fn control_to_driver_step(
             scan_id,
             producer_id,
         } => {
+            info!(
+                session_epoch,
+                scan_id, producer_id, "received ScanFinished on dedicated scan peer"
+            );
             validate_scan_terminal(request, session_epoch, scan_id)?;
             driver.accept_producer_eof(producer_id)
         }
@@ -316,6 +370,10 @@ fn control_to_driver_step(
             producer_id,
             message,
         } => {
+            warn!(
+                session_epoch,
+                scan_id, producer_id, message, "received ScanFailed on dedicated scan peer"
+            );
             validate_scan_terminal(request, session_epoch, scan_id)?;
             driver.accept_producer_error(producer_id, message.to_string())
         }

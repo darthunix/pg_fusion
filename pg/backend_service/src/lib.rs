@@ -57,7 +57,6 @@ thread_local! {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct BackendServiceConfig {
-    pub scan_payload_block_size: u32,
     pub scan_fetch_batch_rows: u32,
     pub estimator_default: EstimatorConfig,
     pub plan_page_kind: u16,
@@ -69,7 +68,6 @@ pub struct BackendServiceConfig {
 impl Default for BackendServiceConfig {
     fn default() -> Self {
         Self {
-            scan_payload_block_size: 4096,
             scan_fetch_batch_rows: 1024,
             estimator_default: EstimatorConfig::default(),
             plan_page_kind: 0x504c,
@@ -235,7 +233,8 @@ struct PreparedScanEntry {
     _spec: Arc<PgScanSpec>,
     schema: arrow_schema::SchemaRef,
     prepared_scan: PreparedScan,
-    estimator: PageRowEstimator,
+    physical_columns: Vec<ColumnSpec>,
+    estimator_config: EstimatorConfig,
     canonical_open: ScanOpen,
     scan_peer: BackendLeaseSlot,
     scan_lease: Option<BackendSlotLease>,
@@ -433,6 +432,16 @@ impl BackendService {
             for spec in built.scans.iter().cloned() {
                 let scan_lease = BackendSlotLease::acquire(input.scan_slot_region)?;
                 let scan_peer = scan_lease.backend_lease_slot();
+                backend_diag_warning(format!(
+                    "backend_service begin_execution acquired scan lease slot_id={} session_epoch={} scan_id={} peer_slot_id={} generation={} lease_epoch={} backend_pid={}",
+                    key.slot_id,
+                    key.session_epoch,
+                    spec.scan_id.get(),
+                    scan_peer.slot_id(),
+                    scan_peer.lease_id().generation(),
+                    scan_peer.lease_id().lease_epoch(),
+                    std::process::id()
+                ));
                 let entry =
                     prepare_scan_entry(session_epoch, input.config, spec, scan_peer, scan_lease)?;
                 scans.insert(entry.scan_id, entry);
@@ -476,6 +485,12 @@ impl BackendService {
                 scans,
                 active_scans: BTreeMap::new(),
             });
+            backend_diag_info(format!(
+                "backend_service begin_execution installed slot_id={} session_epoch={} scans={}",
+                key.slot_id,
+                key.session_epoch,
+                scan_channels.len()
+            ));
 
             Ok(BeginExecutionOutput {
                 key,
@@ -543,6 +558,12 @@ impl BackendService {
                     state: *active.as_ref().unwrap().machine.state(),
                 });
             }
+            backend_diag_warning(format!(
+                "backend_service abort_execution_start slot_id={} session_epoch={} state={:?}",
+                execution.key.slot_id,
+                execution.key.session_epoch,
+                execution.machine.state()
+            ));
             cleanup_execution(execution, Some(BackendExecutionEvent::CancelExecution))
         })
     }
@@ -555,6 +576,16 @@ impl BackendService {
             let Some(execution) = active.as_mut() else {
                 return classify_missing_execution(0, input.session_epoch).map(|_| None);
             };
+            backend_diag_info(format!(
+                "backend_service open_scan requested slot_id={} session_epoch={} scan_id={} peer={:?} state={:?} active_scans={} unfinished_scans={}",
+                execution.key.slot_id,
+                input.session_epoch,
+                input.scan_id,
+                input.peer,
+                execution.machine.state(),
+                execution.active_scans.len(),
+                execution_unfinished_scan_count(execution)
+            ));
 
             if classify_session_epoch_for_scan_open(input.session_epoch)?
                 == SessionEpochMatch::Stale
@@ -563,10 +594,14 @@ impl BackendService {
             }
             ensure_execution_state(execution, BackendExecutionState::Running, "open scan")?;
             let snapshot = execution.snapshot.snapshot;
-            let block_size = execution.config.scan_payload_block_size;
+            let block_size = u32::try_from(input.scan_tx.payload_capacity()).map_err(|_| {
+                BackendServiceError::ProtocolViolation(
+                    "scan payload capacity exceeds u32".into(),
+                )
+            })?;
             let fetch_batch_rows =
                 normalize_scan_fetch_batch_rows(execution.config.scan_fetch_batch_rows);
-            let (prepared_scan, schema, estimator, canonical_open) = {
+            let (prepared_scan, schema, physical_columns, estimator_config, canonical_open) = {
                 let entry = execution.scans.get_mut(&input.scan_id).ok_or(
                     BackendServiceError::UnknownScanId {
                         scan_id: input.scan_id,
@@ -603,7 +638,8 @@ impl BackendService {
                 (
                     entry.prepared_scan.clone(),
                     Arc::clone(&entry.schema),
-                    entry.estimator.clone(),
+                    entry.physical_columns.clone(),
+                    entry.estimator_config,
                     entry.canonical_open.clone(),
                 )
             };
@@ -612,6 +648,7 @@ impl BackendService {
                     "execution has no installed shared scan SPI context".into(),
                 )
             })?;
+            let estimator = PageRowEstimator::new(&physical_columns, block_size, estimator_config)?;
 
             let source = source::SlotScanPageSource::new(
                 snapshot,
@@ -643,6 +680,14 @@ impl BackendService {
                     coordinator,
                 },
             );
+            backend_diag_info(format!(
+                "backend_service open_scan installed driver slot_id={} session_epoch={} scan_id={} active_scans={} unfinished_scans={}",
+                execution.key.slot_id,
+                execution.key.session_epoch,
+                input.scan_id,
+                execution.active_scans.len(),
+                execution_unfinished_scan_count(execution)
+            ));
 
             Ok(Some(ActiveScanDriver {
                 key: execution.key,
@@ -1104,9 +1149,19 @@ fn step_scan_with_driver(
     ACTIVE_EXECUTION.with(|slot| {
         let mut active = slot.borrow_mut();
         let mut active_scan = {
-            let execution = active
-                .as_mut()
-                .ok_or(BackendServiceError::NoActiveExecution)?;
+            let execution = match active.as_mut() {
+                Some(execution) => execution,
+                None => {
+                    backend_diag_warning(format!(
+                        "backend_service step_scan_with_driver missing execution slot_id={} session_epoch={} scan_id={} current_session_epoch={}",
+                        key.slot_id,
+                        key.session_epoch,
+                        scan_id,
+                        current_session_epoch()
+                    ));
+                    return Err(BackendServiceError::NoActiveExecution);
+                }
+            };
             ensure_driver_matches_execution(execution, key, scan_id, "step scan")?;
             ensure_execution_state(execution, BackendExecutionState::Running, "step scan")?;
             execution.active_scans.remove(&scan_id).ok_or_else(|| {
@@ -1222,11 +1277,6 @@ fn prepare_scan_entry(
         &projected_columns,
         config.estimator_default,
     )?;
-    let estimator = PageRowEstimator::new(
-        &physical_columns,
-        config.scan_payload_block_size,
-        seeded_config,
-    )?;
     let prepared_scan = prepare_scan(
         &spec.compiled_scan.sql,
         ScanOptions {
@@ -1249,7 +1299,8 @@ fn prepare_scan_entry(
         _spec: spec,
         schema,
         prepared_scan,
-        estimator,
+        physical_columns,
+        estimator_config: seeded_config,
         canonical_open,
         scan_peer,
         scan_lease: Some(scan_lease),
@@ -1437,8 +1488,21 @@ fn mark_scan_terminal(
         .scans
         .get_mut(&scan_id)
         .ok_or(BackendServiceError::UnknownScanId { scan_id })?;
+    backend_diag_warning(format!(
+        "backend_service mark_scan_terminal slot_id={} session_epoch={} scan_id={} terminal_state={:?} peer_slot_id={} generation={} lease_epoch={} scan_lease_live={}",
+        execution.key.slot_id,
+        execution.key.session_epoch,
+        scan_id,
+        state,
+        entry.scan_peer.slot_id(),
+        entry.scan_peer.lease_id().generation(),
+        entry.scan_peer.lease_id().lease_epoch(),
+        entry.scan_lease.is_some()
+    ));
     entry.state = state;
-    entry.scan_lease.take();
+    // Keep the dedicated scan lease alive until execution cleanup so the host
+    // can still publish ScanFinished/ScanFailed on the same peer after the
+    // scan runtime transitions to a terminal state.
     Ok(())
 }
 
@@ -1517,6 +1581,15 @@ fn terminate_current_execution(
                 state: *current.machine.state(),
             });
         }
+        backend_diag_info(format!(
+            "backend_service terminate_current_execution slot_id={} session_epoch={} event={:?} state={:?} active_scans={} unfinished_scans={}",
+            slot_id,
+            session_epoch,
+            event,
+            current.machine.state(),
+            current.active_scans.len(),
+            execution_unfinished_scan_count(current)
+        ));
 
         let execution = active.take().expect("checked above");
         cleanup_execution(execution, Some(event))?;
@@ -1555,6 +1628,16 @@ fn terminate_current_execution_from_driver(
                 state: *current.machine.state(),
             });
         }
+        backend_diag_info(format!(
+            "backend_service terminate_current_execution_from_driver slot_id={} session_epoch={} scan_id={} event={:?} state={:?} active_scans={} unfinished_scans={}",
+            key.slot_id,
+            key.session_epoch,
+            scan_id,
+            event,
+            current.machine.state(),
+            current.active_scans.len(),
+            execution_unfinished_scan_count(current)
+        ));
 
         let execution = active.take().expect("checked above");
         cleanup_execution(execution, Some(event))?;
@@ -1591,10 +1674,63 @@ fn terminal_event_action(event: BackendExecutionEvent) -> &'static str {
     }
 }
 
+fn backend_diag_info(message: String) {
+    backend_diag_write_file(&message);
+    #[cfg(not(test))]
+    {
+        pgrx::log!("{message}");
+    }
+    #[cfg(test)]
+    {
+        let _ = message;
+    }
+}
+
+fn backend_diag_warning(message: String) {
+    backend_diag_write_file(&message);
+    #[cfg(not(test))]
+    {
+        pgrx::log!("{message}");
+    }
+    #[cfg(test)]
+    {
+        let _ = message;
+    }
+}
+
+fn backend_diag_write_file(message: &str) {
+    #[cfg(not(test))]
+    {
+        use std::fs::OpenOptions;
+        use std::io::Write;
+
+        if let Ok(mut file) = OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open("/tmp/pg_fusion_backend.log")
+        {
+            let _ = writeln!(file, "pid={} {}", std::process::id(), message);
+        }
+    }
+    #[cfg(test)]
+    {
+        let _ = message;
+    }
+}
+
 fn cleanup_execution(
     mut execution: ActiveExecution,
     terminal_event: Option<BackendExecutionEvent>,
 ) -> Result<(), BackendServiceError> {
+    backend_diag_info(format!(
+        "backend_service cleanup_execution slot_id={} session_epoch={} terminal_event={:?} state_before={:?} active_scans={} unfinished_scans={}",
+        execution.key.slot_id,
+        execution.key.session_epoch,
+        terminal_event,
+        execution.machine.state(),
+        execution.active_scans.len(),
+        execution_unfinished_scan_count(&execution)
+    ));
     let mut cleanup_error = None;
 
     if let Some(event) = terminal_event {
@@ -1616,6 +1752,18 @@ fn cleanup_execution(
     }
 
     for entry in execution.scans.values_mut() {
+        if entry.scan_lease.is_some() {
+            backend_diag_warning(format!(
+                "backend_service cleanup_execution releasing remaining scan lease slot_id={} session_epoch={} scan_id={} peer_slot_id={} generation={} lease_epoch={} scan_state={:?}",
+                execution.key.slot_id,
+                execution.key.session_epoch,
+                entry.scan_id,
+                entry.scan_peer.slot_id(),
+                entry.scan_peer.lease_id().generation(),
+                entry.scan_peer.lease_id().lease_epoch(),
+                entry.state
+            ));
+        }
         entry.scan_lease.take();
     }
     execution.scan_spi.take();
@@ -1641,6 +1789,10 @@ fn fail_current_execution_after_scan_error(
     active_scan: ActiveScanStream,
     err: BackendServiceError,
 ) -> BackendServiceError {
+    backend_diag_warning(format!(
+        "backend_service fatal scan cleanup after error scan_id={} error={}",
+        active_scan.scan_id, err
+    ));
     if let Some(execution) = active.as_mut() {
         execution
             .active_scans
@@ -1667,6 +1819,10 @@ fn finish_current_execution_after_fatal_scan_step(
     step: ScanStreamStep,
 ) -> Result<ScanStreamStep, BackendServiceError> {
     let detail = fatal_scan_step_detail(&step);
+    backend_diag_warning(format!(
+        "backend_service fatal scan step cleanup scan_id={} detail={}",
+        active_scan.scan_id, detail
+    ));
     if let Some(execution) = active.as_mut() {
         execution
             .active_scans

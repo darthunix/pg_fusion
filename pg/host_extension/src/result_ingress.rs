@@ -24,6 +24,7 @@ pub(crate) enum ResultIngressError {
 pub(crate) struct ResultIngress {
     rx: IssuedRx,
     _per_tuple_memory: PgMemoryContexts,
+    queued_tuple_memory: PgMemoryContexts,
     projector: ArrowSlotProjector,
     project_slot: *mut pg_sys::TupleTableSlot,
     queued: VecDeque<OwnedMinimalTuple>,
@@ -39,6 +40,7 @@ impl ResultIngress {
         issuance_pool: IssuancePool,
     ) -> Result<Self, ResultIngressError> {
         let per_tuple_memory = PgMemoryContexts::new("pg_fusion_result_ingress");
+        let queued_tuple_memory = PgMemoryContexts::new("pg_fusion_result_queue");
         let projector =
             ArrowSlotProjector::new(transport_schema, tuple_desc, per_tuple_memory.value())?;
         let project_slot =
@@ -46,6 +48,7 @@ impl ResultIngress {
         Ok(Self {
             rx: IssuedRx::new(PageRx::new(page_pool), issuance_pool),
             _per_tuple_memory: per_tuple_memory,
+            queued_tuple_memory,
             projector,
             project_slot,
             queued: VecDeque::new(),
@@ -62,7 +65,10 @@ impl ResultIngress {
             IssueEvent::Page(page) => {
                 let mut cursor = self.projector.open_owned_page(page)?;
                 while let Some(slot) = unsafe { cursor.next_into_slot(self.project_slot) }? {
-                    let tuple = unsafe { pg_sys::ExecCopySlotMinimalTuple(slot) };
+                    let tuple = unsafe {
+                        PgMemoryContexts::For(self.queued_tuple_memory.value())
+                            .switch_to(|_| pg_sys::ExecCopySlotMinimalTuple(slot))
+                    };
                     if tuple.is_null() {
                         return Err(ResultIngressError::CopyMinimalTuple);
                     }
@@ -86,7 +92,7 @@ impl ResultIngress {
     ) -> Option<*mut pg_sys::TupleTableSlot> {
         let tuple = self.queued.pop_front()?;
         let tuple = tuple.into_raw();
-        unsafe { Some(pg_sys::ExecStoreMinimalTuple(tuple, scan_slot, false)) }
+        unsafe { Some(pg_sys::ExecStoreMinimalTuple(tuple, scan_slot, true)) }
     }
 
     pub(crate) fn is_complete(&self) -> bool {

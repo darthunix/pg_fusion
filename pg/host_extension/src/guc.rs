@@ -30,7 +30,6 @@ pub(crate) static PAGE_SIZE: GucSetting<i32> = GucSetting::<i32>::new(64 * 1024)
 pub(crate) static PAGE_COUNT: GucSetting<i32> = GucSetting::<i32>::new(256);
 pub(crate) static PERMIT_COUNT: GucSetting<i32> = GucSetting::<i32>::new(256);
 
-pub(crate) static SCAN_PAYLOAD_BLOCK_SIZE: GucSetting<i32> = GucSetting::<i32>::new(4096);
 pub(crate) static SCAN_FETCH_BATCH_ROWS: GucSetting<i32> = GucSetting::<i32>::new(1024);
 pub(crate) static ESTIMATOR_INITIAL_TAIL_BYTES_PER_ROW: GucSetting<i32> =
     GucSetting::<i32>::new(64);
@@ -50,7 +49,6 @@ pub struct HostConfig {
     pub page_size: usize,
     pub page_count: u32,
     pub permit_count: u32,
-    pub scan_payload_block_size: u32,
     pub scan_fetch_batch_rows: u32,
     pub estimator_initial_tail_bytes_per_row: u32,
 }
@@ -159,12 +157,6 @@ pub fn register_gucs() {
         &PERMIT_COUNT,
     );
     define_positive_int(
-        c"pg_fusion.scan_payload_block_size",
-        c"Backend scan payload block size",
-        c"Payload block size used by backend scan page encoding",
-        &SCAN_PAYLOAD_BLOCK_SIZE,
-    );
-    define_positive_int(
         c"pg_fusion.scan_fetch_batch_rows",
         c"Backend scan fetch batch rows",
         c"Number of rows fetched per PostgreSQL cursor batch in backend scan streaming",
@@ -221,10 +213,6 @@ pub fn host_config() -> Result<HostConfig, HostConfigError> {
         page_size: positive_usize("pg_fusion.page_size", PAGE_SIZE.get())?,
         page_count: positive_u32("pg_fusion.page_count", PAGE_COUNT.get())?,
         permit_count: positive_u32("pg_fusion.permit_count", PERMIT_COUNT.get())?,
-        scan_payload_block_size: positive_u32(
-            "pg_fusion.scan_payload_block_size",
-            SCAN_PAYLOAD_BLOCK_SIZE.get(),
-        )?,
         scan_fetch_batch_rows: positive_u32(
             "pg_fusion.scan_fetch_batch_rows",
             SCAN_FETCH_BATCH_ROWS.get(),
@@ -259,7 +247,6 @@ impl HostConfig {
 
     pub fn backend_service_config(&self) -> BackendServiceConfig {
         let mut config = BackendServiceConfig::default();
-        config.scan_payload_block_size = self.scan_payload_block_size;
         config.scan_fetch_batch_rows = self.scan_fetch_batch_rows;
         config.estimator_default.initial_tail_bytes_per_row =
             self.estimator_initial_tail_bytes_per_row;
@@ -342,7 +329,6 @@ mod tests {
             page_size: 65536,
             page_count: 256,
             permit_count: 256,
-            scan_payload_block_size: 2048,
             scan_fetch_batch_rows: 77,
             estimator_initial_tail_bytes_per_row: 33,
         };
@@ -350,7 +336,6 @@ mod tests {
         let backend = config.backend_service_config();
         let worker = config.worker_runtime_config();
 
-        assert_eq!(backend.scan_payload_block_size, 2048);
         assert_eq!(backend.scan_fetch_batch_rows, 77);
         assert_eq!(backend.estimator_default.initial_tail_bytes_per_row, 33);
         assert_eq!(worker.control_frame_capacity, 4096);

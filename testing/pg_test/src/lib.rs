@@ -263,11 +263,6 @@ mod tests {
     }
 
     #[pg_test]
-    fn backend_service_local_scan_failure_dominates_late_complete() {
-        super::backend_service::backend_service_local_scan_failure_dominates_late_complete();
-    }
-
-    #[pg_test]
     fn backend_service_interleaves_two_scan_portals_under_shared_spi() {
         super::backend_service::backend_service_interleaves_two_scan_portals_under_shared_spi();
     }

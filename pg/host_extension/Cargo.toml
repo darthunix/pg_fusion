@@ -12,8 +12,8 @@ path = "./src/bin/pgrx_embed.rs"
 
 [features]
 default = ["pg17"]
-pg17 = ["pgrx/pg17", "pgrx-tests/pg17"]
-pg_test = []
+pg17 = ["pgrx/pg17", "pgrx-tests?/pg17"]
+pg_test = ["dep:postgres", "dep:pgrx-tests"]
 
 [dependencies]
 arrow-schema = { workspace = true }
@@ -30,11 +30,13 @@ plan_builder = { path = "../plan_builder", version = "25.0" }
 pool = { path = "../../page/pool", version = "25.0" }
 row_estimator = { path = "../../page/row_estimator", version = "25.0" }
 pgrx = { workspace = true }
+pgrx-tests = { workspace = true, optional = true }
+postgres = { version = "0.19.10", optional = true }
 runtime_protocol = { path = "../../runtime_protocol", version = "25.0" }
 slot_import = { path = "../slot_import", version = "25.0" }
 thiserror = "2.0"
+tracing = "0.1"
+tracing-appender = "0.2"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
 transfer = { path = "../../page/transfer", version = "25.0" }
 worker_runtime = { path = "../../worker_runtime", version = "25.0" }
-
-[dev-dependencies]
-pgrx-tests = { workspace = true }

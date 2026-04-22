@@ -42,6 +42,11 @@ impl IssuedTx {
         Self { tx, permits }
     }
 
+    /// Return the writable page payload capacity in bytes.
+    pub fn payload_capacity(&self) -> usize {
+        self.tx.payload_capacity()
+    }
+
     /// Begin writing one page after acquiring a permit.
     ///
     /// If no permit is available, this returns

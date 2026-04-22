@@ -7,7 +7,7 @@ use backend_service::{
 };
 use control_transport::{BackendLeaseId, BackendLeaseSlot, TransportRegion, TransportRegionLayout};
 use datafusion_common::ScalarValue;
-use import::{ArrowPageDecoder, ARROW_LAYOUT_BATCH_KIND};
+use import::ArrowPageDecoder;
 use issuance::{IssuanceConfig, IssuancePool, IssueEvent, IssuedRx, IssuedTx};
 use pgrx::prelude::*;
 use plan_builder::{PlanBuildInput, PlanBuilder};
@@ -122,14 +122,6 @@ impl IssuedTransportHarness {
 
     fn rx(&self) -> IssuedRx {
         IssuedRx::new(PageRx::new(self.page_pool), self.issuance_pool)
-    }
-
-    fn payload_capacity(&self, kind: u16, flags: u16) -> usize {
-        let mut writer = self
-            .tx()
-            .begin(kind, flags)
-            .expect("payload capacity writer");
-        writer.payload_mut().len()
     }
 
     fn assert_drained(&self) {
@@ -408,9 +400,6 @@ pub fn backend_service_streams_scan_under_saved_snapshot() {
     let scan_transport = IssuedTransportHarness::new();
     let scan_slots = ControlTransportHarness::new(8);
     let mut config = BackendServiceConfig::default();
-    config.scan_payload_block_size =
-        u32::try_from(scan_transport.payload_capacity(ARROW_LAYOUT_BATCH_KIND, 0))
-            .expect("scan payload capacity must fit into u32");
     config.scan_fetch_batch_rows = 2;
     let _snapshot = unsafe { LatestSnapshotGuard::acquire() };
     let begin = begin_and_finalize_execution(TEST_SLOT_ID, &query, config, scan_slots.region());
@@ -502,10 +491,7 @@ pub fn backend_service_yields_for_control_on_permit_backpressure() {
     let query = test_query();
     let scan_transport = IssuedTransportHarness::with_counts(1, 1);
     let scan_slots = ControlTransportHarness::new(8);
-    let mut config = BackendServiceConfig::default();
-    config.scan_payload_block_size =
-        u32::try_from(scan_transport.payload_capacity(ARROW_LAYOUT_BATCH_KIND, 0))
-            .expect("scan payload capacity must fit into u32");
+    let config = BackendServiceConfig::default();
     let _snapshot = unsafe { LatestSnapshotGuard::acquire() };
     let begin = begin_and_finalize_execution(TEST_SLOT_ID, &query, config, scan_slots.region());
     let mut execution_guard = ActiveExecutionGuard::new(begin.key);
@@ -600,10 +586,7 @@ pub fn backend_service_driver_fail_execution_from_control_yield() {
     let query = test_query();
     let scan_transport = IssuedTransportHarness::with_counts(1, 1);
     let scan_slots = ControlTransportHarness::new(8);
-    let mut config = BackendServiceConfig::default();
-    config.scan_payload_block_size =
-        u32::try_from(scan_transport.payload_capacity(ARROW_LAYOUT_BATCH_KIND, 0))
-            .expect("scan payload capacity must fit into u32");
+    let config = BackendServiceConfig::default();
     let _snapshot = unsafe { LatestSnapshotGuard::acquire() };
     let begin = begin_and_finalize_execution(TEST_SLOT_ID, &query, config, scan_slots.region());
     let mut execution_guard = ActiveExecutionGuard::new(begin.key);
@@ -670,10 +653,7 @@ pub fn backend_service_wait_interrupt_cleans_up_active_execution() {
     let query = test_query();
     let scan_transport = IssuedTransportHarness::with_counts(1, 1);
     let scan_slots = ControlTransportHarness::new(8);
-    let mut config = BackendServiceConfig::default();
-    config.scan_payload_block_size =
-        u32::try_from(scan_transport.payload_capacity(ARROW_LAYOUT_BATCH_KIND, 0))
-            .expect("scan payload capacity must fit into u32");
+    let config = BackendServiceConfig::default();
     let _snapshot = unsafe { LatestSnapshotGuard::acquire() };
     let begin = begin_and_finalize_execution(TEST_SLOT_ID, &query, config, scan_slots.region());
     let mut execution_guard = ActiveExecutionGuard::new(begin.key);
@@ -777,10 +757,7 @@ pub fn backend_service_cancel_during_stream_marks_scan_used() {
     let query = test_query();
     let scan_transport = IssuedTransportHarness::new();
     let scan_slots = ControlTransportHarness::new(8);
-    let mut config = BackendServiceConfig::default();
-    config.scan_payload_block_size =
-        u32::try_from(scan_transport.payload_capacity(ARROW_LAYOUT_BATCH_KIND, 0))
-            .expect("scan payload capacity must fit into u32");
+    let config = BackendServiceConfig::default();
     let _snapshot = unsafe { LatestSnapshotGuard::acquire() };
     let begin = begin_and_finalize_execution(TEST_SLOT_ID, &query, config, scan_slots.region());
     let mut execution_guard = ActiveExecutionGuard::new(begin.key);
@@ -897,59 +874,6 @@ pub fn backend_service_rejects_descriptor_mismatch_without_poisoning_execution()
     execution_guard.disarm();
 }
 
-pub fn backend_service_local_scan_failure_dominates_late_complete() {
-    reset_backend_service_table();
-    Spi::run("SET LOCAL max_parallel_workers_per_gather = 0").unwrap();
-
-    let query = test_query();
-    let scan_transport = IssuedTransportHarness::new();
-    let scan_slots = ControlTransportHarness::new(8);
-    let actual_payload_capacity =
-        u32::try_from(scan_transport.payload_capacity(ARROW_LAYOUT_BATCH_KIND, 0))
-            .expect("scan payload capacity must fit into u32");
-    let mut config = BackendServiceConfig::default();
-    config.scan_payload_block_size = actual_payload_capacity + 1;
-    let _snapshot = unsafe { LatestSnapshotGuard::acquire() };
-    let begin = begin_and_finalize_execution(TEST_SLOT_ID, &query, config, scan_slots.region());
-    let mut execution_guard = ActiveExecutionGuard::new(begin.key);
-
-    let built = PlanBuilder::new()
-        .build(PlanBuildInput {
-            sql: &query,
-            params: Vec::<ScalarValue>::new(),
-        })
-        .expect("build scan metadata");
-    assert_eq!(built.scans.len(), 1, "expected exactly one leaf scan");
-    let spec = &built.scans[0];
-    let scan_peer = peer_from_scan_channels(&begin, spec.scan_id.get());
-
-    let mut driver = open_scan_with_runtime_protocol(
-        scan_peer,
-        begin.key.session_epoch,
-        spec.scan_id.get(),
-        config,
-        scan_transport.tx(),
-    );
-
-    match driver.step().expect("step scan local failure") {
-        ScanStreamStep::Failed { message, .. } => {
-            assert!(
-                message.contains("scan payload block size mismatch"),
-                "unexpected local failure message: {message}"
-            );
-        }
-        other => panic!("expected fatal scan failure, got {other:?}"),
-    }
-
-    scan_transport.assert_drained();
-    assert!(
-        !BackendService::accept_complete_execution(TEST_SLOT_ID, begin.key.session_epoch)
-            .expect("late complete should be ignored after local fatal scan failure"),
-        "late complete must not override a backend-observed fatal scan failure"
-    );
-    execution_guard.disarm();
-}
-
 pub fn backend_service_interleaves_two_scan_portals_under_shared_spi() {
     reset_backend_service_table();
     Spi::run("SET LOCAL max_parallel_workers_per_gather = 0").unwrap();
@@ -959,9 +883,6 @@ pub fn backend_service_interleaves_two_scan_portals_under_shared_spi() {
     let scan_transport_right = IssuedTransportHarness::new();
     let scan_slots = ControlTransportHarness::new(16);
     let mut config = BackendServiceConfig::default();
-    config.scan_payload_block_size =
-        u32::try_from(scan_transport_left.payload_capacity(ARROW_LAYOUT_BATCH_KIND, 0))
-            .expect("scan payload capacity must fit into u32");
     config.scan_fetch_batch_rows = 1;
     let _snapshot = unsafe { LatestSnapshotGuard::acquire() };
     let begin = begin_and_finalize_execution(TEST_SLOT_ID, &query, config, scan_slots.region());
@@ -1026,9 +947,6 @@ pub fn backend_service_drop_finished_driver_does_not_cancel_sibling_scan() {
     let scan_transport_right = IssuedTransportHarness::new();
     let scan_slots = ControlTransportHarness::new(16);
     let mut config = BackendServiceConfig::default();
-    config.scan_payload_block_size =
-        u32::try_from(scan_transport_left.payload_capacity(ARROW_LAYOUT_BATCH_KIND, 0))
-            .expect("scan payload capacity must fit into u32");
     config.scan_fetch_batch_rows = 1;
     let _snapshot = unsafe { LatestSnapshotGuard::acquire() };
     let begin = begin_and_finalize_execution(TEST_SLOT_ID, &query, config, scan_slots.region());

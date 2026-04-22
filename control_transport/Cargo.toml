@@ -13,6 +13,7 @@ doctest = false
 libc = "0.2"
 lockfree = { path = "../lockfree", version = "25.0" }
 portable-atomic = "1.13.1"
+tracing = "0.1"
 
 [dev-dependencies]
 loom = "0.7"

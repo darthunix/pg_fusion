@@ -1,5 +1,5 @@
 use control_transport::{AcquireError, BackendSlotLease};
-use pgrx::prelude::*;
+use postgres::{Client, SimpleQueryMessage, Transaction};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -8,10 +8,9 @@ use crate::shmem::attach_control_region;
 const WORKER_START_TIMEOUT: Duration = Duration::from_secs(5);
 const SMOKE_TEST_ADVISORY_LOCK: i64 = 0x5047_4655_5349_4f4e;
 
-fn ensure_shared_preload() {
-    let preload = Spi::get_one::<String>("SHOW shared_preload_libraries")
-        .expect("SHOW shared_preload_libraries must succeed")
-        .unwrap_or_default();
+fn ensure_shared_preload(client: &mut Client) {
+    let preload = simple_query_first_column_client(client, "SHOW shared_preload_libraries")
+        .expect("SHOW shared_preload_libraries must return one row");
     assert!(
         preload
             .split(',')
@@ -22,7 +21,6 @@ fn ensure_shared_preload() {
 }
 
 fn wait_for_worker() {
-    ensure_shared_preload();
     let region = attach_control_region();
     let deadline = Instant::now() + WORKER_START_TIMEOUT;
     loop {
@@ -43,56 +41,107 @@ fn wait_for_worker() {
     }
 }
 
-fn enable_pg_fusion() {
+fn smoke_client() -> Client {
     wait_for_worker();
-    Spi::run(&format!(
-        "SELECT pg_advisory_xact_lock({SMOKE_TEST_ADVISORY_LOCK})"
+    let (client, _session_id) = pgrx_tests::client().expect("connect to pgrx test cluster");
+    client
+}
+
+fn smoke_transaction(client: &mut Client) -> Transaction<'_> {
+    ensure_shared_preload(client);
+    let mut tx = client.transaction().expect("start smoke-test transaction");
+    tx.batch_execute(&format!(
+        "\
+        SELECT pg_advisory_xact_lock({SMOKE_TEST_ADVISORY_LOCK});
+        SET LOCAL pg_fusion.enable = on
+        "
     ))
-    .expect("serialize pg_fusion smoke tests");
-    Spi::run("SET LOCAL pg_fusion.enable = on").expect("enable pg_fusion");
+    .expect("initialize pg_fusion smoke-test session state");
+    tx
+}
+
+fn simple_query_first_column_client(client: &mut Client, sql: &str) -> Option<String> {
+    client
+        .simple_query(sql)
+        .expect("simple query must succeed")
+        .into_iter()
+        .find_map(|message| match message {
+            SimpleQueryMessage::Row(row) => row.get(0).map(str::to_owned),
+            _ => None,
+        })
+}
+
+fn simple_query_first_column_tx(tx: &mut Transaction<'_>, sql: &str) -> Option<String> {
+    tx.simple_query(sql)
+        .expect("simple query must succeed")
+        .into_iter()
+        .find_map(|message| match message {
+            SimpleQueryMessage::Row(row) => row.get(0).map(str::to_owned),
+            _ => None,
+        })
 }
 
 pub(crate) fn simple_select_smoke() {
-    enable_pg_fusion();
-    Spi::run("SELECT 1::bigint AS one").expect("simple smoke select must succeed");
+    let mut client = smoke_client();
+    let mut tx = smoke_transaction(&mut client);
+    let one: i64 = simple_query_first_column_tx(&mut tx, "SELECT 1::bigint AS one")
+        .expect("simple smoke select must return one row")
+        .parse()
+        .expect("simple smoke select must return one bigint value");
+    assert_eq!(one, 1);
 }
 
 pub(crate) fn explain_smoke() {
-    enable_pg_fusion();
-    Spi::run("EXPLAIN (FORMAT JSON) SELECT 1::bigint AS one").expect("smoke EXPLAIN must succeed");
+    let mut client = smoke_client();
+    let mut tx = smoke_transaction(&mut client);
+    let explain =
+        simple_query_first_column_tx(&mut tx, "EXPLAIN (FORMAT JSON) SELECT 1::bigint AS one")
+            .expect("smoke EXPLAIN must return one row");
+    assert!(
+        explain.contains("\"Plan\""),
+        "unexpected EXPLAIN JSON: {explain}"
+    );
 }
 
-fn reset_heap_fixture(table_name: &str) {
-    Spi::run(&format!("DROP TABLE IF EXISTS {table_name}"))
-        .expect("drop temp heap table must succeed");
-    Spi::run(&format!(
+fn reset_heap_fixture(tx: &mut Transaction<'_>, table_name: &str) {
+    tx.batch_execute(&format!(
         "CREATE TEMP TABLE {table_name} (id bigint NOT NULL, payload text NOT NULL)"
     ))
     .expect("create temp heap table must succeed");
-    Spi::run(&format!(
+    tx.batch_execute(&format!(
         "INSERT INTO {table_name} (id, payload) VALUES (1, 'one'), (2, 'two'), (3, 'three')"
     ))
     .expect("insert temp heap fixture rows must succeed");
 }
 
 pub(crate) fn heap_select_single_row_smoke() {
-    enable_pg_fusion();
+    let mut client = smoke_client();
+    let mut tx = smoke_transaction(&mut client);
     let table_name = "pg_temp.pgf_heap_single_row_smoke";
-    reset_heap_fixture(table_name);
+    reset_heap_fixture(&mut tx, table_name);
 
-    let id = Spi::get_one::<i64>(&format!("SELECT id::bigint FROM {table_name} WHERE id = 2"))
-        .expect("single-row heap select must succeed")
-        .expect("single-row heap select must return one row");
+    let id: i64 = simple_query_first_column_tx(
+        &mut tx,
+        &format!("SELECT id::bigint FROM {table_name} WHERE id = 2"),
+    )
+    .expect("single-row heap select must return one row")
+    .parse()
+    .expect("single-row heap select must return one bigint value");
     assert_eq!(id, 2);
 }
 
 pub(crate) fn heap_select_filtered_row_smoke() {
-    enable_pg_fusion();
+    let mut client = smoke_client();
+    let mut tx = smoke_transaction(&mut client);
     let table_name = "pg_temp.pgf_heap_filtered_row_smoke";
-    reset_heap_fixture(table_name);
+    reset_heap_fixture(&mut tx, table_name);
 
-    let id = Spi::get_one::<i64>(&format!("SELECT id::bigint FROM {table_name} WHERE id > 2"))
-        .expect("filtered heap select must succeed")
-        .expect("filtered heap select must return one row");
+    let id: i64 = simple_query_first_column_tx(
+        &mut tx,
+        &format!("SELECT id::bigint FROM {table_name} WHERE id > 2"),
+    )
+    .expect("filtered heap select must return one row")
+    .parse()
+    .expect("filtered heap select must return one bigint value");
     assert_eq!(id, 3);
 }

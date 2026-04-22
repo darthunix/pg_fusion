@@ -10,6 +10,7 @@ use pgrx::bgworkers::{BackgroundWorker, BackgroundWorkerBuilder, SignalWakeFlags
 use pgrx::prelude::*;
 use pool::PagePool;
 use runtime_protocol::{ExecutionFailureCode, WorkerExecutionToBackend};
+use tracing::{info, warn};
 use transfer::PageTx;
 use worker_runtime::{
     DecodedInbound, ResultPageProducer, ResultPageProducerConfig, ResultPageStep,
@@ -18,6 +19,7 @@ use worker_runtime::{
 };
 
 use crate::guc::host_config;
+use crate::logging::init_tracing_file_logger;
 use crate::shmem::{
     attach_control_region, attach_issuance_pool, attach_page_pool, attach_scan_region,
 };
@@ -45,6 +47,17 @@ fn run_worker_main() -> Result<(), WorkerRuntimeError> {
     let config = host_config().map_err(|err| {
         WorkerRuntimeError::ProtocolViolation(format!("invalid host configuration: {err}"))
     })?;
+    init_tracing_file_logger(&config.worker_log_path, &config.worker_log_filter);
+    info!(
+        worker_pid = std::process::id(),
+        control_slots = config.control_slot_count,
+        scan_slots = config.scan_slot_count,
+        control_b2w = config.control_backend_to_worker_capacity,
+        control_w2b = config.control_worker_to_backend_capacity,
+        scan_b2w = config.scan_backend_to_worker_capacity,
+        scan_w2b = config.scan_worker_to_backend_capacity,
+        "pg_fusion worker starting"
+    );
     let control_region = attach_control_region();
     let scan_region = attach_scan_region();
     let page_pool = attach_page_pool();
@@ -53,9 +66,13 @@ fn run_worker_main() -> Result<(), WorkerRuntimeError> {
     let worker_config = config.worker_runtime_config();
     let scan_transport = WorkerTransport::attach(&scan_region)?;
     let worker_pid = std::process::id() as i32;
+    info!(worker_pid, "attached dedicated scan transport region");
     scan_transport.activate_generation(worker_pid)?;
+    info!(worker_pid, "activated dedicated scan transport generation");
     let mut transport = TransportWorkerRuntime::attach(&control_region, &worker_config)?;
+    info!(worker_pid, "attached primary control transport region");
     transport.activate_generation(worker_pid)?;
+    info!(worker_pid, "activated primary control transport generation");
 
     let scan_source = Arc::new(TransportScanBatchSource::new(
         scan_region,
@@ -67,10 +84,12 @@ fn run_worker_main() -> Result<(), WorkerRuntimeError> {
     )?);
     let mut runtime = WorkerRuntimeCore::new(worker_config, scan_source);
     let mut plan_rx: Option<IssuedRx> = None;
+    info!("worker entering main poll loop");
 
     while BackgroundWorker::wait_latch(Some(POLL_INTERVAL)) {
         let mut ready_cursor = 0;
         while let Some(peer) = transport.next_ready_backend_lease(&mut ready_cursor) {
+            info!(peer = ?peer, state = ?runtime.state(), "worker polling ready backend peer");
             let mut steps = VecDeque::new();
             transport.recv_peer_frames(peer, |bytes| {
                 let decoded = WorkerRuntimeCore::decode_inbound(bytes)?;
@@ -111,6 +130,7 @@ fn run_worker_main() -> Result<(), WorkerRuntimeError> {
 
     transport.deactivate_generation()?;
     scan_transport.deactivate_generation()?;
+    info!("worker stopped cleanly");
     Ok(())
 }
 
@@ -129,15 +149,26 @@ fn handle_steps(
             | WorkerRuntimeStep::StaleControlIgnored { .. }
             | WorkerRuntimeStep::PlanFrameAccepted { .. }
             | WorkerRuntimeStep::PlanningResultIgnored { .. } => {}
-            WorkerRuntimeStep::PlanOpened { .. } => {}
+            WorkerRuntimeStep::PlanOpened {
+                session_epoch,
+                plan_id,
+            } => {
+                info!(session_epoch, plan_id, "worker opened logical plan ingress");
+            }
             WorkerRuntimeStep::PlanningStarted(pending) => {
                 let peer = pending.peer();
                 let flow = pending.flow();
+                info!(peer = ?peer, flow = ?flow, "worker starting physical planning");
                 let result = block_on(pending.plan());
                 steps.push_back(runtime.finish_physical_planning(peer, flow, result)?);
             }
             WorkerRuntimeStep::PhysicalPlanReady(result) => {
                 let peer = runtime.active_peer().expect("peer");
+                info!(
+                    session_epoch = result.session_epoch,
+                    peer = ?peer,
+                    "worker received physical plan and is starting execution"
+                );
                 let execution_result: Result<(), WorkerRuntimeError> = (|| {
                     let plan = runtime
                         .take_physical_plan()
@@ -165,6 +196,11 @@ fn handle_steps(
                     loop {
                         match producer.next_step()? {
                             Some(ResultPageStep::OutboundPage(outbound)) => {
+                                info!(
+                                    session_epoch = result.session_epoch,
+                                    peer = ?peer,
+                                    "worker produced one result page"
+                                );
                                 let frame =
                                     encode_issued_frame(outbound.frame()).map_err(|err| {
                                         WorkerRuntimeError::ProtocolViolation(format!(
@@ -175,6 +211,11 @@ fn handle_steps(
                                 outbound.mark_sent();
                             }
                             Some(ResultPageStep::CloseFrame(frame)) => {
+                                info!(
+                                    session_epoch = result.session_epoch,
+                                    peer = ?peer,
+                                    "worker produced terminal result close frame"
+                                );
                                 let frame = encode_issued_frame(frame).map_err(|err| {
                                     WorkerRuntimeError::ProtocolViolation(format!(
                                         "failed to encode result close frame: {err}"
@@ -190,6 +231,11 @@ fn handle_steps(
 
                 match execution_result {
                     Ok(()) => {
+                        info!(
+                            session_epoch = result.session_epoch,
+                            peer = ?peer,
+                            "worker finished execution successfully and is sending CompleteExecution"
+                        );
                         transport.send_peer_message(
                             peer,
                             WorkerExecutionToBackend::CompleteExecution {
@@ -199,6 +245,12 @@ fn handle_steps(
                         steps.push_back(runtime.mark_execution_complete()?);
                     }
                     Err(err) => {
+                        warn!(
+                            session_epoch = result.session_epoch,
+                            peer = ?peer,
+                            error = %err,
+                            "worker execution failed locally; sending FailExecution"
+                        );
                         transport.send_peer_message(
                             peer,
                             WorkerExecutionToBackend::FailExecution {
@@ -214,12 +266,49 @@ fn handle_steps(
                     }
                 }
             }
-            WorkerRuntimeStep::ExecutionCancelled { .. }
-            | WorkerRuntimeStep::ExecutionFailed { .. }
-            | WorkerRuntimeStep::ExecutionCompleted { .. } => {
+            WorkerRuntimeStep::ExecutionCancelled { session_epoch } => {
+                info!(session_epoch, "worker observed execution cancel");
                 plan_rx.take();
                 if runtime.state() == worker_runtime::fsm::WorkerExecutionState::Terminal {
                     runtime.cleanup()?;
+                    info!(
+                        session_epoch,
+                        "worker cleaned up terminal execution after cancel"
+                    );
+                }
+            }
+            WorkerRuntimeStep::ExecutionFailed {
+                session_epoch,
+                code,
+                detail,
+            } => {
+                warn!(
+                    session_epoch,
+                    code = ?code,
+                    detail = ?detail,
+                    "worker observed execution failure transition"
+                );
+                plan_rx.take();
+                if runtime.state() == worker_runtime::fsm::WorkerExecutionState::Terminal {
+                    runtime.cleanup()?;
+                    info!(
+                        session_epoch,
+                        "worker cleaned up terminal execution after failure"
+                    );
+                }
+            }
+            WorkerRuntimeStep::ExecutionCompleted { session_epoch } => {
+                info!(
+                    session_epoch,
+                    "worker observed execution complete transition"
+                );
+                plan_rx.take();
+                if runtime.state() == worker_runtime::fsm::WorkerExecutionState::Terminal {
+                    runtime.cleanup()?;
+                    info!(
+                        session_epoch,
+                        "worker cleaned up terminal execution after completion"
+                    );
                 }
             }
         }

@@ -6,6 +6,7 @@ use super::{
 use crate::error::{LeaseError, SlotAccessError, WorkerLifecycleError};
 use crate::process::probe_pid_alive;
 use std::sync::atomic::Ordering;
+use tracing::{info, warn};
 
 #[cfg(test)]
 use std::cell::RefCell;
@@ -83,9 +84,30 @@ impl SlotSnapshot {
 }
 
 #[derive(Clone, Copy)]
+struct SlotDiagnosticSnapshot {
+    current_region_generation: u64,
+    current_region_worker_state: u32,
+    current_slot_generation: u64,
+    current_slot_lease_epoch: u64,
+    current_lease_state: u32,
+    current_owner_mask: u32,
+    backend_pid: i32,
+    worker_pid: i32,
+    has_backend_owner: bool,
+    has_worker_owner: bool,
+    is_leased: bool,
+}
+
+#[derive(Clone, Copy)]
 pub(super) struct OwnerMutationResult {
     changed: bool,
     remaining_mask: u32,
+}
+
+#[derive(Clone, Copy)]
+pub(super) enum LogLevel {
+    Info,
+    Warn,
 }
 
 impl OwnerMutationResult {
@@ -98,6 +120,10 @@ impl OwnerMutationResult {
 
     pub(super) fn changed(self) -> bool {
         self.changed
+    }
+
+    pub(super) fn remaining_mask(self) -> u32 {
+        self.remaining_mask
     }
 
     fn ownerless(self) -> bool {
@@ -222,6 +248,117 @@ impl TransportRegion {
         }
     }
 
+    fn load_slot_diagnostic_snapshot(&self, slot_id: u32) -> Option<SlotDiagnosticSnapshot> {
+        let region_snapshot = self.load_region_snapshot();
+        let slot = self.slot_view(slot_id).ok()?;
+        let slot_snapshot = self.load_slot_snapshot(slot);
+        Some(SlotDiagnosticSnapshot {
+            current_region_generation: region_snapshot.generation,
+            current_region_worker_state: region_snapshot.worker_state,
+            current_slot_generation: slot_snapshot.slot_generation,
+            current_slot_lease_epoch: slot_snapshot.lease_epoch(),
+            current_lease_state: slot_snapshot.slot_meta.lease_state(),
+            current_owner_mask: slot_snapshot.owner_mask(),
+            backend_pid: slot_snapshot.backend_pid,
+            worker_pid: slot.worker_pid.load(Ordering::Acquire),
+            has_backend_owner: slot_snapshot.has_backend_owner(),
+            has_worker_owner: slot_snapshot.has_worker_owner(),
+            is_leased: slot_snapshot.is_leased(),
+        })
+    }
+
+    pub(super) fn log_worker_slot_access_failure(
+        &self,
+        reason: &'static str,
+        slot_id: u32,
+        incarnation: LeaseIncarnation,
+    ) {
+        let snapshot = self.load_slot_diagnostic_snapshot(slot_id);
+        let region_key = self.region_key();
+        warn!(
+            reason,
+            region_key,
+            slot_id,
+            claimed_generation = incarnation.generation,
+            claimed_lease_epoch = incarnation.lease_epoch,
+            current_region_generation = snapshot.map_or(0, |s| s.current_region_generation),
+            current_region_worker_state = snapshot.map_or(0, |s| s.current_region_worker_state),
+            current_slot_generation = snapshot.map_or(0, |s| s.current_slot_generation),
+            current_slot_lease_epoch = snapshot.map_or(0, |s| s.current_slot_lease_epoch),
+            current_lease_state = snapshot.map_or(0, |s| s.current_lease_state),
+            current_owner_mask = snapshot.map_or(0, |s| s.current_owner_mask),
+            backend_pid = snapshot.map_or(-1, |s| s.backend_pid),
+            worker_pid = snapshot.map_or(-1, |s| s.worker_pid),
+            has_backend_owner = snapshot.is_some_and(|s| s.has_backend_owner),
+            has_worker_owner = snapshot.is_some_and(|s| s.has_worker_owner),
+            is_leased = snapshot.is_some_and(|s| s.is_leased),
+            "control_transport worker slot access failure"
+        );
+    }
+
+    pub(super) fn log_slot_owner_transition(
+        &self,
+        level: LogLevel,
+        reason: &'static str,
+        slot_id: u32,
+        incarnation: LeaseIncarnation,
+        previous_owner_mask: u32,
+        remaining_owner_mask: u32,
+        backend_pid_before: i32,
+        backend_pid_after: i32,
+    ) {
+        let snapshot = self.load_slot_diagnostic_snapshot(slot_id);
+        let region_key = self.region_key();
+        match level {
+            LogLevel::Info => info!(
+                reason,
+                region_key,
+                slot_id,
+                generation = incarnation.generation,
+                lease_epoch = incarnation.lease_epoch,
+                previous_owner_mask,
+                remaining_owner_mask,
+                backend_pid_before,
+                backend_pid_after,
+                current_region_generation = snapshot.map_or(0, |s| s.current_region_generation),
+                current_region_worker_state = snapshot.map_or(0, |s| s.current_region_worker_state),
+                current_slot_generation = snapshot.map_or(0, |s| s.current_slot_generation),
+                current_slot_lease_epoch = snapshot.map_or(0, |s| s.current_slot_lease_epoch),
+                current_lease_state = snapshot.map_or(0, |s| s.current_lease_state),
+                current_owner_mask = snapshot.map_or(0, |s| s.current_owner_mask),
+                backend_pid = snapshot.map_or(-1, |s| s.backend_pid),
+                worker_pid = snapshot.map_or(-1, |s| s.worker_pid),
+                has_backend_owner = snapshot.is_some_and(|s| s.has_backend_owner),
+                has_worker_owner = snapshot.is_some_and(|s| s.has_worker_owner),
+                is_leased = snapshot.is_some_and(|s| s.is_leased),
+                "control_transport slot ownership transition"
+            ),
+            LogLevel::Warn => warn!(
+                reason,
+                region_key,
+                slot_id,
+                generation = incarnation.generation,
+                lease_epoch = incarnation.lease_epoch,
+                previous_owner_mask,
+                remaining_owner_mask,
+                backend_pid_before,
+                backend_pid_after,
+                current_region_generation = snapshot.map_or(0, |s| s.current_region_generation),
+                current_region_worker_state = snapshot.map_or(0, |s| s.current_region_worker_state),
+                current_slot_generation = snapshot.map_or(0, |s| s.current_slot_generation),
+                current_slot_lease_epoch = snapshot.map_or(0, |s| s.current_slot_lease_epoch),
+                current_lease_state = snapshot.map_or(0, |s| s.current_lease_state),
+                current_owner_mask = snapshot.map_or(0, |s| s.current_owner_mask),
+                backend_pid = snapshot.map_or(-1, |s| s.backend_pid),
+                worker_pid = snapshot.map_or(-1, |s| s.worker_pid),
+                has_backend_owner = snapshot.is_some_and(|s| s.has_backend_owner),
+                has_worker_owner = snapshot.is_some_and(|s| s.has_worker_owner),
+                is_leased = snapshot.is_some_and(|s| s.is_leased),
+                "control_transport slot ownership transition"
+            ),
+        }
+    }
+
     pub(super) fn clear_owner_bits_if_matching(
         &self,
         slot: SlotView<'_>,
@@ -268,7 +405,41 @@ impl TransportRegion {
         mutation: OwnerMutationResult,
     ) {
         if mutation.changed && mutation.ownerless() {
-            let _ = self.try_finalize_slot(slot_id, incarnation);
+            let snapshot = self.load_slot_diagnostic_snapshot(slot_id);
+            let region_key = self.region_key();
+            info!(
+                reason = "finalize_if_ownerless",
+                region_key,
+                slot_id,
+                generation = incarnation.generation,
+                lease_epoch = incarnation.lease_epoch,
+                remaining_owner_mask = mutation.remaining_mask,
+                current_region_generation = snapshot.map_or(0, |s| s.current_region_generation),
+                current_region_worker_state = snapshot.map_or(0, |s| s.current_region_worker_state),
+                current_slot_generation = snapshot.map_or(0, |s| s.current_slot_generation),
+                current_slot_lease_epoch = snapshot.map_or(0, |s| s.current_slot_lease_epoch),
+                current_lease_state = snapshot.map_or(0, |s| s.current_lease_state),
+                current_owner_mask = snapshot.map_or(0, |s| s.current_owner_mask),
+                backend_pid = snapshot.map_or(-1, |s| s.backend_pid),
+                worker_pid = snapshot.map_or(-1, |s| s.worker_pid),
+                has_backend_owner = snapshot.is_some_and(|s| s.has_backend_owner),
+                has_worker_owner = snapshot.is_some_and(|s| s.has_worker_owner),
+                is_leased = snapshot.is_some_and(|s| s.is_leased),
+                "control_transport slot ready for ownerless finalization"
+            );
+            let finalized = self.try_finalize_slot(slot_id, incarnation);
+            if finalized {
+                self.log_slot_owner_transition(
+                    LogLevel::Info,
+                    "finalize_if_ownerless_committed",
+                    slot_id,
+                    incarnation,
+                    mutation.remaining_mask,
+                    0,
+                    -1,
+                    -1,
+                );
+            }
         }
     }
 
@@ -336,6 +507,7 @@ impl TransportRegion {
         attached: bool,
     ) -> Result<SlotView<'_>, SlotAccessError> {
         if !attached {
+            self.log_worker_slot_access_failure("released", slot_id, incarnation);
             return Err(SlotAccessError::Released {
                 slot_id,
                 claimed_generation: incarnation.generation,
@@ -344,6 +516,7 @@ impl TransportRegion {
 
         let region_snapshot = self.load_region_snapshot();
         if region_snapshot.generation != incarnation.generation {
+            self.log_worker_slot_access_failure("stale_generation", slot_id, incarnation);
             return Err(SlotAccessError::StaleGeneration {
                 slot_id,
                 claimed_generation: incarnation.generation,
@@ -351,12 +524,14 @@ impl TransportRegion {
             });
         }
         if !region_snapshot.is_online() {
+            self.log_worker_slot_access_failure("worker_offline", slot_id, incarnation);
             return Err(SlotAccessError::WorkerOffline);
         }
 
         let slot = self.slot_view(slot_id)?;
         let slot_snapshot = self.load_slot_snapshot(slot);
         if !slot_snapshot.is_leased() {
+            self.log_worker_slot_access_failure("released", slot_id, incarnation);
             return Err(SlotAccessError::Released {
                 slot_id,
                 claimed_generation: incarnation.generation,
@@ -364,6 +539,7 @@ impl TransportRegion {
         }
 
         if slot_snapshot.slot_generation != incarnation.generation {
+            self.log_worker_slot_access_failure("released", slot_id, incarnation);
             return Err(SlotAccessError::Released {
                 slot_id,
                 claimed_generation: incarnation.generation,
@@ -371,6 +547,7 @@ impl TransportRegion {
         }
 
         if slot_snapshot.lease_epoch() != incarnation.lease_epoch {
+            self.log_worker_slot_access_failure("stale_lease_epoch", slot_id, incarnation);
             return Err(SlotAccessError::StaleLeaseEpoch {
                 slot_id,
                 claimed_generation: incarnation.generation,
@@ -380,6 +557,7 @@ impl TransportRegion {
         }
 
         if !slot_snapshot.has_worker_owner() || !slot_snapshot.has_backend_owner() {
+            self.log_worker_slot_access_failure("released", slot_id, incarnation);
             return Err(SlotAccessError::Released {
                 slot_id,
                 claimed_generation: incarnation.generation,
@@ -779,6 +957,16 @@ impl TransportRegion {
         self.clear_slot(slot_id);
         slot.slot_generation.store(0, Ordering::Release);
         let _ = self.publish_free_slot(slot_id, slot);
+        self.log_slot_owner_transition(
+            LogLevel::Info,
+            "finalize_slot",
+            slot_id,
+            incarnation,
+            snapshot.owner_mask(),
+            0,
+            snapshot.backend_pid,
+            0,
+        );
         true
     }
 
@@ -873,7 +1061,18 @@ impl TransportRegion {
             return Ok(false);
         }
 
+        let backend_pid_before = snapshot.backend_pid;
         slot.backend_pid.store(0, Ordering::Release);
+        self.log_slot_owner_transition(
+            LogLevel::Warn,
+            "reap_dead_backend",
+            slot_id,
+            incarnation,
+            snapshot.owner_mask(),
+            mutation.remaining_mask,
+            backend_pid_before,
+            0,
+        );
         self.finalize_if_ownerless(slot_id, incarnation, mutation);
         Ok(true)
     }

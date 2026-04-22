@@ -30,6 +30,7 @@ rust-fsm = { version = "0.7", features = ["diagram"] }
 scan_flow = { path = "../page/scan_flow", version = "25.0" }
 scan_node = { path = "../pg/scan_node", version = "25.0" }
 thiserror = "2.0"
+tracing = "0.1"
 transfer = { path = "../page/transfer", version = "25.0" }
 
 [dev-dependencies]

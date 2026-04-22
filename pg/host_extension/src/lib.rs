@@ -1,16 +1,17 @@
 #![doc = include_str!("../README.md")]
 
-#[cfg(any(test, feature = "pg_test"))]
+#[cfg(feature = "pg_test")]
 use pgrx::pg_schema;
 use pgrx::pg_sys::AsPgCStr;
 use pgrx::prelude::*;
 
 mod custom_scan;
 mod guc;
+mod logging;
 mod planner;
 mod result_ingress;
 mod shmem;
-#[cfg(any(test, feature = "pg_test"))]
+#[cfg(feature = "pg_test")]
 mod smoke_tests;
 mod utility_hook;
 mod worker;
@@ -35,7 +36,7 @@ fn mark_guc_prefix_reserved(guc_prefix: &str) {
     unsafe { pgrx::pg_sys::MarkGUCPrefixReserved(guc_prefix.as_pg_cstr()) }
 }
 
-#[cfg(any(test, feature = "pg_test"))]
+#[cfg(feature = "pg_test")]
 #[pg_schema]
 mod tests {
     use pgrx::prelude::*;

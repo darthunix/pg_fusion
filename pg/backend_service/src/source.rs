@@ -111,21 +111,22 @@ impl BackendPageSource for SlotScanPageSource {
     }
 
     fn fill_next_page(&mut self, payload: &mut [u8]) -> Result<SourcePageStatus, Self::Error> {
-        let payload_len_u32 = u32::try_from(payload.len()).map_err(|_| {
+        let block_size = usize::try_from(self.block_size).map_err(|_| {
             BackendServiceError::PageSource(format!(
-                "scan page payload size {} does not fit into u32",
-                payload.len()
+                "scan block size {} does not fit into usize",
+                self.block_size
             ))
         })?;
-        if payload_len_u32 != self.block_size {
+        if payload.len() < block_size {
             return Err(BackendServiceError::PageSource(format!(
-                "scan payload block size mismatch: expected {}, got {}",
-                self.block_size,
+                "scan page payload too small: required {}, got {}",
+                block_size,
                 payload.len()
             )));
         }
+        let block = &mut payload[..block_size];
 
-        with_registered_snapshot(self.snapshot, || self.fill_next_page_with_snapshot(payload))
+        with_registered_snapshot(self.snapshot, || self.fill_next_page_with_snapshot(block))
     }
 
     fn close(&mut self) -> Result<(), Self::Error> {
