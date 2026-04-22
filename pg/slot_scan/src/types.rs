@@ -225,6 +225,11 @@ impl OwnedSpiPlan {
 
 impl Drop for OwnedSpiPlan {
     fn drop(&mut self) {
+        slot_scan_diag(format!(
+            "slot_scan drop OwnedSpiPlan ptr={:p} current_mcxt={:p}",
+            self.ptr,
+            diagnostic_current_memory_context()
+        ));
         unsafe {
             if !self.ptr.is_null() {
                 pg_sys::SPI_freeplan(self.ptr);
@@ -262,9 +267,17 @@ pub(crate) struct ExecutionSpiConnection;
 
 impl Drop for ExecutionSpiConnection {
     fn drop(&mut self) {
+        slot_scan_diag(format!(
+            "slot_scan drop ExecutionSpiConnection before SPI_finish current_mcxt={:p}",
+            diagnostic_current_memory_context()
+        ));
         unsafe {
             let _ = pg_sys::SPI_finish();
         }
+        slot_scan_diag(format!(
+            "slot_scan drop ExecutionSpiConnection after SPI_finish current_mcxt={:p}",
+            diagnostic_current_memory_context()
+        ));
     }
 }
 
@@ -278,6 +291,37 @@ impl Drop for ExecutionSpiConnection {
 #[derive(Clone, Debug)]
 pub struct ExecutionSpiContext {
     pub(crate) _inner: Rc<ExecutionSpiConnection>,
+}
+
+fn slot_scan_diag(message: String) {
+    #[cfg(not(test))]
+    {
+        use std::fs::OpenOptions;
+        use std::io::Write;
+
+        if let Ok(mut file) = OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open("/tmp/pg_fusion_backend.log")
+        {
+            let _ = writeln!(file, "pid={} {}", std::process::id(), message);
+        }
+    }
+    #[cfg(test)]
+    {
+        let _ = message;
+    }
+}
+
+fn diagnostic_current_memory_context() -> pg_sys::MemoryContext {
+    #[cfg(test)]
+    {
+        std::ptr::null_mut()
+    }
+    #[cfg(not(test))]
+    unsafe {
+        pg_sys::CurrentMemoryContext
+    }
 }
 
 /// Internal stackful scan session used by backend-side page streaming.

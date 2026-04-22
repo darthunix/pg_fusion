@@ -120,6 +120,12 @@ impl ExecutionSnapshot {
 
 impl Drop for ExecutionSnapshot {
     fn drop(&mut self) {
+        backend_diag_info(format!(
+            "backend_service drop ExecutionSnapshot snapshot={:p} owner={:p} current_mcxt={:p}",
+            self.snapshot,
+            self.owner,
+            diagnostic_current_memory_context()
+        ));
         unsafe {
             if !self.snapshot.is_null() && !self.owner.is_null() {
                 pg_sys::UnregisterSnapshotFromOwner(self.snapshot, self.owner);
@@ -1674,6 +1680,17 @@ fn terminal_event_action(event: BackendExecutionEvent) -> &'static str {
     }
 }
 
+fn diagnostic_current_memory_context() -> pg_sys::MemoryContext {
+    #[cfg(test)]
+    {
+        std::ptr::null_mut()
+    }
+    #[cfg(not(test))]
+    unsafe {
+        pg_sys::CurrentMemoryContext
+    }
+}
+
 fn backend_diag_info(message: String) {
     backend_diag_write_file(&message);
     #[cfg(not(test))]
@@ -1766,6 +1783,14 @@ fn cleanup_execution(
         }
         entry.scan_lease.take();
     }
+    if execution.scan_spi.is_some() {
+        backend_diag_info(format!(
+            "backend_service cleanup_execution dropping shared scan SPI slot_id={} session_epoch={} current_mcxt={:p}",
+            execution.key.slot_id,
+            execution.key.session_epoch,
+            diagnostic_current_memory_context()
+        ));
+    }
     execution.scan_spi.take();
 
     if execution.machine.state() == &BackendExecutionState::Terminal {
@@ -1776,7 +1801,76 @@ fn cleanup_execution(
         }
     }
 
-    drop(execution);
+    let ActiveExecution {
+        key,
+        snapshot,
+        _logical_plan,
+        machine,
+        config: _,
+        starting,
+        scan_spi,
+        scans,
+        active_scans,
+    } = execution;
+
+    backend_diag_info(format!(
+        "backend_service cleanup_execution drop sequence start slot_id={} session_epoch={} scans={} active_scans={} current_mcxt={:p}",
+        key.slot_id,
+        key.session_epoch,
+        scans.len(),
+        active_scans.len(),
+        diagnostic_current_memory_context()
+    ));
+
+    drop(active_scans);
+    backend_diag_info(format!(
+        "backend_service cleanup_execution dropped active_scans slot_id={} session_epoch={} current_mcxt={:p}",
+        key.slot_id,
+        key.session_epoch,
+        diagnostic_current_memory_context()
+    ));
+    drop(scans);
+    backend_diag_info(format!(
+        "backend_service cleanup_execution dropped scans slot_id={} session_epoch={} current_mcxt={:p}",
+        key.slot_id,
+        key.session_epoch,
+        diagnostic_current_memory_context()
+    ));
+    drop(scan_spi);
+    backend_diag_info(format!(
+        "backend_service cleanup_execution dropped scan_spi slot_id={} session_epoch={} current_mcxt={:p}",
+        key.slot_id,
+        key.session_epoch,
+        diagnostic_current_memory_context()
+    ));
+    drop(starting);
+    backend_diag_info(format!(
+        "backend_service cleanup_execution dropped starting runtime slot_id={} session_epoch={} current_mcxt={:p}",
+        key.slot_id,
+        key.session_epoch,
+        diagnostic_current_memory_context()
+    ));
+    drop(machine);
+    backend_diag_info(format!(
+        "backend_service cleanup_execution dropped machine slot_id={} session_epoch={} current_mcxt={:p}",
+        key.slot_id,
+        key.session_epoch,
+        diagnostic_current_memory_context()
+    ));
+    drop(_logical_plan);
+    backend_diag_info(format!(
+        "backend_service cleanup_execution dropped logical_plan slot_id={} session_epoch={} current_mcxt={:p}",
+        key.slot_id,
+        key.session_epoch,
+        diagnostic_current_memory_context()
+    ));
+    drop(snapshot);
+    backend_diag_info(format!(
+        "backend_service cleanup_execution dropped snapshot slot_id={} session_epoch={} current_mcxt={:p}",
+        key.slot_id,
+        key.session_epoch,
+        diagnostic_current_memory_context()
+    ));
 
     if let Some(err) = cleanup_error {
         return Err(err);

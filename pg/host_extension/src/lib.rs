@@ -10,6 +10,8 @@ mod guc;
 mod logging;
 mod planner;
 mod result_ingress;
+#[cfg(feature = "pg_test")]
+mod result_ingress_tests;
 mod shmem;
 #[cfg(feature = "pg_test")]
 mod smoke_tests;
@@ -59,6 +61,11 @@ mod tests {
     #[pg_test]
     fn pg_fusion_host_heap_select_filtered_row_smoke() {
         super::smoke_tests::heap_select_filtered_row_smoke();
+    }
+
+    #[pg_test]
+    fn pg_fusion_host_result_ingress_roundtrip_smoke() {
+        super::result_ingress_tests::result_ingress_roundtrip_smoke();
     }
 }
 

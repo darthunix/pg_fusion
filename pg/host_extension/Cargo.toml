@@ -13,9 +13,10 @@ path = "./src/bin/pgrx_embed.rs"
 [features]
 default = ["pg17"]
 pg17 = ["pgrx/pg17", "pgrx-tests?/pg17"]
-pg_test = ["dep:postgres", "dep:pgrx-tests"]
+pg_test = ["dep:arrow-array", "dep:postgres", "dep:pgrx-tests"]
 
 [dependencies]
+arrow-array = { workspace = true, optional = true }
 arrow-schema = { workspace = true }
 backend_service = { path = "../backend_service", version = "25.0" }
 control_transport = { path = "../../control_transport", version = "25.0" }

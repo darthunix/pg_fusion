@@ -77,6 +77,7 @@ struct HostScanState {
     primary_scratch: Vec<u8>,
     scan_scratch: Vec<u8>,
     terminal_error: Option<String>,
+    owns_result_slot: bool,
 }
 
 enum PrimaryInbound {
@@ -114,6 +115,7 @@ unsafe extern "C-unwind" fn create_pg_fusion_scan_state(cscan: *mut CustomScan) 
         primary_scratch: Vec::new(),
         scan_scratch: Vec::new(),
         terminal_error: None,
+        owns_result_slot: false,
     });
 
     let state_ptr =
@@ -130,6 +132,75 @@ unsafe extern "C-unwind" fn create_pg_fusion_scan_state(cscan: *mut CustomScan) 
     state_ptr.cast()
 }
 
+unsafe fn with_query_context<T>(estate: *mut pg_sys::EState, f: impl FnOnce() -> T) -> T {
+    if estate.is_null() || (*estate).es_query_cxt.is_null() {
+        error!("pg_fusion expected non-null estate->es_query_cxt for slot allocation");
+    }
+    let previous = pg_sys::MemoryContextSwitchTo((*estate).es_query_cxt);
+    let result = f();
+    pg_sys::MemoryContextSwitchTo(previous);
+    result
+}
+
+unsafe fn ensure_slot_query_context(
+    slot: *mut pg_sys::TupleTableSlot,
+    estate: *mut pg_sys::EState,
+    slot_name: &str,
+) {
+    if slot.is_null() {
+        error!("pg_fusion expected non-null {slot_name}");
+    }
+    let query_cxt = (*estate).es_query_cxt;
+    if (*slot).tts_mcxt != query_cxt {
+        error!(
+            "pg_fusion {slot_name} was allocated in wrong context: slot_mcxt={:p} es_query_cxt={:p}",
+            (*slot).tts_mcxt,
+            query_cxt
+        );
+    }
+}
+
+unsafe fn install_scan_slot_in_query_context(
+    node: *mut CustomScanState,
+    estate: *mut pg_sys::EState,
+    tuple_desc: pg_sys::TupleDesc,
+) {
+    with_query_context(estate, || {
+        pg_sys::ExecInitScanTupleSlot(
+            estate,
+            &mut (*node).ss,
+            tuple_desc,
+            &raw const pg_sys::TTSOpsMinimalTuple,
+        );
+    });
+    ensure_slot_query_context((*node).ss.ss_ScanTupleSlot, estate, "ss_ScanTupleSlot");
+}
+
+unsafe fn install_minimal_slots_in_query_context(
+    node: *mut CustomScanState,
+    estate: *mut pg_sys::EState,
+    tuple_desc: pg_sys::TupleDesc,
+    state: &mut HostScanState,
+) {
+    install_scan_slot_in_query_context(node, estate, tuple_desc);
+    drop_owned_result_slot(node, state);
+    if (*node).ss.ps.ps_ResultTupleSlot.is_null() {
+        error!("pg_fusion expected non-null core ps_ResultTupleSlot");
+    }
+}
+
+unsafe fn drop_owned_result_slot(node: *mut CustomScanState, state: &mut HostScanState) {
+    if !state.owns_result_slot {
+        return;
+    }
+    let result_slot = (*node).ss.ps.ps_ResultTupleSlot;
+    if !result_slot.is_null() {
+        pg_sys::ExecDropSingleTupleTableSlot(result_slot);
+        (*node).ss.ps.ps_ResultTupleSlot = std::ptr::null_mut();
+    }
+    state.owns_result_slot = false;
+}
+
 #[pg_guard]
 unsafe extern "C-unwind" fn begin_pg_fusion_scan(
     node: *mut CustomScanState,
@@ -138,15 +209,8 @@ unsafe extern "C-unwind" fn begin_pg_fusion_scan(
 ) {
     let state = host_state_mut(node);
     if eflags & pg_sys::EXEC_FLAG_EXPLAIN_ONLY as i32 != 0 {
-        let tuple_desc = tuple_desc_from_scan(node);
-        pg_sys::ExecInitScanTupleSlot(
-            estate,
-            &mut (*node).ss,
-            tuple_desc,
-            &raw const pg_sys::TTSOpsMinimalTuple,
-        );
-        (*node).ss.ps.ps_ResultTupleSlot =
-            pg_sys::MakeSingleTupleTableSlot(tuple_desc, &raw const pg_sys::TTSOpsMinimalTuple);
+        let tuple_desc = tuple_desc_for_slots(node);
+        install_minimal_slots_in_query_context(node, estate, tuple_desc, state);
         state.control_lease = None;
         state.execution_key = None;
         state.scan_peers.clear();
@@ -214,20 +278,15 @@ unsafe extern "C-unwind" fn begin_pg_fusion_scan(
         control_lease_snapshot(&control_lease),
         host_state_snapshot(state)
     ));
-    let tuple_desc = tuple_desc_from_scan(node);
+    let tuple_desc = tuple_desc_for_slots(node);
 
-    pg_sys::ExecInitScanTupleSlot(
-        estate,
-        &mut (*node).ss,
-        tuple_desc,
-        &raw const pg_sys::TTSOpsMinimalTuple,
-    );
-    (*node).ss.ps.ps_ResultTupleSlot =
-        pg_sys::MakeSingleTupleTableSlot(tuple_desc, &raw const pg_sys::TTSOpsMinimalTuple);
+    install_minimal_slots_in_query_context(node, estate, tuple_desc, state);
 
     state.result_ingress = Some(
-        ResultIngress::new(transport_schema, tuple_desc, page_pool, issuance_pool)
-            .unwrap_or_else(|err| error!("pg_fusion result ingress init failed: {err}")),
+        with_query_context(estate, || {
+            ResultIngress::new(transport_schema, tuple_desc, page_pool, issuance_pool)
+        })
+        .unwrap_or_else(|err| error!("pg_fusion result ingress init failed: {err}")),
     );
     state.control_lease = Some(control_lease);
     state.execution_key = Some(key);
@@ -264,6 +323,12 @@ unsafe extern "C-unwind" fn exec_pg_fusion_scan(
 ) -> *mut pg_sys::TupleTableSlot {
     let state = host_state_mut(node);
     let mut scan_slot = (*node).ss.ss_ScanTupleSlot;
+    host_diag(format!(
+        "pg_fusion exec entry slots scan_slot={} result_slot={} state={}",
+        tuple_slot_snapshot((*node).ss.ss_ScanTupleSlot),
+        tuple_slot_snapshot((*node).ss.ps.ps_ResultTupleSlot),
+        host_state_snapshot(state)
+    ));
     if scan_slot.is_null() || (*scan_slot).tts_ops != &raw const pg_sys::TTSOpsMinimalTuple {
         let estate = (*node).ss.ps.state;
         if !estate.is_null() {
@@ -273,15 +338,16 @@ unsafe extern "C-unwind" fn exec_pg_fusion_scan(
                 std::ptr::null_mut()
             };
             if tuple_desc.is_null() {
-                tuple_desc = tuple_desc_from_scan(node);
+                let result_slot = (*node).ss.ps.ps_ResultTupleSlot;
+                if !result_slot.is_null() {
+                    tuple_desc = (*result_slot).tts_tupleDescriptor;
+                }
+            }
+            if tuple_desc.is_null() {
+                tuple_desc = tuple_desc_for_slots(node);
             }
             if !tuple_desc.is_null() {
-                pg_sys::ExecInitScanTupleSlot(
-                    estate,
-                    &mut (*node).ss,
-                    tuple_desc,
-                    &raw const pg_sys::TTSOpsMinimalTuple,
-                );
+                install_scan_slot_in_query_context(node, estate, tuple_desc);
                 scan_slot = (*node).ss.ss_ScanTupleSlot;
             }
         }
@@ -300,6 +366,12 @@ unsafe extern "C-unwind" fn exec_pg_fusion_scan(
             .as_mut()
             .and_then(|ingress| ingress.store_next_into(scan_slot))
         {
+            host_diag(format!(
+                "pg_fusion exec returning row from scan_slot={} result_slot={} state={}",
+                tuple_slot_snapshot((*node).ss.ss_ScanTupleSlot),
+                tuple_slot_snapshot((*node).ss.ps.ps_ResultTupleSlot),
+                host_state_snapshot(state)
+            ));
             return result;
         }
 
@@ -312,13 +384,24 @@ unsafe extern "C-unwind" fn exec_pg_fusion_scan(
             .as_mut()
             .and_then(|ingress| ingress.store_next_into(scan_slot))
         {
+            host_diag(format!(
+                "pg_fusion exec returning row after primary poll scan_slot={} result_slot={} state={}",
+                tuple_slot_snapshot((*node).ss.ss_ScanTupleSlot),
+                tuple_slot_snapshot((*node).ss.ps.ps_ResultTupleSlot),
+                host_state_snapshot(state)
+            ));
             return result;
         }
 
         progressed |= poll_scan_peers(state).unwrap_or_else(|err| {
             error!("pg_fusion scan peer poll failed: {err}");
         });
-        progressed |= drive_active_scans(state).unwrap_or_else(|err| {
+        progressed |= drive_active_scans(
+            state,
+            (*node).ss.ss_ScanTupleSlot,
+            (*node).ss.ps.ps_ResultTupleSlot,
+        )
+        .unwrap_or_else(|err| {
             warning!(
                 "pg_fusion scan driver failure snapshot before raising: {}",
                 host_state_snapshot(state)
@@ -331,6 +414,12 @@ unsafe extern "C-unwind" fn exec_pg_fusion_scan(
             .as_mut()
             .and_then(|ingress| ingress.store_next_into(scan_slot))
         {
+            host_diag(format!(
+                "pg_fusion exec returning row after scan drive scan_slot={} result_slot={} state={}",
+                tuple_slot_snapshot((*node).ss.ss_ScanTupleSlot),
+                tuple_slot_snapshot((*node).ss.ps.ps_ResultTupleSlot),
+                host_state_snapshot(state)
+            ));
             return result;
         }
 
@@ -339,6 +428,12 @@ unsafe extern "C-unwind" fn exec_pg_fusion_scan(
             .as_ref()
             .is_some_and(ResultIngress::is_complete)
         {
+            host_diag(format!(
+                "pg_fusion exec returning EOF scan_slot={} result_slot={} state={}",
+                tuple_slot_snapshot((*node).ss.ss_ScanTupleSlot),
+                tuple_slot_snapshot((*node).ss.ps.ps_ResultTupleSlot),
+                host_state_snapshot(state)
+            ));
             return std::ptr::null_mut();
         }
 
@@ -362,6 +457,7 @@ unsafe extern "C-unwind" fn end_pg_fusion_scan(node: *mut CustomScanState) {
     state.pending_complete_session_epoch = None;
     state.result_ingress.take();
     state.control_lease.take();
+    drop_owned_result_slot(node, state);
 
     let host_state = std::mem::replace(&mut state_from_node(node).state, std::ptr::null_mut());
     if !host_state.is_null() {
@@ -571,7 +667,11 @@ fn poll_scan_peers(state: &mut HostScanState) -> Result<bool, BackendServiceErro
     Ok(progressed)
 }
 
-fn drive_active_scans(state: &mut HostScanState) -> Result<bool, BackendServiceError> {
+fn drive_active_scans(
+    state: &mut HostScanState,
+    scan_slot: *mut pg_sys::TupleTableSlot,
+    result_slot: *mut pg_sys::TupleTableSlot,
+) -> Result<bool, BackendServiceError> {
     let scan_ids = state.active_drivers.keys().copied().collect::<Vec<_>>();
     let mut progressed = false;
     for scan_id in scan_ids {
@@ -701,7 +801,7 @@ fn drive_active_scans(state: &mut HostScanState) -> Result<bool, BackendServiceE
         }
     }
     if state.active_drivers.is_empty() && result_ingress_complete(state) {
-        progressed |= flush_pending_complete(state)?;
+        progressed |= flush_pending_complete(state, scan_slot, result_slot)?;
     }
     Ok(progressed)
 }
@@ -713,13 +813,20 @@ fn result_ingress_complete(state: &HostScanState) -> bool {
         .is_none_or(ResultIngress::is_complete)
 }
 
-fn flush_pending_complete(state: &mut HostScanState) -> Result<bool, BackendServiceError> {
+fn flush_pending_complete(
+    state: &mut HostScanState,
+    scan_slot: *mut pg_sys::TupleTableSlot,
+    result_slot: *mut pg_sys::TupleTableSlot,
+) -> Result<bool, BackendServiceError> {
     let Some(session_epoch) = state.pending_complete_session_epoch.take() else {
         return Ok(false);
     };
     host_diag(format!(
-        "pg_fusion flushing pending CompleteExecution session_epoch={} state={}",
+        "pg_fusion flushing pending CompleteExecution session_epoch={} scan_slot={} result_slot={} current_mcxt={:p} state={}",
         session_epoch,
+        tuple_slot_snapshot(scan_slot),
+        tuple_slot_snapshot(result_slot),
+        unsafe { pg_sys::CurrentMemoryContext },
         host_state_snapshot(state)
     ));
     let slot_id = state
@@ -730,8 +837,11 @@ fn flush_pending_complete(state: &mut HostScanState) -> Result<bool, BackendServ
     let _ = BackendService::accept_complete_execution(slot_id, session_epoch)?;
     state.execution_key = None;
     host_diag(format!(
-        "pg_fusion accepted backend CompleteExecution session_epoch={} state_after={}",
+        "pg_fusion accepted backend CompleteExecution session_epoch={} scan_slot={} result_slot={} current_mcxt={:p} state_after={}",
         session_epoch,
+        tuple_slot_snapshot(scan_slot),
+        tuple_slot_snapshot(result_slot),
+        unsafe { pg_sys::CurrentMemoryContext },
         host_state_snapshot(state)
     ));
     Ok(true)
@@ -881,13 +991,39 @@ fn active_driver_keys(state: &HostScanState) -> Vec<u64> {
 
 fn host_state_snapshot(state: &HostScanState) -> String {
     format!(
-        "execution_key={:?} pending_complete={:?} active_drivers={:?} scan_peers={:?} result_complete={:?}",
+        "execution_key={:?} pending_complete={:?} active_drivers={:?} scan_peers={:?} result_complete={:?} owns_result_slot={}",
         state.execution_key,
         state.pending_complete_session_epoch,
         active_driver_keys(state),
         scan_peer_keys(state),
-        state.result_ingress.as_ref().map(ResultIngress::is_complete)
+        state.result_ingress.as_ref().map(ResultIngress::is_complete),
+        state.owns_result_slot,
     )
+}
+
+fn tuple_slot_snapshot(slot: *mut pg_sys::TupleTableSlot) -> String {
+    if slot.is_null() {
+        return "slot=null".to_string();
+    }
+
+    unsafe {
+        let flags = (*slot).tts_flags as u32;
+        let ops = if (*slot).tts_ops == &raw const pg_sys::TTSOpsMinimalTuple {
+            "minimal"
+        } else if (*slot).tts_ops == &raw const pg_sys::TTSOpsVirtual {
+            "virtual"
+        } else {
+            "other"
+        };
+        format!(
+            "slot={:p} ops={} flags=0x{:x} tupdesc={:p} mcxt={:p}",
+            slot,
+            ops,
+            flags,
+            (*slot).tts_tupleDescriptor,
+            (*slot).tts_mcxt,
+        )
+    }
 }
 
 fn host_diag(message: String) {
@@ -925,6 +1061,20 @@ fn host_diag_write_file(message: &str) {
 unsafe fn tuple_desc_from_scan(node: *mut CustomScanState) -> pg_sys::TupleDesc {
     let plan = (*node).ss.ps.plan as *mut CustomScan;
     pg_sys::ExecTypeFromTL((*plan).custom_scan_tlist)
+}
+
+unsafe fn tuple_desc_for_slots(node: *mut CustomScanState) -> pg_sys::TupleDesc {
+    let scan_slot = (*node).ss.ss_ScanTupleSlot;
+    if !scan_slot.is_null() && !(*scan_slot).tts_tupleDescriptor.is_null() {
+        return (*scan_slot).tts_tupleDescriptor;
+    }
+
+    let result_slot = (*node).ss.ps.ps_ResultTupleSlot;
+    if !result_slot.is_null() && !(*result_slot).tts_tupleDescriptor.is_null() {
+        return (*result_slot).tts_tupleDescriptor;
+    }
+
+    tuple_desc_from_scan(node)
 }
 
 fn truncate_scan_failure_message(message: &str) -> String {
