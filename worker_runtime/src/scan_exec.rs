@@ -1,7 +1,9 @@
 use std::any::Any;
+use std::collections::BTreeMap;
 use std::sync::Arc;
 
 use arrow_schema::SchemaRef;
+use control_transport::BackendLeaseSlot;
 use datafusion::physical_plan::execution_plan::{Boundedness, EmissionType};
 use datafusion::physical_plan::{
     DisplayAs, DisplayFormatType, ExecutionPlan, Partitioning, PlanProperties,
@@ -14,11 +16,14 @@ use scan_node::{PgScanExecFactory, PgScanId, PgScanSpec};
 
 /// Worker request for one backend-owned scan.
 ///
-/// The worker-side physical scan only receives stable scan identity and output
-/// schema. Backend-only state such as snapshots, compiled SQL execution, and
-/// table access remains behind `scan_id`.
+/// The worker-side physical scan only receives stable scan identity, output
+/// schema, and the dedicated scan peer published in `StartExecution`.
+/// Backend-only state such as snapshots, compiled SQL execution, and table
+/// access remains behind `scan_id`.
 #[derive(Debug, Clone)]
 pub struct OpenScanRequest {
+    /// Dedicated scan slot chosen by the backend for this `scan_id`.
+    pub peer: BackendLeaseSlot,
     pub session_epoch: u64,
     pub scan_id: PgScanId,
     pub output_schema: SchemaRef,
@@ -29,8 +34,8 @@ pub struct OpenScanRequest {
 /// Runtime-specific source of scan batches.
 ///
 /// Production implementations are expected to send
-/// `runtime_protocol::WorkerScanToBackend::OpenScan` over the dedicated scan
-/// slot, drive `scan_flow::WorkerScanRole`, and import pages with
+/// `runtime_protocol::WorkerScanToBackend::OpenScan` over `request.peer`,
+/// drive `scan_flow::WorkerScanRole`, and import pages with
 /// `ArrowPageDecoder`. Tests can provide an in-memory source.
 pub trait ScanBatchSource: std::fmt::Debug + Send + Sync {
     fn open_scan(&self, request: OpenScanRequest) -> DFResult<SendableRecordBatchStream>;
@@ -40,6 +45,7 @@ pub trait ScanBatchSource: std::fmt::Debug + Send + Sync {
 pub struct WorkerPgScanExecFactory {
     session_epoch: u64,
     source: Arc<dyn ScanBatchSource>,
+    scan_peers: BTreeMap<u64, BackendLeaseSlot>,
     page_kind: transfer::MessageKind,
     page_flags: u16,
 }
@@ -48,12 +54,14 @@ impl WorkerPgScanExecFactory {
     pub fn new(
         session_epoch: u64,
         source: Arc<dyn ScanBatchSource>,
+        scan_peers: BTreeMap<u64, BackendLeaseSlot>,
         page_kind: transfer::MessageKind,
         page_flags: u16,
     ) -> Self {
         Self {
             session_epoch,
             source,
+            scan_peers,
             page_kind,
             page_flags,
         }
@@ -64,6 +72,7 @@ impl std::fmt::Debug for WorkerPgScanExecFactory {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("WorkerPgScanExecFactory")
             .field("session_epoch", &self.session_epoch)
+            .field("scan_peer_count", &self.scan_peers.len())
             .field("page_kind", &self.page_kind)
             .field("page_flags", &self.page_flags)
             .finish_non_exhaustive()
@@ -72,7 +81,17 @@ impl std::fmt::Debug for WorkerPgScanExecFactory {
 
 impl PgScanExecFactory for WorkerPgScanExecFactory {
     fn create(&self, spec: Arc<PgScanSpec>) -> DFResult<Arc<dyn ExecutionPlan>> {
+        let peer = self
+            .scan_peers
+            .get(&spec.scan_id.get())
+            .copied()
+            .ok_or_else(|| {
+                DataFusionError::External(Box::new(crate::WorkerRuntimeError::MissingScanPeer {
+                    scan_id: spec.scan_id.get(),
+                }))
+            })?;
         Ok(Arc::new(WorkerPgScanExec::new(
+            peer,
             self.session_epoch,
             spec,
             Arc::clone(&self.source),
@@ -84,6 +103,7 @@ impl PgScanExecFactory for WorkerPgScanExecFactory {
 
 #[derive(Debug)]
 pub struct WorkerPgScanExec {
+    peer: BackendLeaseSlot,
     session_epoch: u64,
     spec: Arc<PgScanSpec>,
     output_schema: SchemaRef,
@@ -95,6 +115,7 @@ pub struct WorkerPgScanExec {
 
 impl WorkerPgScanExec {
     pub fn new(
+        peer: BackendLeaseSlot,
         session_epoch: u64,
         spec: Arc<PgScanSpec>,
         source: Arc<dyn ScanBatchSource>,
@@ -109,6 +130,7 @@ impl WorkerPgScanExec {
             Boundedness::Bounded,
         );
         Self {
+            peer,
             session_epoch,
             spec,
             output_schema,
@@ -121,6 +143,10 @@ impl WorkerPgScanExec {
 
     pub fn scan_id(&self) -> PgScanId {
         self.spec.scan_id
+    }
+
+    pub fn peer(&self) -> BackendLeaseSlot {
+        self.peer
     }
 
     pub fn session_epoch(&self) -> u64 {
@@ -188,6 +214,7 @@ impl ExecutionPlan for WorkerPgScanExec {
         }
 
         self.source.open_scan(OpenScanRequest {
+            peer: self.peer,
             session_epoch: self.session_epoch,
             scan_id: self.spec.scan_id,
             output_schema: Arc::clone(&self.output_schema),
@@ -205,6 +232,7 @@ impl ExecutionPlan for WorkerPgScanExec {
 mod tests {
     use super::*;
 
+    use std::collections::BTreeMap;
     use std::pin::Pin;
     use std::sync::Mutex;
     use std::task::{Context, Poll};
@@ -300,13 +328,22 @@ mod tests {
     #[test]
     fn factory_builds_worker_pg_scan_exec() {
         let source = Arc::new(RecordingSource::new());
-        let factory = WorkerPgScanExecFactory::new(99, source, 0x4152, 0);
+        let mut scan_peers = BTreeMap::new();
+        scan_peers.insert(
+            7,
+            BackendLeaseSlot::new(0, control_transport::BackendLeaseId::new(1, 1)),
+        );
+        let factory = WorkerPgScanExecFactory::new(99, source, scan_peers, 0x4152, 0);
         let plan = factory.create(spec(7)).unwrap();
 
         let exec = plan
             .as_any()
             .downcast_ref::<WorkerPgScanExec>()
             .expect("worker scan exec");
+        assert_eq!(
+            exec.peer(),
+            BackendLeaseSlot::new(0, control_transport::BackendLeaseId::new(1, 1))
+        );
         assert_eq!(exec.session_epoch(), 99);
         assert_eq!(exec.scan_id(), PgScanId::new(7));
         assert_eq!(exec.name(), "WorkerPgScanExec");
@@ -315,13 +352,15 @@ mod tests {
     #[test]
     fn execute_uses_scan_id_and_schema_from_spec() {
         let source = Arc::new(RecordingSource::new());
-        let exec = WorkerPgScanExec::new(100, spec(8), source.clone(), 0x4152, 0);
+        let peer = BackendLeaseSlot::new(2, control_transport::BackendLeaseId::new(1, 3));
+        let exec = WorkerPgScanExec::new(peer, 100, spec(8), source.clone(), 0x4152, 0);
         let ctx = Arc::new(TaskContext::default());
         let stream = exec.execute(0, ctx).unwrap();
 
         assert_eq!(stream.schema().fields().len(), 1);
         let requests = source.requests.lock().unwrap();
         assert_eq!(requests.len(), 1);
+        assert_eq!(requests[0].peer, peer);
         assert_eq!(requests[0].session_epoch, 100);
         assert_eq!(requests[0].scan_id, PgScanId::new(8));
         assert_eq!(requests[0].page_kind, 0x4152);
@@ -331,12 +370,31 @@ mod tests {
     #[test]
     fn execute_rejects_nonzero_partition() {
         let source = Arc::new(RecordingSource::new());
-        let exec = WorkerPgScanExec::new(100, spec(9), source, 0x4152, 0);
+        let exec = WorkerPgScanExec::new(
+            BackendLeaseSlot::new(3, control_transport::BackendLeaseId::new(1, 4)),
+            100,
+            spec(9),
+            source,
+            0x4152,
+            0,
+        );
         let err = match exec.execute(1, Arc::new(TaskContext::default())) {
             Ok(_) => panic!("nonzero partition should fail"),
             Err(err) => err,
         };
 
         assert!(err.to_string().contains("one partition"));
+    }
+
+    #[test]
+    fn factory_rejects_missing_scan_peer_mapping() {
+        let source = Arc::new(RecordingSource::new());
+        let err = WorkerPgScanExecFactory::new(99, source, BTreeMap::new(), 0x4152, 0)
+            .create(spec(7))
+            .expect_err("missing scan peer mapping should fail");
+
+        assert!(err
+            .to_string()
+            .contains("no dedicated scan peer was published for scan_id 7"));
     }
 }

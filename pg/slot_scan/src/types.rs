@@ -2,6 +2,7 @@ use crate::error::SinkError;
 use pgrx::pg_sys;
 use std::ffi::c_void;
 use std::marker::PhantomData;
+use std::rc::Rc;
 use std::sync::Arc;
 
 /// Options that affect one `slot_scan` execution.
@@ -256,18 +257,42 @@ impl PreparedScan {
     }
 }
 
+#[derive(Debug)]
+pub(crate) struct ExecutionSpiConnection;
+
+impl Drop for ExecutionSpiConnection {
+    fn drop(&mut self) {
+        unsafe {
+            let _ = pg_sys::SPI_finish();
+        }
+    }
+}
+
+/// Internal execution-scoped SPI connection shared across one or more
+/// streaming scan portals.
+///
+/// This type is intentionally hidden from normal crate docs. It exists so
+/// backend-side multi-scan execution can keep one PostgreSQL SPI connection
+/// alive while switching between multiple open portals.
+#[doc(hidden)]
+#[derive(Clone, Debug)]
+pub struct ExecutionSpiContext {
+    pub(crate) _inner: Rc<ExecutionSpiConnection>,
+}
+
 /// Internal stackful scan session used by backend-side page streaming.
 ///
 /// This type is intentionally hidden from normal crate docs. It is not a
-/// durable resumable cursor: it keeps one SPI connection, one portal, and the
-/// current fetched batch alive across calls. Callers must not interleave other
-/// SPI or planning work while a session is active.
+/// durable resumable cursor: it keeps one portal and the current fetched batch
+/// alive across calls, and it relies on an execution-scoped SPI connection
+/// remaining active for the lifetime of the session. Callers must not
+/// interleave other SPI or planning work while such sessions are active.
 #[doc(hidden)]
 #[derive(Debug)]
 pub struct StreamingScanSession {
     pub(crate) prepared: PreparedScan,
+    pub(crate) _spi: ExecutionSpiContext,
     pub(crate) portal: pg_sys::Portal,
-    pub(crate) spi_connected: bool,
     pub(crate) slot: *mut pg_sys::TupleTableSlot,
     pub(crate) fetch_batch_rows: usize,
     pub(crate) batch: *mut pg_sys::SPITupleTable,

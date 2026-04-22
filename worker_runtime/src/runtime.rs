@@ -1,6 +1,9 @@
+use std::collections::BTreeMap;
 use std::sync::Arc;
 
-use control_transport::{BackendLeaseSlot, CommitOutcome, TransportRegion, WorkerTransport};
+use control_transport::{
+    BackendLeaseId, BackendLeaseSlot, CommitOutcome, TransportRegion, WorkerTransport,
+};
 use datafusion::config::ConfigOptions;
 use datafusion::execution::SessionState;
 use datafusion::execution::SessionStateBuilder;
@@ -69,6 +72,7 @@ pub struct PendingPhysicalPlanning {
     flow: PlanFlowId,
     config: WorkerRuntimeConfig,
     scan_source: Arc<dyn ScanBatchSource>,
+    scan_peers: BTreeMap<u64, BackendLeaseSlot>,
     logical_plan: LogicalPlan,
 }
 
@@ -124,6 +128,7 @@ pub struct WorkerRuntimeCore {
     active_session_epoch: Option<u64>,
     latest_session: Option<RetainedSession>,
     active_plan_flow: Option<PlanFlowId>,
+    scan_peers: BTreeMap<u64, BackendLeaseSlot>,
     plan_role: WorkerPlanRole,
     scan_source: Arc<dyn ScanBatchSource>,
     physical_plan: Option<Arc<dyn ExecutionPlan>>,
@@ -137,6 +142,7 @@ impl std::fmt::Debug for WorkerRuntimeCore {
             .field("active_session_epoch", &self.active_session_epoch)
             .field("latest_session", &self.latest_session)
             .field("active_plan_flow", &self.active_plan_flow)
+            .field("scan_peer_count", &self.scan_peers.len())
             .field("has_physical_plan", &self.physical_plan.is_some())
             .finish()
     }
@@ -152,6 +158,7 @@ impl WorkerRuntimeCore {
             active_session_epoch: None,
             latest_session: None,
             active_plan_flow: None,
+            scan_peers: BTreeMap::new(),
             plan_role: WorkerPlanRole::new(),
             scan_source,
             physical_plan: None,
@@ -232,8 +239,8 @@ impl WorkerRuntimeCore {
             BackendToWorkerRef::StartExecution {
                 session_epoch,
                 plan,
-                scans: _,
-            } => self.start_execution(peer, session_epoch, plan),
+                scans,
+            } => self.start_execution(peer, session_epoch, plan, scans),
             BackendToWorkerRef::CancelExecution { session_epoch } => {
                 self.cancel_execution(peer, session_epoch)
             }
@@ -392,6 +399,7 @@ impl WorkerRuntimeCore {
             flow,
             config: self.config.clone(),
             scan_source: Arc::clone(&self.scan_source),
+            scan_peers: self.scan_peers.clone(),
             logical_plan,
         }
     }
@@ -433,6 +441,7 @@ impl WorkerRuntimeCore {
         peer: BackendLeaseSlot,
         session_epoch: u64,
         plan: runtime_protocol::PlanFlowDescriptor,
+        scans: runtime_protocol::ScanChannelSetRef<'_>,
     ) -> Result<WorkerRuntimeStep, WorkerRuntimeError> {
         if self.state() != WorkerExecutionState::Idle {
             return Err(WorkerRuntimeError::InvalidState {
@@ -455,6 +464,7 @@ impl WorkerRuntimeCore {
             session_epoch,
             plan_id: plan.plan_id,
         };
+        let scan_peers = materialize_scan_peer_map(scans)?;
         self.plan_role
             .open(PlanOpen::new(flow, plan.page_kind, plan.page_flags))?;
         self.active_peer = Some(peer);
@@ -464,6 +474,7 @@ impl WorkerRuntimeCore {
             session_epoch,
         });
         self.active_plan_flow = Some(flow);
+        self.scan_peers = scan_peers;
         self.physical_plan = None;
         Ok(WorkerRuntimeStep::PlanOpened {
             session_epoch,
@@ -573,6 +584,7 @@ impl WorkerRuntimeCore {
         self.active_peer = None;
         self.active_session_epoch = None;
         self.active_plan_flow = None;
+        self.scan_peers.clear();
         self.plan_role.abort();
         self.physical_plan = None;
     }
@@ -627,6 +639,7 @@ impl PendingPhysicalPlanning {
         let factory = WorkerPgScanExecFactory::new(
             self.flow.session_epoch,
             Arc::clone(&self.scan_source),
+            self.scan_peers,
             self.config.scan_page_kind,
             self.config.scan_page_flags,
         );
@@ -638,6 +651,31 @@ impl PendingPhysicalPlanning {
             .create_physical_plan(&self.logical_plan, &session_state)
             .await?)
     }
+}
+
+fn materialize_scan_peer_map(
+    scans: runtime_protocol::ScanChannelSetRef<'_>,
+) -> Result<BTreeMap<u64, BackendLeaseSlot>, WorkerRuntimeError> {
+    let mut scan_peers = BTreeMap::new();
+    for channel in scans.iter() {
+        let previous =
+            scan_peers.insert(channel.scan_id, backend_lease_slot_from_wire(channel.peer));
+        if previous.is_some() {
+            return Err(WorkerRuntimeError::RuntimeDecode(
+                runtime_protocol::DecodeError::DuplicateScanId {
+                    scan_id: channel.scan_id,
+                },
+            ));
+        }
+    }
+    Ok(scan_peers)
+}
+
+fn backend_lease_slot_from_wire(peer: runtime_protocol::BackendLeaseSlotWire) -> BackendLeaseSlot {
+    BackendLeaseSlot::new(
+        peer.slot_id(),
+        BackendLeaseId::new(peer.generation(), peer.lease_epoch()),
+    )
 }
 
 fn build_worker_planning_session_state() -> SessionState {
@@ -794,7 +832,8 @@ mod tests {
     use issuance::{IssuanceConfig, IssuancePool, IssuedTx};
     use pool::{PagePool, PagePoolConfig};
     use runtime_protocol::{
-        BackendExecutionToWorker as BackendToWorker, PlanFlowDescriptor, ScanChannelSet,
+        BackendExecutionToWorker as BackendToWorker, BackendLeaseSlotWire, PlanFlowDescriptor,
+        ScanChannelDescriptorWire, ScanChannelSet,
     };
     use transfer::{PageRx, PageTx};
 
@@ -885,7 +924,7 @@ mod tests {
     fn accept_from_peer(
         core: &mut WorkerRuntimeCore,
         peer: BackendLeaseSlot,
-        message: BackendToWorker<'static>,
+        message: BackendToWorker<'_>,
     ) -> Result<WorkerRuntimeStep, WorkerRuntimeError> {
         let mut encoded =
             vec![0_u8; runtime_protocol::encoded_len_backend_execution_to_worker(message)];
@@ -899,7 +938,7 @@ mod tests {
 
     fn accept(
         core: &mut WorkerRuntimeCore,
-        message: BackendToWorker<'static>,
+        message: BackendToWorker<'_>,
     ) -> Result<WorkerRuntimeStep, WorkerRuntimeError> {
         accept_from_peer(core, peer_a(), message)
     }
@@ -909,6 +948,17 @@ mod tests {
             plan_id,
             page_kind: 0x5150,
             page_flags: 0,
+        }
+    }
+
+    fn scan_channel(scan_id: u64, peer: BackendLeaseSlot) -> ScanChannelDescriptorWire {
+        ScanChannelDescriptorWire {
+            scan_id,
+            peer: BackendLeaseSlotWire::new(
+                peer.slot_id(),
+                peer.lease_id().generation(),
+                peer.lease_id().lease_epoch(),
+            ),
         }
     }
 
@@ -1015,6 +1065,46 @@ mod tests {
         ));
         assert_eq!(core.state(), WorkerExecutionState::ReceivingPlan);
         assert_eq!(core.session_epoch(), Some(10));
+    }
+
+    #[test]
+    fn start_execution_retains_scan_peers_and_cleanup_clears_them() {
+        let mut core = core();
+        let channels = [scan_channel(7, peer_a()), scan_channel(8, peer_b())];
+        let step = accept(
+            &mut core,
+            BackendToWorker::StartExecution {
+                session_epoch: 10,
+                plan: plan_descriptor(20),
+                scans: ScanChannelSet::new(&channels).unwrap(),
+            },
+        )
+        .unwrap();
+
+        assert!(matches!(
+            step,
+            WorkerRuntimeStep::PlanOpened {
+                session_epoch: 10,
+                plan_id: 20
+            }
+        ));
+        assert_eq!(core.scan_peers.get(&7), Some(&peer_a()));
+        assert_eq!(core.scan_peers.get(&8), Some(&peer_b()));
+
+        let cancelled = accept(
+            &mut core,
+            BackendToWorker::CancelExecution { session_epoch: 10 },
+        )
+        .unwrap();
+        assert!(matches!(
+            cancelled,
+            WorkerRuntimeStep::ExecutionCancelled { session_epoch: 10 }
+        ));
+        assert_eq!(core.state(), WorkerExecutionState::Terminal);
+        assert_eq!(core.scan_peers.len(), 0);
+
+        core.cleanup().unwrap();
+        assert!(core.scan_peers.is_empty());
     }
 
     #[test]

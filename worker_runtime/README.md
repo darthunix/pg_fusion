@@ -9,7 +9,8 @@ messages, receives logical plans through `plan_flow`, lowers `PgScanNode`
 locally, and imports scan pages through `page/import`.
 
 Snapshot ownership is backend-only. The worker requests scans by `scan_id` and
-does not expose an explain path.
+the dedicated scan peer published in `StartExecution`; it does not expose an
+explain path.
 
 Typical control-path usage:
 
@@ -52,7 +53,7 @@ Typical scan-open control encoding without heap allocation:
 use worker_runtime::{ScanFlowDriver, ScanFlowOpen};
 
 let (driver, open_scan) = ScanFlowDriver::open(open, issued_rx)?;
-transport.send_peer_encoded(peer, |scratch| open_scan.encode_into(scratch))?;
+transport.send_peer_encoded(request.peer, |scratch| open_scan.encode_into(scratch))?;
 # let _ = driver;
 # Ok::<(), worker_runtime::WorkerRuntimeError>(())
 ```

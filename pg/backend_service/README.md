@@ -93,16 +93,20 @@ Typical backend flow:
 
 ```rust,ignore
 use backend_service::{BackendService, StartExecutionInput};
+use control_transport::TransportRegion;
+
+let scan_slot_region: &TransportRegion = /* dedicated scan-slot region */;
 
 let begin = BackendService::begin_execution(StartExecutionInput {
     slot_id,
     sql,
     params,
     plan_tx,
+    scan_slot_region,
     config,
 })?;
 
-send_control(begin.control)?;
+send_control(begin.control())?;
 
 loop {
     match BackendService::step_execution_start()? {
@@ -132,7 +136,7 @@ use backend_service::{
 };
 
 if let Some(mut driver) = BackendService::open_scan(OpenScanInput {
-    slot_id,
+    peer,
     session_epoch,
     scan_id,
     scan,
@@ -182,7 +186,6 @@ Explain stays backend-local:
 ## Non-goals
 
 - multiple concurrent executions in one backend process
-- multiple simultaneously streaming scans in one execution
 - doing unrelated SPI/planning work while an `ActiveScanDriver` is alive
 - resumable public scan cursors that survive arbitrary retry-later boundaries
 - worker-side snapshot ownership

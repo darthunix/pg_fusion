@@ -1,12 +1,21 @@
 use crate::fsm::BackendExecutionState;
+use control_transport::{AcquireError, BackendLeaseSlot};
 use thiserror::Error;
 
 #[derive(Debug, Error)]
 pub enum BackendServiceError {
     #[error("a backend execution is already active in this process")]
     ExecutionAlreadyActive,
-    #[error("cannot {action} while scan driver for scan_id {scan_id} is active")]
-    ScanDriverActive { action: &'static str, scan_id: u64 },
+    #[error("cannot {action} while {count} scan stream(s) are still active")]
+    ActiveScansStillStreaming { action: &'static str, count: usize },
+    #[error(
+        "cannot {action} while {unfinished_count} scan(s) are not terminal ({active_count} currently active)"
+    )]
+    ExecutionScansNotTerminal {
+        action: &'static str,
+        active_count: usize,
+        unfinished_count: usize,
+    },
     #[error("no active backend execution")]
     NoActiveExecution,
     #[error("no active backend scan stream")]
@@ -36,6 +45,14 @@ pub enum BackendServiceError {
     ScanAlreadyStreaming { scan_id: u64 },
     #[error("active scan stream does not match cancel request for scan_id {scan_id}")]
     ScanNotActive { scan_id: u64 },
+    #[error(
+        "scan {scan_id} was opened on unexpected dedicated peer {incoming:?}; expected {expected:?}"
+    )]
+    ScanPeerMismatch {
+        scan_id: u64,
+        expected: BackendLeaseSlot,
+        incoming: BackendLeaseSlot,
+    },
     #[error("scan {scan_id} did not produce a logical terminal event on EOF")]
     MissingLogicalTerminal { scan_id: u64 },
     #[error("scan {scan_id} output field {index} has unsupported Arrow type {data_type}")]
@@ -68,6 +85,8 @@ pub enum BackendServiceError {
     SlotEncoderConfig(#[from] slot_encoder::ConfigError),
     #[error("slot encoder failed: {0}")]
     SlotEncode(#[from] slot_encoder::EncodeError),
+    #[error("scan slot acquisition failed: {0}")]
+    ScanSlotAcquire(#[from] AcquireError),
     #[error("backend scan page source failed: {0}")]
     PageSource(String),
     #[error("PostgreSQL error: {0}")]

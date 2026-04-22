@@ -53,7 +53,7 @@ mod types;
 pub use error::{ScanError, SinkError};
 pub use plan::prepare_scan;
 #[doc(hidden)]
-pub use types::StreamingScanSession;
+pub use types::{ExecutionSpiContext, StreamingScanSession};
 pub use types::{
     PreparedScan, ScanOptions, ScanPlanKind, ScanStats, SlotSink, SlotSinkAction, SlotSinkContext,
     SlotSinkMethods,

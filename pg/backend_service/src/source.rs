@@ -4,10 +4,11 @@ use arrow_schema::SchemaRef;
 use row_estimator::PageRowEstimator;
 use scan_flow::{BackendPageSource, FlowId, SourcePageStatus};
 use slot_encoder::{AppendStatus, PageBatchEncoder};
-use slot_scan::{PreparedScan, StreamingScanSession};
+use slot_scan::{ExecutionSpiContext, PreparedScan, StreamingScanSession};
 
 pub(crate) struct SlotScanPageSource {
     snapshot: pgrx::pg_sys::Snapshot,
+    spi: ExecutionSpiContext,
     prepared: PreparedScan,
     schema: SchemaRef,
     block_size: u32,
@@ -19,6 +20,7 @@ pub(crate) struct SlotScanPageSource {
 impl SlotScanPageSource {
     pub(crate) fn new(
         snapshot: pgrx::pg_sys::Snapshot,
+        spi: ExecutionSpiContext,
         prepared: PreparedScan,
         schema: SchemaRef,
         block_size: u32,
@@ -27,6 +29,7 @@ impl SlotScanPageSource {
     ) -> Self {
         Self {
             snapshot,
+            spi,
             prepared,
             schema,
             block_size,
@@ -100,7 +103,7 @@ impl BackendPageSource for SlotScanPageSource {
     fn open(&mut self, _flow: FlowId) -> Result<(), Self::Error> {
         let session = with_registered_snapshot(self.snapshot, || {
             self.prepared
-                .open_streaming_session(self.fetch_batch_rows)
+                .open_streaming_session_in(&self.spi, self.fetch_batch_rows)
                 .map_err(BackendServiceError::PrepareScan)
         })?;
         self.session = Some(session);

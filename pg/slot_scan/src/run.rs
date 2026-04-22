@@ -1,14 +1,15 @@
 use crate::error::{ScanError, SinkError};
 use crate::plan::{inspect_planned_stmt, scan_error_from_caught_error, spi_status_error};
 use crate::types::{
-    PreparedScan, ScanStats, SlotSink, SlotSinkAction, SlotSinkContext, SlotSinkMethods,
-    StreamingScanSession,
+    ExecutionSpiConnection, ExecutionSpiContext, PreparedScan, ScanStats, SlotSink, SlotSinkAction,
+    SlotSinkContext, SlotSinkMethods, StreamingScanSession,
 };
 use pgrx::pg_sys;
 use pgrx::PgTryBuilder;
 use std::cell::Cell;
 use std::ffi::c_void;
 use std::panic::AssertUnwindSafe;
+use std::rc::Rc;
 
 const DEFAULT_FETCH_BATCH_ROWS: usize = 1024;
 
@@ -64,19 +65,22 @@ impl PreparedScan {
         &self,
         fetch_batch_rows: usize,
     ) -> Result<StreamingScanSession, ScanError> {
+        let spi = ExecutionSpiContext::connect()?;
+        self.open_streaming_session_in(&spi, fetch_batch_rows)
+    }
+
+    #[doc(hidden)]
+    pub fn open_streaming_session_in(
+        &self,
+        spi: &ExecutionSpiContext,
+        fetch_batch_rows: usize,
+    ) -> Result<StreamingScanSession, ScanError> {
         let fetch_batch_rows = normalize_fetch_batch_rows(fetch_batch_rows);
         let portal = Cell::new(std::ptr::null_mut());
         let slot = Cell::new(std::ptr::null_mut());
-        let connected = Cell::new(false);
         let success = Cell::new(false);
 
         PgTryBuilder::new(AssertUnwindSafe(|| unsafe {
-            let connect_rc = pg_sys::SPI_connect();
-            if connect_rc != pg_sys::SPI_OK_CONNECT as i32 {
-                return Err(spi_status_error("SPI_connect", connect_rc));
-            }
-            connected.set(true);
-
             portal.set(pg_sys::SPI_cursor_open(
                 std::ptr::null(),
                 self.plan.as_ptr(),
@@ -112,8 +116,8 @@ impl PreparedScan {
             success.set(true);
             Ok(StreamingScanSession {
                 prepared: self.clone(),
+                _spi: spi.clone(),
                 portal: portal.get(),
-                spi_connected: true,
                 slot: slot.get(),
                 fetch_batch_rows,
                 batch: std::ptr::null_mut(),
@@ -140,10 +144,6 @@ impl PreparedScan {
                 if !portal.get().is_null() {
                     pg_sys::SPI_cursor_close(portal.get());
                     portal.set(std::ptr::null_mut());
-                }
-                if connected.get() {
-                    let _ = pg_sys::SPI_finish();
-                    connected.set(false);
                 }
             }
         })
@@ -340,7 +340,6 @@ impl StreamingScanSession {
         let portal = std::mem::replace(&mut self.portal, std::ptr::null_mut());
         let slot = std::mem::replace(&mut self.slot, std::ptr::null_mut());
         let batch = std::mem::replace(&mut self.batch, std::ptr::null_mut());
-        let spi_connected = std::mem::replace(&mut self.spi_connected, false);
         self.batch_processed = 0;
         self.batch_index = 0;
         self.row_loaded = false;
@@ -359,12 +358,6 @@ impl StreamingScanSession {
             if !portal.is_null() {
                 pg_sys::SPI_cursor_close(portal);
             }
-            if spi_connected {
-                let finish_rc = pg_sys::SPI_finish();
-                if finish_rc != pg_sys::SPI_OK_FINISH as i32 {
-                    return Err(spi_status_error("SPI_finish", finish_rc));
-                }
-            }
             Ok(())
         }))
         .catch_others(|error| Err(scan_error_from_caught_error(error)))
@@ -382,6 +375,23 @@ impl StreamingScanSession {
 impl Drop for StreamingScanSession {
     fn drop(&mut self) {
         self.best_effort_close();
+    }
+}
+
+impl ExecutionSpiContext {
+    #[doc(hidden)]
+    pub fn connect() -> Result<Self, ScanError> {
+        PgTryBuilder::new(AssertUnwindSafe(|| unsafe {
+            let connect_rc = pg_sys::SPI_connect();
+            if connect_rc != pg_sys::SPI_OK_CONNECT as i32 {
+                return Err(spi_status_error("SPI_connect", connect_rc));
+            }
+            Ok(Self {
+                _inner: Rc::new(ExecutionSpiConnection),
+            })
+        }))
+        .catch_others(|error| Err(scan_error_from_caught_error(error)))
+        .execute()
     }
 }
 

@@ -268,6 +268,16 @@ mod tests {
     }
 
     #[pg_test]
+    fn backend_service_interleaves_two_scan_portals_under_shared_spi() {
+        super::backend_service::backend_service_interleaves_two_scan_portals_under_shared_spi();
+    }
+
+    #[pg_test]
+    fn backend_service_finished_driver_drop_keeps_sibling_alive() {
+        super::backend_service::backend_service_drop_finished_driver_does_not_cancel_sibling_scan();
+    }
+
+    #[pg_test]
     fn df_catalog_resolves_bare_names_via_search_path() {
         super::df_catalog::df_catalog_resolves_bare_names_via_search_path();
     }

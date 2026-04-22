@@ -174,8 +174,10 @@ Important callback rules:
 `backend_service` also uses a hidden stackful streaming session inside this
 crate. That path is intentionally not part of the public contract:
 
-- it keeps one `SPI_connect()` frame, one portal, and the current fetched batch
-  alive across page-building steps
+- it keeps one execution-scoped `SPI_connect()` frame alive and may switch
+  between multiple open portals inside that shared SPI context
+- each open portal keeps its own current fetched batch alive across
+  page-building steps
 - it exists to minimize PostgreSQL calls, `palloc` churn, and row copies when
   streaming directly from PostgreSQL slots into `slot_encoder`
 - callers must not interleave other SPI or planning work while such a session

@@ -50,6 +50,8 @@ pub enum WorkerRuntimeError {
     },
     #[error("received a future session epoch {incoming}; current epoch is {current}")]
     FutureSession { current: u64, incoming: u64 },
+    #[error("no dedicated scan peer was published for scan_id {scan_id}")]
+    MissingScanPeer { scan_id: u64 },
     #[error("control frame payload is too large for configured scratch buffer")]
     ControlFrameTooLarge,
     #[error("worker runtime has no physical plan yet")]

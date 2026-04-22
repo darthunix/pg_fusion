@@ -1,4 +1,8 @@
 use super::*;
+use crate::envelope::{write_runtime_header_to, BACKEND_EXECUTION_START_TAG, WORKER_SCAN_OPEN_TAG};
+use crate::msgpack::{write_array_len_to, write_u16_to, write_u32_to, write_u64_to, write_u8_to};
+use crate::scan::{PRODUCER_DESCRIPTOR_LEN, SCAN_CHANNEL_DESCRIPTOR_LEN};
+use transfer::MessageKind;
 
 fn plan_descriptor() -> PlanFlowDescriptor {
     PlanFlowDescriptor {
@@ -122,6 +126,43 @@ fn encode_raw_producer_set_array32(entries: &[(u16, u8)]) -> Vec<u8> {
     buf
 }
 
+fn encode_raw_scan_channel_set(entries: &[(u64, BackendLeaseSlotWire)]) -> Vec<u8> {
+    let mut buf = Vec::new();
+    write_array_len_to(
+        &mut buf,
+        u32::try_from(entries.len()).expect("scan channel len"),
+    )
+    .expect("scan channel set len");
+    for &(scan_id, peer) in entries {
+        write_array_len_to(&mut buf, SCAN_CHANNEL_DESCRIPTOR_LEN).expect("scan channel len");
+        write_u64_to(&mut buf, scan_id).expect("scan id");
+        write_u32_to(&mut buf, peer.slot_id()).expect("slot id");
+        write_u64_to(&mut buf, peer.generation()).expect("generation");
+        write_u64_to(&mut buf, peer.lease_epoch()).expect("lease epoch");
+    }
+    buf
+}
+
+fn encode_raw_backend_start_execution(
+    session_epoch: u64,
+    plan: PlanFlowDescriptor,
+    scan_channel_bytes: &[u8],
+) -> Vec<u8> {
+    let mut buf = Vec::new();
+    write_runtime_header_to(
+        &mut buf,
+        RuntimeMessageFamily::BackendExecutionToWorker,
+        BACKEND_EXECUTION_START_TAG,
+    )
+    .expect("runtime header");
+    write_u64_to(&mut buf, session_epoch).expect("session");
+    write_u64_to(&mut buf, plan.plan_id).expect("plan id");
+    write_u16_to(&mut buf, plan.page_kind).expect("page kind");
+    write_u16_to(&mut buf, plan.page_flags).expect("page flags");
+    buf.extend_from_slice(scan_channel_bytes);
+    buf
+}
+
 fn decode_open_scan(message: WorkerScanToBackendRef<'_>) -> (u64, u64, ScanFlowDescriptorRef<'_>) {
     match message {
         WorkerScanToBackendRef::OpenScan {
@@ -237,6 +278,56 @@ fn scan_channel_set_rejects_duplicate_scan_id() {
     ];
     let err = ScanChannelSet::new(&channels).expect_err("duplicate scan id");
     assert_eq!(err, ScanChannelSetError::DuplicateScanId { scan_id: 7 });
+}
+
+#[test]
+fn scan_channel_set_rejects_out_of_order_scan_id() {
+    let channels = [
+        ScanChannelDescriptorWire {
+            scan_id: 8,
+            peer: backend_peer(1, 2, 3),
+        },
+        ScanChannelDescriptorWire {
+            scan_id: 7,
+            peer: backend_peer(4, 5, 6),
+        },
+    ];
+    let err = ScanChannelSet::new(&channels).expect_err("out-of-order scan id");
+    assert_eq!(
+        err,
+        ScanChannelSetError::ScanIdOutOfOrder {
+            previous: 8,
+            current: 7,
+        }
+    );
+}
+
+#[test]
+fn decode_backend_start_execution_rejects_duplicate_scan_id() {
+    let encoded = encode_raw_backend_start_execution(
+        9,
+        plan_descriptor(),
+        &encode_raw_scan_channel_set(&[(7, backend_peer(1, 2, 3)), (7, backend_peer(4, 5, 6))]),
+    );
+    let err = decode_backend_execution_to_worker(&encoded).expect_err("duplicate scan id");
+    assert_eq!(err, DecodeError::DuplicateScanId { scan_id: 7 });
+}
+
+#[test]
+fn decode_backend_start_execution_rejects_out_of_order_scan_id() {
+    let encoded = encode_raw_backend_start_execution(
+        9,
+        plan_descriptor(),
+        &encode_raw_scan_channel_set(&[(8, backend_peer(1, 2, 3)), (7, backend_peer(4, 5, 6))]),
+    );
+    let err = decode_backend_execution_to_worker(&encoded).expect_err("out-of-order scan id");
+    assert_eq!(
+        err,
+        DecodeError::ScanIdOutOfOrder {
+            previous: 8,
+            current: 7,
+        }
+    );
 }
 
 #[test]

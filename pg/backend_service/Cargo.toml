@@ -17,6 +17,7 @@ pg_test = []
 [dependencies]
 arrow-schema = { workspace = true }
 arrow_layout = { path = "../../page/arrow_layout", version = "25.0" }
+control_transport = { path = "../../control_transport", version = "25.0" }
 datafusion-common = { workspace = true }
 datafusion-expr = { workspace = true }
 import = { path = "../../page/import", version = "25.0" }

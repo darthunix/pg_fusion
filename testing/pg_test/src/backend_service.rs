@@ -5,6 +5,7 @@ use backend_service::{
     BeginExecutionOutput, ExecutionKey, OpenScanInput, ScanStreamStep, ScanYieldReason,
     StartExecutionInput,
 };
+use control_transport::{BackendLeaseId, BackendLeaseSlot, TransportRegion, TransportRegionLayout};
 use datafusion_common::ScalarValue;
 use import::{ArrowPageDecoder, ARROW_LAYOUT_BATCH_KIND};
 use issuance::{IssuanceConfig, IssuancePool, IssueEvent, IssuedRx, IssuedTx};
@@ -15,8 +16,8 @@ use pool::{PagePool, PagePoolConfig};
 use runtime_protocol::{
     decode_worker_scan_to_backend, encode_worker_scan_to_backend_into,
     encoded_len_worker_scan_to_backend, BackendExecutionToWorker as BackendToWorker,
-    ExecutionFailureCode, ProducerDescriptorWire, ProducerRole, ScanFlowDescriptor,
-    WorkerScanToBackend, WorkerScanToBackendRef,
+    ExecutionFailureCode, ProducerDescriptorWire, ProducerRole, ScanChannelDescriptorWire,
+    ScanFlowDescriptor, WorkerScanToBackend, WorkerScanToBackendRef,
 };
 use std::alloc::{alloc_zeroed, dealloc, Layout};
 use std::ptr::NonNull;
@@ -54,6 +55,35 @@ struct IssuedTransportHarness {
     _issuance_region: OwnedRegion,
     page_pool: PagePool,
     issuance_pool: IssuancePool,
+}
+
+struct ControlTransportHarness {
+    _region: OwnedRegion,
+    region: TransportRegion,
+}
+
+impl ControlTransportHarness {
+    fn new(slot_count: u32) -> Self {
+        let layout = TransportRegionLayout::new(slot_count, 256, 256).expect("transport layout");
+        let region_mem = OwnedRegion::from_size_align(layout.size, layout.align);
+        let region =
+            unsafe { TransportRegion::init_in_place(region_mem.base, layout.size, layout) }
+                .expect("transport init");
+        assert_eq!(
+            region
+                .activate_worker_generation(std::process::id() as i32)
+                .expect("activate worker generation"),
+            1
+        );
+        Self {
+            _region: region_mem,
+            region,
+        }
+    }
+
+    fn region(&self) -> &TransportRegion {
+        &self.region
+    }
 }
 
 impl IssuedTransportHarness {
@@ -167,6 +197,14 @@ fn test_query() -> String {
     format!("SELECT id, payload FROM {BACKEND_SERVICE_TABLE} WHERE id > 0")
 }
 
+fn self_join_query() -> String {
+    format!(
+        "SELECT l.id, r.payload \
+         FROM {BACKEND_SERVICE_TABLE} AS l \
+         JOIN {BACKEND_SERVICE_TABLE} AS r ON l.id = r.id"
+    )
+}
+
 fn transport_schema(schema: SchemaRef) -> SchemaRef {
     Arc::new(Schema::new(
         schema
@@ -187,6 +225,7 @@ fn begin_and_finalize_execution(
     slot_id: u32,
     sql: &str,
     config: BackendServiceConfig,
+    scan_slots: &TransportRegion,
 ) -> BeginExecutionOutput {
     let plan_transport = IssuedTransportHarness::new();
     let plan_rx = plan_transport.rx();
@@ -195,6 +234,7 @@ fn begin_and_finalize_execution(
         sql,
         params: Vec::<ScalarValue>::new(),
         plan_tx: plan_transport.tx(),
+        scan_slot_region: scan_slots,
         config,
     })
     .expect("begin execution");
@@ -202,11 +242,12 @@ fn begin_and_finalize_execution(
     let BackendToWorker::StartExecution {
         session_epoch,
         plan,
-        scans: _,
-    } = begin.control
+        scans,
+    } = begin.control()
     else {
         panic!("begin execution must emit StartExecution");
     };
+    assert_eq!(scans.len(), begin.scan_channels.len());
 
     let open = PlanOpen::new(
         PlanFlowId {
@@ -267,7 +308,7 @@ fn begin_and_finalize_execution(
 }
 
 fn try_open_scan_with_runtime_protocol<'a>(
-    slot_id: u32,
+    peer: BackendLeaseSlot,
     session_epoch: u64,
     scan_id: u64,
     config: BackendServiceConfig,
@@ -302,7 +343,7 @@ fn try_open_scan_with_runtime_protocol<'a>(
     assert_eq!(decoded_scan_id, scan_id);
 
     BackendService::open_scan(OpenScanInput {
-        slot_id,
+        peer,
         session_epoch,
         scan_id,
         scan,
@@ -311,16 +352,52 @@ fn try_open_scan_with_runtime_protocol<'a>(
 }
 
 fn open_scan_with_runtime_protocol<'a>(
-    slot_id: u32,
+    peer: BackendLeaseSlot,
     session_epoch: u64,
     scan_id: u64,
     config: BackendServiceConfig,
     scan_tx: IssuedTx,
 ) -> ActiveScanDriver {
-    let opened =
-        try_open_scan_with_runtime_protocol(slot_id, session_epoch, scan_id, config, scan_tx)
-            .expect("open scan");
+    let opened = try_open_scan_with_runtime_protocol(peer, session_epoch, scan_id, config, scan_tx)
+        .expect("open scan");
     opened.expect("fresh scan open must be accepted")
+}
+
+fn step_scan_and_drain_page(driver: &mut ActiveScanDriver, scan_rx: &IssuedRx) -> bool {
+    match driver.step().expect("step scan") {
+        ScanStreamStep::OutboundPage { outbound, .. } => {
+            let frame = outbound.frame();
+            outbound.mark_sent();
+            match scan_rx.accept(&frame).expect("accept scan frame") {
+                IssueEvent::Page(page) => drop(page),
+                IssueEvent::Closed => panic!("scan transport should not emit close frame"),
+            }
+            false
+        }
+        ScanStreamStep::YieldForControl { reason } => {
+            panic!("unexpected control yield in multi-scan happy path: {reason:?}")
+        }
+        ScanStreamStep::Finished { .. } => true,
+        ScanStreamStep::Failed { message, .. } => {
+            panic!("unexpected scan failure in multi-scan happy path: {message}")
+        }
+    }
+}
+
+fn peer_from_scan_channels(begin: &BeginExecutionOutput, scan_id: u64) -> BackendLeaseSlot {
+    let descriptor = begin
+        .scan_channels
+        .iter()
+        .find(|descriptor| descriptor.scan_id == scan_id)
+        .unwrap_or_else(|| panic!("missing scan channel for scan_id {scan_id}"));
+    backend_lease_slot_from_wire(*descriptor)
+}
+
+fn backend_lease_slot_from_wire(channel: ScanChannelDescriptorWire) -> BackendLeaseSlot {
+    BackendLeaseSlot::new(
+        channel.peer.slot_id(),
+        BackendLeaseId::new(channel.peer.generation(), channel.peer.lease_epoch()),
+    )
 }
 
 pub fn backend_service_streams_scan_under_saved_snapshot() {
@@ -329,13 +406,14 @@ pub fn backend_service_streams_scan_under_saved_snapshot() {
 
     let query = test_query();
     let scan_transport = IssuedTransportHarness::new();
+    let scan_slots = ControlTransportHarness::new(8);
     let mut config = BackendServiceConfig::default();
     config.scan_payload_block_size =
         u32::try_from(scan_transport.payload_capacity(ARROW_LAYOUT_BATCH_KIND, 0))
             .expect("scan payload capacity must fit into u32");
     config.scan_fetch_batch_rows = 2;
     let _snapshot = unsafe { LatestSnapshotGuard::acquire() };
-    let begin = begin_and_finalize_execution(TEST_SLOT_ID, &query, config);
+    let begin = begin_and_finalize_execution(TEST_SLOT_ID, &query, config, scan_slots.region());
     let mut execution_guard = ActiveExecutionGuard::new(begin.key);
 
     Spi::run(&format!(
@@ -352,10 +430,11 @@ pub fn backend_service_streams_scan_under_saved_snapshot() {
     assert_eq!(built.scans.len(), 1, "expected exactly one leaf scan");
     let spec = &built.scans[0];
     let schema = transport_schema(spec.arrow_schema());
+    let scan_peer = peer_from_scan_channels(&begin, spec.scan_id.get());
 
     let scan_rx = scan_transport.rx();
     let mut driver = open_scan_with_runtime_protocol(
-        TEST_SLOT_ID,
+        scan_peer,
         begin.key.session_epoch,
         spec.scan_id.get(),
         config,
@@ -422,12 +501,13 @@ pub fn backend_service_yields_for_control_on_permit_backpressure() {
 
     let query = test_query();
     let scan_transport = IssuedTransportHarness::with_counts(1, 1);
+    let scan_slots = ControlTransportHarness::new(8);
     let mut config = BackendServiceConfig::default();
     config.scan_payload_block_size =
         u32::try_from(scan_transport.payload_capacity(ARROW_LAYOUT_BATCH_KIND, 0))
             .expect("scan payload capacity must fit into u32");
     let _snapshot = unsafe { LatestSnapshotGuard::acquire() };
-    let begin = begin_and_finalize_execution(TEST_SLOT_ID, &query, config);
+    let begin = begin_and_finalize_execution(TEST_SLOT_ID, &query, config, scan_slots.region());
     let mut execution_guard = ActiveExecutionGuard::new(begin.key);
 
     let built = PlanBuilder::new()
@@ -438,10 +518,11 @@ pub fn backend_service_yields_for_control_on_permit_backpressure() {
         .expect("build scan metadata");
     assert_eq!(built.scans.len(), 1, "expected exactly one leaf scan");
     let spec = &built.scans[0];
+    let scan_peer = peer_from_scan_channels(&begin, spec.scan_id.get());
 
     let scan_rx = scan_transport.rx();
     let mut driver = open_scan_with_runtime_protocol(
-        TEST_SLOT_ID,
+        scan_peer,
         begin.key.session_epoch,
         spec.scan_id.get(),
         config,
@@ -469,7 +550,7 @@ pub fn backend_service_yields_for_control_on_permit_backpressure() {
 
     assert!(matches!(
         BackendService::accept_complete_execution(TEST_SLOT_ID, begin.key.session_epoch),
-        Err(BackendServiceError::ScanDriverActive { .. })
+        Err(BackendServiceError::ExecutionScansNotTerminal { .. })
     ));
     assert!(matches!(
         driver.complete_execution(),
@@ -518,12 +599,13 @@ pub fn backend_service_driver_fail_execution_from_control_yield() {
 
     let query = test_query();
     let scan_transport = IssuedTransportHarness::with_counts(1, 1);
+    let scan_slots = ControlTransportHarness::new(8);
     let mut config = BackendServiceConfig::default();
     config.scan_payload_block_size =
         u32::try_from(scan_transport.payload_capacity(ARROW_LAYOUT_BATCH_KIND, 0))
             .expect("scan payload capacity must fit into u32");
     let _snapshot = unsafe { LatestSnapshotGuard::acquire() };
-    let begin = begin_and_finalize_execution(TEST_SLOT_ID, &query, config);
+    let begin = begin_and_finalize_execution(TEST_SLOT_ID, &query, config, scan_slots.region());
     let mut execution_guard = ActiveExecutionGuard::new(begin.key);
 
     let built = PlanBuilder::new()
@@ -534,10 +616,11 @@ pub fn backend_service_driver_fail_execution_from_control_yield() {
         .expect("build scan metadata");
     assert_eq!(built.scans.len(), 1, "expected exactly one leaf scan");
     let spec = &built.scans[0];
+    let scan_peer = peer_from_scan_channels(&begin, spec.scan_id.get());
 
     let scan_rx = scan_transport.rx();
     let mut driver = open_scan_with_runtime_protocol(
-        TEST_SLOT_ID,
+        scan_peer,
         begin.key.session_epoch,
         spec.scan_id.get(),
         config,
@@ -586,12 +669,13 @@ pub fn backend_service_wait_interrupt_cleans_up_active_execution() {
 
     let query = test_query();
     let scan_transport = IssuedTransportHarness::with_counts(1, 1);
+    let scan_slots = ControlTransportHarness::new(8);
     let mut config = BackendServiceConfig::default();
     config.scan_payload_block_size =
         u32::try_from(scan_transport.payload_capacity(ARROW_LAYOUT_BATCH_KIND, 0))
             .expect("scan payload capacity must fit into u32");
     let _snapshot = unsafe { LatestSnapshotGuard::acquire() };
-    let begin = begin_and_finalize_execution(TEST_SLOT_ID, &query, config);
+    let begin = begin_and_finalize_execution(TEST_SLOT_ID, &query, config, scan_slots.region());
     let mut execution_guard = ActiveExecutionGuard::new(begin.key);
 
     let built = PlanBuilder::new()
@@ -602,10 +686,11 @@ pub fn backend_service_wait_interrupt_cleans_up_active_execution() {
         .expect("build scan metadata");
     assert_eq!(built.scans.len(), 1, "expected exactly one leaf scan");
     let spec = &built.scans[0];
+    let scan_peer = peer_from_scan_channels(&begin, spec.scan_id.get());
 
     let scan_rx = scan_transport.rx();
     let mut driver = open_scan_with_runtime_protocol(
-        TEST_SLOT_ID,
+        scan_peer,
         begin.key.session_epoch,
         spec.scan_id.get(),
         config,
@@ -643,7 +728,7 @@ pub fn backend_service_wait_interrupt_cleans_up_active_execution() {
     );
     execution_guard.disarm();
 
-    let restarted = begin_and_finalize_execution(TEST_SLOT_ID, &query, config);
+    let restarted = begin_and_finalize_execution(TEST_SLOT_ID, &query, config, scan_slots.region());
     assert!(
         restarted.key.session_epoch > begin.key.session_epoch,
         "a fresh execution should start after wait-interrupt cleanup"
@@ -657,11 +742,12 @@ pub fn backend_service_wait_interrupt_cleans_up_active_execution() {
 
 pub fn backend_service_stale_cancel_is_ignored_after_new_execution() {
     reset_backend_service_table();
-    let query = test_query();
+    let query = "SELECT 1".to_string();
     let config = BackendServiceConfig::default();
     let _snapshot = unsafe { LatestSnapshotGuard::acquire() };
+    let scan_slots = ControlTransportHarness::new(8);
 
-    let first = begin_and_finalize_execution(TEST_SLOT_ID, &query, config);
+    let first = begin_and_finalize_execution(TEST_SLOT_ID, &query, config, scan_slots.region());
     let mut first_guard = ActiveExecutionGuard::new(first.key);
     assert!(
         BackendService::accept_complete_execution(TEST_SLOT_ID, first.key.session_epoch)
@@ -669,7 +755,7 @@ pub fn backend_service_stale_cancel_is_ignored_after_new_execution() {
     );
     first_guard.disarm();
 
-    let second = begin_and_finalize_execution(TEST_SLOT_ID, &query, config);
+    let second = begin_and_finalize_execution(TEST_SLOT_ID, &query, config, scan_slots.region());
     let mut second_guard = ActiveExecutionGuard::new(second.key);
 
     assert!(
@@ -690,12 +776,13 @@ pub fn backend_service_cancel_during_stream_marks_scan_used() {
 
     let query = test_query();
     let scan_transport = IssuedTransportHarness::new();
+    let scan_slots = ControlTransportHarness::new(8);
     let mut config = BackendServiceConfig::default();
     config.scan_payload_block_size =
         u32::try_from(scan_transport.payload_capacity(ARROW_LAYOUT_BATCH_KIND, 0))
             .expect("scan payload capacity must fit into u32");
     let _snapshot = unsafe { LatestSnapshotGuard::acquire() };
-    let begin = begin_and_finalize_execution(TEST_SLOT_ID, &query, config);
+    let begin = begin_and_finalize_execution(TEST_SLOT_ID, &query, config, scan_slots.region());
     let mut execution_guard = ActiveExecutionGuard::new(begin.key);
 
     let built = PlanBuilder::new()
@@ -706,10 +793,11 @@ pub fn backend_service_cancel_during_stream_marks_scan_used() {
         .expect("build scan metadata");
     assert_eq!(built.scans.len(), 1, "expected exactly one leaf scan");
     let spec = &built.scans[0];
+    let scan_peer = peer_from_scan_channels(&begin, spec.scan_id.get());
 
     let scan_rx = scan_transport.rx();
     let mut driver = open_scan_with_runtime_protocol(
-        TEST_SLOT_ID,
+        scan_peer,
         begin.key.session_epoch,
         spec.scan_id.get(),
         config,
@@ -735,7 +823,7 @@ pub fn backend_service_cancel_during_stream_marks_scan_used() {
     );
     assert!(matches!(
         try_open_scan_with_runtime_protocol(
-            TEST_SLOT_ID,
+            scan_peer,
             begin.key.session_epoch,
             spec.scan_id.get(),
             config,
@@ -760,8 +848,9 @@ pub fn backend_service_rejects_descriptor_mismatch_without_poisoning_execution()
     let query = test_query();
     let config = BackendServiceConfig::default();
     let scan_transport = IssuedTransportHarness::new();
+    let scan_slots = ControlTransportHarness::new(8);
     let _snapshot = unsafe { LatestSnapshotGuard::acquire() };
-    let begin = begin_and_finalize_execution(TEST_SLOT_ID, &query, config);
+    let begin = begin_and_finalize_execution(TEST_SLOT_ID, &query, config, scan_slots.region());
     let mut execution_guard = ActiveExecutionGuard::new(begin.key);
 
     let built = PlanBuilder::new()
@@ -772,12 +861,13 @@ pub fn backend_service_rejects_descriptor_mismatch_without_poisoning_execution()
         .expect("build scan metadata");
     assert_eq!(built.scans.len(), 1, "expected exactly one leaf scan");
     let spec = &built.scans[0];
+    let scan_peer = peer_from_scan_channels(&begin, spec.scan_id.get());
 
     let mut mismatched = config;
     mismatched.scan_page_flags ^= 0x0001;
     assert!(matches!(
         try_open_scan_with_runtime_protocol(
-            TEST_SLOT_ID,
+            scan_peer,
             begin.key.session_epoch,
             spec.scan_id.get(),
             mismatched,
@@ -788,7 +878,7 @@ pub fn backend_service_rejects_descriptor_mismatch_without_poisoning_execution()
     ));
 
     let mut driver = open_scan_with_runtime_protocol(
-        TEST_SLOT_ID,
+        scan_peer,
         begin.key.session_epoch,
         spec.scan_id.get(),
         config,
@@ -813,13 +903,14 @@ pub fn backend_service_local_scan_failure_dominates_late_complete() {
 
     let query = test_query();
     let scan_transport = IssuedTransportHarness::new();
+    let scan_slots = ControlTransportHarness::new(8);
     let actual_payload_capacity =
         u32::try_from(scan_transport.payload_capacity(ARROW_LAYOUT_BATCH_KIND, 0))
             .expect("scan payload capacity must fit into u32");
     let mut config = BackendServiceConfig::default();
     config.scan_payload_block_size = actual_payload_capacity + 1;
     let _snapshot = unsafe { LatestSnapshotGuard::acquire() };
-    let begin = begin_and_finalize_execution(TEST_SLOT_ID, &query, config);
+    let begin = begin_and_finalize_execution(TEST_SLOT_ID, &query, config, scan_slots.region());
     let mut execution_guard = ActiveExecutionGuard::new(begin.key);
 
     let built = PlanBuilder::new()
@@ -830,9 +921,10 @@ pub fn backend_service_local_scan_failure_dominates_late_complete() {
         .expect("build scan metadata");
     assert_eq!(built.scans.len(), 1, "expected exactly one leaf scan");
     let spec = &built.scans[0];
+    let scan_peer = peer_from_scan_channels(&begin, spec.scan_id.get());
 
     let mut driver = open_scan_with_runtime_protocol(
-        TEST_SLOT_ID,
+        scan_peer,
         begin.key.session_epoch,
         spec.scan_id.get(),
         config,
@@ -854,6 +946,143 @@ pub fn backend_service_local_scan_failure_dominates_late_complete() {
         !BackendService::accept_complete_execution(TEST_SLOT_ID, begin.key.session_epoch)
             .expect("late complete should be ignored after local fatal scan failure"),
         "late complete must not override a backend-observed fatal scan failure"
+    );
+    execution_guard.disarm();
+}
+
+pub fn backend_service_interleaves_two_scan_portals_under_shared_spi() {
+    reset_backend_service_table();
+    Spi::run("SET LOCAL max_parallel_workers_per_gather = 0").unwrap();
+
+    let query = self_join_query();
+    let scan_transport_left = IssuedTransportHarness::new();
+    let scan_transport_right = IssuedTransportHarness::new();
+    let scan_slots = ControlTransportHarness::new(16);
+    let mut config = BackendServiceConfig::default();
+    config.scan_payload_block_size =
+        u32::try_from(scan_transport_left.payload_capacity(ARROW_LAYOUT_BATCH_KIND, 0))
+            .expect("scan payload capacity must fit into u32");
+    config.scan_fetch_batch_rows = 1;
+    let _snapshot = unsafe { LatestSnapshotGuard::acquire() };
+    let begin = begin_and_finalize_execution(TEST_SLOT_ID, &query, config, scan_slots.region());
+    let mut execution_guard = ActiveExecutionGuard::new(begin.key);
+
+    let built = PlanBuilder::new()
+        .build(PlanBuildInput {
+            sql: &query,
+            params: Vec::<ScalarValue>::new(),
+        })
+        .expect("build multi-scan metadata");
+    assert_eq!(built.scans.len(), 2, "expected exactly two leaf scans");
+    let left_spec = &built.scans[0];
+    let right_spec = &built.scans[1];
+    let left_peer = peer_from_scan_channels(&begin, left_spec.scan_id.get());
+    let right_peer = peer_from_scan_channels(&begin, right_spec.scan_id.get());
+
+    let left_rx = scan_transport_left.rx();
+    let right_rx = scan_transport_right.rx();
+    let mut left_driver = open_scan_with_runtime_protocol(
+        left_peer,
+        begin.key.session_epoch,
+        left_spec.scan_id.get(),
+        config,
+        scan_transport_left.tx(),
+    );
+    let mut right_driver = open_scan_with_runtime_protocol(
+        right_peer,
+        begin.key.session_epoch,
+        right_spec.scan_id.get(),
+        config,
+        scan_transport_right.tx(),
+    );
+
+    let mut left_finished = false;
+    let mut right_finished = false;
+    while !left_finished || !right_finished {
+        if !left_finished {
+            left_finished = step_scan_and_drain_page(&mut left_driver, &left_rx);
+        }
+        if !right_finished {
+            right_finished = step_scan_and_drain_page(&mut right_driver, &right_rx);
+        }
+    }
+
+    scan_transport_left.assert_drained();
+    scan_transport_right.assert_drained();
+    assert!(
+        BackendService::accept_complete_execution(TEST_SLOT_ID, begin.key.session_epoch)
+            .expect("complete execution after interleaved multi-scan"),
+        "execution should complete after both scan portals finish"
+    );
+    execution_guard.disarm();
+}
+
+pub fn backend_service_drop_finished_driver_does_not_cancel_sibling_scan() {
+    reset_backend_service_table();
+    Spi::run("SET LOCAL max_parallel_workers_per_gather = 0").unwrap();
+
+    let query = self_join_query();
+    let scan_transport_left = IssuedTransportHarness::new();
+    let scan_transport_right = IssuedTransportHarness::new();
+    let scan_slots = ControlTransportHarness::new(16);
+    let mut config = BackendServiceConfig::default();
+    config.scan_payload_block_size =
+        u32::try_from(scan_transport_left.payload_capacity(ARROW_LAYOUT_BATCH_KIND, 0))
+            .expect("scan payload capacity must fit into u32");
+    config.scan_fetch_batch_rows = 1;
+    let _snapshot = unsafe { LatestSnapshotGuard::acquire() };
+    let begin = begin_and_finalize_execution(TEST_SLOT_ID, &query, config, scan_slots.region());
+    let mut execution_guard = ActiveExecutionGuard::new(begin.key);
+
+    let built = PlanBuilder::new()
+        .build(PlanBuildInput {
+            sql: &query,
+            params: Vec::<ScalarValue>::new(),
+        })
+        .expect("build multi-scan metadata");
+    assert_eq!(built.scans.len(), 2, "expected exactly two leaf scans");
+    let left_spec = &built.scans[0];
+    let right_spec = &built.scans[1];
+    let left_peer = peer_from_scan_channels(&begin, left_spec.scan_id.get());
+    let right_peer = peer_from_scan_channels(&begin, right_spec.scan_id.get());
+
+    let left_rx = scan_transport_left.rx();
+    let right_rx = scan_transport_right.rx();
+    let mut left_driver = open_scan_with_runtime_protocol(
+        left_peer,
+        begin.key.session_epoch,
+        left_spec.scan_id.get(),
+        config,
+        scan_transport_left.tx(),
+    );
+    let mut right_driver = open_scan_with_runtime_protocol(
+        right_peer,
+        begin.key.session_epoch,
+        right_spec.scan_id.get(),
+        config,
+        scan_transport_right.tx(),
+    );
+
+    while !step_scan_and_drain_page(&mut left_driver, &left_rx) {}
+
+    assert!(matches!(
+        BackendService::accept_complete_execution(TEST_SLOT_ID, begin.key.session_epoch),
+        Err(BackendServiceError::ExecutionScansNotTerminal {
+            unfinished_count: 1,
+            ..
+        })
+    ));
+
+    drop(left_driver);
+
+    while !step_scan_and_drain_page(&mut right_driver, &right_rx) {}
+
+    scan_transport_left.assert_drained();
+    scan_transport_right.assert_drained();
+    assert!(
+        BackendService::accept_complete_execution(TEST_SLOT_ID, begin.key.session_epoch)
+            .expect("complete execution after sibling scan finishes"),
+        "dropping a finished driver must not cancel the still-active sibling scan"
     );
     execution_guard.disarm();
 }

@@ -28,6 +28,7 @@ The main contracts are:
   `session_epoch`
 - `ScanChannelDescriptorWire` publishes one dedicated scan slot for one `scan_id`
   up front in `StartExecution`
+- `scan_channels` are encoded in strictly increasing `scan_id` order
 - `ScanFlowDescriptorRef` reconstructs a `scan_flow::ScanOpen` when paired with
   `session_epoch` and `scan_id`
 - `ScanFlowDescriptor::new` validates the declared producer set up front, so
@@ -82,6 +83,7 @@ match msg {
         plan,
         scans,
     } => {
+        // Entries are already validated to be sorted by `scan_id`.
         let scan_channels: Vec<_> = scans.iter().collect();
         let _ = (session_epoch, plan, scan_channels);
     }

@@ -9,6 +9,7 @@ mod tests;
 
 use arrow_layout::{ColumnSpec, TypeTag};
 use arrow_schema::{DataType, Field, Schema, SchemaRef};
+use control_transport::{BackendLeaseSlot, BackendSlotLease, TransportRegion};
 use datafusion_common::ScalarValue;
 use datafusion_expr::logical_plan::LogicalPlan;
 use fsm::backend_execution_flow::StateMachine as BackendExecutionMachine;
@@ -22,16 +23,17 @@ use plan_flow::{BackendPlanRole, BackendPlanStep, PlanOpen};
 use row_estimator::{EstimatorConfig, PageRowEstimator};
 use row_estimator_seed::{seed_estimator_config, ProjectedColumnRef};
 use runtime_protocol::{
-    BackendExecutionToWorker, ExecutionFailureCode, PlanFlowDescriptor, ProducerRole,
-    ScanChannelSet, ScanFlowDescriptorRef,
+    BackendExecutionToWorker, BackendLeaseSlotWire, ExecutionFailureCode, PlanFlowDescriptor,
+    ProducerRole, ScanChannelDescriptorWire, ScanChannelSet, ScanFlowDescriptorRef,
 };
 use scan_flow::{
     BackendProducerRole, BackendProducerStep, BackendScanCoordinator, FlowId as ScanFlowId,
     LogicalTerminal, ProducerDescriptor, ProducerRoleKind, ScanOpen,
 };
 use scan_node::PgScanSpec;
-use slot_scan::{prepare_scan, PreparedScan, ScanOptions};
+use slot_scan::{prepare_scan, ExecutionSpiContext, PreparedScan, ScanOptions};
 use std::cell::{Cell, RefCell};
+use std::collections::BTreeMap;
 use std::marker::PhantomData;
 use std::panic::AssertUnwindSafe;
 use std::rc::Rc;
@@ -133,19 +135,32 @@ pub struct StartExecutionInput<'a> {
     pub sql: &'a str,
     pub params: Vec<ScalarValue>,
     pub plan_tx: IssuedTx,
+    pub scan_slot_region: &'a TransportRegion,
     pub config: BackendServiceConfig,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Debug, PartialEq, Eq)]
 pub struct BeginExecutionOutput {
     pub key: ExecutionKey,
-    pub control: BackendExecutionToWorker<'static>,
+    pub plan: PlanFlowDescriptor,
+    pub scan_channels: Box<[ScanChannelDescriptorWire]>,
+}
+
+impl BeginExecutionOutput {
+    pub fn control(&self) -> BackendExecutionToWorker<'_> {
+        BackendExecutionToWorker::StartExecution {
+            session_epoch: self.key.session_epoch,
+            plan: self.plan,
+            scans: ScanChannelSet::new(&self.scan_channels)
+                .expect("begin_execution scan channels must remain unique"),
+        }
+    }
 }
 
 pub type ExecutionStartStep = BackendPlanStep;
 
 pub struct OpenScanInput<'a> {
-    pub slot_id: u32,
+    pub peer: BackendLeaseSlot,
     pub session_epoch: u64,
     pub scan_id: u64,
     pub scan: ScanFlowDescriptorRef<'a>,
@@ -222,6 +237,8 @@ struct PreparedScanEntry {
     prepared_scan: PreparedScan,
     estimator: PageRowEstimator,
     canonical_open: ScanOpen,
+    scan_peer: BackendLeaseSlot,
+    scan_lease: Option<BackendSlotLease>,
     state: ScanEntryState,
 }
 
@@ -245,9 +262,9 @@ struct ActiveExecution {
     machine: BackendExecutionMachine,
     config: BackendServiceConfig,
     starting: Option<StartingRuntime>,
-    scans: Vec<PreparedScanEntry>,
-    active_scan: Option<ActiveScanStream>,
-    driver_scan_id: Option<u64>,
+    scan_spi: Option<ExecutionSpiContext>,
+    scans: BTreeMap<u64, PreparedScanEntry>,
+    active_scans: BTreeMap<u64, ActiveScanStream>,
 }
 
 impl ActiveScanDriver {
@@ -265,7 +282,11 @@ impl ActiveScanDriver {
                 let step = step_scan_with_driver(self.key, self.scan_id)?;
                 match step {
                     ScanStreamStep::Finished { .. } => {
-                        self.state = ActiveScanDriverState::AwaitingExecutionTerminal;
+                        self.state = if execution_ready_for_completion(self.key)? {
+                            ActiveScanDriverState::AwaitingExecutionTerminal
+                        } else {
+                            ActiveScanDriverState::Released
+                        };
                     }
                     ScanStreamStep::Failed { .. } => {
                         self.state = ActiveScanDriverState::Released;
@@ -360,15 +381,19 @@ impl ActiveScanDriver {
 
 impl Drop for ActiveScanDriver {
     fn drop(&mut self) {
-        if self.state == ActiveScanDriverState::Released {
-            return;
+        match self.state {
+            ActiveScanDriverState::Streaming => {
+                let _ = terminate_current_execution_from_driver(
+                    self.key,
+                    self.scan_id,
+                    BackendExecutionEvent::CancelExecution,
+                );
+                self.state = ActiveScanDriverState::Released;
+            }
+            ActiveScanDriverState::AwaitingExecutionTerminal | ActiveScanDriverState::Released => {
+                self.state = ActiveScanDriverState::Released;
+            }
         }
-        let _ = terminate_current_execution_from_driver(
-            self.key,
-            self.scan_id,
-            BackendExecutionEvent::CancelExecution,
-        );
-        self.state = ActiveScanDriverState::Released;
     }
 }
 
@@ -377,13 +402,7 @@ impl BackendService {
         input: StartExecutionInput<'_>,
     ) -> Result<BeginExecutionOutput, BackendServiceError> {
         ACTIVE_EXECUTION.with(|slot| {
-            if let Some(execution) = slot.borrow().as_ref() {
-                if let Some(scan_id) = execution.driver_scan_id {
-                    return Err(BackendServiceError::ScanDriverActive {
-                        action: "begin execution",
-                        scan_id,
-                    });
-                }
+            if slot.borrow().is_some() {
                 return Err(BackendServiceError::ExecutionAlreadyActive);
             }
 
@@ -410,25 +429,40 @@ impl BackendService {
             let mut plan_role = BackendPlanRole::new(input.plan_tx);
             plan_role.open(plan_open, &built.logical_plan)?;
 
-            let scans = built
-                .scans
-                .iter()
-                .cloned()
-                .map(|spec| prepare_scan_entry(session_epoch, input.config, spec))
-                .collect::<Result<Vec<_>, _>>()?;
+            let mut scans = BTreeMap::new();
+            for spec in built.scans.iter().cloned() {
+                let scan_lease = BackendSlotLease::acquire(input.scan_slot_region)?;
+                let scan_peer = scan_lease.backend_lease_slot();
+                let entry =
+                    prepare_scan_entry(session_epoch, input.config, spec, scan_peer, scan_lease)?;
+                scans.insert(entry.scan_id, entry);
+            }
+
+            let scan_channels = scans
+                .values()
+                .map(|entry| ScanChannelDescriptorWire {
+                    scan_id: entry.scan_id,
+                    peer: BackendLeaseSlotWire::new(
+                        entry.scan_peer.slot_id(),
+                        entry.scan_peer.lease_id().generation(),
+                        entry.scan_peer.lease_id().lease_epoch(),
+                    ),
+                })
+                .collect::<Vec<_>>()
+                .into_boxed_slice();
 
             let snapshot = ExecutionSnapshot::capture_current()?;
             let mut machine = BackendExecutionMachine::new();
             consume_execution_event(&mut machine, BackendExecutionEvent::BeginExecution)?;
-
-            let control = BackendExecutionToWorker::StartExecution {
-                session_epoch,
-                plan: PlanFlowDescriptor {
-                    plan_id: PLAN_ID,
-                    page_kind: input.config.plan_page_kind,
-                    page_flags: input.config.plan_page_flags,
-                },
-                scans: ScanChannelSet::empty(),
+            let scan_spi = if scans.is_empty() {
+                None
+            } else {
+                Some(ExecutionSpiContext::connect()?)
+            };
+            let plan = PlanFlowDescriptor {
+                plan_id: PLAN_ID,
+                page_kind: input.config.plan_page_kind,
+                page_flags: input.config.plan_page_flags,
             };
 
             *slot.borrow_mut() = Some(ActiveExecution {
@@ -438,12 +472,16 @@ impl BackendService {
                 machine,
                 config: input.config,
                 starting: Some(StartingRuntime { plan_role }),
+                scan_spi,
                 scans,
-                active_scan: None,
-                driver_scan_id: None,
+                active_scans: BTreeMap::new(),
             });
 
-            Ok(BeginExecutionOutput { key, control })
+            Ok(BeginExecutionOutput {
+                key,
+                plan,
+                scan_channels,
+            })
         })
     }
 
@@ -515,39 +553,32 @@ impl BackendService {
         ACTIVE_EXECUTION.with(|slot| {
             let mut active = slot.borrow_mut();
             let Some(execution) = active.as_mut() else {
-                return classify_missing_execution(input.slot_id, input.session_epoch)
-                    .map(|_| None);
+                return classify_missing_execution(0, input.session_epoch).map(|_| None);
             };
 
-            if should_ignore_message(execution, input.slot_id, input.session_epoch)? {
+            if classify_session_epoch_for_scan_open(input.session_epoch)?
+                == SessionEpochMatch::Stale
+            {
                 return Ok(None);
             }
             ensure_execution_state(execution, BackendExecutionState::Running, "open scan")?;
-            if let Some(scan_id) = execution.driver_scan_id {
-                return Err(BackendServiceError::ScanDriverActive {
-                    action: "open scan",
-                    scan_id,
-                });
-            }
-            if execution.active_scan.is_some() {
-                return Err(BackendServiceError::ProtocolViolation(
-                    "only one backend scan may stream at a time".into(),
-                ));
-            }
-
-            let scan_index = execution
-                .scans
-                .iter()
-                .position(|entry| entry.scan_id == input.scan_id)
-                .ok_or(BackendServiceError::UnknownScanId {
-                    scan_id: input.scan_id,
-                })?;
             let snapshot = execution.snapshot.snapshot;
             let block_size = execution.config.scan_payload_block_size;
             let fetch_batch_rows =
                 normalize_scan_fetch_batch_rows(execution.config.scan_fetch_batch_rows);
             let (prepared_scan, schema, estimator, canonical_open) = {
-                let entry = &mut execution.scans[scan_index];
+                let entry = execution.scans.get_mut(&input.scan_id).ok_or(
+                    BackendServiceError::UnknownScanId {
+                        scan_id: input.scan_id,
+                    },
+                )?;
+                if entry.scan_peer != input.peer {
+                    return Err(BackendServiceError::ScanPeerMismatch {
+                        scan_id: input.scan_id,
+                        expected: entry.scan_peer,
+                        incoming: input.peer,
+                    });
+                }
                 match entry.state {
                     ScanEntryState::Prepared => {}
                     ScanEntryState::Streaming => {
@@ -576,9 +607,15 @@ impl BackendService {
                     entry.canonical_open.clone(),
                 )
             };
+            let spi = execution.scan_spi.clone().ok_or_else(|| {
+                BackendServiceError::ProtocolViolation(
+                    "execution has no installed shared scan SPI context".into(),
+                )
+            })?;
 
             let source = source::SlotScanPageSource::new(
                 snapshot,
+                spi,
                 prepared_scan,
                 schema,
                 block_size,
@@ -593,13 +630,19 @@ impl BackendService {
             producer.open(&canonical_open, SINGLE_SCAN_PRODUCER_ID, source)?;
 
             consume_execution_event(&mut execution.machine, BackendExecutionEvent::OpenScan)?;
-            execution.scans[scan_index].state = ScanEntryState::Streaming;
-            execution.active_scan = Some(ActiveScanStream {
-                scan_id: input.scan_id,
-                producer,
-                coordinator,
-            });
-            execution.driver_scan_id = Some(input.scan_id);
+            execution
+                .scans
+                .get_mut(&input.scan_id)
+                .expect("scan entry must remain installed while opening")
+                .state = ScanEntryState::Streaming;
+            execution.active_scans.insert(
+                input.scan_id,
+                ActiveScanStream {
+                    scan_id: input.scan_id,
+                    producer,
+                    coordinator,
+                },
+            );
 
             Ok(Some(ActiveScanDriver {
                 key: execution.key,
@@ -644,7 +687,12 @@ impl BackendService {
     }
 
     pub fn render_explain(input: ExplainInput<'_>) -> Result<String, BackendServiceError> {
-        ensure_no_scan_driver_active("render explain")?;
+        ACTIVE_EXECUTION.with(|slot| {
+            if slot.borrow().is_some() {
+                return Err(BackendServiceError::ExecutionAlreadyActive);
+            }
+            Ok(())
+        })?;
         let built = PlanBuilder::new().build(PlanBuildInput {
             sql: input.sql,
             params: input.params,
@@ -717,9 +765,9 @@ impl BackendService {
                 machine,
                 config: BackendServiceConfig::default(),
                 starting: None,
-                scans: Vec::new(),
-                active_scan: None,
-                driver_scan_id: None,
+                scan_spi: None,
+                scans: BTreeMap::new(),
+                active_scans: BTreeMap::new(),
             });
         });
     }
@@ -749,47 +797,9 @@ impl BackendService {
                 machine,
                 config: BackendServiceConfig::default(),
                 starting: Some(StartingRuntime { plan_role }),
-                scans: Vec::new(),
-                active_scan: None,
-                driver_scan_id: None,
-            });
-        });
-    }
-
-    #[cfg(test)]
-    pub(crate) fn install_fake_execution_with_driver_for_tests(
-        slot_id: u32,
-        session_epoch: u64,
-        state: BackendExecutionState,
-        scan_id: u64,
-    ) {
-        CURRENT_SESSION_EPOCH.with(|epoch| epoch.set(session_epoch));
-        ACTIVE_EXECUTION.with(|slot| {
-            let mut machine = BackendExecutionMachine::new();
-            if state != BackendExecutionState::Idle {
-                let _ = machine.consume(&BackendExecutionEvent::BeginExecution);
-            }
-            if state == BackendExecutionState::Running {
-                let _ = machine.consume(&BackendExecutionEvent::PlanPublished);
-            }
-            *slot.borrow_mut() = Some(ActiveExecution {
-                key: ExecutionKey {
-                    slot_id,
-                    session_epoch,
-                },
-                snapshot: ExecutionSnapshot::unregistered_for_tests(),
-                _logical_plan: datafusion_expr::logical_plan::LogicalPlan::EmptyRelation(
-                    datafusion_expr::logical_plan::EmptyRelation {
-                        produce_one_row: false,
-                        schema: Arc::new(datafusion_common::DFSchema::empty()),
-                    },
-                ),
-                machine,
-                config: BackendServiceConfig::default(),
-                starting: None,
-                scans: Vec::new(),
-                active_scan: None,
-                driver_scan_id: Some(scan_id),
+                scan_spi: None,
+                scans: BTreeMap::new(),
+                active_scans: BTreeMap::new(),
             });
         });
     }
@@ -895,16 +905,24 @@ fn classify_missing_execution(
     }
 }
 
-fn ensure_no_scan_driver_active(action: &'static str) -> Result<(), BackendServiceError> {
-    ACTIVE_EXECUTION.with(|slot| {
-        let active = slot.borrow();
-        if let Some(execution) = active.as_ref() {
-            if let Some(scan_id) = execution.driver_scan_id {
-                return Err(BackendServiceError::ScanDriverActive { action, scan_id });
-            }
-        }
-        Ok(())
-    })
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum SessionEpochMatch {
+    Current,
+    Stale,
+}
+
+fn classify_session_epoch_for_scan_open(
+    session_epoch: u64,
+) -> Result<SessionEpochMatch, BackendServiceError> {
+    let current = current_session_epoch();
+    match session_epoch.cmp(&current) {
+        std::cmp::Ordering::Less => Ok(SessionEpochMatch::Stale),
+        std::cmp::Ordering::Equal => Ok(SessionEpochMatch::Current),
+        std::cmp::Ordering::Greater => Err(BackendServiceError::FutureSession {
+            current,
+            incoming: session_epoch,
+        }),
+    }
 }
 
 fn should_ignore_message(
@@ -935,9 +953,30 @@ fn ensure_driver_matches_execution(
             action, key, execution.key
         )));
     }
-    if execution.driver_scan_id != Some(scan_id) {
+    if !execution.active_scans.contains_key(&scan_id) {
         return Err(BackendServiceError::ProtocolViolation(format!(
             "scan driver for scan_id {} is not active during {}",
+            scan_id, action
+        )));
+    }
+    Ok(())
+}
+
+fn ensure_driver_belongs_to_execution(
+    execution: &ActiveExecution,
+    key: ExecutionKey,
+    scan_id: u64,
+    action: &'static str,
+) -> Result<(), BackendServiceError> {
+    if execution.key != key {
+        return Err(BackendServiceError::ProtocolViolation(format!(
+            "scan driver key mismatch during {}: driver {:?}, execution {:?}",
+            action, key, execution.key
+        )));
+    }
+    if !execution.scans.contains_key(&scan_id) {
+        return Err(BackendServiceError::ProtocolViolation(format!(
+            "scan driver for scan_id {} is not installed during {}",
             scan_id, action
         )));
     }
@@ -957,6 +996,32 @@ fn ensure_execution_state(
     }
 }
 
+fn scan_state_is_terminal(state: ScanEntryState) -> bool {
+    matches!(state, ScanEntryState::Finished | ScanEntryState::Cancelled)
+}
+
+fn execution_unfinished_scan_count(execution: &ActiveExecution) -> usize {
+    execution
+        .scans
+        .values()
+        .filter(|entry| !scan_state_is_terminal(entry.state))
+        .count()
+}
+
+fn execution_ready_for_completion(key: ExecutionKey) -> Result<bool, BackendServiceError> {
+    ACTIVE_EXECUTION.with(|slot| {
+        let active = slot.borrow();
+        let execution = active.as_ref().ok_or(BackendServiceError::NoActiveExecution)?;
+        if execution.key != key {
+            return Err(BackendServiceError::ProtocolViolation(format!(
+                "execution key mismatch while checking completion readiness: expected {:?}, found {:?}",
+                key, execution.key
+            )));
+        }
+        Ok(execution.active_scans.is_empty() && execution_unfinished_scan_count(execution) == 0)
+    })
+}
+
 fn step_scan_with_driver(
     key: ExecutionKey,
     scan_id: u64,
@@ -969,7 +1034,7 @@ fn step_scan_with_driver(
                 .ok_or(BackendServiceError::NoActiveExecution)?;
             ensure_driver_matches_execution(execution, key, scan_id, "step scan")?;
             ensure_execution_state(execution, BackendExecutionState::Running, "step scan")?;
-            execution.active_scan.take().ok_or_else(|| {
+            execution.active_scans.remove(&scan_id).ok_or_else(|| {
                 BackendServiceError::ProtocolViolation(format!(
                     "scan driver for scan_id {} lost its active scan stream during step scan",
                     scan_id
@@ -991,7 +1056,8 @@ fn step_scan_with_driver(
                     active
                         .as_mut()
                         .expect("active execution must exist for continuing scan")
-                        .active_scan = Some(active_scan);
+                        .active_scans
+                        .insert(scan_id, active_scan);
                     return Ok(step);
                 }
                 Ok(ScanDriveOutcome::Blocked) => {
@@ -1007,7 +1073,8 @@ fn step_scan_with_driver(
                             active
                                 .as_mut()
                                 .expect("active execution must exist while yielding scan control")
-                                .active_scan = Some(active_scan);
+                                .active_scans
+                                .insert(scan_id, active_scan);
                             return Ok(ScanStreamStep::YieldForControl {
                                 reason: ScanYieldReason::PermitBackpressure,
                             });
@@ -1051,6 +1118,8 @@ fn prepare_scan_entry(
     session_epoch: u64,
     config: BackendServiceConfig,
     spec: Arc<PgScanSpec>,
+    scan_peer: BackendLeaseSlot,
+    scan_lease: BackendSlotLease,
 ) -> Result<PreparedScanEntry, BackendServiceError> {
     let scan_id = spec.scan_id.get();
     if spec.compiled_scan.uses_dummy_projection {
@@ -1107,6 +1176,8 @@ fn prepare_scan_entry(
         prepared_scan,
         estimator,
         canonical_open,
+        scan_peer,
+        scan_lease: Some(scan_lease),
         state: ScanEntryState::Prepared,
     })
 }
@@ -1289,10 +1360,10 @@ fn mark_scan_terminal(
 ) -> Result<(), BackendServiceError> {
     let entry = execution
         .scans
-        .iter_mut()
-        .find(|entry| entry.scan_id == scan_id)
+        .get_mut(&scan_id)
         .ok_or(BackendServiceError::UnknownScanId { scan_id })?;
     entry.state = state;
+    entry.scan_lease.take();
     Ok(())
 }
 
@@ -1314,21 +1385,14 @@ fn cancel_scan_from_driver(key: ExecutionKey, scan_id: u64) -> Result<bool, Back
         let mut active_scan = active
             .as_mut()
             .expect("active execution must remain installed during cancel_scan")
-            .active_scan
-            .take()
+            .active_scans
+            .remove(&scan_id)
             .ok_or_else(|| {
                 BackendServiceError::ProtocolViolation(format!(
                     "scan driver for scan_id {} lost its active scan stream during cancel scan",
                     scan_id
                 ))
             })?;
-        if active_scan.scan_id != scan_id {
-            active
-                .as_mut()
-                .expect("active execution must exist for mismatched cancel")
-                .active_scan = Some(active_scan);
-            return Err(BackendServiceError::ScanNotActive { scan_id });
-        }
 
         let cancel_result = {
             let execution = active
@@ -1338,13 +1402,7 @@ fn cancel_scan_from_driver(key: ExecutionKey, scan_id: u64) -> Result<bool, Back
         };
 
         match cancel_result {
-            Ok(()) => {
-                let execution = active
-                    .as_mut()
-                    .expect("active execution must remain installed after cancel_scan");
-                execution.driver_scan_id = None;
-                Ok(true)
-            }
+            Ok(()) => Ok(true),
             Err(err) => Err(fail_current_execution_after_scan_error(
                 &mut active,
                 active_scan,
@@ -1368,11 +1426,15 @@ fn terminate_current_execution(
         if should_ignore_message(current, slot_id, session_epoch)? {
             return Ok(false);
         }
-        if let Some(scan_id) = current.driver_scan_id {
-            return Err(BackendServiceError::ScanDriverActive {
-                action: terminal_event_action(event),
-                scan_id,
-            });
+        if event == BackendExecutionEvent::CompleteExecution {
+            let unfinished_count = execution_unfinished_scan_count(current);
+            if unfinished_count != 0 {
+                return Err(BackendServiceError::ExecutionScansNotTerminal {
+                    action: terminal_event_action(event),
+                    active_count: current.active_scans.len(),
+                    unfinished_count,
+                });
+            }
         }
         if !terminal_event_allowed(*current.machine.state(), event) {
             return Err(BackendServiceError::InvalidExecutionState {
@@ -1401,7 +1463,17 @@ fn terminate_current_execution_from_driver(
         if should_ignore_message(current, key.slot_id, key.session_epoch)? {
             return Ok(false);
         }
-        ensure_driver_matches_execution(current, key, scan_id, terminal_event_action(event))?;
+        ensure_driver_belongs_to_execution(current, key, scan_id, terminal_event_action(event))?;
+        if event == BackendExecutionEvent::CompleteExecution {
+            let unfinished_count = execution_unfinished_scan_count(current);
+            if unfinished_count != 0 {
+                return Err(BackendServiceError::ExecutionScansNotTerminal {
+                    action: terminal_event_action(event),
+                    active_count: current.active_scans.len(),
+                    unfinished_count,
+                });
+            }
+        }
         if !terminal_event_allowed(*current.machine.state(), event) {
             return Err(BackendServiceError::InvalidExecutionState {
                 action: terminal_event_action(event),
@@ -1449,7 +1521,6 @@ fn cleanup_execution(
     terminal_event: Option<BackendExecutionEvent>,
 ) -> Result<(), BackendServiceError> {
     let mut cleanup_error = None;
-    execution.driver_scan_id = None;
 
     if let Some(event) = terminal_event {
         if let Err(err) = consume_execution_event(&mut execution.machine, event) {
@@ -1461,17 +1532,18 @@ fn cleanup_execution(
         starting.plan_role.abort();
     }
 
-    if let Some(mut active_scan) = execution.active_scan.take() {
+    for (scan_id, mut active_scan) in std::mem::take(&mut execution.active_scans) {
         if let Err(err) = active_scan.producer.abort() {
             cleanup_error.get_or_insert(BackendServiceError::ScanProducer(err));
         }
         active_scan.coordinator.abort();
-        let _ = mark_scan_terminal(
-            &mut execution,
-            active_scan.scan_id,
-            ScanEntryState::Cancelled,
-        );
+        let _ = mark_scan_terminal(&mut execution, scan_id, ScanEntryState::Cancelled);
     }
+
+    for entry in execution.scans.values_mut() {
+        entry.scan_lease.take();
+    }
+    execution.scan_spi.take();
 
     if execution.machine.state() == &BackendExecutionState::Terminal {
         if let Err(err) =
@@ -1495,7 +1567,9 @@ fn fail_current_execution_after_scan_error(
     err: BackendServiceError,
 ) -> BackendServiceError {
     if let Some(execution) = active.as_mut() {
-        execution.active_scan = Some(active_scan);
+        execution
+            .active_scans
+            .insert(active_scan.scan_id, active_scan);
     } else {
         return err;
     }
@@ -1519,7 +1593,9 @@ fn finish_current_execution_after_fatal_scan_step(
 ) -> Result<ScanStreamStep, BackendServiceError> {
     let detail = fatal_scan_step_detail(&step);
     if let Some(execution) = active.as_mut() {
-        execution.active_scan = Some(active_scan);
+        execution
+            .active_scans
+            .insert(active_scan.scan_id, active_scan);
     } else {
         return Err(BackendServiceError::ProtocolViolation(format!(
             "fatal scan step lost active execution before cleanup: {}",
