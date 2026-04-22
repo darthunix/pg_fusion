@@ -3,7 +3,7 @@ use crate::message::RuntimeMessageFamily;
 use std::io::Write;
 
 const RUNTIME_PROTOCOL_MAGIC: u32 = 0x5046_5232;
-const RUNTIME_PROTOCOL_VERSION: u16 = 2;
+const RUNTIME_PROTOCOL_VERSION: u16 = 3;
 pub const RUNTIME_ENVELOPE_HEADER_LEN: usize = 8;
 
 pub(crate) const BACKEND_EXECUTION_START_TAG: u8 = 1;
@@ -14,6 +14,8 @@ pub(crate) const WORKER_EXECUTION_COMPLETE_TAG: u8 = 1;
 pub(crate) const WORKER_EXECUTION_FAIL_TAG: u8 = 2;
 pub(crate) const WORKER_SCAN_OPEN_TAG: u8 = 1;
 pub(crate) const WORKER_SCAN_CANCEL_TAG: u8 = 2;
+pub(crate) const BACKEND_SCAN_FINISHED_TAG: u8 = 1;
+pub(crate) const BACKEND_SCAN_FAILED_TAG: u8 = 2;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct RuntimeEnvelopeHeader {

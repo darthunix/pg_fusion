@@ -30,5 +30,6 @@ thiserror = "2.0"
 transfer = { path = "../page/transfer", version = "25.0" }
 
 [dev-dependencies]
+libc = "0.2"
 pool = { path = "../page/pool", version = "25.0" }
 scan_sql = { path = "../pg/scan_sql", version = "25.0" }

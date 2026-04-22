@@ -5,6 +5,7 @@ pub mod fsm;
 pub mod runtime;
 pub mod scan_exec;
 pub mod scan_flow_driver;
+pub mod transport_scan_source;
 
 pub use control_transport::{BackendLeaseId, BackendLeaseSlot};
 pub use error::WorkerRuntimeError;
@@ -17,3 +18,4 @@ pub use scan_flow_driver::{
     ScanFlowDriver, ScanFlowDriverStep, ScanFlowOpen, SingleLeaderOpenScanControl,
     SingleLeaderScanDescriptor,
 };
+pub use transport_scan_source::{ScanIngressProvider, TransportScanBatchSource};

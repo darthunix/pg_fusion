@@ -23,12 +23,16 @@ The main contracts are:
 - `session_epoch` is carried in every message and used by higher layers to drop
   stale traffic before it mutates fresh execution state
 - the primary execution slot carries only execution lifecycle control
-- secondary scan slots carry only scan lifecycle control
+- secondary scan slots carry only scan lifecycle control and scan terminal signals
+- dedicated scan slots must provide at least `256` bytes backend-to-worker and
+  `44` bytes worker-to-backend raw ring capacity
 - `PlanFlowDescriptor` reconstructs a `plan_flow::PlanOpen` when paired with
   `session_epoch`
 - `ScanChannelDescriptorWire` publishes one dedicated scan slot for one `scan_id`
   up front in `StartExecution`
 - `scan_channels` are encoded in strictly increasing `scan_id` order
+- `BackendScanToWorker::ScanFailed.message` is bounded to `220` UTF-8 bytes so
+  it always fits into the minimum dedicated inbound scan ring
 - `ScanFlowDescriptorRef` reconstructs a `scan_flow::ScanOpen` when paired with
   `session_epoch` and `scan_id`
 - `ScanFlowDescriptor::new` validates the declared producer set up front, so
@@ -127,5 +131,30 @@ let msg = WorkerExecutionToBackend::CompleteExecution { session_epoch: 7 };
 let mut buf = [0u8; 64];
 let len = encode_worker_execution_to_backend_into(msg, &mut buf)?;
 control_tx.send_frame(&buf[..len])?;
+# Ok::<(), Box<dyn std::error::Error>>(())
+```
+
+Typical backend-to-worker scan terminal decode on a dedicated scan slot:
+
+```rust,ignore
+use runtime_protocol::{decode_backend_scan_to_worker, BackendScanToWorkerRef};
+
+match decode_backend_scan_to_worker(frame_bytes)? {
+    BackendScanToWorkerRef::ScanFinished {
+        session_epoch,
+        scan_id,
+        producer_id,
+    } => {
+        let _ = (session_epoch, scan_id, producer_id);
+    }
+    BackendScanToWorkerRef::ScanFailed {
+        session_epoch,
+        scan_id,
+        producer_id,
+        message,
+    } => {
+        let _ = (session_epoch, scan_id, producer_id, message);
+    }
+}
 # Ok::<(), Box<dyn std::error::Error>>(())
 ```

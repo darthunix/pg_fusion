@@ -16,6 +16,8 @@ pub enum WorkerRuntimeError {
     RuntimeDecode(#[from] runtime_protocol::DecodeError),
     #[error("runtime protocol encode failed: {0}")]
     RuntimeEncode(#[from] runtime_protocol::EncodeError),
+    #[error("runtime protocol violation: {0}")]
+    ProtocolViolation(String),
     #[error("runtime protocol scan producer set is invalid: {0}")]
     ProducerSet(#[from] runtime_protocol::ProducerSetError),
     #[error("issued frame decode failed: {0}")]
@@ -52,8 +54,26 @@ pub enum WorkerRuntimeError {
     FutureSession { current: u64, incoming: u64 },
     #[error("no dedicated scan peer was published for scan_id {scan_id}")]
     MissingScanPeer { scan_id: u64 },
+    #[error(
+        "no issued scan ingress is configured for session_epoch={session_epoch}, scan_id={scan_id}"
+    )]
+    MissingScanIngress { session_epoch: u64, scan_id: u64 },
+    #[error(
+        "control frame scratch capacity is too small: need at least {required} bytes, got {actual}"
+    )]
+    ControlFrameCapacityTooSmall { required: usize, actual: usize },
+    #[error(
+        "scan transport {direction} ring is too small: need at least {required} bytes, got {actual}"
+    )]
+    ScanTransportRingTooSmall {
+        direction: &'static str,
+        required: usize,
+        actual: usize,
+    },
     #[error("control frame payload is too large for configured scratch buffer")]
     ControlFrameTooLarge,
     #[error("worker runtime has no physical plan yet")]
     MissingPhysicalPlan,
+    #[error("failed to spawn worker scan thread: {0}")]
+    ThreadSpawn(String),
 }

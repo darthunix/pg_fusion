@@ -4,6 +4,7 @@
 //! level:
 //!
 //! - backend-to-worker execution control is carried only on the primary slot
+//! - backend-to-worker scan terminals are carried only on dedicated scan slots
 //! - worker-to-backend execution control is carried only on the primary slot
 //! - worker-to-backend scan control is carried only on dedicated scan slots
 
@@ -23,6 +24,8 @@ pub enum RuntimeMessageFamily {
     WorkerExecutionToBackend = 2,
     /// Worker scan control sent back to the backend on dedicated scan slots.
     WorkerScanToBackend = 3,
+    /// Backend scan terminal signals sent to the worker on dedicated scan slots.
+    BackendScanToWorker = 4,
 }
 
 impl TryFrom<u8> for RuntimeMessageFamily {
@@ -33,6 +36,7 @@ impl TryFrom<u8> for RuntimeMessageFamily {
             1 => Ok(Self::BackendExecutionToWorker),
             2 => Ok(Self::WorkerExecutionToBackend),
             3 => Ok(Self::WorkerScanToBackend),
+            4 => Ok(Self::BackendScanToWorker),
             actual => Err(DecodeError::UnexpectedMessageFamily { actual }),
         }
     }
@@ -191,6 +195,68 @@ impl WorkerScanToBackendRef<'_> {
     pub fn session_epoch(self) -> u64 {
         match self {
             Self::OpenScan { session_epoch, .. } | Self::CancelScan { session_epoch, .. } => {
+                session_epoch
+            }
+        }
+    }
+}
+
+/// Scan-level backend-to-worker terminal control carried only on dedicated scan slots.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum BackendScanToWorker<'a> {
+    /// One producer reached logical EOF.
+    ScanFinished {
+        session_epoch: u64,
+        scan_id: u64,
+        producer_id: u16,
+    },
+    /// One producer failed and terminated the logical scan.
+    ///
+    /// `message` is bounded to
+    /// [`crate::MAX_SCAN_FAILURE_MESSAGE_LEN`] UTF-8 bytes because this
+    /// terminal still rides over one framed `control_transport` slot.
+    ScanFailed {
+        session_epoch: u64,
+        scan_id: u64,
+        producer_id: u16,
+        message: &'a str,
+    },
+}
+
+impl BackendScanToWorker<'_> {
+    /// Return the `session_epoch` targeted by this message.
+    pub fn session_epoch(self) -> u64 {
+        match self {
+            Self::ScanFinished { session_epoch, .. } | Self::ScanFailed { session_epoch, .. } => {
+                session_epoch
+            }
+        }
+    }
+}
+
+/// Borrowed decode-side scan-level backend-to-worker terminal control.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum BackendScanToWorkerRef<'a> {
+    /// Borrowed `ScanFinished` view.
+    ScanFinished {
+        session_epoch: u64,
+        scan_id: u64,
+        producer_id: u16,
+    },
+    /// Borrowed `ScanFailed` view.
+    ScanFailed {
+        session_epoch: u64,
+        scan_id: u64,
+        producer_id: u16,
+        message: &'a str,
+    },
+}
+
+impl BackendScanToWorkerRef<'_> {
+    /// Return the `session_epoch` targeted by this message.
+    pub fn session_epoch(self) -> u64 {
+        match self {
+            Self::ScanFinished { session_epoch, .. } | Self::ScanFailed { session_epoch, .. } => {
                 session_epoch
             }
         }

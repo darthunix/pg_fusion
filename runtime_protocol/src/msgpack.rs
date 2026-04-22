@@ -1,6 +1,8 @@
 use crate::error::{DecodeError, EncodeError};
-use rmp::decode::{read_array_len, read_marker, read_u16, read_u64, read_u8, RmpRead};
-use rmp::encode::{write_array_len, write_nil, write_u16, write_u64, write_u8};
+use rmp::decode::{
+    read_array_len, read_marker, read_str_len, read_u16, read_u64, read_u8, RmpRead,
+};
+use rmp::encode::{write_array_len, write_nil, write_str, write_u16, write_u64, write_u8};
 use rmp::Marker;
 use std::io::{self, Write};
 
@@ -24,6 +26,21 @@ pub(crate) fn read_u64_from(source: &mut &[u8]) -> Result<u64, DecodeError> {
     read_u64(source).map_err(|error| DecodeError::MsgPack(error.to_string()))
 }
 
+pub(crate) fn read_str_from<'a>(source: &mut &'a [u8]) -> Result<&'a str, DecodeError> {
+    let len = read_str_len(source).map_err(|error| DecodeError::MsgPack(error.to_string()))?;
+    let len = usize::try_from(len)
+        .map_err(|_| DecodeError::MsgPack("string length does not fit into usize".to_string()))?;
+    if source.len() < len {
+        return Err(DecodeError::MsgPack(format!(
+            "truncated string payload: expected {len} bytes, got {}",
+            source.len()
+        )));
+    }
+    let (bytes, tail) = source.split_at(len);
+    *source = tail;
+    std::str::from_utf8(bytes).map_err(|error| DecodeError::MsgPack(error.to_string()))
+}
+
 pub(crate) fn write_array_len_to<W: Write>(sink: &mut W, len: u32) -> Result<(), EncodeError> {
     write_array_len(sink, len)
         .map(|_| ())
@@ -44,6 +61,10 @@ pub(crate) fn write_u16_to<W: Write>(sink: &mut W, value: u16) -> Result<(), Enc
 
 pub(crate) fn write_u64_to<W: Write>(sink: &mut W, value: u64) -> Result<(), EncodeError> {
     write_u64(sink, value).map_err(|error| EncodeError::MsgPack(error.to_string()))
+}
+
+pub(crate) fn write_str_to<W: Write>(sink: &mut W, value: &str) -> Result<(), EncodeError> {
+    write_str(sink, value).map_err(|error| EncodeError::MsgPack(error.to_string()))
 }
 
 pub(crate) fn write_nil_to<W: Write>(sink: &mut W) -> Result<(), EncodeError> {

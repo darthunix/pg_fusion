@@ -12,6 +12,15 @@ Snapshot ownership is backend-only. The worker requests scans by `scan_id` and
 the dedicated scan peer published in `StartExecution`; it does not expose an
 explain path.
 
+For a transport-backed scan data-plane, use `TransportScanBatchSource` together
+with a `ScanIngressProvider`. That source claims the dedicated scan peer for
+the lifetime of each scan stream, sends `OpenScan` / `CancelScan` on that peer,
+and consumes both issued page headers and backend-emitted scan terminal
+messages from the same slot. Dedicated scan slots must provide at least:
+
+- `256` bytes raw backend-to-worker ring capacity
+- `44` bytes raw worker-to-backend ring capacity
+
 Typical control-path usage:
 
 ```rust,ignore

@@ -1,6 +1,11 @@
 use super::*;
-use crate::envelope::{write_runtime_header_to, BACKEND_EXECUTION_START_TAG, WORKER_SCAN_OPEN_TAG};
-use crate::msgpack::{write_array_len_to, write_u16_to, write_u32_to, write_u64_to, write_u8_to};
+use crate::envelope::{
+    write_runtime_header_to, BACKEND_EXECUTION_START_TAG, BACKEND_SCAN_FAILED_TAG,
+    WORKER_SCAN_OPEN_TAG,
+};
+use crate::msgpack::{
+    write_array_len_to, write_str_to, write_u16_to, write_u32_to, write_u64_to, write_u8_to,
+};
 use crate::scan::{PRODUCER_DESCRIPTOR_LEN, SCAN_CHANNEL_DESCRIPTOR_LEN};
 use transfer::MessageKind;
 
@@ -59,6 +64,13 @@ fn encode_worker_execution(message: WorkerExecutionToBackend) -> Vec<u8> {
 fn encode_worker_scan(message: WorkerScanToBackend<'_>) -> Vec<u8> {
     let mut buf = vec![0u8; encoded_len_worker_scan_to_backend(message)];
     let len = encode_worker_scan_to_backend_into(message, &mut buf).expect("encode");
+    assert_eq!(len, buf.len());
+    buf
+}
+
+fn encode_backend_scan(message: BackendScanToWorker<'_>) -> Vec<u8> {
+    let mut buf = vec![0u8; encoded_len_backend_scan_to_worker(message)];
+    let len = encode_backend_scan_to_worker_into(message, &mut buf).expect("encode");
     assert_eq!(len, buf.len());
     buf
 }
@@ -160,6 +172,26 @@ fn encode_raw_backend_start_execution(
     write_u16_to(&mut buf, plan.page_kind).expect("page kind");
     write_u16_to(&mut buf, plan.page_flags).expect("page flags");
     buf.extend_from_slice(scan_channel_bytes);
+    buf
+}
+
+fn encode_raw_backend_scan_failed(
+    session_epoch: u64,
+    scan_id: u64,
+    producer_id: u16,
+    message: &str,
+) -> Vec<u8> {
+    let mut buf = Vec::new();
+    write_runtime_header_to(
+        &mut buf,
+        RuntimeMessageFamily::BackendScanToWorker,
+        BACKEND_SCAN_FAILED_TAG,
+    )
+    .expect("runtime header");
+    write_u64_to(&mut buf, session_epoch).expect("session");
+    write_u64_to(&mut buf, scan_id).expect("scan id");
+    write_u16_to(&mut buf, producer_id).expect("producer id");
+    write_str_to(&mut buf, message).expect("message");
     buf
 }
 
@@ -398,6 +430,89 @@ fn worker_open_scan_round_trips_many_producers() {
 }
 
 #[test]
+fn backend_scan_finished_round_trips() {
+    let message = BackendScanToWorker::ScanFinished {
+        session_epoch: 5,
+        scan_id: 77,
+        producer_id: 0,
+    };
+    let encoded = encode_backend_scan(message);
+    let decoded = decode_backend_scan_to_worker(&encoded).expect("decode");
+    assert_eq!(
+        decoded,
+        BackendScanToWorkerRef::ScanFinished {
+            session_epoch: 5,
+            scan_id: 77,
+            producer_id: 0,
+        }
+    );
+}
+
+#[test]
+fn backend_scan_failed_round_trips_with_borrowed_message() {
+    let message = BackendScanToWorker::ScanFailed {
+        session_epoch: 5,
+        scan_id: 77,
+        producer_id: 0,
+        message: "boom",
+    };
+    let encoded = encode_backend_scan(message);
+    let decoded = decode_backend_scan_to_worker(&encoded).expect("decode");
+    assert_eq!(
+        decoded,
+        BackendScanToWorkerRef::ScanFailed {
+            session_epoch: 5,
+            scan_id: 77,
+            producer_id: 0,
+            message: "boom",
+        }
+    );
+}
+
+#[test]
+fn backend_scan_failed_accepts_max_bounded_message_len() {
+    let message_text = "x".repeat(MAX_SCAN_FAILURE_MESSAGE_LEN);
+    let message = BackendScanToWorker::ScanFailed {
+        session_epoch: u64::MAX,
+        scan_id: u64::MAX,
+        producer_id: u16::MAX,
+        message: &message_text,
+    };
+    let encoded = encode_backend_scan(message);
+    let decoded = decode_backend_scan_to_worker(&encoded).expect("decode");
+    assert_eq!(
+        decoded,
+        BackendScanToWorkerRef::ScanFailed {
+            session_epoch: u64::MAX,
+            scan_id: u64::MAX,
+            producer_id: u16::MAX,
+            message: &message_text,
+        }
+    );
+}
+
+#[test]
+fn backend_scan_failed_rejects_message_over_bounded_len() {
+    let message_text = "x".repeat(MAX_SCAN_FAILURE_MESSAGE_LEN + 1);
+    let message = BackendScanToWorker::ScanFailed {
+        session_epoch: 1,
+        scan_id: 2,
+        producer_id: 3,
+        message: &message_text,
+    };
+    let mut buf = vec![0_u8; 512];
+    let err = encode_backend_scan_to_worker_into(message, &mut buf)
+        .expect_err("too long scan failure text");
+    assert_eq!(
+        err,
+        EncodeError::ScanFailureMessageTooLong {
+            actual: MAX_SCAN_FAILURE_MESSAGE_LEN + 1,
+            maximum: MAX_SCAN_FAILURE_MESSAGE_LEN,
+        }
+    );
+}
+
+#[test]
 fn worker_fail_execution_round_trips_without_detail() {
     let message = WorkerExecutionToBackend::FailExecution {
         session_epoch: 12,
@@ -514,6 +629,24 @@ fn decode_rejects_wrong_message_family() {
     });
     let err = decode_backend_execution_to_worker(&encoded).expect_err("wrong family");
     assert!(matches!(err, DecodeError::UnexpectedMessageFamily { .. }));
+}
+
+#[test]
+fn decode_backend_scan_rejects_wrong_message_family() {
+    let encoded = encode_worker_scan(WorkerScanToBackend::CancelScan {
+        session_epoch: 2,
+        scan_id: 3,
+    });
+    let err = decode_backend_scan_to_worker(&encoded).expect_err("wrong family");
+    assert!(matches!(err, DecodeError::UnexpectedMessageFamily { .. }));
+}
+
+#[test]
+fn decode_backend_scan_failed_rejects_trailing_bytes() {
+    let mut encoded = encode_raw_backend_scan_failed(2, 3, 0, "boom");
+    encoded.push(0);
+    let err = decode_backend_scan_to_worker(&encoded).expect_err("trailing");
+    assert!(matches!(err, DecodeError::TrailingBytes { remaining: 1 }));
 }
 
 #[test]

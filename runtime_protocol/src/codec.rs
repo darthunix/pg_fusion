@@ -8,17 +8,19 @@
 use crate::envelope::{
     decode_runtime_header, expect_runtime_family, write_runtime_header_to,
     BACKEND_EXECUTION_CANCEL_TAG, BACKEND_EXECUTION_FAIL_TAG, BACKEND_EXECUTION_START_TAG,
-    WORKER_EXECUTION_COMPLETE_TAG, WORKER_EXECUTION_FAIL_TAG, WORKER_SCAN_CANCEL_TAG,
-    WORKER_SCAN_OPEN_TAG,
+    BACKEND_SCAN_FAILED_TAG, BACKEND_SCAN_FINISHED_TAG, WORKER_EXECUTION_COMPLETE_TAG,
+    WORKER_EXECUTION_FAIL_TAG, WORKER_SCAN_CANCEL_TAG, WORKER_SCAN_OPEN_TAG,
 };
 use crate::error::{DecodeError, EncodeError};
 use crate::message::{
-    BackendExecutionToWorker, BackendExecutionToWorkerRef, ExecutionFailureCode,
-    RuntimeMessageFamily, WorkerExecutionToBackend, WorkerScanToBackend, WorkerScanToBackendRef,
+    BackendExecutionToWorker, BackendExecutionToWorkerRef, BackendScanToWorker,
+    BackendScanToWorkerRef, ExecutionFailureCode, RuntimeMessageFamily, WorkerExecutionToBackend,
+    WorkerScanToBackend, WorkerScanToBackendRef,
 };
 use crate::msgpack::{
-    encode_into_with_len, encoded_len_with, read_optional_u64_from, read_u16_from, read_u64_from,
-    read_u8_from, write_optional_u64_to, write_u16_to, write_u64_to, write_u8_to,
+    encode_into_with_len, encoded_len_with, read_optional_u64_from, read_str_from, read_u16_from,
+    read_u64_from, read_u8_from, write_optional_u64_to, write_str_to, write_u16_to, write_u64_to,
+    write_u8_to,
 };
 use crate::scan::{
     write_producer_slice_to, write_scan_channel_slice_to, PlanFlowDescriptor, ScanFlowDescriptorRef,
@@ -41,6 +43,12 @@ pub fn encoded_len_worker_execution_to_backend(message: WorkerExecutionToBackend
 pub fn encoded_len_worker_scan_to_backend(message: WorkerScanToBackend<'_>) -> usize {
     try_encoded_len_worker_scan_to_backend(message)
         .expect("runtime_protocol worker scan length must fit into usize")
+}
+
+/// Return the exact encoded length of one backend-scan terminal message.
+pub fn encoded_len_backend_scan_to_worker(message: BackendScanToWorker<'_>) -> usize {
+    try_encoded_len_backend_scan_to_worker(message)
+        .expect("runtime_protocol backend scan length must fit into usize")
 }
 
 /// Encode one backend-execution control message into `out`.
@@ -76,6 +84,18 @@ pub fn encode_worker_scan_to_backend_into(
         try_encoded_len_worker_scan_to_backend(message)?,
         out,
         |mut writer| encode_worker_scan_to_backend_to(message, &mut writer),
+    )
+}
+
+/// Encode one backend-scan terminal message into `out`.
+pub fn encode_backend_scan_to_worker_into(
+    message: BackendScanToWorker<'_>,
+    out: &mut [u8],
+) -> Result<usize, EncodeError> {
+    encode_into_with_len(
+        try_encoded_len_backend_scan_to_worker(message)?,
+        out,
+        |mut writer| encode_backend_scan_to_worker_to(message, &mut writer),
     )
 }
 
@@ -190,6 +210,37 @@ pub fn decode_worker_scan_to_backend(
     Ok(message)
 }
 
+/// Decode one borrowed backend-scan terminal message.
+pub fn decode_backend_scan_to_worker(
+    bytes: &[u8],
+) -> Result<BackendScanToWorkerRef<'_>, DecodeError> {
+    let original = bytes;
+    let mut source = bytes;
+    let header = decode_runtime_header(&mut source)?;
+    expect_runtime_family(header.family, RuntimeMessageFamily::BackendScanToWorker)?;
+
+    let session_epoch = read_u64_from(&mut source)?;
+    let scan_id = read_u64_from(&mut source)?;
+    let producer_id = read_u16_from(&mut source)?;
+    let message = match header.tag {
+        BACKEND_SCAN_FINISHED_TAG => BackendScanToWorkerRef::ScanFinished {
+            session_epoch,
+            scan_id,
+            producer_id,
+        },
+        BACKEND_SCAN_FAILED_TAG => BackendScanToWorkerRef::ScanFailed {
+            session_epoch,
+            scan_id,
+            producer_id,
+            message: read_str_from(&mut source)?,
+        },
+        actual => return Err(DecodeError::UnexpectedTag { actual }),
+    };
+
+    ensure_no_trailing_bytes(original, source)?;
+    Ok(message)
+}
+
 fn try_encoded_len_backend_execution_to_worker(
     message: BackendExecutionToWorker<'_>,
 ) -> Result<usize, EncodeError> {
@@ -206,6 +257,12 @@ fn try_encoded_len_worker_scan_to_backend(
     message: WorkerScanToBackend<'_>,
 ) -> Result<usize, EncodeError> {
     encoded_len_with(|sink| encode_worker_scan_to_backend_to(message, sink))
+}
+
+fn try_encoded_len_backend_scan_to_worker(
+    message: BackendScanToWorker<'_>,
+) -> Result<usize, EncodeError> {
+    encoded_len_with(|sink| encode_backend_scan_to_worker_to(message, sink))
 }
 
 fn encode_backend_execution_to_worker_to<W: std::io::Write>(
@@ -318,6 +375,51 @@ fn encode_worker_scan_to_backend_to<W: std::io::Write>(
             )?;
             write_u64_to(sink, session_epoch)?;
             write_u64_to(sink, scan_id)?;
+        }
+    }
+    Ok(())
+}
+
+fn encode_backend_scan_to_worker_to<W: std::io::Write>(
+    message: BackendScanToWorker<'_>,
+    sink: &mut W,
+) -> Result<(), EncodeError> {
+    match message {
+        BackendScanToWorker::ScanFinished {
+            session_epoch,
+            scan_id,
+            producer_id,
+        } => {
+            write_runtime_header_to(
+                sink,
+                RuntimeMessageFamily::BackendScanToWorker,
+                BACKEND_SCAN_FINISHED_TAG,
+            )?;
+            write_u64_to(sink, session_epoch)?;
+            write_u64_to(sink, scan_id)?;
+            write_u16_to(sink, producer_id)?;
+        }
+        BackendScanToWorker::ScanFailed {
+            session_epoch,
+            scan_id,
+            producer_id,
+            message,
+        } => {
+            if message.len() > crate::MAX_SCAN_FAILURE_MESSAGE_LEN {
+                return Err(EncodeError::ScanFailureMessageTooLong {
+                    actual: message.len(),
+                    maximum: crate::MAX_SCAN_FAILURE_MESSAGE_LEN,
+                });
+            }
+            write_runtime_header_to(
+                sink,
+                RuntimeMessageFamily::BackendScanToWorker,
+                BACKEND_SCAN_FAILED_TAG,
+            )?;
+            write_u64_to(sink, session_epoch)?;
+            write_u64_to(sink, scan_id)?;
+            write_u16_to(sink, producer_id)?;
+            write_str_to(sink, message)?;
         }
     }
     Ok(())
