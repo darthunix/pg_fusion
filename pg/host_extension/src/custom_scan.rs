@@ -9,7 +9,9 @@ use backend_service::{
     ExplainInput, OpenScanInput, ScanStreamStep, StartExecutionInput,
 };
 use control_transport::{BackendLeaseSlot, BackendSlotLease};
-use issuance::{decode_issued_frame, encode_issued_frame, IssuancePool, IssuedOwnedFrame, IssuedTx};
+use issuance::{
+    decode_issued_frame, encode_issued_frame, IssuancePool, IssuedOwnedFrame, IssuedTx,
+};
 use pgrx::pg_sys::{
     self, CustomExecMethods, CustomScan, CustomScanMethods, CustomScanState, List, MyLatch, Node,
     WL_LATCH_SET, WL_POSTMASTER_DEATH, WL_TIMEOUT,
@@ -18,18 +20,20 @@ use pgrx::prelude::*;
 use pgrx::{check_for_interrupts, pg_guard};
 use pool::PagePool;
 use runtime_protocol::{
-    decode_runtime_message_family, decode_worker_execution_to_backend, decode_worker_scan_to_backend,
-    encode_backend_execution_to_worker_into, encode_backend_scan_to_worker_into,
-    encoded_len_backend_execution_to_worker, encoded_len_backend_scan_to_worker,
-    BackendExecutionToWorker, BackendScanToWorker, RuntimeMessageFamily, WorkerExecutionToBackend,
-    WorkerScanToBackendRef,
+    decode_runtime_message_family, decode_worker_execution_to_backend,
+    decode_worker_scan_to_backend, encode_backend_execution_to_worker_into,
+    encode_backend_scan_to_worker_into, encoded_len_backend_execution_to_worker,
+    encoded_len_backend_scan_to_worker, BackendExecutionToWorker, BackendScanToWorker,
+    RuntimeMessageFamily, WorkerExecutionToBackend, WorkerScanToBackendRef,
 };
 use transfer::PageTx;
 use worker_runtime::normalize_result_transport_schema;
 
 use crate::guc::host_config;
 use crate::result_ingress::ResultIngress;
-use crate::shmem::{attach_control_region, attach_issuance_pool, attach_page_pool, attach_scan_region};
+use crate::shmem::{
+    attach_control_region, attach_issuance_pool, attach_page_pool, attach_scan_region,
+};
 
 thread_local! {
     static SCAN_METHODS: CustomScanMethods = CustomScanMethods {
@@ -93,9 +97,7 @@ fn exec_methods() -> *const CustomExecMethods {
 }
 
 #[pg_guard]
-unsafe extern "C-unwind" fn create_pg_fusion_scan_state(
-    cscan: *mut CustomScan,
-) -> *mut Node {
+unsafe extern "C-unwind" fn create_pg_fusion_scan_state(cscan: *mut CustomScan) -> *mut Node {
     let sql = sql_from_custom_private((*cscan).custom_private);
     let host_state = Box::new(HostScanState {
         sql,
@@ -111,7 +113,8 @@ unsafe extern "C-unwind" fn create_pg_fusion_scan_state(
         terminal_error: None,
     });
 
-    let state_ptr = pg_sys::palloc0(std::mem::size_of::<PgFusionScanState>()) as *mut PgFusionScanState;
+    let state_ptr =
+        pg_sys::palloc0(std::mem::size_of::<PgFusionScanState>()) as *mut PgFusionScanState;
     let mut state = PgFusionScanState {
         css: CustomScanState {
             methods: exec_methods(),
@@ -128,9 +131,28 @@ unsafe extern "C-unwind" fn create_pg_fusion_scan_state(
 unsafe extern "C-unwind" fn begin_pg_fusion_scan(
     node: *mut CustomScanState,
     estate: *mut pg_sys::EState,
-    _eflags: i32,
+    eflags: i32,
 ) {
     let state = host_state_mut(node);
+    if eflags & pg_sys::EXEC_FLAG_EXPLAIN_ONLY as i32 != 0 {
+        let tuple_desc = tuple_desc_from_scan(node);
+        pg_sys::ExecInitScanTupleSlot(
+            estate,
+            &mut (*node).ss,
+            tuple_desc,
+            &raw const pg_sys::TTSOpsMinimalTuple,
+        );
+        (*node).ss.ps.ps_ResultTupleSlot =
+            pg_sys::MakeSingleTupleTableSlot(tuple_desc, &raw const pg_sys::TTSOpsMinimalTuple);
+        state.control_lease = None;
+        state.execution_key = None;
+        state.scan_peers.clear();
+        state.active_drivers.clear();
+        state.result_ingress = None;
+        state.terminal_error = None;
+        return;
+    }
+
     let config = host_config().unwrap_or_else(|err| error!("pg_fusion config error: {err}"));
     let backend_config = config.backend_service_config();
     let control_region = attach_control_region();
@@ -154,11 +176,12 @@ unsafe extern "C-unwind" fn begin_pg_fusion_scan(
     .unwrap_or_else(|err| error!("pg_fusion begin execution failed: {err}"));
 
     let mut control_lease = control_lease;
-    send_backend_execution(&mut control_lease, begin.control(), &mut Vec::new())
-        .unwrap_or_else(|err| {
+    send_backend_execution(&mut control_lease, begin.control(), &mut Vec::new()).unwrap_or_else(
+        |err| {
             let _ = BackendService::abort_execution_start();
             error!("pg_fusion failed to send StartExecution: {err}");
-        });
+        },
+    );
     publish_plan_to_worker(&mut control_lease).unwrap_or_else(|err| {
         let _ = BackendService::abort_execution_start();
         error!("pg_fusion failed to publish logical plan: {err}");
@@ -167,7 +190,12 @@ unsafe extern "C-unwind" fn begin_pg_fusion_scan(
         .unwrap_or_else(|err| error!("pg_fusion finalize execution failed: {err}"));
     let tuple_desc = tuple_desc_from_scan(node);
 
-    pg_sys::ExecInitScanTupleSlot(estate, &mut (*node).ss, tuple_desc, &raw const pg_sys::TTSOpsMinimalTuple);
+    pg_sys::ExecInitScanTupleSlot(
+        estate,
+        &mut (*node).ss,
+        tuple_desc,
+        &raw const pg_sys::TTSOpsMinimalTuple,
+    );
     (*node).ss.ps.ps_ResultTupleSlot =
         pg_sys::MakeSingleTupleTableSlot(tuple_desc, &raw const pg_sys::TTSOpsMinimalTuple);
 
@@ -509,7 +537,9 @@ fn publish_plan_to_worker(lease: &mut BackendSlotLease) -> Result<(), BackendSer
                 let _ = tx.send_frame(&frame)?;
                 break;
             }
-            plan_flow::BackendPlanStep::Blocked { .. } => wait_latch(Some(Duration::from_millis(1))),
+            plan_flow::BackendPlanStep::Blocked { .. } => {
+                wait_latch(Some(Duration::from_millis(1)))
+            }
             plan_flow::BackendPlanStep::LogicalError { message, .. } => {
                 return Err(BackendServiceError::ProtocolViolation(message));
             }
@@ -536,9 +566,9 @@ fn send_backend_execution(
 
 fn decode_primary_inbound(bytes: &[u8]) -> Result<PrimaryInbound, Box<dyn std::error::Error>> {
     match decode_runtime_message_family(bytes) {
-        Ok(RuntimeMessageFamily::WorkerExecutionToBackend) => {
-            Ok(PrimaryInbound::Control(decode_worker_execution_to_backend(bytes)?))
-        }
+        Ok(RuntimeMessageFamily::WorkerExecutionToBackend) => Ok(PrimaryInbound::Control(
+            decode_worker_execution_to_backend(bytes)?,
+        )),
         Ok(other) => Err(format!("unexpected primary message family {other:?}").into()),
         Err(runtime_error)
             if matches!(
@@ -562,15 +592,16 @@ fn build_transport_schema(sql: &str) -> Result<SchemaRef, String> {
         })
         .map_err(|err| err.to_string())?;
     let output_schema = Arc::new(Schema::new(
-        built.logical_plan
+        built
+            .logical_plan
             .schema()
             .fields()
             .iter()
             .map(|field| Field::new(field.name(), field.data_type().clone(), field.is_nullable()))
             .collect::<Vec<_>>(),
     ));
-    let (schema, _) = normalize_result_transport_schema(&output_schema)
-        .map_err(|err| err.to_string())?;
+    let (schema, _) =
+        normalize_result_transport_schema(&output_schema).map_err(|err| err.to_string())?;
     Ok(schema)
 }
 
@@ -647,7 +678,12 @@ fn wait_latch(timeout: Option<Duration>) {
         WL_LATCH_SET | WL_POSTMASTER_DEATH
     };
     let rc = unsafe {
-        let rc = pg_sys::WaitLatch(MyLatch, events as i32, timeout_ms, pg_sys::PG_WAIT_EXTENSION);
+        let rc = pg_sys::WaitLatch(
+            MyLatch,
+            events as i32,
+            timeout_ms,
+            pg_sys::PG_WAIT_EXTENSION,
+        );
         pg_sys::ResetLatch(MyLatch);
         rc
     };

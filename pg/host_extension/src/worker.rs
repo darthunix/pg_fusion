@@ -2,7 +2,6 @@ use std::collections::VecDeque;
 use std::sync::Arc;
 use std::time::Duration;
 
-use control_transport::WorkerTransport;
 use datafusion_execution::TaskContext;
 use futures::executor::block_on;
 use issuance::{encode_issued_frame, IssuancePool, IssuedRx, IssuedTx};
@@ -18,7 +17,9 @@ use worker_runtime::{
 };
 
 use crate::guc::host_config;
-use crate::shmem::{attach_control_region, attach_issuance_pool, attach_page_pool, attach_scan_region};
+use crate::shmem::{
+    attach_control_region, attach_issuance_pool, attach_page_pool, attach_scan_region,
+};
 
 const POLL_INTERVAL: Duration = Duration::from_millis(5);
 
@@ -52,9 +53,6 @@ fn run_worker_main() -> Result<(), WorkerRuntimeError> {
     let mut transport = TransportWorkerRuntime::attach(&control_region, &worker_config)?;
     transport.activate_generation(std::process::id() as i32)?;
 
-    let scan_transport = WorkerTransport::attach(&scan_region)?;
-    scan_transport.activate_generation(std::process::id() as i32)?;
-
     let scan_source = Arc::new(TransportScanBatchSource::new(
         scan_region,
         config.scan_backend_to_worker_capacity,
@@ -73,7 +71,9 @@ fn run_worker_main() -> Result<(), WorkerRuntimeError> {
             transport.recv_peer_frames(peer, |bytes| {
                 let decoded = WorkerRuntimeCore::decode_inbound(bytes)?;
                 let step = match decoded {
-                    DecodedInbound::Control(message) => runtime.accept_backend_control(peer, message)?,
+                    DecodedInbound::Control(message) => {
+                        runtime.accept_backend_control(peer, message)?
+                    }
                     DecodedInbound::IssuedFrame(frame) => {
                         let rx = plan_rx.as_ref().ok_or_else(|| {
                             WorkerRuntimeError::ProtocolViolation(
@@ -84,7 +84,10 @@ fn run_worker_main() -> Result<(), WorkerRuntimeError> {
                     }
                 };
                 if matches!(step, WorkerRuntimeStep::PlanOpened { .. }) {
-                    plan_rx = Some(IssuedRx::new(transfer::PageRx::new(page_pool), issuance_pool));
+                    plan_rx = Some(IssuedRx::new(
+                        transfer::PageRx::new(page_pool),
+                        issuance_pool,
+                    ));
                 }
                 steps.push_back(step);
                 Ok(())
@@ -103,7 +106,6 @@ fn run_worker_main() -> Result<(), WorkerRuntimeError> {
     }
 
     transport.deactivate_generation()?;
-    scan_transport.deactivate_generation()?;
     Ok(())
 }
 
@@ -137,11 +139,12 @@ fn handle_steps(
                         .ok_or(WorkerRuntimeError::MissingPhysicalPlan)?;
                     let stream = plan.execute(0, Arc::new(TaskContext::default()))?;
                     let page_tx = PageTx::new(page_pool);
-                    let payload_capacity = u32::try_from(page_tx.payload_capacity()).map_err(|_| {
-                        WorkerRuntimeError::ProtocolViolation(
-                            "result payload capacity exceeds u32".into(),
-                        )
-                    })?;
+                    let payload_capacity =
+                        u32::try_from(page_tx.payload_capacity()).map_err(|_| {
+                            WorkerRuntimeError::ProtocolViolation(
+                                "result payload capacity exceeds u32".into(),
+                            )
+                        })?;
                     let mut producer = ResultPageProducer::new(
                         stream,
                         IssuedTx::new(page_tx, issuance_pool),
@@ -157,11 +160,12 @@ fn handle_steps(
                     loop {
                         match producer.next_step()? {
                             Some(ResultPageStep::OutboundPage(outbound)) => {
-                                let frame = encode_issued_frame(outbound.frame()).map_err(|err| {
-                                    WorkerRuntimeError::ProtocolViolation(format!(
-                                        "failed to encode result page frame: {err}"
-                                    ))
-                                })?;
+                                let frame =
+                                    encode_issued_frame(outbound.frame()).map_err(|err| {
+                                        WorkerRuntimeError::ProtocolViolation(format!(
+                                            "failed to encode result page frame: {err}"
+                                        ))
+                                    })?;
                                 transport.send_peer_bytes(peer, &frame)?;
                                 outbound.mark_sent();
                             }

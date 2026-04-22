@@ -1,5 +1,7 @@
 #![doc = include_str!("../README.md")]
 
+#[cfg(any(test, feature = "pg_test"))]
+use pgrx::pg_schema;
 use pgrx::pg_sys::AsPgCStr;
 use pgrx::prelude::*;
 
@@ -8,6 +10,8 @@ mod guc;
 mod planner;
 mod result_ingress;
 mod shmem;
+#[cfg(any(test, feature = "pg_test"))]
+mod smoke_tests;
 mod utility_hook;
 mod worker;
 
@@ -29,4 +33,30 @@ pub unsafe extern "C-unwind" fn _PG_init() {
 
 fn mark_guc_prefix_reserved(guc_prefix: &str) {
     unsafe { pgrx::pg_sys::MarkGUCPrefixReserved(guc_prefix.as_pg_cstr()) }
+}
+
+#[cfg(any(test, feature = "pg_test"))]
+#[pg_schema]
+mod tests {
+    use pgrx::prelude::*;
+
+    #[pg_test]
+    fn pg_fusion_host_simple_select_smoke() {
+        super::smoke_tests::simple_select_smoke();
+    }
+
+    #[pg_test]
+    fn pg_fusion_host_explain_smoke() {
+        super::smoke_tests::explain_smoke();
+    }
+}
+
+#[cfg(test)]
+pub mod pg_test {
+    pub fn setup(_options: Vec<&str>) {}
+
+    #[must_use]
+    pub fn postgresql_conf_options() -> Vec<&'static str> {
+        vec!["shared_preload_libraries = 'pg_fusion_host'"]
+    }
 }

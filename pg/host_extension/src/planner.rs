@@ -8,8 +8,8 @@ use datafusion::logical_expr::LogicalPlan;
 use pgrx::pg_sys::SysCacheIdentifier::TYPEOID;
 use pgrx::pg_sys::{
     list_append_unique_ptr, list_make1_impl, palloc0, planner_hook, planner_hook_type,
-    standard_planner, CustomScan, List, ListCell, NodeTag, Oid, ParamListInfo, Plan,
-    PlannedStmt, Query,
+    standard_planner, CustomScan, List, ListCell, NodeTag, Oid, ParamListInfo, Plan, PlannedStmt,
+    Query,
 };
 use pgrx::prelude::*;
 
@@ -38,7 +38,7 @@ unsafe extern "C-unwind" fn pg_fusion_planner_hook(
             && (*parse).commandType == pgrx::pg_sys::CmdType::CMD_SELECT
             && !(*parse).hasModifyingCTE
         {
-            return build_planned_custom_scan(query_string, bound_params);
+            return build_planned_custom_scan(parse, query_string, bound_params);
         }
     }
 
@@ -51,6 +51,7 @@ unsafe extern "C-unwind" fn pg_fusion_planner_hook(
 
 #[pg_guard]
 unsafe extern "C-unwind" fn build_planned_custom_scan(
+    parse: *mut Query,
     query_string: *const c_char,
     bound_params: ParamListInfo,
 ) -> *mut PlannedStmt {
@@ -60,19 +61,17 @@ unsafe extern "C-unwind" fn build_planned_custom_scan(
         );
     }
 
-    let sql = CStr::from_ptr(query_string)
-        .to_str()
-        .expect("planner query string must be valid UTF-8");
+    let sql = select_sql_from_query(parse, query_string);
     let built = plan_builder::PlanBuilder::new()
         .build(plan_builder::PlanBuildInput {
-            sql,
+            sql: &sql,
             params: Vec::new(),
         })
         .unwrap_or_else(|err| error!("pg_fusion planner build failed: {err}"));
 
     let target_list = build_target_list(&built.logical_plan)
         .unwrap_or_else(|err| error!("pg_fusion targetlist build failed: {err}"));
-    let custom_scan = pack_custom_scan(sql, target_list);
+    let custom_scan = pack_custom_scan(&sql, target_list);
 
     let stmt_ptr = palloc0(size_of::<PlannedStmt>()) as *mut PlannedStmt;
     let mut hasher = std::collections::hash_map::DefaultHasher::new();
@@ -106,6 +105,25 @@ unsafe extern "C-unwind" fn build_planned_custom_scan(
     stmt_ptr
 }
 
+unsafe fn select_sql_from_query(parse: *mut Query, query_string: *const c_char) -> String {
+    let sql = CStr::from_ptr(query_string)
+        .to_str()
+        .expect("planner query string must be valid UTF-8");
+    if parse.is_null() {
+        return sql.to_owned();
+    }
+
+    let deparsed = pgrx::pg_sys::pg_get_querydef(parse, false);
+    if !deparsed.is_null() {
+        return CStr::from_ptr(deparsed)
+            .to_str()
+            .expect("deparsed query text must be valid UTF-8")
+            .to_owned();
+    }
+
+    sql.to_owned()
+}
+
 unsafe fn pack_custom_scan(sql: &str, target_list: *mut List) -> *mut CustomScan {
     let sql_copy = palloc0(sql.len() + 1) as *mut u8;
     std::ptr::copy_nonoverlapping(sql.as_ptr(), sql_copy, sql.len());
@@ -132,7 +150,8 @@ fn build_target_list(logical_plan: &LogicalPlan) -> Result<*mut List, String> {
         let oid = type_to_oid(field.data_type())
             .ok_or_else(|| format!("unsupported output type {}", field.data_type()))?;
         unsafe {
-            let tuple = pgrx::pg_sys::SearchSysCache1(TYPEOID as i32, pgrx::pg_sys::ObjectIdGetDatum(oid));
+            let tuple =
+                pgrx::pg_sys::SearchSysCache1(TYPEOID as i32, pgrx::pg_sys::ObjectIdGetDatum(oid));
             if tuple.is_null() {
                 return Err(format!("type cache lookup failed for oid {}", oid.to_u32()));
             }
