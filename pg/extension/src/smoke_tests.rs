@@ -15,8 +15,8 @@ fn ensure_shared_preload(client: &mut Client) {
         preload
             .split(',')
             .map(str::trim)
-            .any(|lib| lib == "pg_fusion_host"),
-        "pg_fusion_host must be in shared_preload_libraries, got: {preload}"
+            .any(|lib| lib == "pg_fusion"),
+        "pg_fusion must be in shared_preload_libraries, got: {preload}"
     );
 }
 

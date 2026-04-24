@@ -9,11 +9,11 @@ importance: 0.7
 
 # Gotchas & Pitfalls
 
-- `pg_fusion_host` is the active extension crate; do not use the retired
-  `pg_fusion`/`pg/extension` path.
+- `pg_fusion` is the active extension crate at `pg/extension`; do not re-add
+  the retired raw-heap `executor`/`scan`/`storage` stack.
 - Integration tests that exercise the background worker/shared memory need
-  `shared_preload_libraries = 'pg_fusion_host'` in the test cluster.
-- `pg_fusion` queries in `pg/host_extension` smoke tests currently run through a
+  `shared_preload_libraries = 'pg_fusion'` in the test cluster.
+- `pg_fusion` queries in `pg/extension` smoke tests currently run through a
   normal PostgreSQL client connection, not SPI-owned execution contexts.
 - `slot_scan` should execute trusted compiler-generated scan SQL. SQL safety and
   expression pushdown policy belong in `scan_sql`.

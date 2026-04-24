@@ -1,6 +1,6 @@
-# `pg_fusion_host`
+# `pg_fusion`
 
-New thin-host extension crate for the `pg_fusion` runtime cutover.
+Pgrx extension crate for the `pg_fusion` runtime path.
 
 This crate owns the new pgrx host integration:
 
@@ -20,7 +20,7 @@ Current scope:
 
 ## Current limitation
 
-`pg_fusion_host` queries must currently run as top-level SQL over the normal
+`pg_fusion` queries must currently run as top-level SQL over the normal
 Postgres client protocol.
 
 Running `pg_fusion` queries from SPI-owned execution contexts is not supported

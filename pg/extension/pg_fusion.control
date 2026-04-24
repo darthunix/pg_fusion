@@ -1,0 +1,6 @@
+comment = 'pg_fusion: PostgreSQL extension for DataFusion-backed execution'
+default_version = '@CARGO_VERSION@'
+module_pathname = '$libdir/pg_fusion'
+relocatable = false
+superuser = true
+trusted = false

@@ -187,7 +187,7 @@ fn result_diag(message: impl FnOnce() -> String) {
     crate::logging::write_backend_log(
         DiagnosticLogLevel::Trace,
         "backend",
-        "host_extension::result_ingress",
+        "extension::result_ingress",
         message,
     );
 }

@@ -2,7 +2,7 @@
 
 pg_fusion is a PostgreSQL extension that delegates selected query execution to an
 in-process Apache DataFusion worker runtime. The active extension crate is
-`pg/host_extension` (`pg_fusion_host`).
+`pg/extension` (`pg_fusion`).
 
 The current runtime boundary keeps PostgreSQL responsible for catalog lookup,
 planning integration, snapshots, table access, and slot materialization. Backend
@@ -12,7 +12,7 @@ projected back into PostgreSQL tuple slots.
 
 ## Architecture
 
-- `pg/host_extension/` - pgrx host extension, GUCs, planner/custom-scan hooks,
+- `pg/extension/` - pgrx host extension, GUCs, planner/custom-scan hooks,
   shared-memory bootstrap, background worker entrypoint.
 - `pg/backend_service/` - backend-side execution orchestration and scan page
   production.
@@ -60,13 +60,13 @@ cargo pgrx init --pg17 $(which pg_config)
 Enable the active extension in the dev cluster:
 
 ```sh
-echo "shared_preload_libraries = 'pg_fusion_host'" >> ~/.pgrx/data-17/postgresql.conf
+echo "shared_preload_libraries = 'pg_fusion'" >> ~/.pgrx/data-17/postgresql.conf
 ```
 
 Build only the host extension crate:
 
 ```sh
-cargo build -p pg_fusion_host
+cargo build -p pg_fusion
 ```
 
 Run pgrx tests for the shared test extension:

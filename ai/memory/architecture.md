@@ -9,14 +9,14 @@ importance: 0.8
 
 # pg_fusion Architecture Overview
 
-The active PostgreSQL extension is `pg/host_extension` (`pg_fusion_host`). It
+The active PostgreSQL extension is `pg/extension` (`pg_fusion`). It
 hooks PostgreSQL planning/execution and delegates selected query work to an
 in-process DataFusion worker runtime through shared-memory control rings and
 page-backed Arrow batches.
 
 ## Top-Level Runtime Path
 
-- `pg/host_extension/`: pgrx host extension, GUCs, planner/custom-scan hooks,
+- `pg/extension/`: pgrx host extension, GUCs, planner/custom-scan hooks,
   shared-memory bootstrap, and background worker entrypoint.
 - `pg/backend_service/`: backend execution state, scan coordination, and
   PostgreSQL slot-scan page production.
@@ -47,7 +47,7 @@ page-backed Arrow batches.
 
 ## Retired Legacy Stack
 
-The old raw-heap-page extension stack has been retired from the workspace:
-`pg/extension`, `executor`, `scan`, `storage`, `protocol`, and `common` are no
-longer active crates. `lockfree` remains active because it underpins the new
-transport/page stack.
+The old raw-heap-page stack has been retired from the workspace: `executor`,
+`scan`, `storage`, `protocol`, and `common` are no longer active crates. The
+active extension crate now lives at `pg/extension`. `lockfree` remains active
+because it underpins the new transport/page stack.

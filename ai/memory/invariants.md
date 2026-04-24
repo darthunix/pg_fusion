@@ -11,7 +11,7 @@ importance: 0.95
 
 1. No panics in PostgreSQL extension paths.
 
-- In `pg/host_extension` and backend-facing pgrx code, prefer structured
+- In `pg/extension` and backend-facing pgrx code, prefer structured
   errors and controlled PostgreSQL error reporting.
 
 2. SHM slices and page payloads must stay within bounds.

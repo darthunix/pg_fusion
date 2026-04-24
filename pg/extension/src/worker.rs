@@ -29,7 +29,7 @@ const POLL_INTERVAL: Duration = Duration::from_millis(5);
 pub(crate) fn register_background_worker() {
     BackgroundWorkerBuilder::new("pg_fusion")
         .set_function("worker_main")
-        .set_library("pg_fusion_host")
+        .set_library("pg_fusion")
         .enable_shmem_access(Some(crate::shmem::init_shmem))
         .load();
 }

@@ -1,5 +1,5 @@
 [package]
-name = "pg_fusion_host"
+name = "pg_fusion"
 version = "24.0.0"
 edition = "2021"
 
@@ -7,7 +7,7 @@ edition = "2021"
 crate-type = ["cdylib", "lib"]
 
 [[bin]]
-name = "pgrx_embed_pg_fusion_host"
+name = "pgrx_embed_pg_fusion"
 path = "./src/bin/pgrx_embed.rs"
 
 [features]

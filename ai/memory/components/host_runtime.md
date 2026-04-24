@@ -9,7 +9,7 @@ importance: 0.8
 
 # Component: Host Runtime
 
-- `pg/host_extension` is the active pgrx extension crate.
+- `pg/extension` is the active pgrx extension crate.
 - Backend control uses `runtime_protocol` messages over `control_transport`.
 - Backend scan production uses PostgreSQL `slot_scan` plus `slot_encoder` to
   stream Arrow layout pages to the worker.
@@ -17,5 +17,5 @@ importance: 0.8
   batches through `page/import`.
 - Results return as issued Arrow pages and are projected into PostgreSQL tuple
   slots through `pg/slot_import`.
-- The retired raw heap page stack (`pg/extension`, `executor`, `scan`,
-  `storage`, `protocol`, `common`) is no longer part of the workspace.
+- The retired raw heap page stack (`executor`, `scan`, `storage`, `protocol`,
+  `common`) is no longer part of the workspace.

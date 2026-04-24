@@ -22,7 +22,7 @@ members = [
   "pg/slot_scan",
   "pg/slot_encoder",
   "pg/slot_import",
-  "pg/host_extension",
+  "pg/extension",
   "worker_runtime",
   "testing/pg_test",
 ]

@@ -240,7 +240,7 @@ pub(crate) fn backend_diag(message: impl FnOnce() -> String) {
     logging::write_backend_log(
         DiagnosticLogLevel::Trace,
         "backend",
-        "host_extension::diag",
+        "extension::diag",
         message,
     );
 }

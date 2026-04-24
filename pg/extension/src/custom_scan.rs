@@ -1255,7 +1255,7 @@ fn tuple_slot_snapshot(slot: *mut pg_sys::TupleTableSlot) -> String {
 }
 
 fn host_diag(level: DiagnosticLogLevel, message: impl FnOnce() -> String) {
-    logging::write_backend_log(level, "backend", "host_extension::custom_scan", message);
+    logging::write_backend_log(level, "backend", "extension::custom_scan", message);
 }
 
 unsafe fn tuple_desc_from_scan(node: *mut CustomScanState) -> pg_sys::TupleDesc {

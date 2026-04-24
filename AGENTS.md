@@ -1,7 +1,7 @@
 # Repository Guidelines
 
 ## Project Structure & Module Organization
-- `pg/host_extension/`: active pgrx host extension (`pg_fusion_host`), GUCs,
+- `pg/extension/`: active pgrx host extension (`pg_fusion`), GUCs,
   planner/custom-scan hooks, shared-memory bootstrap, and background worker.
 - `pg/backend_service/`: backend-side execution state, scan orchestration, and
   PostgreSQL slot-scan page production.
@@ -34,7 +34,7 @@
 - pgrx toolchain:
   - Install: `cargo install cargo-pgrx` then
     `cargo pgrx init --pg17 $(which pg_config)`.
-  - Build only the host extension crate: `cargo build -p pg_fusion_host`.
+  - Build only the host extension crate: `cargo build -p pg_fusion`.
   - pgrx tests (PG 17): `cargo pgrx test pg17 -p pg_test`.
 
 ## Coding Style & Naming Conventions
@@ -60,7 +60,7 @@
   pass locally before requesting review.
 
 ## Security & Configuration Tips
-- PostgreSQL: add `shared_preload_libraries = 'pg_fusion_host'` in the target
+- PostgreSQL: add `shared_preload_libraries = 'pg_fusion'` in the target
   cluster.
 - GUC: toggle runtime via `pg_fusion.enable`.
 - Avoid panics in extension code paths; return structured errors.

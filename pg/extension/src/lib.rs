@@ -45,32 +45,32 @@ mod tests {
     use pgrx::prelude::*;
 
     #[pg_test]
-    fn pg_fusion_host_simple_select_smoke() {
+    fn pg_fusion_simple_select_smoke() {
         super::smoke_tests::simple_select_smoke();
     }
 
     #[pg_test]
-    fn pg_fusion_host_explain_smoke() {
+    fn pg_fusion_explain_smoke() {
         super::smoke_tests::explain_smoke();
     }
 
     #[pg_test]
-    fn pg_fusion_host_heap_select_single_row_smoke() {
+    fn pg_fusion_heap_select_single_row_smoke() {
         super::smoke_tests::heap_select_single_row_smoke();
     }
 
     #[pg_test]
-    fn pg_fusion_host_heap_select_filtered_row_smoke() {
+    fn pg_fusion_heap_select_filtered_row_smoke() {
         super::smoke_tests::heap_select_filtered_row_smoke();
     }
 
     #[pg_test]
-    fn pg_fusion_host_heap_join_two_tables_smoke() {
+    fn pg_fusion_heap_join_two_tables_smoke() {
         super::smoke_tests::heap_join_two_tables_smoke();
     }
 
     #[pg_test]
-    fn pg_fusion_host_result_ingress_roundtrip_smoke() {
+    fn pg_fusion_result_ingress_roundtrip_smoke() {
         super::result_ingress_tests::result_ingress_roundtrip_smoke();
     }
 }
@@ -81,6 +81,6 @@ pub mod pg_test {
 
     #[must_use]
     pub fn postgresql_conf_options() -> Vec<&'static str> {
-        vec!["shared_preload_libraries = 'pg_fusion_host'"]
+        vec!["shared_preload_libraries = 'pg_fusion'"]
     }
 }
