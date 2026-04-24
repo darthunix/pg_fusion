@@ -45,7 +45,7 @@ unsafe extern "C-unwind" fn pg_fusion_shmem_request_hook() {
         PagePool::layout(PagePoolConfig::new(config.page_size, config.page_count).expect("cfg"))
             .expect("page pool layout");
     let issuance_layout =
-        IssuancePool::layout(IssuanceConfig::new(config.permit_count).expect("issuance config"))
+        IssuancePool::layout(IssuanceConfig::new(config.page_count).expect("issuance config"))
             .expect("issuance pool layout");
 
     let total = control_layout
@@ -73,7 +73,7 @@ pub(crate) unsafe extern "C-unwind" fn init_shmem() {
         config.scan_worker_to_backend_capacity,
     );
     init_page_pool(PAGE_POOL_NAME, config.page_size, config.page_count);
-    init_issuance_pool(ISSUANCE_POOL_NAME, config.permit_count);
+    init_issuance_pool(ISSUANCE_POOL_NAME, config.page_count);
 }
 
 pub(crate) fn attach_control_region() -> TransportRegion {
@@ -106,7 +106,7 @@ pub(crate) fn attach_page_pool() -> PagePool {
 
 pub(crate) fn attach_issuance_pool() -> IssuancePool {
     let config = host_config().expect("host config");
-    let cfg = IssuanceConfig::new(config.permit_count).expect("issuance config");
+    let cfg = IssuanceConfig::new(config.page_count).expect("issuance config");
     let layout = IssuancePool::layout(cfg).expect("issuance layout");
     let base = lookup_shmem(ISSUANCE_POOL_NAME, layout.size);
     unsafe { IssuancePool::attach(base, layout.size) }.expect("attach issuance pool")

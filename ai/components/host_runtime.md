@@ -17,6 +17,8 @@ importance: 0.8
   batches through `page/import`.
 - Results return as issued Arrow pages and are projected into PostgreSQL tuple
   slots through `pg/slot_import`.
+- The issuance permit pool is sized from `pg_fusion.page_count`; there is no
+  separate host GUC for permit count.
 - `EXPLAIN` stays backend-local: `backend_service` lowers the planned query to
   a DataFusion physical plan, renders PostgreSQL scan leaves with present
   soft-limit/fetch-hint metadata, and prints the nested multiline `slot_scan`

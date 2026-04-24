@@ -103,7 +103,6 @@ pg_fusion.scan_worker_to_backend_capacity = 44
 # Shared page pool and issued-page flow.
 pg_fusion.page_size = 65536
 pg_fusion.page_count = 256
-pg_fusion.permit_count = 256
 
 # Backend PostgreSQL cursor scan streaming.
 pg_fusion.scan_fetch_batch_rows = 1024
@@ -115,6 +114,8 @@ All settings above are `Postmaster` GUCs and require a cluster restart after
 changes. `pg_fusion.worker_threads = 0` lets the worker runtime choose its
 thread count automatically. The scan ring capacities must stay at least `256`
 backend-to-worker and `44` worker-to-backend.
+The issued-page permit pool is sized from `pg_fusion.page_count`, so each
+shared page can have one outstanding issued handoff.
 
 After configuring the pgrx cluster, install the extension and open `psql`:
 

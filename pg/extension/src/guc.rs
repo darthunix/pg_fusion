@@ -29,7 +29,6 @@ pub(crate) static SCAN_WORKER_TO_BACKEND_CAPACITY: GucSetting<i32> =
 
 pub(crate) static PAGE_SIZE: GucSetting<i32> = GucSetting::<i32>::new(64 * 1024);
 pub(crate) static PAGE_COUNT: GucSetting<i32> = GucSetting::<i32>::new(256);
-pub(crate) static PERMIT_COUNT: GucSetting<i32> = GucSetting::<i32>::new(256);
 
 pub(crate) static SCAN_FETCH_BATCH_ROWS: GucSetting<i32> = GucSetting::<i32>::new(1024);
 pub(crate) static ESTIMATOR_INITIAL_TAIL_BYTES_PER_ROW: GucSetting<i32> =
@@ -50,7 +49,6 @@ pub struct HostConfig {
     pub scan_worker_to_backend_capacity: usize,
     pub page_size: usize,
     pub page_count: u32,
-    pub permit_count: u32,
     pub scan_fetch_batch_rows: u32,
     pub estimator_initial_tail_bytes_per_row: u32,
 }
@@ -164,12 +162,6 @@ pub fn register_gucs() {
         &PAGE_COUNT,
     );
     define_positive_int(
-        c"pg_fusion.permit_count",
-        c"Unified issuance permit count",
-        c"Number of outstanding shared-page transfers allowed at once",
-        &PERMIT_COUNT,
-    );
-    define_positive_int(
         c"pg_fusion.scan_fetch_batch_rows",
         c"Backend scan fetch batch rows",
         c"Number of rows fetched per PostgreSQL cursor batch in backend scan streaming",
@@ -226,7 +218,6 @@ pub fn host_config() -> Result<HostConfig, HostConfigError> {
         scan_worker_to_backend_capacity,
         page_size: positive_usize("pg_fusion.page_size", PAGE_SIZE.get())?,
         page_count: positive_u32("pg_fusion.page_count", PAGE_COUNT.get())?,
-        permit_count: positive_u32("pg_fusion.permit_count", PERMIT_COUNT.get())?,
         scan_fetch_batch_rows: positive_u32(
             "pg_fusion.scan_fetch_batch_rows",
             SCAN_FETCH_BATCH_ROWS.get(),
@@ -352,7 +343,6 @@ mod tests {
             scan_worker_to_backend_capacity: MIN_SCAN_WORKER_TO_BACKEND_RING_CAPACITY,
             page_size: 65536,
             page_count: 256,
-            permit_count: 256,
             scan_fetch_batch_rows: 77,
             estimator_initial_tail_bytes_per_row: 33,
         };
