@@ -60,12 +60,11 @@ use std::ffi::CString;
 use std::panic::AssertUnwindSafe;
 use std::sync::Arc;
 
-use arrow_schema::{Field, Schema, SchemaRef};
+use arrow_schema::{DataType, Field, IntervalUnit, Schema, SchemaRef, TimeUnit};
 use datafusion_common::TableReference;
 use pgrx::pg_sys;
 use pgrx::pg_sys::panic::CaughtError;
 use pgrx::{PgRelation, PgTryBuilder};
-use protocol::data_type::EncodedType;
 use scan_sql::PgRelation as ScanRelation;
 
 pub use crate::error::ResolveError;
@@ -287,27 +286,28 @@ fn validate_relkind(rel: &PgRelation) -> Result<(), ResolveError> {
 }
 
 fn oid_to_arrow_type(oid: pg_sys::Oid) -> Option<arrow_schema::DataType> {
-    let encoded = match oid {
-        o if o == pg_sys::BOOLOID => EncodedType::Boolean,
+    match oid {
+        o if o == pg_sys::BOOLOID => Some(DataType::Boolean),
         o if o == pg_sys::TEXTOID
             || o == pg_sys::VARCHAROID
             || o == pg_sys::BPCHAROID
             || o == pg_sys::NAMEOID =>
         {
-            EncodedType::Utf8
+            Some(DataType::Utf8)
         }
-        o if o == pg_sys::INT2OID => EncodedType::Int16,
-        o if o == pg_sys::INT4OID => EncodedType::Int32,
-        o if o == pg_sys::INT8OID => EncodedType::Int64,
-        o if o == pg_sys::FLOAT4OID => EncodedType::Float32,
-        o if o == pg_sys::FLOAT8OID => EncodedType::Float64,
-        o if o == pg_sys::DATEOID => EncodedType::Date32,
-        o if o == pg_sys::TIMEOID => EncodedType::Time64,
-        o if o == pg_sys::TIMESTAMPOID || o == pg_sys::TIMESTAMPTZOID => EncodedType::Timestamp,
-        o if o == pg_sys::INTERVALOID => EncodedType::Interval,
-        _ => return None,
-    };
-    Some(encoded.to_arrow())
+        o if o == pg_sys::INT2OID => Some(DataType::Int16),
+        o if o == pg_sys::INT4OID => Some(DataType::Int32),
+        o if o == pg_sys::INT8OID => Some(DataType::Int64),
+        o if o == pg_sys::FLOAT4OID => Some(DataType::Float32),
+        o if o == pg_sys::FLOAT8OID => Some(DataType::Float64),
+        o if o == pg_sys::DATEOID => Some(DataType::Date32),
+        o if o == pg_sys::TIMEOID => Some(DataType::Time64(TimeUnit::Microsecond)),
+        o if o == pg_sys::TIMESTAMPOID || o == pg_sys::TIMESTAMPTZOID => {
+            Some(DataType::Timestamp(TimeUnit::Microsecond, None))
+        }
+        o if o == pg_sys::INTERVALOID => Some(DataType::Interval(IntervalUnit::MonthDayNano)),
+        _ => None,
+    }
 }
 
 fn resolve_error_from_caught_error(error: CaughtError) -> ResolveError {
@@ -319,4 +319,49 @@ fn resolve_error_from_caught_error(error: CaughtError) -> ResolveError {
         } => report.message().to_owned(),
     };
     ResolveError::Postgres(message)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn oid_to_arrow_type_maps_supported_oids() {
+        let cases = [
+            (pg_sys::BOOLOID, DataType::Boolean),
+            (pg_sys::TEXTOID, DataType::Utf8),
+            (pg_sys::VARCHAROID, DataType::Utf8),
+            (pg_sys::BPCHAROID, DataType::Utf8),
+            (pg_sys::NAMEOID, DataType::Utf8),
+            (pg_sys::INT2OID, DataType::Int16),
+            (pg_sys::INT4OID, DataType::Int32),
+            (pg_sys::INT8OID, DataType::Int64),
+            (pg_sys::FLOAT4OID, DataType::Float32),
+            (pg_sys::FLOAT8OID, DataType::Float64),
+            (pg_sys::DATEOID, DataType::Date32),
+            (pg_sys::TIMEOID, DataType::Time64(TimeUnit::Microsecond)),
+            (
+                pg_sys::TIMESTAMPOID,
+                DataType::Timestamp(TimeUnit::Microsecond, None),
+            ),
+            (
+                pg_sys::TIMESTAMPTZOID,
+                DataType::Timestamp(TimeUnit::Microsecond, None),
+            ),
+            (
+                pg_sys::INTERVALOID,
+                DataType::Interval(IntervalUnit::MonthDayNano),
+            ),
+        ];
+
+        for (oid, data_type) in cases {
+            assert_eq!(oid_to_arrow_type(oid), Some(data_type));
+        }
+    }
+
+    #[test]
+    fn oid_to_arrow_type_rejects_unsupported_oids() {
+        assert_eq!(oid_to_arrow_type(pg_sys::TIMETZOID), None);
+        assert_eq!(oid_to_arrow_type(pg_sys::JSONBOID), None);
+    }
 }
