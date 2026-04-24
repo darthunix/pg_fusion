@@ -52,8 +52,11 @@ pub fn prepare_scan(sql: &str, options: ScanOptions) -> Result<PreparedScan, Sca
 
         Ok(PreparedScan {
             sql: sql.to_string(),
+            plan: Arc::new(OwnedSpiPlan::from_spi_plan(
+                plan,
+                options.diagnostics.clone(),
+            )),
             options,
-            plan: Arc::new(OwnedSpiPlan::from_spi_plan(plan)),
         })
     })
 }

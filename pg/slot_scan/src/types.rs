@@ -1,9 +1,67 @@
 use crate::error::SinkError;
 use pgrx::pg_sys;
+use std::cell::RefCell;
 use std::ffi::c_void;
+use std::fs::{create_dir_all, File, OpenOptions};
+use std::io::Write;
 use std::marker::PhantomData;
+use std::path::Path;
 use std::rc::Rc;
 use std::sync::Arc;
+
+const DEFAULT_EXTENSION_LOG_PATH: &str = "/tmp/pg_fusion.log";
+
+/// Diagnostic log verbosity for PostgreSQL-side scan internals.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord)]
+pub enum DiagnosticLogLevel {
+    #[default]
+    Off = 0,
+    Basic = 1,
+    Trace = 2,
+}
+
+impl DiagnosticLogLevel {
+    pub fn from_i32(value: i32) -> Self {
+        match value {
+            1 => Self::Basic,
+            value if value >= 2 => Self::Trace,
+            _ => Self::Off,
+        }
+    }
+
+    fn allows(self, required: Self) -> bool {
+        self >= required && self != Self::Off
+    }
+}
+
+/// Diagnostics sink configuration shared with callers that embed `slot_scan`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct DiagnosticsConfig {
+    pub level: DiagnosticLogLevel,
+    pub log_path: Arc<str>,
+}
+
+impl DiagnosticsConfig {
+    pub fn new(level: DiagnosticLogLevel, log_path: impl Into<Arc<str>>) -> Self {
+        Self {
+            level,
+            log_path: log_path.into(),
+        }
+    }
+
+    fn enabled(&self, required: DiagnosticLogLevel) -> bool {
+        self.level.allows(required)
+    }
+}
+
+impl Default for DiagnosticsConfig {
+    fn default() -> Self {
+        Self {
+            level: DiagnosticLogLevel::Off,
+            log_path: Arc::from(DEFAULT_EXTENSION_LOG_PATH),
+        }
+    }
+}
 
 /// Options that affect one `slot_scan` execution.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -25,6 +83,8 @@ pub struct ScanOptions {
     /// In the default `scan_sql -> slot_scan` path, this is the intended
     /// run-time lowering target for `CompiledScan.requested_limit`.
     pub local_row_cap: Option<usize>,
+    /// Optional diagnostics for debug/repro runs. Defaults to disabled.
+    pub diagnostics: DiagnosticsConfig,
 }
 
 /// Leaf scan shape chosen by the current run-time PostgreSQL plan.
@@ -211,11 +271,15 @@ impl<'a> SlotSink<'a> {
 #[derive(Debug)]
 pub(crate) struct OwnedSpiPlan {
     ptr: pg_sys::SPIPlanPtr,
+    diagnostics: DiagnosticsConfig,
 }
 
 impl OwnedSpiPlan {
-    pub(crate) unsafe fn from_spi_plan(ptr: pg_sys::SPIPlanPtr) -> Self {
-        Self { ptr }
+    pub(crate) unsafe fn from_spi_plan(
+        ptr: pg_sys::SPIPlanPtr,
+        diagnostics: DiagnosticsConfig,
+    ) -> Self {
+        Self { ptr, diagnostics }
     }
 
     pub(crate) fn as_ptr(&self) -> pg_sys::SPIPlanPtr {
@@ -225,11 +289,13 @@ impl OwnedSpiPlan {
 
 impl Drop for OwnedSpiPlan {
     fn drop(&mut self) {
-        slot_scan_diag(format!(
-            "slot_scan drop OwnedSpiPlan ptr={:p} current_mcxt={:p}",
-            self.ptr,
-            diagnostic_current_memory_context()
-        ));
+        slot_scan_diag(&self.diagnostics, DiagnosticLogLevel::Trace, || {
+            format!(
+                "drop OwnedSpiPlan ptr={:p} current_mcxt={:p}",
+                self.ptr,
+                diagnostic_current_memory_context()
+            )
+        });
         unsafe {
             if !self.ptr.is_null() {
                 pg_sys::SPI_freeplan(self.ptr);
@@ -265,22 +331,27 @@ impl PreparedScan {
 #[derive(Debug)]
 pub(crate) struct ExecutionSpiConnection {
     pub(crate) finish_restore_context: pg_sys::MemoryContext,
+    pub(crate) diagnostics: DiagnosticsConfig,
 }
 
 impl Drop for ExecutionSpiConnection {
     fn drop(&mut self) {
-        slot_scan_diag(format!(
-            "slot_scan drop ExecutionSpiConnection before SPI_finish current_mcxt={:p} finish_restore_mcxt={:p}",
-            diagnostic_current_memory_context(),
-            self.finish_restore_context,
-        ));
+        slot_scan_diag(&self.diagnostics, DiagnosticLogLevel::Trace, || {
+            format!(
+                "drop ExecutionSpiConnection before SPI_finish current_mcxt={:p} finish_restore_mcxt={:p}",
+                diagnostic_current_memory_context(),
+                self.finish_restore_context,
+            )
+        });
         unsafe {
             let _ = pg_sys::SPI_finish();
         }
-        slot_scan_diag(format!(
-            "slot_scan drop ExecutionSpiConnection after SPI_finish current_mcxt={:p}",
-            diagnostic_current_memory_context()
-        ));
+        slot_scan_diag(&self.diagnostics, DiagnosticLogLevel::Trace, || {
+            format!(
+                "drop ExecutionSpiConnection after SPI_finish current_mcxt={:p}",
+                diagnostic_current_memory_context()
+            )
+        });
     }
 }
 
@@ -296,24 +367,66 @@ pub struct ExecutionSpiContext {
     pub(crate) _inner: Rc<ExecutionSpiConnection>,
 }
 
-fn slot_scan_diag(message: String) {
-    #[cfg(not(test))]
-    {
-        use std::fs::OpenOptions;
-        use std::io::Write;
+struct CachedLogFile {
+    path: Arc<str>,
+    file: File,
+}
 
-        if let Ok(mut file) = OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open("/tmp/pg_fusion_backend.log")
+thread_local! {
+    static LOG_FILE: RefCell<Option<CachedLogFile>> = const { RefCell::new(None) };
+}
+
+fn slot_scan_diag(
+    diagnostics: &DiagnosticsConfig,
+    required: DiagnosticLogLevel,
+    message: impl FnOnce() -> String,
+) {
+    if !diagnostics.enabled(required) {
+        return;
+    }
+    write_diag_line(diagnostics, "slot_scan", required, &message());
+}
+
+fn write_diag_line(
+    diagnostics: &DiagnosticsConfig,
+    component: &str,
+    level: DiagnosticLogLevel,
+    message: &str,
+) {
+    LOG_FILE.with(|slot| {
+        let mut cached = slot.borrow_mut();
+        if cached
+            .as_ref()
+            .is_none_or(|cached| cached.path.as_ref() != diagnostics.log_path.as_ref())
         {
-            let _ = writeln!(file, "pid={} {}", std::process::id(), message);
+            *cached = open_log_file(Arc::clone(&diagnostics.log_path));
         }
+
+        let Some(cached) = cached.as_mut() else {
+            return;
+        };
+        let _ = writeln!(
+            cached.file,
+            "pid={} component={} level={:?} target=slot_scan {}",
+            std::process::id(),
+            component,
+            level,
+            message
+        );
+    });
+}
+
+fn open_log_file(path: Arc<str>) -> Option<CachedLogFile> {
+    let path_ref = Path::new(path.as_ref());
+    if let Some(parent) = path_ref.parent() {
+        let _ = create_dir_all(parent);
     }
-    #[cfg(test)]
-    {
-        let _ = message;
-    }
+    let file = OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path_ref)
+        .ok()?;
+    Some(CachedLogFile { path, file })
 }
 
 fn diagnostic_current_memory_context() -> pg_sys::MemoryContext {

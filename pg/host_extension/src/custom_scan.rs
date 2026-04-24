@@ -5,8 +5,9 @@ use std::time::Duration;
 
 use arrow_schema::{Field, Schema, SchemaRef};
 use backend_service::{
-    ActiveScanDriver, BackendService, BackendServiceError, BeginExecutionOutput, ExecutionKey,
-    ExplainInput, OpenScanInput, ScanStreamStep, StartExecutionInput,
+    ActiveScanDriver, BackendService, BackendServiceError, BeginExecutionOutput,
+    DiagnosticLogLevel, ExecutionKey, ExplainInput, OpenScanInput, ScanStreamStep,
+    StartExecutionInput,
 };
 use control_transport::{BackendLeaseSlot, BackendSlotLease};
 use issuance::{
@@ -31,6 +32,7 @@ use worker_runtime::normalize_result_transport_schema;
 
 use crate::diag;
 use crate::guc::host_config;
+use crate::logging;
 use crate::result_ingress::{AcceptedResultFrame, ResultIngress};
 use crate::shmem::{
     attach_control_region, attach_issuance_pool, attach_page_pool, attach_scan_region,
@@ -124,10 +126,12 @@ unsafe extern "C-unwind" fn pg_fusion_executor_end_hook(query_desc: *mut QueryDe
         };
 
     diag::update_executor_watch(query_desc, estate, custom_scan);
-    diag::backend_diag(format!(
-        "pg_fusion ExecutorEnd hook entry query_desc={:p} estate={:p} planstate={:p} custom_scan={:p}",
-        query_desc, estate, planstate, custom_scan
-    ));
+    diag::backend_diag(|| {
+        format!(
+            "pg_fusion ExecutorEnd hook entry query_desc={:p} estate={:p} planstate={:p} custom_scan={:p}",
+            query_desc, estate, planstate, custom_scan
+        )
+    });
     if !custom_scan.is_null() {
         diag::log_live_watch("pg_fusion ExecutorEnd hook entry live watch");
     }
@@ -138,13 +142,15 @@ unsafe extern "C-unwind" fn pg_fusion_executor_end_hook(query_desc: *mut QueryDe
         pg_sys::standard_ExecutorEnd(query_desc);
     }
 
-    diag::backend_diag(format!(
-        "pg_fusion ExecutorEnd hook exit query_desc={:p} estate={:p} custom_scan={:p} {}",
-        query_desc,
-        estate,
-        custom_scan,
-        diag::watch_snapshot()
-    ));
+    diag::backend_diag(|| {
+        format!(
+            "pg_fusion ExecutorEnd hook exit query_desc={:p} estate={:p} custom_scan={:p} {}",
+            query_desc,
+            estate,
+            custom_scan,
+            diag::watch_snapshot()
+        )
+    });
     diag::clear_watch();
 }
 
@@ -247,6 +253,9 @@ unsafe fn drop_owned_result_slot(node: *mut CustomScanState, state: &mut HostSca
 }
 
 unsafe fn refresh_debug_watch(node: *mut CustomScanState, state: &HostScanState) {
+    if !logging::backend_log_enabled(DiagnosticLogLevel::Trace) {
+        return;
+    }
     let estate = (*node).ss.ps.state;
     diag::update_executor_watch(std::ptr::null_mut(), estate, node);
     diag::update_slot_watch(
@@ -315,11 +324,13 @@ unsafe extern "C-unwind" fn begin_pg_fusion_scan(
         .unwrap_or_else(|err| error!("pg_fusion schema preparation failed: {err}"));
     let control_lease = BackendSlotLease::acquire(&control_region)
         .unwrap_or_else(|err| error!("pg_fusion failed to acquire primary control slot: {err}"));
-    host_diag(format!(
-        "pg_fusion acquired primary control lease {} state={}",
-        control_lease_snapshot(&control_lease),
-        host_state_snapshot(state)
-    ));
+    host_diag(DiagnosticLogLevel::Basic, || {
+        format!(
+            "pg_fusion acquired primary control lease {} state={}",
+            control_lease_snapshot(&control_lease),
+            host_state_snapshot(state)
+        )
+    });
 
     let plan_tx = IssuedTx::new(PageTx::new(page_pool), issuance_pool);
     let begin = {
@@ -334,13 +345,15 @@ unsafe extern "C-unwind" fn begin_pg_fusion_scan(
         })
     }
     .unwrap_or_else(|err| error!("pg_fusion begin execution failed: {err}"));
-    host_diag(format!(
-        "pg_fusion begin_execution returned key={:?} scan_channel_count={} primary_peer={} state={}",
-        begin.key,
-        begin.scan_channels.len(),
-        control_lease_snapshot(&control_lease),
-        host_state_snapshot(state)
-    ));
+    host_diag(DiagnosticLogLevel::Basic, || {
+        format!(
+            "pg_fusion begin_execution returned key={:?} scan_channel_count={} primary_peer={} state={}",
+            begin.key,
+            begin.scan_channels.len(),
+            control_lease_snapshot(&control_lease),
+            host_state_snapshot(state)
+        )
+    });
 
     let mut control_lease = control_lease;
     send_backend_execution(&mut control_lease, begin.control(), &mut Vec::new()).unwrap_or_else(
@@ -355,13 +368,15 @@ unsafe extern "C-unwind" fn begin_pg_fusion_scan(
     });
     let key = BackendService::finalize_execution_start()
         .unwrap_or_else(|err| error!("pg_fusion finalize execution failed: {err}"));
-    host_diag(format!(
-        "pg_fusion finalized execution start slot_id={} session_epoch={} primary_peer={} state={}",
-        key.slot_id,
-        key.session_epoch,
-        control_lease_snapshot(&control_lease),
-        host_state_snapshot(state)
-    ));
+    host_diag(DiagnosticLogLevel::Basic, || {
+        format!(
+            "pg_fusion finalized execution start slot_id={} session_epoch={} primary_peer={} state={}",
+            key.slot_id,
+            key.session_epoch,
+            control_lease_snapshot(&control_lease),
+            host_state_snapshot(state)
+        )
+    });
     let tuple_desc = tuple_desc_for_slots(node);
 
     validate_core_slots(node, estate, state);
@@ -395,13 +410,15 @@ unsafe extern "C-unwind" fn begin_pg_fusion_scan(
     refresh_debug_watch(node, state);
     register_debug_context_callbacks(estate, state);
     diag::log_live_watch("pg_fusion begin scan live watch");
-    host_diag(format!(
-        "pg_fusion begin scan installed execution slot_id={} session_epoch={} scan_peers={:?} state={}",
-        key.slot_id,
-        key.session_epoch,
-        scan_peer_keys(state),
-        host_state_snapshot(state)
-    ));
+    host_diag(DiagnosticLogLevel::Basic, || {
+        format!(
+            "pg_fusion begin scan installed execution slot_id={} session_epoch={} scan_peers={:?} state={}",
+            key.slot_id,
+            key.session_epoch,
+            scan_peer_keys(state),
+            host_state_snapshot(state)
+        )
+    });
 }
 
 #[pg_guard]
@@ -412,12 +429,14 @@ unsafe extern "C-unwind" fn exec_pg_fusion_scan(
     let scan_slot = (*node).ss.ss_ScanTupleSlot;
     refresh_debug_watch(node, state);
     diag::log_live_watch("pg_fusion exec entry live watch");
-    host_diag(format!(
-        "pg_fusion exec entry slots scan_slot={} result_slot={} state={}",
-        tuple_slot_snapshot((*node).ss.ss_ScanTupleSlot),
-        tuple_slot_snapshot((*node).ss.ps.ps_ResultTupleSlot),
-        host_state_snapshot(state)
-    ));
+    host_diag(DiagnosticLogLevel::Trace, || {
+        format!(
+            "pg_fusion exec entry slots scan_slot={} result_slot={} state={}",
+            tuple_slot_snapshot((*node).ss.ss_ScanTupleSlot),
+            tuple_slot_snapshot((*node).ss.ps.ps_ResultTupleSlot),
+            host_state_snapshot(state)
+        )
+    });
     if scan_slot.is_null() {
         error!("pg_fusion expected non-null core ss_ScanTupleSlot in ExecCustomScan");
     }
@@ -445,12 +464,14 @@ unsafe extern "C-unwind" fn exec_pg_fusion_scan(
         {
             refresh_debug_watch(node, state);
             diag::log_live_watch("pg_fusion exec returning row live watch");
-            host_diag(format!(
-                "pg_fusion exec returning row from scan_slot={} result_slot={} state={}",
-                tuple_slot_snapshot((*node).ss.ss_ScanTupleSlot),
-                tuple_slot_snapshot((*node).ss.ps.ps_ResultTupleSlot),
-                host_state_snapshot(state)
-            ));
+            host_diag(DiagnosticLogLevel::Trace, || {
+                format!(
+                    "pg_fusion exec returning row from scan_slot={} result_slot={} state={}",
+                    tuple_slot_snapshot((*node).ss.ss_ScanTupleSlot),
+                    tuple_slot_snapshot((*node).ss.ps.ps_ResultTupleSlot),
+                    host_state_snapshot(state)
+                )
+            });
             return result;
         }
 
@@ -470,12 +491,14 @@ unsafe extern "C-unwind" fn exec_pg_fusion_scan(
         {
             refresh_debug_watch(node, state);
             diag::log_live_watch("pg_fusion exec returning row after primary poll live watch");
-            host_diag(format!(
-                "pg_fusion exec returning row after primary poll scan_slot={} result_slot={} state={}",
-                tuple_slot_snapshot((*node).ss.ss_ScanTupleSlot),
-                tuple_slot_snapshot((*node).ss.ps.ps_ResultTupleSlot),
-                host_state_snapshot(state)
-            ));
+            host_diag(DiagnosticLogLevel::Trace, || {
+                format!(
+                    "pg_fusion exec returning row after primary poll scan_slot={} result_slot={} state={}",
+                    tuple_slot_snapshot((*node).ss.ss_ScanTupleSlot),
+                    tuple_slot_snapshot((*node).ss.ps.ps_ResultTupleSlot),
+                    host_state_snapshot(state)
+                )
+            });
             return result;
         }
 
@@ -488,10 +511,12 @@ unsafe extern "C-unwind" fn exec_pg_fusion_scan(
             (*node).ss.ps.ps_ResultTupleSlot,
         )
         .unwrap_or_else(|err| {
-            warning!(
-                "pg_fusion scan driver failure snapshot before raising: {}",
-                host_state_snapshot(state)
-            );
+            host_diag(DiagnosticLogLevel::Basic, || {
+                format!(
+                    "pg_fusion scan driver failure snapshot before raising: {}",
+                    host_state_snapshot(state)
+                )
+            });
             error!("pg_fusion scan driver failed: {err}");
         });
 
@@ -507,12 +532,14 @@ unsafe extern "C-unwind" fn exec_pg_fusion_scan(
         {
             refresh_debug_watch(node, state);
             diag::log_live_watch("pg_fusion exec returning row after scan drive live watch");
-            host_diag(format!(
-                "pg_fusion exec returning row after scan drive scan_slot={} result_slot={} state={}",
-                tuple_slot_snapshot((*node).ss.ss_ScanTupleSlot),
-                tuple_slot_snapshot((*node).ss.ps.ps_ResultTupleSlot),
-                host_state_snapshot(state)
-            ));
+            host_diag(DiagnosticLogLevel::Trace, || {
+                format!(
+                    "pg_fusion exec returning row after scan drive scan_slot={} result_slot={} state={}",
+                    tuple_slot_snapshot((*node).ss.ss_ScanTupleSlot),
+                    tuple_slot_snapshot((*node).ss.ps.ps_ResultTupleSlot),
+                    host_state_snapshot(state)
+                )
+            });
             return result;
         }
 
@@ -523,12 +550,14 @@ unsafe extern "C-unwind" fn exec_pg_fusion_scan(
         {
             refresh_debug_watch(node, state);
             diag::log_live_watch("pg_fusion returning EOF live watch");
-            host_diag(format!(
-                "pg_fusion exec returning EOF scan_slot={} result_slot={} state={}",
-                tuple_slot_snapshot((*node).ss.ss_ScanTupleSlot),
-                tuple_slot_snapshot((*node).ss.ps.ps_ResultTupleSlot),
-                host_state_snapshot(state)
-            ));
+            host_diag(DiagnosticLogLevel::Basic, || {
+                format!(
+                    "pg_fusion exec returning EOF scan_slot={} result_slot={} state={}",
+                    tuple_slot_snapshot((*node).ss.ss_ScanTupleSlot),
+                    tuple_slot_snapshot((*node).ss.ps.ps_ResultTupleSlot),
+                    host_state_snapshot(state)
+                )
+            });
             return std::ptr::null_mut();
         }
 
@@ -543,10 +572,12 @@ unsafe extern "C-unwind" fn end_pg_fusion_scan(node: *mut CustomScanState) {
     let state = host_state_mut(node);
     refresh_debug_watch(node, state);
     diag::log_live_watch("pg_fusion EndCustomScan entry");
-    host_diag(format!(
-        "pg_fusion ending custom scan with state {}",
-        host_state_snapshot(state)
-    ));
+    host_diag(DiagnosticLogLevel::Basic, || {
+        format!(
+            "pg_fusion ending custom scan with state {}",
+            host_state_snapshot(state)
+        )
+    });
     if let Some(key) = state.execution_key.take() {
         let _ = BackendService::accept_cancel_execution(key.slot_id, key.session_epoch);
     }
@@ -565,7 +596,9 @@ unsafe extern "C-unwind" fn end_pg_fusion_scan(node: *mut CustomScanState) {
         drop(Box::from_raw(host_state));
     }
     diag::clear_watch();
-    host_diag("pg_fusion finished custom scan cleanup".to_string());
+    host_diag(DiagnosticLogLevel::Basic, || {
+        "pg_fusion finished custom scan cleanup".to_string()
+    });
 }
 
 #[pg_guard]
@@ -637,33 +670,39 @@ fn handle_primary_control(
         .ok_or(BackendServiceError::NoActiveExecution)?;
     match message {
         WorkerExecutionToBackend::CompleteExecution { session_epoch } => {
-            host_diag(format!(
-                "pg_fusion backend received CompleteExecution session_epoch={} state={}",
-                session_epoch,
-                host_state_snapshot(state)
-            ));
+            host_diag(DiagnosticLogLevel::Basic, || {
+                format!(
+                    "pg_fusion backend received CompleteExecution session_epoch={} state={}",
+                    session_epoch,
+                    host_state_snapshot(state)
+                )
+            });
             if let Some(ingress) = state.result_ingress.as_mut() {
                 ingress.mark_execution_complete();
             }
             state.pending_complete_session_epoch = Some(session_epoch);
-            host_diag(format!(
-                "pg_fusion backend stored pending CompleteExecution session_epoch={} state_after={}",
-                session_epoch,
-                host_state_snapshot(state)
-            ));
+            host_diag(DiagnosticLogLevel::Basic, || {
+                format!(
+                    "pg_fusion backend stored pending CompleteExecution session_epoch={} state_after={}",
+                    session_epoch,
+                    host_state_snapshot(state)
+                )
+            });
         }
         WorkerExecutionToBackend::FailExecution {
             session_epoch,
             code,
             detail,
         } => {
-            host_diag(format!(
-                "pg_fusion backend received FailExecution session_epoch={} code={:?} detail={:?} state={}",
-                session_epoch,
-                code,
-                detail,
-                host_state_snapshot(state)
-            ));
+            host_diag(DiagnosticLogLevel::Basic, || {
+                format!(
+                    "pg_fusion backend received FailExecution session_epoch={} code={:?} detail={:?} state={}",
+                    session_epoch,
+                    code,
+                    detail,
+                    host_state_snapshot(state)
+                )
+            });
             let _ = BackendService::accept_fail_execution(slot_id, session_epoch, code, detail)?;
             state.execution_key = None;
             state.active_drivers.clear();
@@ -671,11 +710,13 @@ fn handle_primary_control(
             state.terminal_error = Some(format!(
                 "worker failed execution session_epoch={session_epoch} code={code:?} detail={detail:?}"
             ));
-            host_diag(format!(
-                "pg_fusion backend applied FailExecution session_epoch={} state_after={}",
-                session_epoch,
-                host_state_snapshot(state)
-            ));
+            host_diag(DiagnosticLogLevel::Basic, || {
+                format!(
+                    "pg_fusion backend applied FailExecution session_epoch={} state_after={}",
+                    session_epoch,
+                    host_state_snapshot(state)
+                )
+            });
         }
     }
     Ok(())
@@ -701,14 +742,16 @@ fn poll_scan_peers(state: &mut HostScanState) -> Result<bool, BackendServiceErro
                     scan_id,
                     scan,
                 } => {
-                    host_diag(format!(
-                        "pg_fusion backend received OpenScan session_epoch={} scan_id={} peer={} active_drivers={:?} state={}",
-                        session_epoch,
-                        scan_id,
-                        peer_snapshot(peer),
-                        active_driver_keys(state),
-                        host_state_snapshot(state)
-                    ));
+                    host_diag(DiagnosticLogLevel::Basic, || {
+                        format!(
+                            "pg_fusion backend received OpenScan session_epoch={} scan_id={} peer={} active_drivers={:?} state={}",
+                            session_epoch,
+                            scan_id,
+                            peer_snapshot(peer),
+                            active_driver_keys(state),
+                            host_state_snapshot(state)
+                        )
+                    });
                     let page_pool = state.page_pool.expect("page pool");
                     let issuance_pool = state.issuance_pool.expect("issuance pool");
                     let opened = {
@@ -723,47 +766,57 @@ fn poll_scan_peers(state: &mut HostScanState) -> Result<bool, BackendServiceErro
                     }?;
                     if let Some(driver) = opened {
                         state.active_drivers.insert(scan_id, driver);
-                        host_diag(format!(
-                            "pg_fusion backend installed active scan driver scan_id={} peer={} active_drivers={:?} state={}",
-                            scan_id,
-                            peer_snapshot(peer),
-                            active_driver_keys(state),
-                            host_state_snapshot(state)
-                        ));
+                        host_diag(DiagnosticLogLevel::Basic, || {
+                            format!(
+                                "pg_fusion backend installed active scan driver scan_id={} peer={} active_drivers={:?} state={}",
+                                scan_id,
+                                peer_snapshot(peer),
+                                active_driver_keys(state),
+                                host_state_snapshot(state)
+                            )
+                        });
                     } else {
-                        warning!(
-                    "pg_fusion backend ignored OpenScan session_epoch={} scan_id={} peer={} state={}",
-                    session_epoch,
-                    scan_id,
-                    peer_snapshot(peer),
-                    host_state_snapshot(state)
-                );
+                        host_diag(DiagnosticLogLevel::Basic, || {
+                            format!(
+                                "pg_fusion backend ignored OpenScan session_epoch={} scan_id={} peer={} state={}",
+                                session_epoch,
+                                scan_id,
+                                peer_snapshot(peer),
+                                host_state_snapshot(state)
+                            )
+                        });
                     }
                 }
                 WorkerScanToBackendRef::CancelScan {
                     session_epoch: _,
                     scan_id,
                 } => {
-                    warning!(
-                "pg_fusion backend received CancelScan scan_id={} active_drivers_before={:?} state={}",
-                scan_id,
-                active_driver_keys(state),
-                host_state_snapshot(state)
-            );
+                    host_diag(DiagnosticLogLevel::Basic, || {
+                        format!(
+                            "pg_fusion backend received CancelScan scan_id={} active_drivers_before={:?} state={}",
+                            scan_id,
+                            active_driver_keys(state),
+                            host_state_snapshot(state)
+                        )
+                    });
                     if let Some(mut driver) = state.active_drivers.remove(&scan_id) {
                         let _ = driver.cancel_scan()?;
-                        warning!(
-                    "pg_fusion backend cancelled scan driver scan_id={} active_drivers_after={:?} state={}",
-                    scan_id,
-                    active_driver_keys(state),
-                    host_state_snapshot(state)
-                );
+                        host_diag(DiagnosticLogLevel::Basic, || {
+                            format!(
+                                "pg_fusion backend cancelled scan driver scan_id={} active_drivers_after={:?} state={}",
+                                scan_id,
+                                active_driver_keys(state),
+                                host_state_snapshot(state)
+                            )
+                        });
                     } else {
-                        warning!(
-                    "pg_fusion backend ignored CancelScan for missing driver scan_id={} state={}",
-                    scan_id,
-                    host_state_snapshot(state)
-                );
+                        host_diag(DiagnosticLogLevel::Basic, || {
+                            format!(
+                                "pg_fusion backend ignored CancelScan for missing driver scan_id={} state={}",
+                                scan_id,
+                                host_state_snapshot(state)
+                            )
+                        });
                     }
                 }
             }
@@ -780,51 +833,61 @@ fn drive_active_scans(
     let scan_ids = state.active_drivers.keys().copied().collect::<Vec<_>>();
     let mut progressed = false;
     for scan_id in scan_ids {
-        host_diag(format!(
-            "pg_fusion preparing to detach active scan driver scan_id={} state_before_remove={}",
-            scan_id,
-            host_state_snapshot(state)
-        ));
+        host_diag(DiagnosticLogLevel::Trace, || {
+            format!(
+                "pg_fusion preparing to detach active scan driver scan_id={} state_before_remove={}",
+                scan_id,
+                host_state_snapshot(state)
+            )
+        });
         let Some(mut driver) = state.active_drivers.remove(&scan_id) else {
             continue;
         };
-        host_diag(format!(
-            "pg_fusion detached active scan driver scan_id={} state_after_remove={}",
-            scan_id,
-            host_state_snapshot(state)
-        ));
+        host_diag(DiagnosticLogLevel::Trace, || {
+            format!(
+                "pg_fusion detached active scan driver scan_id={} state_after_remove={}",
+                scan_id,
+                host_state_snapshot(state)
+            )
+        });
         let peer = state.scan_peers.get(&scan_id).copied().ok_or_else(|| {
             BackendServiceError::ProtocolViolation(format!(
                 "missing dedicated peer for active scan {scan_id}"
             ))
         })?;
-        host_diag(format!(
-            "pg_fusion calling driver.step() scan_id={} peer={} state_before_step={}",
-            scan_id,
-            peer_snapshot(peer),
-            host_state_snapshot(state)
-        ));
+        host_diag(DiagnosticLogLevel::Trace, || {
+            format!(
+                "pg_fusion calling driver.step() scan_id={} peer={} state_before_step={}",
+                scan_id,
+                peer_snapshot(peer),
+                host_state_snapshot(state)
+            )
+        });
         let step = match driver.step() {
             Ok(step) => step,
             Err(err) => {
-                host_diag(format!(
-                    "pg_fusion driver.step() returned error scan_id={} peer={} state_on_error={} error={}",
-                    scan_id,
-                    peer_snapshot(peer),
-                    host_state_snapshot(state),
-                    err
-                ));
+                host_diag(DiagnosticLogLevel::Basic, || {
+                    format!(
+                        "pg_fusion driver.step() returned error scan_id={} peer={} state_on_error={} error={}",
+                        scan_id,
+                        peer_snapshot(peer),
+                        host_state_snapshot(state),
+                        err
+                    )
+                });
                 return Err(err);
             }
         };
         match step {
             ScanStreamStep::OutboundPage { outbound, .. } => {
-                warning!(
-                    "pg_fusion active scan scan_id={} produced one outbound page peer={} state_before_reinsert={}",
-                    scan_id,
-                    peer_snapshot(peer),
-                    host_state_snapshot(state)
-                );
+                host_diag(DiagnosticLogLevel::Trace, || {
+                    format!(
+                        "pg_fusion active scan scan_id={} produced one outbound page peer={} state_before_reinsert={}",
+                        scan_id,
+                        peer_snapshot(peer),
+                        host_state_snapshot(state)
+                    )
+                });
                 let frame = encode_issued_frame(outbound.frame()).map_err(|err| {
                     BackendServiceError::ProtocolViolation(format!(
                         "failed to encode scan page header: {err}"
@@ -833,36 +896,44 @@ fn drive_active_scans(
                 let _ = BackendService::send_scan_peer_bytes(peer, &frame)?;
                 outbound.mark_sent();
                 state.active_drivers.insert(scan_id, driver);
-                warning!(
-                    "pg_fusion reinserted active scan driver after outbound page scan_id={} state_after_reinsert={}",
-                    scan_id,
-                    host_state_snapshot(state)
-                );
+                host_diag(DiagnosticLogLevel::Trace, || {
+                    format!(
+                        "pg_fusion reinserted active scan driver after outbound page scan_id={} state_after_reinsert={}",
+                        scan_id,
+                        host_state_snapshot(state)
+                    )
+                });
                 progressed = true;
             }
             ScanStreamStep::YieldForControl { reason } => {
-                warning!(
-                    "pg_fusion active scan scan_id={} yielded for control reason={:?} peer={} state_before_reinsert={}",
-                    scan_id,
-                    reason,
-                    peer_snapshot(peer),
-                    host_state_snapshot(state)
-                );
+                host_diag(DiagnosticLogLevel::Trace, || {
+                    format!(
+                        "pg_fusion active scan scan_id={} yielded for control reason={:?} peer={} state_before_reinsert={}",
+                        scan_id,
+                        reason,
+                        peer_snapshot(peer),
+                        host_state_snapshot(state)
+                    )
+                });
                 state.active_drivers.insert(scan_id, driver);
-                warning!(
-                    "pg_fusion reinserted active scan driver after yield scan_id={} state_after_reinsert={}",
-                    scan_id,
-                    host_state_snapshot(state)
-                );
+                host_diag(DiagnosticLogLevel::Trace, || {
+                    format!(
+                        "pg_fusion reinserted active scan driver after yield scan_id={} state_after_reinsert={}",
+                        scan_id,
+                        host_state_snapshot(state)
+                    )
+                });
             }
             ScanStreamStep::Finished { flow } => {
-                warning!(
-                    "pg_fusion active scan scan_id={} finished flow={:?} peer={} state={}",
-                    scan_id,
-                    flow,
-                    peer_snapshot(peer),
-                    host_state_snapshot(state)
-                );
+                host_diag(DiagnosticLogLevel::Basic, || {
+                    format!(
+                        "pg_fusion active scan scan_id={} finished flow={:?} peer={} state={}",
+                        scan_id,
+                        flow,
+                        peer_snapshot(peer),
+                        host_state_snapshot(state)
+                    )
+                });
                 send_scan_terminal(
                     peer,
                     BackendScanToWorker::ScanFinished {
@@ -878,13 +949,15 @@ fn drive_active_scans(
                 producer_id,
                 message,
             } => {
-                warning!(
-                    "pg_fusion active scan scan_id={} failed flow={:?} producer_id={} message={}",
-                    scan_id,
-                    flow,
-                    producer_id,
-                    message
-                );
+                host_diag(DiagnosticLogLevel::Basic, || {
+                    format!(
+                        "pg_fusion active scan scan_id={} failed flow={:?} producer_id={} message={}",
+                        scan_id,
+                        flow,
+                        producer_id,
+                        message
+                    )
+                });
                 let message = truncate_scan_failure_message(&message);
                 send_scan_terminal(
                     peer,
@@ -896,11 +969,13 @@ fn drive_active_scans(
                     },
                 )?;
                 state.active_drivers.clear();
-                warning!(
-                    "pg_fusion cleared active drivers after scan failure scan_id={} state_after={}",
-                    scan_id,
-                    host_state_snapshot(state)
-                );
+                host_diag(DiagnosticLogLevel::Basic, || {
+                    format!(
+                        "pg_fusion cleared active drivers after scan failure scan_id={} state_after={}",
+                        scan_id,
+                        host_state_snapshot(state)
+                    )
+                });
                 progressed = true;
             }
         }
@@ -926,33 +1001,37 @@ fn flush_pending_complete(
     let Some(session_epoch) = state.pending_complete_session_epoch.take() else {
         return Ok(false);
     };
-    host_diag(format!(
-        "pg_fusion flushing pending CompleteExecution session_epoch={} scan_slot={} result_slot={} current_mcxt={:p} state={}",
-        session_epoch,
-        tuple_slot_snapshot(scan_slot),
-        tuple_slot_snapshot(result_slot),
-        unsafe { pg_sys::CurrentMemoryContext },
-        host_state_snapshot(state)
-    ));
-    unsafe {
-        diag::update_slot_watch(scan_slot, result_slot);
-        if let Some(ingress) = state.result_ingress.as_ref() {
-            let (per_tuple_cxt, queue_cxt) = ingress.debug_contexts();
-            diag::update_result_ingress_watch(
-                ingress.debug_project_slot(),
-                ingress.debug_front_queued_tuple(),
-                per_tuple_cxt,
-                queue_cxt,
-            );
-        } else {
-            diag::update_result_ingress_watch(
-                std::ptr::null_mut(),
-                std::ptr::null_mut(),
-                std::ptr::null_mut(),
-                std::ptr::null_mut(),
-            );
+    host_diag(DiagnosticLogLevel::Basic, || {
+        format!(
+            "pg_fusion flushing pending CompleteExecution session_epoch={} scan_slot={} result_slot={} current_mcxt={:p} state={}",
+            session_epoch,
+            tuple_slot_snapshot(scan_slot),
+            tuple_slot_snapshot(result_slot),
+            unsafe { pg_sys::CurrentMemoryContext },
+            host_state_snapshot(state)
+        )
+    });
+    if logging::backend_log_enabled(DiagnosticLogLevel::Trace) {
+        unsafe {
+            diag::update_slot_watch(scan_slot, result_slot);
+            if let Some(ingress) = state.result_ingress.as_ref() {
+                let (per_tuple_cxt, queue_cxt) = ingress.debug_contexts();
+                diag::update_result_ingress_watch(
+                    ingress.debug_project_slot(),
+                    ingress.debug_front_queued_tuple(),
+                    per_tuple_cxt,
+                    queue_cxt,
+                );
+            } else {
+                diag::update_result_ingress_watch(
+                    std::ptr::null_mut(),
+                    std::ptr::null_mut(),
+                    std::ptr::null_mut(),
+                    std::ptr::null_mut(),
+                );
+            }
+            diag::log_live_watch("pg_fusion before accept_complete_execution");
         }
-        diag::log_live_watch("pg_fusion before accept_complete_execution");
     }
     let slot_id = state
         .control_lease
@@ -961,34 +1040,38 @@ fn flush_pending_complete(
         .ok_or(BackendServiceError::NoActiveExecution)?;
     let _ = BackendService::accept_complete_execution(slot_id, session_epoch)?;
     state.execution_key = None;
-    unsafe {
-        diag::update_slot_watch(scan_slot, result_slot);
-        if let Some(ingress) = state.result_ingress.as_ref() {
-            let (per_tuple_cxt, queue_cxt) = ingress.debug_contexts();
-            diag::update_result_ingress_watch(
-                ingress.debug_project_slot(),
-                ingress.debug_front_queued_tuple(),
-                per_tuple_cxt,
-                queue_cxt,
-            );
-        } else {
-            diag::update_result_ingress_watch(
-                std::ptr::null_mut(),
-                std::ptr::null_mut(),
-                std::ptr::null_mut(),
-                std::ptr::null_mut(),
-            );
+    if logging::backend_log_enabled(DiagnosticLogLevel::Trace) {
+        unsafe {
+            diag::update_slot_watch(scan_slot, result_slot);
+            if let Some(ingress) = state.result_ingress.as_ref() {
+                let (per_tuple_cxt, queue_cxt) = ingress.debug_contexts();
+                diag::update_result_ingress_watch(
+                    ingress.debug_project_slot(),
+                    ingress.debug_front_queued_tuple(),
+                    per_tuple_cxt,
+                    queue_cxt,
+                );
+            } else {
+                diag::update_result_ingress_watch(
+                    std::ptr::null_mut(),
+                    std::ptr::null_mut(),
+                    std::ptr::null_mut(),
+                    std::ptr::null_mut(),
+                );
+            }
+            diag::log_live_watch("pg_fusion after accept_complete_execution");
         }
-        diag::log_live_watch("pg_fusion after accept_complete_execution");
     }
-    host_diag(format!(
-        "pg_fusion accepted backend CompleteExecution session_epoch={} scan_slot={} result_slot={} current_mcxt={:p} state_after={}",
-        session_epoch,
-        tuple_slot_snapshot(scan_slot),
-        tuple_slot_snapshot(result_slot),
-        unsafe { pg_sys::CurrentMemoryContext },
-        host_state_snapshot(state)
-    ));
+    host_diag(DiagnosticLogLevel::Basic, || {
+        format!(
+            "pg_fusion accepted backend CompleteExecution session_epoch={} scan_slot={} result_slot={} current_mcxt={:p} state_after={}",
+            session_epoch,
+            tuple_slot_snapshot(scan_slot),
+            tuple_slot_snapshot(result_slot),
+            unsafe { pg_sys::CurrentMemoryContext },
+            host_state_snapshot(state)
+        )
+    });
     Ok(true)
 }
 
@@ -1171,32 +1254,8 @@ fn tuple_slot_snapshot(slot: *mut pg_sys::TupleTableSlot) -> String {
     }
 }
 
-fn host_diag(message: String) {
-    host_diag_write_file(&message);
-    #[cfg(test)]
-    {
-        let _ = message;
-    }
-}
-
-fn host_diag_write_file(message: &str) {
-    #[cfg(not(test))]
-    {
-        use std::fs::OpenOptions;
-        use std::io::Write;
-
-        if let Ok(mut file) = OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open("/tmp/pg_fusion_backend.log")
-        {
-            let _ = writeln!(file, "pid={} {}", std::process::id(), message);
-        }
-    }
-    #[cfg(test)]
-    {
-        let _ = message;
-    }
+fn host_diag(level: DiagnosticLogLevel, message: impl FnOnce() -> String) {
+    logging::write_backend_log(level, "backend", "host_extension::custom_scan", message);
 }
 
 unsafe fn tuple_desc_from_scan(node: *mut CustomScanState) -> pg_sys::TupleDesc {

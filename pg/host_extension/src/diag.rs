@@ -3,6 +3,10 @@ use std::ffi::c_void;
 
 use pgrx::pg_sys;
 
+use backend_service::DiagnosticLogLevel;
+
+use crate::logging;
+
 #[derive(Clone, Copy, Default)]
 pub(crate) struct WatchSnapshot {
     pub query_desc: *mut pg_sys::QueryDesc,
@@ -21,6 +25,7 @@ pub(crate) struct WatchSnapshot {
     pub ingress_queue_cxt: pg_sys::MemoryContext,
 }
 
+#[cfg(feature = "memory_context_diag")]
 #[repr(C)]
 struct RegisteredMemoryContextCallback {
     callback: pg_sys::MemoryContextCallback,
@@ -101,42 +106,46 @@ pub(crate) fn clear_watch() {
 }
 
 pub(crate) unsafe fn log_live_watch(label: &str) {
+    if !logging::backend_log_enabled(DiagnosticLogLevel::Trace) {
+        return;
+    }
     let watch = WATCH.with(|watch| *watch.borrow());
-    backend_diag(format!("{label} {}", format_watch(watch)));
+    backend_diag(|| format!("{label} {}", format_watch(watch)));
 
     if !watch.scan_slot.is_null() {
-        backend_diag(live_chunk_line("scan_slot", watch.scan_slot.cast()));
+        backend_diag(|| live_chunk_line("scan_slot", watch.scan_slot.cast()));
     }
     if !watch.scan_mintuple.is_null() {
-        backend_diag(live_chunk_line("scan_mintuple", watch.scan_mintuple.cast()));
+        backend_diag(|| live_chunk_line("scan_mintuple", watch.scan_mintuple.cast()));
     }
     if !watch.scan_tupdesc.is_null() {
-        backend_diag(live_tuple_desc_line("scan_tupdesc", watch.scan_tupdesc));
+        backend_diag(|| live_tuple_desc_line("scan_tupdesc", watch.scan_tupdesc));
     }
     if !watch.result_slot.is_null() {
-        backend_diag(live_chunk_line("result_slot", watch.result_slot.cast()));
+        backend_diag(|| live_chunk_line("result_slot", watch.result_slot.cast()));
     }
     if !watch.result_tupdesc.is_null() {
-        backend_diag(live_tuple_desc_line("result_tupdesc", watch.result_tupdesc));
+        backend_diag(|| live_tuple_desc_line("result_tupdesc", watch.result_tupdesc));
     }
     if !watch.project_slot.is_null() {
-        backend_diag(live_chunk_line("project_slot", watch.project_slot.cast()));
+        backend_diag(|| live_chunk_line("project_slot", watch.project_slot.cast()));
     }
     if !watch.project_tupdesc.is_null() {
-        backend_diag(live_tuple_desc_line(
-            "project_tupdesc",
-            watch.project_tupdesc,
-        ));
+        backend_diag(|| live_tuple_desc_line("project_tupdesc", watch.project_tupdesc));
     }
     if !watch.queued_tuple.is_null() {
-        backend_diag(live_chunk_line("queued_tuple", watch.queued_tuple.cast()));
+        backend_diag(|| live_chunk_line("queued_tuple", watch.queued_tuple.cast()));
     }
 }
 
+#[cfg(feature = "memory_context_diag")]
 pub(crate) unsafe fn register_context_callback(
     label: &'static str,
     context: pg_sys::MemoryContext,
 ) {
+    if !logging::backend_log_enabled(DiagnosticLogLevel::Trace) {
+        return;
+    }
     if context.is_null() {
         return;
     }
@@ -151,13 +160,23 @@ pub(crate) unsafe fn register_context_callback(
     record.callback.arg = arg;
     record.callback.next = std::ptr::null_mut();
     pg_sys::MemoryContextRegisterResetCallback(context, &mut record.callback);
-    backend_diag(format!(
-        "registered memory context callback label={} context={:p} {}",
-        label,
-        context,
-        watch_snapshot()
-    ));
+    backend_diag(|| {
+        format!(
+            "registered memory context callback label={} context={:p} {}",
+            label,
+            context,
+            watch_snapshot()
+        )
+    });
     let _ = Box::into_raw(record);
+}
+
+#[cfg(not(feature = "memory_context_diag"))]
+pub(crate) unsafe fn register_context_callback(
+    label: &'static str,
+    context: pg_sys::MemoryContext,
+) {
+    let _ = (label, context);
 }
 
 fn scan_mintuple(slot: *mut pg_sys::TupleTableSlot) -> pg_sys::MinimalTuple {
@@ -217,42 +236,25 @@ unsafe fn live_tuple_desc_line(label: &str, desc: pg_sys::TupleDesc) -> String {
     )
 }
 
-pub(crate) fn backend_diag(message: String) {
-    backend_diag_write_file(&message);
-    #[cfg(test)]
-    {
-        let _ = message;
-    }
+pub(crate) fn backend_diag(message: impl FnOnce() -> String) {
+    logging::write_backend_log(
+        DiagnosticLogLevel::Trace,
+        "backend",
+        "host_extension::diag",
+        message,
+    );
 }
 
-fn backend_diag_write_file(message: &str) {
-    #[cfg(not(test))]
-    {
-        use std::fs::OpenOptions;
-        use std::io::Write;
-
-        if let Ok(mut file) = OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open("/tmp/pg_fusion_backend.log")
-        {
-            let _ = writeln!(file, "pid={} {}", std::process::id(), message);
-        }
-    }
-    #[cfg(test)]
-    {
-        let _ = message;
-    }
-}
-
+#[cfg(feature = "memory_context_diag")]
 #[pgrx::pg_guard]
 unsafe extern "C-unwind" fn memory_context_callback(arg: *mut c_void) {
     let record = &*(arg.cast::<RegisteredMemoryContextCallback>());
-    let message = format!(
-        "memory context callback label={} context={:p} {}",
-        record.label,
-        record.context,
-        watch_snapshot()
-    );
-    backend_diag_write_file(&message);
+    backend_diag(|| {
+        format!(
+            "memory context callback label={} context={:p} {}",
+            record.label,
+            record.context,
+            watch_snapshot()
+        )
+    });
 }

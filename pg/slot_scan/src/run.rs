@@ -65,7 +65,7 @@ impl PreparedScan {
         &self,
         fetch_batch_rows: usize,
     ) -> Result<StreamingScanSession, ScanError> {
-        let spi = ExecutionSpiContext::connect()?;
+        let spi = ExecutionSpiContext::connect(self.options.diagnostics.clone())?;
         self.open_streaming_session_in(&spi, fetch_batch_rows)
     }
 
@@ -395,7 +395,7 @@ impl Drop for StreamingScanSession {
 
 impl ExecutionSpiContext {
     #[doc(hidden)]
-    pub fn connect() -> Result<Self, ScanError> {
+    pub fn connect(diagnostics: crate::types::DiagnosticsConfig) -> Result<Self, ScanError> {
         let previous_context = Cell::new(std::ptr::null_mut());
         let switched_context = Cell::new(false);
 
@@ -422,6 +422,7 @@ impl ExecutionSpiContext {
             Ok(Self {
                 _inner: Rc::new(ExecutionSpiConnection {
                     finish_restore_context,
+                    diagnostics,
                 }),
             })
         }))

@@ -367,6 +367,7 @@ pub fn slot_scan_local_row_cap_smoke() {
         ScanOptions {
             planner_fetch_hint: None,
             local_row_cap: Some(17),
+            ..ScanOptions::default()
         },
     )
     .expect("prepare_scan");
@@ -799,6 +800,7 @@ pub fn slot_scan_planner_fetch_hint_reports_plan_kind() {
         ScanOptions {
             planner_fetch_hint: Some(1),
             local_row_cap: None,
+            ..ScanOptions::default()
         },
     )
     .expect("prepare_scan with planner hint");
@@ -822,6 +824,7 @@ pub fn slot_scan_planner_fetch_hint_is_independent_from_local_cap() {
         ScanOptions {
             planner_fetch_hint: Some(1),
             local_row_cap: None,
+            ..ScanOptions::default()
         },
     )
     .expect("prepare_scan");

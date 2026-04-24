@@ -10,7 +10,7 @@ use pgrx::bgworkers::{BackgroundWorker, BackgroundWorkerBuilder, SignalWakeFlags
 use pgrx::prelude::*;
 use pool::PagePool;
 use runtime_protocol::{ExecutionFailureCode, WorkerExecutionToBackend};
-use tracing::{info, warn};
+use tracing::{debug, info, trace, warn, Level};
 use transfer::PageTx;
 use worker_runtime::{
     DecodedInbound, ResultPageProducer, ResultPageProducerConfig, ResultPageStep,
@@ -39,7 +39,12 @@ pub(crate) fn register_background_worker() {
 pub extern "C-unwind" fn worker_main(_arg: pgrx::pg_sys::Datum) {
     BackgroundWorker::attach_signal_handlers(SignalWakeFlags::SIGTERM | SignalWakeFlags::SIGHUP);
     if let Err(err) = run_worker_main() {
-        warning!("pg_fusion worker exited with error: {err}");
+        init_tracing_file_logger("/tmp/pg_fusion.log", "warn");
+        warn!(
+            component = "worker",
+            error = %err,
+            "pg_fusion worker exited with error"
+        );
     }
 }
 
@@ -47,8 +52,9 @@ fn run_worker_main() -> Result<(), WorkerRuntimeError> {
     let config = host_config().map_err(|err| {
         WorkerRuntimeError::ProtocolViolation(format!("invalid host configuration: {err}"))
     })?;
-    init_tracing_file_logger(&config.worker_log_path, &config.worker_log_filter);
+    init_tracing_file_logger(&config.log_path, &config.worker_log_filter);
     info!(
+        component = "worker",
         worker_pid = std::process::id(),
         control_slots = config.control_slot_count,
         scan_slots = config.scan_slot_count,
@@ -66,13 +72,25 @@ fn run_worker_main() -> Result<(), WorkerRuntimeError> {
     let worker_config = config.worker_runtime_config();
     let scan_transport = WorkerTransport::attach(&scan_region)?;
     let worker_pid = std::process::id() as i32;
-    info!(worker_pid, "attached dedicated scan transport region");
+    debug!(
+        component = "worker",
+        worker_pid, "attached dedicated scan transport region"
+    );
     scan_transport.activate_generation(worker_pid)?;
-    info!(worker_pid, "activated dedicated scan transport generation");
+    debug!(
+        component = "worker",
+        worker_pid, "activated dedicated scan transport generation"
+    );
     let mut transport = TransportWorkerRuntime::attach(&control_region, &worker_config)?;
-    info!(worker_pid, "attached primary control transport region");
+    debug!(
+        component = "worker",
+        worker_pid, "attached primary control transport region"
+    );
     transport.activate_generation(worker_pid)?;
-    info!(worker_pid, "activated primary control transport generation");
+    debug!(
+        component = "worker",
+        worker_pid, "activated primary control transport generation"
+    );
 
     let scan_source = Arc::new(TransportScanBatchSource::new(
         scan_region,
@@ -84,12 +102,19 @@ fn run_worker_main() -> Result<(), WorkerRuntimeError> {
     )?);
     let mut runtime = WorkerRuntimeCore::new(worker_config, scan_source);
     let mut plan_rx: Option<IssuedRx> = None;
-    info!("worker entering main poll loop");
+    debug!(component = "worker", "worker entering main poll loop");
 
     while BackgroundWorker::wait_latch(Some(POLL_INTERVAL)) {
         let mut ready_cursor = 0;
         while let Some(peer) = transport.next_ready_backend_lease(&mut ready_cursor) {
-            info!(peer = ?peer, state = ?runtime.state(), "worker polling ready backend peer");
+            if tracing::enabled!(Level::TRACE) {
+                trace!(
+                    component = "worker",
+                    peer = ?peer,
+                    state = ?runtime.state(),
+                    "worker polling ready backend peer"
+                );
+            }
             let mut steps = VecDeque::new();
             transport.recv_peer_frames(peer, |bytes| {
                 let decoded = WorkerRuntimeCore::decode_inbound(bytes)?;
@@ -130,7 +155,7 @@ fn run_worker_main() -> Result<(), WorkerRuntimeError> {
 
     transport.deactivate_generation()?;
     scan_transport.deactivate_generation()?;
-    info!("worker stopped cleanly");
+    info!(component = "worker", "worker stopped cleanly");
     Ok(())
 }
 
@@ -153,18 +178,27 @@ fn handle_steps(
                 session_epoch,
                 plan_id,
             } => {
-                info!(session_epoch, plan_id, "worker opened logical plan ingress");
+                debug!(
+                    component = "worker",
+                    session_epoch, plan_id, "worker opened logical plan ingress"
+                );
             }
             WorkerRuntimeStep::PlanningStarted(pending) => {
                 let peer = pending.peer();
                 let flow = pending.flow();
-                info!(peer = ?peer, flow = ?flow, "worker starting physical planning");
+                debug!(
+                    component = "worker",
+                    peer = ?peer,
+                    flow = ?flow,
+                    "worker starting physical planning"
+                );
                 let result = block_on(pending.plan());
                 steps.push_back(runtime.finish_physical_planning(peer, flow, result)?);
             }
             WorkerRuntimeStep::PhysicalPlanReady(result) => {
                 let peer = runtime.active_peer().expect("peer");
                 info!(
+                    component = "worker",
                     session_epoch = result.session_epoch,
                     peer = ?peer,
                     "worker received physical plan and is starting execution"
@@ -196,7 +230,8 @@ fn handle_steps(
                     loop {
                         match producer.next_step()? {
                             Some(ResultPageStep::OutboundPage(outbound)) => {
-                                info!(
+                                trace!(
+                                    component = "worker",
                                     session_epoch = result.session_epoch,
                                     peer = ?peer,
                                     "worker produced one result page"
@@ -211,7 +246,8 @@ fn handle_steps(
                                 outbound.mark_sent();
                             }
                             Some(ResultPageStep::CloseFrame(frame)) => {
-                                info!(
+                                debug!(
+                                    component = "worker",
                                     session_epoch = result.session_epoch,
                                     peer = ?peer,
                                     "worker produced terminal result close frame"
@@ -232,6 +268,7 @@ fn handle_steps(
                 match execution_result {
                     Ok(()) => {
                         info!(
+                            component = "worker",
                             session_epoch = result.session_epoch,
                             peer = ?peer,
                             "worker finished execution successfully and is sending CompleteExecution"
@@ -246,6 +283,7 @@ fn handle_steps(
                     }
                     Err(err) => {
                         warn!(
+                            component = "worker",
                             session_epoch = result.session_epoch,
                             peer = ?peer,
                             error = %err,
@@ -262,18 +300,20 @@ fn handle_steps(
                         steps.push_back(
                             runtime.fail_execution_locally(ExecutionFailureCode::Internal, None)?,
                         );
-                        warning!("pg_fusion worker local execution failed: {err}");
                     }
                 }
             }
             WorkerRuntimeStep::ExecutionCancelled { session_epoch } => {
-                info!(session_epoch, "worker observed execution cancel");
+                info!(
+                    component = "worker",
+                    session_epoch, "worker observed execution cancel"
+                );
                 plan_rx.take();
                 if runtime.state() == worker_runtime::fsm::WorkerExecutionState::Terminal {
                     runtime.cleanup()?;
                     info!(
-                        session_epoch,
-                        "worker cleaned up terminal execution after cancel"
+                        component = "worker",
+                        session_epoch, "worker cleaned up terminal execution after cancel"
                     );
                 }
             }
@@ -283,6 +323,7 @@ fn handle_steps(
                 detail,
             } => {
                 warn!(
+                    component = "worker",
                     session_epoch,
                     code = ?code,
                     detail = ?detail,
@@ -292,22 +333,22 @@ fn handle_steps(
                 if runtime.state() == worker_runtime::fsm::WorkerExecutionState::Terminal {
                     runtime.cleanup()?;
                     info!(
-                        session_epoch,
-                        "worker cleaned up terminal execution after failure"
+                        component = "worker",
+                        session_epoch, "worker cleaned up terminal execution after failure"
                     );
                 }
             }
             WorkerRuntimeStep::ExecutionCompleted { session_epoch } => {
                 info!(
-                    session_epoch,
-                    "worker observed execution complete transition"
+                    component = "worker",
+                    session_epoch, "worker observed execution complete transition"
                 );
                 plan_rx.take();
                 if runtime.state() == worker_runtime::fsm::WorkerExecutionState::Terminal {
                     runtime.cleanup()?;
                     info!(
-                        session_epoch,
-                        "worker cleaned up terminal execution after completion"
+                        component = "worker",
+                        session_epoch, "worker cleaned up terminal execution after completion"
                     );
                 }
             }

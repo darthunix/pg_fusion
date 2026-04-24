@@ -1,4 +1,4 @@
-use backend_service::BackendServiceConfig;
+use backend_service::{BackendServiceConfig, DiagnosticLogLevel, DiagnosticsConfig};
 use control_transport::TransportRegionLayout;
 use pgrx::{GucContext, GucFlags, GucRegistry, GucSetting};
 use runtime_protocol::{
@@ -9,10 +9,11 @@ use worker_runtime::WorkerRuntimeConfig;
 
 pub(crate) static ENABLE: GucSetting<bool> = GucSetting::<bool>::new(false);
 pub(crate) static WORKER_THREADS: GucSetting<i32> = GucSetting::<i32>::new(0);
-pub(crate) static WORKER_LOG_PATH: GucSetting<Option<std::ffi::CString>> =
-    GucSetting::<Option<std::ffi::CString>>::new(Some(c"/tmp/pg_fusion_worker.log"));
+pub(crate) static LOG_PATH: GucSetting<Option<std::ffi::CString>> =
+    GucSetting::<Option<std::ffi::CString>>::new(Some(c"/tmp/pg_fusion.log"));
 pub(crate) static WORKER_LOG_FILTER: GucSetting<Option<std::ffi::CString>> =
-    GucSetting::<Option<std::ffi::CString>>::new(Some(c"info"));
+    GucSetting::<Option<std::ffi::CString>>::new(Some(c"warn"));
+pub(crate) static BACKEND_LOG_LEVEL: GucSetting<i32> = GucSetting::<i32>::new(0);
 
 pub(crate) static CONTROL_SLOT_COUNT: GucSetting<i32> = GucSetting::<i32>::new(64);
 pub(crate) static CONTROL_BACKEND_TO_WORKER_CAPACITY: GucSetting<i32> =
@@ -38,8 +39,9 @@ pub(crate) static ESTIMATOR_INITIAL_TAIL_BYTES_PER_ROW: GucSetting<i32> =
 pub struct HostConfig {
     pub enable: bool,
     pub worker_threads: Option<usize>,
-    pub worker_log_path: String,
+    pub log_path: String,
     pub worker_log_filter: String,
+    pub backend_log_level: DiagnosticLogLevel,
     pub control_slot_count: u32,
     pub control_backend_to_worker_capacity: usize,
     pub control_worker_to_backend_capacity: usize,
@@ -85,10 +87,10 @@ pub fn register_gucs() {
     );
 
     GucRegistry::define_string_guc(
-        c"pg_fusion.worker_log_path",
-        c"Worker log file path",
-        c"Absolute path to the pg_fusion background worker log file",
-        &WORKER_LOG_PATH,
+        c"pg_fusion.log_path",
+        c"Extension log file path",
+        c"Absolute path to the shared pg_fusion extension log file",
+        &LOG_PATH,
         GucContext::Postmaster,
         GucFlags::default(),
     );
@@ -99,6 +101,17 @@ pub fn register_gucs() {
         c"Tracing filter expression used by the pg_fusion background worker",
         &WORKER_LOG_FILTER,
         GucContext::Postmaster,
+        GucFlags::default(),
+    );
+
+    GucRegistry::define_int_guc(
+        c"pg_fusion.backend_log_level",
+        c"Backend diagnostic log level",
+        c"Diagnostic verbosity for backend-side pg_fusion code: 0=off, 1=basic, 2=trace",
+        &BACKEND_LOG_LEVEL,
+        0,
+        2,
+        GucContext::Userset,
         GucFlags::default(),
     );
 
@@ -196,8 +209,9 @@ pub fn host_config() -> Result<HostConfig, HostConfigError> {
     Ok(HostConfig {
         enable: ENABLE.get(),
         worker_threads: normalize_worker_threads(WORKER_THREADS.get()),
-        worker_log_path: string_setting(&WORKER_LOG_PATH, "/tmp/pg_fusion_worker.log"),
-        worker_log_filter: string_setting(&WORKER_LOG_FILTER, "info"),
+        log_path: extension_log_path(),
+        worker_log_filter: string_setting(&WORKER_LOG_FILTER, "warn"),
+        backend_log_level: backend_log_level(),
         control_slot_count: positive_u32("pg_fusion.control_slot_count", CONTROL_SLOT_COUNT.get())?,
         control_backend_to_worker_capacity: positive_usize(
             "pg_fusion.control_backend_to_worker_capacity",
@@ -250,6 +264,7 @@ impl HostConfig {
         config.scan_fetch_batch_rows = self.scan_fetch_batch_rows;
         config.estimator_default.initial_tail_bytes_per_row =
             self.estimator_initial_tail_bytes_per_row;
+        config.diagnostics = DiagnosticsConfig::new(self.backend_log_level, self.log_path.clone());
         config
     }
 
@@ -295,6 +310,14 @@ fn string_setting(setting: &GucSetting<Option<std::ffi::CString>>, default: &str
         .unwrap_or_else(|| default.to_string())
 }
 
+pub(crate) fn extension_log_path() -> String {
+    string_setting(&LOG_PATH, "/tmp/pg_fusion.log")
+}
+
+pub(crate) fn backend_log_level() -> DiagnosticLogLevel {
+    DiagnosticLogLevel::from_i32(BACKEND_LOG_LEVEL.get())
+}
+
 fn positive_u32(name: &'static str, actual: i32) -> Result<u32, HostConfigError> {
     if actual <= 0 {
         return Err(HostConfigError::NonPositive { name, actual });
@@ -318,8 +341,9 @@ mod tests {
         let config = HostConfig {
             enable: true,
             worker_threads: Some(4),
-            worker_log_path: "/tmp/pg_fusion_worker.log".into(),
-            worker_log_filter: "info".into(),
+            log_path: "/tmp/pg_fusion.log".into(),
+            worker_log_filter: "warn".into(),
+            backend_log_level: DiagnosticLogLevel::Trace,
             control_slot_count: 8,
             control_backend_to_worker_capacity: 4096,
             control_worker_to_backend_capacity: 4096,
@@ -338,6 +362,8 @@ mod tests {
 
         assert_eq!(backend.scan_fetch_batch_rows, 77);
         assert_eq!(backend.estimator_default.initial_tail_bytes_per_row, 33);
+        assert_eq!(backend.diagnostics.level, DiagnosticLogLevel::Trace);
+        assert_eq!(backend.diagnostics.log_path.as_ref(), "/tmp/pg_fusion.log");
         assert_eq!(worker.control_frame_capacity, 4096);
     }
 }

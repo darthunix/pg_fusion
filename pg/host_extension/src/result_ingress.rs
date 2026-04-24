@@ -8,6 +8,7 @@ use thiserror::Error;
 use transfer::PageRx;
 
 use crate::diag;
+use backend_service::DiagnosticLogLevel;
 
 #[derive(Debug, Error)]
 pub(crate) enum ResultIngressError {
@@ -46,11 +47,13 @@ impl ResultIngress {
         let per_tuple_memory = PgMemoryContexts::new("pg_fusion_result_ingress");
         let projector =
             ArrowSlotProjector::new(transport_schema, tuple_desc, per_tuple_memory.value())?;
-        result_diag(format!(
-            "result_ingress init tuple_desc={:p} per_tuple_mcxt={:p}",
-            tuple_desc,
-            per_tuple_memory.value(),
-        ));
+        result_diag(|| {
+            format!(
+                "result_ingress init tuple_desc={:p} per_tuple_mcxt={:p}",
+                tuple_desc,
+                per_tuple_memory.value(),
+            )
+        });
         Ok(Self {
             rx: IssuedRx::new(PageRx::new(page_pool), issuance_pool),
             per_tuple_memory,
@@ -70,21 +73,25 @@ impl ResultIngress {
                 if self.active_page.is_some() {
                     return Err(ResultIngressError::ActivePageBusy);
                 }
-                result_diag(format!(
-                    "result_ingress accept page active_page_before={}",
-                    self.active_page.is_some(),
-                ));
+                result_diag(|| {
+                    format!(
+                        "result_ingress accept page active_page_before={}",
+                        self.active_page.is_some(),
+                    )
+                });
                 self.active_page = Some(self.projector.open_owned_cursor(page)?);
-                result_diag("result_ingress activated one result page".to_string());
+                result_diag(|| "result_ingress activated one result page".to_string());
                 Ok(AcceptedResultFrame::Page)
             }
             IssueEvent::Closed => {
                 self.stream_closed = true;
-                result_diag(format!(
-                    "result_ingress observed stream close active_page={} execution_completed={}",
-                    self.active_page.is_some(),
-                    self.execution_completed,
-                ));
+                result_diag(|| {
+                    format!(
+                        "result_ingress observed stream close active_page={} execution_completed={}",
+                        self.active_page.is_some(),
+                        self.execution_completed,
+                    )
+                });
                 Ok(AcceptedResultFrame::Closed)
             }
         }
@@ -92,22 +99,26 @@ impl ResultIngress {
 
     pub(crate) fn mark_execution_complete(&mut self) {
         self.execution_completed = true;
-        result_diag(format!(
-            "result_ingress marked execution complete active_page={} stream_closed={}",
-            self.active_page.is_some(),
-            self.stream_closed,
-        ));
+        result_diag(|| {
+            format!(
+                "result_ingress marked execution complete active_page={} stream_closed={}",
+                self.active_page.is_some(),
+                self.stream_closed,
+            )
+        });
     }
 
     pub(crate) fn store_next_into(
         &mut self,
         scan_slot: *mut pg_sys::TupleTableSlot,
     ) -> Result<Option<*mut pg_sys::TupleTableSlot>, ResultIngressError> {
-        result_diag(format!(
-            "result_ingress store_next_into start active_page={} scan_slot={}",
-            self.active_page.is_some(),
-            slot_snapshot(scan_slot),
-        ));
+        result_diag(|| {
+            format!(
+                "result_ingress store_next_into start active_page={} scan_slot={}",
+                self.active_page.is_some(),
+                slot_snapshot(scan_slot),
+            )
+        });
         let Some(cursor) = self.active_page.as_mut() else {
             return Ok(None);
         };
@@ -116,14 +127,16 @@ impl ResultIngress {
                 .next_cursor_row_into_slot(cursor, scan_slot)?
         };
         if let Some(stored) = stored {
-            result_diag(format!(
-                "result_ingress store_next_into projected row scan_slot_after={}",
-                slot_snapshot(scan_slot),
-            ));
+            result_diag(|| {
+                format!(
+                    "result_ingress store_next_into projected row scan_slot_after={}",
+                    slot_snapshot(scan_slot),
+                )
+            });
             Ok(Some(stored))
         } else {
             self.active_page = None;
-            result_diag("result_ingress released exhausted result page".to_string());
+            result_diag(|| "result_ingress released exhausted result page".to_string());
             Ok(None)
         }
     }
@@ -147,51 +160,36 @@ impl ResultIngress {
 
 impl Drop for ResultIngress {
     fn drop(&mut self) {
-        let (per_tuple_cxt, _queue_cxt) = self.debug_contexts();
-        unsafe {
-            diag::update_result_ingress_watch(
-                std::ptr::null_mut(),
-                std::ptr::null_mut(),
-                per_tuple_cxt,
-                std::ptr::null_mut(),
-            );
-            diag::log_live_watch("result_ingress drop live watch");
+        if crate::logging::backend_log_enabled(DiagnosticLogLevel::Trace) {
+            let (per_tuple_cxt, _queue_cxt) = self.debug_contexts();
+            unsafe {
+                diag::update_result_ingress_watch(
+                    std::ptr::null_mut(),
+                    std::ptr::null_mut(),
+                    per_tuple_cxt,
+                    std::ptr::null_mut(),
+                );
+                diag::log_live_watch("result_ingress drop live watch");
+            }
         }
-        result_diag(format!(
-            "result_ingress drop active_page={} stream_closed={} execution_completed={}",
-            self.active_page.is_some(),
-            self.stream_closed,
-            self.execution_completed,
-        ));
+        result_diag(|| {
+            format!(
+                "result_ingress drop active_page={} stream_closed={} execution_completed={}",
+                self.active_page.is_some(),
+                self.stream_closed,
+                self.execution_completed,
+            )
+        });
     }
 }
 
-fn result_diag(message: String) {
-    result_diag_write_file(&message);
-    #[cfg(test)]
-    {
-        let _ = message;
-    }
-}
-
-fn result_diag_write_file(message: &str) {
-    #[cfg(not(test))]
-    {
-        use std::fs::OpenOptions;
-        use std::io::Write;
-
-        if let Ok(mut file) = OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open("/tmp/pg_fusion_backend.log")
-        {
-            let _ = writeln!(file, "pid={} {}", std::process::id(), message);
-        }
-    }
-    #[cfg(test)]
-    {
-        let _ = message;
-    }
+fn result_diag(message: impl FnOnce() -> String) {
+    crate::logging::write_backend_log(
+        DiagnosticLogLevel::Trace,
+        "backend",
+        "host_extension::result_ingress",
+        message,
+    );
 }
 
 fn slot_snapshot(slot: *mut pg_sys::TupleTableSlot) -> String {

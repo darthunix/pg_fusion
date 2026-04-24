@@ -21,7 +21,7 @@ use runtime_protocol::message::{
 use runtime_protocol::session::{
     MIN_SCAN_BACKEND_TO_WORKER_RING_CAPACITY, MIN_SCAN_WORKER_TO_BACKEND_RING_CAPACITY,
 };
-use tracing::{info, warn};
+use tracing::{debug, warn};
 
 use crate::error::WorkerRuntimeError;
 use crate::scan_exec::{OpenScanRequest, ScanBatchSource};
@@ -113,7 +113,8 @@ impl ScanBatchSource for TransportScanBatchSource {
         // only after the scan thread starts polling.
         WorkerTransport::attach(&self.region)
             .map_err(|err| DataFusionError::External(Box::new(WorkerRuntimeError::from(err))))?;
-        info!(
+        debug!(
+            component = "worker_scan",
             session_epoch = request.session_epoch,
             scan_id = request.scan_id.get(),
             peer = ?request.peer,
@@ -206,6 +207,7 @@ fn run_transport_scan_thread(
         &stop,
     ) {
         warn!(
+            component = "worker_scan",
             session_epoch = request.session_epoch,
             scan_id = request.scan_id.get(),
             peer = ?request.peer,
@@ -237,14 +239,16 @@ fn run_transport_scan_thread_inner(
         issued_rx,
     )?;
     let mut scratch = vec![0_u8; control_frame_capacity];
-    info!(
+    debug!(
+        component = "worker_scan",
         session_epoch = request.session_epoch,
         scan_id = request.scan_id.get(),
         peer = ?request.peer,
         "transport scan thread sending OpenScan"
     );
     send_open_scan(&mut slot, open_scan, &mut scratch)?;
-    info!(
+    debug!(
+        component = "worker_scan",
         session_epoch = request.session_epoch,
         scan_id = request.scan_id.get(),
         peer = ?request.peer,
@@ -254,7 +258,8 @@ fn run_transport_scan_thread_inner(
     let mut terminal = false;
     let loop_result: Result<(), WorkerRuntimeError> = loop {
         if stop.load(Ordering::Acquire) {
-            info!(
+            debug!(
+                component = "worker_scan",
                 session_epoch = request.session_epoch,
                 scan_id = request.scan_id.get(),
                 peer = ?request.peer,
@@ -277,7 +282,8 @@ fn run_transport_scan_thread_inner(
                 let step = driver.accept_page_frame(SINGLE_SCAN_PRODUCER_ID, &frame)?;
                 if forward_driver_step(&mut driver, step, tx, stop)? {
                     terminal = true;
-                    info!(
+                    debug!(
+                        component = "worker_scan",
                         session_epoch = request.session_epoch,
                         scan_id = request.scan_id.get(),
                         peer = ?request.peer,
@@ -290,7 +296,8 @@ fn run_transport_scan_thread_inner(
                 let step = control_to_driver_step(request, &mut driver, control)?;
                 if forward_driver_step(&mut driver, step, tx, stop)? {
                     terminal = true;
-                    info!(
+                    debug!(
+                        component = "worker_scan",
                         session_epoch = request.session_epoch,
                         scan_id = request.scan_id.get(),
                         peer = ?request.peer,
@@ -303,7 +310,8 @@ fn run_transport_scan_thread_inner(
     };
 
     if !terminal {
-        info!(
+        debug!(
+            component = "worker_scan",
             session_epoch = request.session_epoch,
             scan_id = request.scan_id.get(),
             peer = ?request.peer,
@@ -357,9 +365,9 @@ fn control_to_driver_step(
             scan_id,
             producer_id,
         } => {
-            info!(
-                session_epoch,
-                scan_id, producer_id, "received ScanFinished on dedicated scan peer"
+            debug!(
+                component = "worker_scan",
+                session_epoch, scan_id, producer_id, "received ScanFinished on dedicated scan peer"
             );
             validate_scan_terminal(request, session_epoch, scan_id)?;
             driver.accept_producer_eof(producer_id)
@@ -371,8 +379,12 @@ fn control_to_driver_step(
             message,
         } => {
             warn!(
+                component = "worker_scan",
                 session_epoch,
-                scan_id, producer_id, message, "received ScanFailed on dedicated scan peer"
+                scan_id,
+                producer_id,
+                message,
+                "received ScanFailed on dedicated scan peer"
             );
             validate_scan_terminal(request, session_epoch, scan_id)?;
             driver.accept_producer_error(producer_id, message.to_string())
