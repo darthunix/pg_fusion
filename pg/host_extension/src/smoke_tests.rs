@@ -145,3 +145,56 @@ pub(crate) fn heap_select_filtered_row_smoke() {
     .expect("filtered heap select must return one bigint value");
     assert_eq!(id, 3);
 }
+
+pub(crate) fn heap_join_two_tables_smoke() {
+    let mut client = smoke_client();
+    let mut tx = smoke_transaction(&mut client);
+    let left_table = "pg_temp.pgf_heap_join_left";
+    let right_table = "pg_temp.pgf_heap_join_right";
+
+    tx.batch_execute(&format!(
+        "\
+        CREATE TEMP TABLE {left_table} (
+            id bigint NOT NULL,
+            payload text NOT NULL
+        );
+        CREATE TEMP TABLE {right_table} (
+            left_id bigint NOT NULL,
+            score bigint NOT NULL,
+            marker text NOT NULL
+        );
+        INSERT INTO {left_table} (id, payload)
+        VALUES (1, 'one'), (2, 'two'), (3, 'three');
+        INSERT INTO {right_table} (left_id, score, marker)
+        VALUES (2, 20, 'dos'), (3, 30, 'tres'), (4, 40, 'cuatro');
+        "
+    ))
+    .expect("create and populate temp heap join fixture must succeed");
+
+    let joined_count: i64 = simple_query_first_column_tx(
+        &mut tx,
+        &format!(
+            "SELECT count(*)::bigint \
+             FROM {left_table} AS l \
+             JOIN {right_table} AS r ON l.id = r.left_id"
+        ),
+    )
+    .expect("heap join count must return one row")
+    .parse()
+    .expect("heap join count must return one bigint value");
+    assert_eq!(joined_count, 2);
+
+    let score: i64 = simple_query_first_column_tx(
+        &mut tx,
+        &format!(
+            "SELECT r.score::bigint \
+             FROM {left_table} AS l \
+             JOIN {right_table} AS r ON l.id = r.left_id \
+             WHERE l.payload = 'two'"
+        ),
+    )
+    .expect("filtered heap join must return one row")
+    .parse()
+    .expect("filtered heap join must return one bigint value");
+    assert_eq!(score, 20);
+}

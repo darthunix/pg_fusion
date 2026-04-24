@@ -65,6 +65,11 @@ mod tests {
     }
 
     #[pg_test]
+    fn pg_fusion_host_heap_join_two_tables_smoke() {
+        super::smoke_tests::heap_join_two_tables_smoke();
+    }
+
+    #[pg_test]
     fn pg_fusion_host_result_ingress_roundtrip_smoke() {
         super::result_ingress_tests::result_ingress_roundtrip_smoke();
     }
