@@ -1,25 +1,34 @@
-# Codex Memory Model for This Repo
+# Agent Context
 
-This repository adopts a human-readable memory model for agents and humans.
+This directory is the living context for agents and humans working on
+`pg_fusion`. It is intentionally small and current; historical notes belong in
+git history, not here.
 
-Structure:
+## Structure
 
 ```
 /ai/
-  memory/      # invariants, decisions, architecture, components
-  log/         # project log (optional, day-by-day)
-  README.md    # this file — how to use the memory bank
+  README.md         # this file
+  architecture.md   # current repo architecture
+  invariants.md     # rules that should not be violated
+  gotchas.md        # practical pitfalls
+  components/       # short component notes
 ```
 
-Agent usage quickstart:
+## Reading Order
 
-- Read `/ai/memory/index.md` first.
-- For architecture answers: load `architecture.md`, relevant component memos, and all invariants with `importance >= 0.8`.
-- For code generation: respect all invariants in `/ai/memory`.
-- If an invariant would be violated, state which one and propose an alternative.
+1. Read `architecture.md` for the active runtime shape.
+2. Read `invariants.md` before planning code changes.
+3. Load relevant files from `components/` for the subsystem being changed.
+4. Check `gotchas.md` when touching pgrx, shared memory, scan execution, or
+   page-backed Arrow data.
 
-See `/ai/memory/CODEX_MEMORY_MODEL.md` for the complete model description.
+## Maintenance
 
-Agent workflow requirement:
-
-- After implementing or changing behavior, update the corresponding files under `/ai/memory` (components, decisions, invariants, architecture). Keep the memory bank current so future agents have accurate context.
+- After behavior or architecture changes, update the relevant file here in the
+  same change.
+- Keep entries short and active. Remove stale history instead of preserving it
+  as agent context.
+- If a new architectural decision needs a durable explanation, summarize the
+  current consequence in `architecture.md`, `invariants.md`, or a component
+  note. Use git history for the full archaeological trail.
