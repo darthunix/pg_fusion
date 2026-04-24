@@ -1,4 +1,0 @@
-processed=0 count=1
-processed=1 count=4032
-processed=2 count=2
-processed=4 count=1

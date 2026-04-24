@@ -1,3 +1,0 @@
-Parse elapsed_us=23223
-Compile elapsed_us=36301
-Bind+Optimize+Translate elapsed_us=46504

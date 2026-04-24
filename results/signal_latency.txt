@@ -1,3 +1,0 @@
-signal_latency benchmark: pid=51612 iters=100000 warmup=10000
-signal_one_way_sigwait: n=100000 min=2.932 us avg=5.453 us p50=4.721 us p95=6.658 us p99=14.180 us max=108.003 us
-signal_ping_pong_rtt: n=100000 min=7.053 us avg=9.120 us p50=7.691 us p95=12.448 us p99=34.818 us max=476.596 us

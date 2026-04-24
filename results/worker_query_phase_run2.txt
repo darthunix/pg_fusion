@@ -1,3 +1,0 @@
-parse_to_exec_ready_us=107344
-exec_ready_to_first_meta_us=1279
-first_meta_to_result_write_us=1029308

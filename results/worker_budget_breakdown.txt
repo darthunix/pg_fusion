@@ -1,7 +1,0 @@
-blocks=4032 first_blk=0 last_blk=4031
-window_exec_ready_to_first_meta_us=1228
-window_first_to_last_meta_us=1101726
-window_last_meta_to_exec_done_us=2815
-sum_decode_us=161809
-meta_cadence_us: n=4031 avg=273.31 p50=274 p95=419 p99=542 max=2933
-cadence_minus_prev_decode_us: n=4031 avg=233.18 p50=233 p95=374 p99=484 max=994
