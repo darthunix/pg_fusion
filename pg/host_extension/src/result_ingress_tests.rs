@@ -38,6 +38,8 @@ pub(crate) fn result_ingress_roundtrip_smoke() {
 
     let relation = OpenRelation::open(RESULT_INGRESS_FIXTURE);
     unsafe {
+        debug_repro::minimal_tuple_queue_context_ownership_repro(relation.tuple_desc())
+            .unwrap_or_else(|err| panic!("result_ingress ownership repro failed: {err}"));
         debug_repro::single_page_result_ingress_roundtrip(relation.tuple_desc())
             .unwrap_or_else(|err| panic!("result_ingress roundtrip repro failed: {err}"));
     }

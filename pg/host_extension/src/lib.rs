@@ -6,6 +6,7 @@ use pgrx::pg_sys::AsPgCStr;
 use pgrx::prelude::*;
 
 mod custom_scan;
+mod diag;
 mod guc;
 mod logging;
 mod planner;

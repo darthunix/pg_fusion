@@ -39,4 +39,4 @@ mod tests;
 pub use error::{ConfigError, ProjectError};
 #[cfg(test)]
 pub(crate) use projector::set_test_database_encoding;
-pub use projector::{ArrowSlotProjector, PageSlotCursor};
+pub use projector::{ArrowSlotProjector, OwnedPageSlotCursor, PageSlotCursor};

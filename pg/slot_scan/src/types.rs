@@ -263,13 +263,16 @@ impl PreparedScan {
 }
 
 #[derive(Debug)]
-pub(crate) struct ExecutionSpiConnection;
+pub(crate) struct ExecutionSpiConnection {
+    pub(crate) finish_restore_context: pg_sys::MemoryContext,
+}
 
 impl Drop for ExecutionSpiConnection {
     fn drop(&mut self) {
         slot_scan_diag(format!(
-            "slot_scan drop ExecutionSpiConnection before SPI_finish current_mcxt={:p}",
-            diagnostic_current_memory_context()
+            "slot_scan drop ExecutionSpiConnection before SPI_finish current_mcxt={:p} finish_restore_mcxt={:p}",
+            diagnostic_current_memory_context(),
+            self.finish_restore_context,
         ));
         unsafe {
             let _ = pg_sys::SPI_finish();

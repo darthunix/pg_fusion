@@ -79,8 +79,10 @@ impl PreparedScan {
         let portal = Cell::new(std::ptr::null_mut());
         let slot = Cell::new(std::ptr::null_mut());
         let success = Cell::new(false);
+        let previous_context = Cell::new(std::ptr::null_mut());
 
         PgTryBuilder::new(AssertUnwindSafe(|| unsafe {
+            previous_context.set(pg_sys::CurrentMemoryContext);
             portal.set(pg_sys::SPI_cursor_open(
                 std::ptr::null(),
                 self.plan.as_ptr(),
@@ -146,6 +148,7 @@ impl PreparedScan {
                     portal.set(std::ptr::null_mut());
                 }
             }
+            restore_current_memory_context(previous_context.get());
         })
         .execute()
     }
@@ -285,13 +288,18 @@ impl StreamingScanSession {
         }
         let processed = Cell::new(0usize);
         let batch_ptr = Cell::new(std::ptr::null_mut());
+        let previous_context = Cell::new(std::ptr::null_mut());
         PgTryBuilder::new(AssertUnwindSafe(|| unsafe {
+            previous_context.set(pg_sys::CurrentMemoryContext);
             pg_sys::SPI_cursor_fetch(self.portal, true, fetch_rows);
             batch_ptr.set(pg_sys::SPI_tuptable);
             processed.set(pg_sys::SPI_processed as usize);
             Ok(())
         }))
         .catch_others(|error| Err(scan_error_from_caught_error(error)))
+        .finally(|| unsafe {
+            restore_current_memory_context(previous_context.get());
+        })
         .execute()?;
         self.batch = batch_ptr.get();
         self.batch_processed = processed.get();
@@ -324,7 +332,9 @@ impl StreamingScanSession {
     fn release_batch(&mut self) {
         if !self.batch.is_null() {
             unsafe {
+                let previous_context = pg_sys::CurrentMemoryContext;
                 pg_sys::SPI_freetuptable(self.batch);
+                restore_current_memory_context(previous_context);
             }
         }
         self.batch = std::ptr::null_mut();
@@ -345,7 +355,9 @@ impl StreamingScanSession {
         self.row_loaded = false;
         self.tuple_desc = std::ptr::null_mut();
 
+        let previous_context = Cell::new(std::ptr::null_mut());
         let result = PgTryBuilder::new(AssertUnwindSafe(|| unsafe {
+            previous_context.set(pg_sys::CurrentMemoryContext);
             if !slot.is_null() {
                 clear_slot(slot);
             }
@@ -361,6 +373,9 @@ impl StreamingScanSession {
             Ok(())
         }))
         .catch_others(|error| Err(scan_error_from_caught_error(error)))
+        .finally(|| unsafe {
+            restore_current_memory_context(previous_context.get());
+        })
         .execute();
 
         self.closed = true;
@@ -381,16 +396,41 @@ impl Drop for StreamingScanSession {
 impl ExecutionSpiContext {
     #[doc(hidden)]
     pub fn connect() -> Result<Self, ScanError> {
+        let previous_context = Cell::new(std::ptr::null_mut());
+        let switched_context = Cell::new(false);
+
         PgTryBuilder::new(AssertUnwindSafe(|| unsafe {
+            let finish_restore_context = pg_sys::TopTransactionContext;
+            if finish_restore_context.is_null() {
+                return Err(ScanError::Postgres(
+                    "TopTransactionContext is not available for SPI connection".into(),
+                ));
+            }
+
+            previous_context.set(pg_sys::CurrentMemoryContext);
+            pg_sys::MemoryContextSwitchTo(finish_restore_context);
+            switched_context.set(true);
+
             let connect_rc = pg_sys::SPI_connect();
+            if !previous_context.get().is_null() {
+                pg_sys::MemoryContextSwitchTo(previous_context.get());
+                switched_context.set(false);
+            }
             if connect_rc != pg_sys::SPI_OK_CONNECT as i32 {
                 return Err(spi_status_error("SPI_connect", connect_rc));
             }
             Ok(Self {
-                _inner: Rc::new(ExecutionSpiConnection),
+                _inner: Rc::new(ExecutionSpiConnection {
+                    finish_restore_context,
+                }),
             })
         }))
         .catch_others(|error| Err(scan_error_from_caught_error(error)))
+        .finally(|| unsafe {
+            if switched_context.get() && !previous_context.get().is_null() {
+                pg_sys::MemoryContextSwitchTo(previous_context.get());
+            }
+        })
         .execute()
     }
 }
@@ -401,6 +441,12 @@ unsafe fn clear_slot(slot: *mut pg_sys::TupleTableSlot) {
     }
     if let Some(clear) = (*(*slot).tts_ops).clear {
         clear(slot);
+    }
+}
+
+unsafe fn restore_current_memory_context(previous_context: pg_sys::MemoryContext) {
+    if !previous_context.is_null() {
+        pg_sys::MemoryContextSwitchTo(previous_context);
     }
 }
 

@@ -1,13 +1,13 @@
-use std::collections::VecDeque;
-
 use arrow_schema::SchemaRef;
 use issuance::{IssuancePool, IssueEvent, IssuedOwnedFrame, IssuedRx};
 use pgrx::pg_sys;
 use pgrx::PgMemoryContexts;
 use pool::PagePool;
-use slot_import::{ArrowSlotProjector, ProjectError};
+use slot_import::{ArrowSlotProjector, OwnedPageSlotCursor, ProjectError};
 use thiserror::Error;
 use transfer::PageRx;
+
+use crate::diag;
 
 #[derive(Debug, Error)]
 pub(crate) enum ResultIngressError {
@@ -17,17 +17,21 @@ pub(crate) enum ResultIngressError {
     ProjectConfig(#[from] slot_import::ConfigError),
     #[error("result projection failed: {0}")]
     Project(#[from] ProjectError),
-    #[error("failed to materialize a minimal tuple from one projected row")]
-    CopyMinimalTuple,
+    #[error("received a result page while the previous result page is still active")]
+    ActivePageBusy,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum AcceptedResultFrame {
+    Page,
+    Closed,
 }
 
 pub(crate) struct ResultIngress {
     rx: IssuedRx,
-    _per_tuple_memory: PgMemoryContexts,
-    queued_tuple_memory: PgMemoryContexts,
+    per_tuple_memory: PgMemoryContexts,
     projector: ArrowSlotProjector,
-    project_slot: *mut pg_sys::TupleTableSlot,
-    queued: VecDeque<OwnedMinimalTuple>,
+    active_page: Option<OwnedPageSlotCursor>,
     stream_closed: bool,
     execution_completed: bool,
 }
@@ -40,25 +44,18 @@ impl ResultIngress {
         issuance_pool: IssuancePool,
     ) -> Result<Self, ResultIngressError> {
         let per_tuple_memory = PgMemoryContexts::new("pg_fusion_result_ingress");
-        let queued_tuple_memory = PgMemoryContexts::new("pg_fusion_result_queue");
         let projector =
             ArrowSlotProjector::new(transport_schema, tuple_desc, per_tuple_memory.value())?;
-        let project_slot =
-            pg_sys::MakeSingleTupleTableSlot(tuple_desc, &raw const pg_sys::TTSOpsVirtual);
         result_diag(format!(
-            "result_ingress init tuple_desc={:p} per_tuple_mcxt={:p} queue_mcxt={:p} project_slot={}",
+            "result_ingress init tuple_desc={:p} per_tuple_mcxt={:p}",
             tuple_desc,
             per_tuple_memory.value(),
-            queued_tuple_memory.value(),
-            slot_snapshot(project_slot),
         ));
         Ok(Self {
             rx: IssuedRx::new(PageRx::new(page_pool), issuance_pool),
-            _per_tuple_memory: per_tuple_memory,
-            queued_tuple_memory,
+            per_tuple_memory,
             projector,
-            project_slot,
-            queued: VecDeque::new(),
+            active_page: None,
             stream_closed: false,
             execution_completed: false,
         })
@@ -67,58 +64,37 @@ impl ResultIngress {
     pub(crate) fn accept_frame(
         &mut self,
         frame: &IssuedOwnedFrame,
-    ) -> Result<(), ResultIngressError> {
+    ) -> Result<AcceptedResultFrame, ResultIngressError> {
         match self.rx.accept(frame)? {
             IssueEvent::Page(page) => {
-                result_diag(format!(
-                    "result_ingress accept page queued_len_before={} project_slot={}",
-                    self.queued.len(),
-                    slot_snapshot(self.project_slot),
-                ));
-                let mut cursor = self.projector.open_owned_page(page)?;
-                while let Some(slot) = unsafe { cursor.next_into_slot(self.project_slot) }? {
-                    result_diag(format!(
-                        "result_ingress projected one virtual row project_slot={} slot={}",
-                        slot_snapshot(self.project_slot),
-                        slot_snapshot(slot),
-                    ));
-                    let tuple = unsafe {
-                        PgMemoryContexts::For(self.queued_tuple_memory.value())
-                            .switch_to(|_| pg_sys::ExecCopySlotMinimalTuple(slot))
-                    };
-                    if tuple.is_null() {
-                        return Err(ResultIngressError::CopyMinimalTuple);
-                    }
-                    result_diag(format!(
-                        "result_ingress copied minimal tuple {} from project_slot={}",
-                        minimal_tuple_snapshot(tuple),
-                        slot_snapshot(self.project_slot),
-                    ));
-                    self.queued.push_back(OwnedMinimalTuple::new(tuple));
-                    result_diag(format!(
-                        "result_ingress queued minimal tuple queued_len_after={} tuple={}",
-                        self.queued.len(),
-                        minimal_tuple_snapshot(tuple),
-                    ));
+                if self.active_page.is_some() {
+                    return Err(ResultIngressError::ActivePageBusy);
                 }
+                result_diag(format!(
+                    "result_ingress accept page active_page_before={}",
+                    self.active_page.is_some(),
+                ));
+                self.active_page = Some(self.projector.open_owned_cursor(page)?);
+                result_diag("result_ingress activated one result page".to_string());
+                Ok(AcceptedResultFrame::Page)
             }
             IssueEvent::Closed => {
                 self.stream_closed = true;
                 result_diag(format!(
-                    "result_ingress observed stream close queued_len={} execution_completed={}",
-                    self.queued.len(),
+                    "result_ingress observed stream close active_page={} execution_completed={}",
+                    self.active_page.is_some(),
                     self.execution_completed,
                 ));
+                Ok(AcceptedResultFrame::Closed)
             }
         }
-        Ok(())
     }
 
     pub(crate) fn mark_execution_complete(&mut self) {
         self.execution_completed = true;
         result_diag(format!(
-            "result_ingress marked execution complete queued_len={} stream_closed={}",
-            self.queued.len(),
+            "result_ingress marked execution complete active_page={} stream_closed={}",
+            self.active_page.is_some(),
             self.stream_closed,
         ));
     }
@@ -126,85 +102,72 @@ impl ResultIngress {
     pub(crate) fn store_next_into(
         &mut self,
         scan_slot: *mut pg_sys::TupleTableSlot,
-    ) -> Option<*mut pg_sys::TupleTableSlot> {
+    ) -> Result<Option<*mut pg_sys::TupleTableSlot>, ResultIngressError> {
         result_diag(format!(
-            "result_ingress store_next_into start queued_len={} scan_slot={}",
-            self.queued.len(),
+            "result_ingress store_next_into start active_page={} scan_slot={}",
+            self.active_page.is_some(),
             slot_snapshot(scan_slot),
         ));
-        let tuple = self.queued.pop_front()?;
-        let tuple_ptr = tuple.ptr;
-        result_diag(format!(
-            "result_ingress store_next_into dequeued tuple={} scan_slot_before={}",
-            minimal_tuple_snapshot(tuple_ptr),
-            slot_snapshot(scan_slot),
-        ));
-        let tuple = tuple.into_raw();
-        let stored = unsafe { pg_sys::ExecStoreMinimalTuple(tuple, scan_slot, true) };
-        result_diag(format!(
-            "result_ingress store_next_into stored tuple={} scan_slot_after={}",
-            minimal_tuple_snapshot(tuple),
-            slot_snapshot(scan_slot),
-        ));
-        Some(stored)
+        let Some(cursor) = self.active_page.as_mut() else {
+            return Ok(None);
+        };
+        let stored = unsafe {
+            self.projector
+                .next_cursor_row_into_slot(cursor, scan_slot)?
+        };
+        if let Some(stored) = stored {
+            result_diag(format!(
+                "result_ingress store_next_into projected row scan_slot_after={}",
+                slot_snapshot(scan_slot),
+            ));
+            Ok(Some(stored))
+        } else {
+            self.active_page = None;
+            result_diag("result_ingress released exhausted result page".to_string());
+            Ok(None)
+        }
     }
 
     pub(crate) fn is_complete(&self) -> bool {
-        self.stream_closed && self.execution_completed && self.queued.is_empty()
+        self.stream_closed && self.execution_completed && self.active_page.is_none()
+    }
+
+    pub(crate) fn debug_project_slot(&self) -> *mut pg_sys::TupleTableSlot {
+        std::ptr::null_mut()
+    }
+
+    pub(crate) fn debug_front_queued_tuple(&self) -> pg_sys::MinimalTuple {
+        std::ptr::null_mut()
+    }
+
+    pub(crate) fn debug_contexts(&self) -> (pg_sys::MemoryContext, pg_sys::MemoryContext) {
+        (self.per_tuple_memory.value(), std::ptr::null_mut())
     }
 }
 
 impl Drop for ResultIngress {
     fn drop(&mut self) {
+        let (per_tuple_cxt, _queue_cxt) = self.debug_contexts();
+        unsafe {
+            diag::update_result_ingress_watch(
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+                per_tuple_cxt,
+                std::ptr::null_mut(),
+            );
+            diag::log_live_watch("result_ingress drop live watch");
+        }
         result_diag(format!(
-            "result_ingress drop queued_len={} stream_closed={} execution_completed={} project_slot={}",
-            self.queued.len(),
+            "result_ingress drop active_page={} stream_closed={} execution_completed={}",
+            self.active_page.is_some(),
             self.stream_closed,
             self.execution_completed,
-            slot_snapshot(self.project_slot),
         ));
-        unsafe {
-            if !self.project_slot.is_null() {
-                pg_sys::ExecDropSingleTupleTableSlot(self.project_slot);
-            }
-        }
-    }
-}
-
-struct OwnedMinimalTuple {
-    ptr: pg_sys::MinimalTuple,
-}
-
-impl OwnedMinimalTuple {
-    fn new(ptr: pg_sys::MinimalTuple) -> Self {
-        Self { ptr }
-    }
-
-    fn into_raw(mut self) -> pg_sys::MinimalTuple {
-        let ptr = self.ptr;
-        self.ptr = std::ptr::null_mut();
-        ptr
-    }
-}
-
-impl Drop for OwnedMinimalTuple {
-    fn drop(&mut self) {
-        if !self.ptr.is_null() {
-            result_diag(format!(
-                "result_ingress dropping owned minimal tuple {}",
-                minimal_tuple_snapshot(self.ptr),
-            ));
-            unsafe { pg_sys::heap_free_minimal_tuple(self.ptr) };
-        }
     }
 }
 
 fn result_diag(message: String) {
     result_diag_write_file(&message);
-    #[cfg(not(test))]
-    {
-        pgrx::warning!("{message}");
-    }
     #[cfg(test)]
     {
         let _ = message;
@@ -271,14 +234,6 @@ fn slot_snapshot(slot: *mut pg_sys::TupleTableSlot) -> String {
     }
 }
 
-fn minimal_tuple_snapshot(tuple: pg_sys::MinimalTuple) -> String {
-    if tuple.is_null() {
-        return "tuple=null".to_string();
-    }
-
-    unsafe { format!("tuple={:p} t_len={}", tuple, (*tuple).t_len) }
-}
-
 #[cfg(feature = "pg_test")]
 #[allow(dead_code)]
 pub(crate) mod debug_repro {
@@ -295,6 +250,7 @@ pub(crate) mod debug_repro {
     use datafusion_common::Result as DFResult;
     use futures::Stream;
     use issuance::{IssuanceConfig, IssuancePool, IssuedTx};
+    use pgrx::varlena::rust_str_to_text_p;
     use pool::{PagePool, PagePoolConfig};
     use transfer::PageTx;
     use worker_runtime::{ResultPageProducer, ResultPageProducerConfig, ResultPageStep};
@@ -343,6 +299,62 @@ pub(crate) mod debug_repro {
     }
 
     #[allow(dead_code)]
+    pub(crate) unsafe fn minimal_tuple_queue_context_ownership_repro(
+        tuple_desc: pg_sys::TupleDesc,
+    ) -> Result<(), String> {
+        let mut queue_memory = PgMemoryContexts::new("pg_fusion_result_queue_repro");
+        let scan_slot =
+            pg_sys::MakeSingleTupleTableSlot(tuple_desc, &raw const pg_sys::TTSOpsMinimalTuple);
+        if scan_slot.is_null() {
+            return Err("MakeSingleTupleTableSlot(TTSOpsMinimalTuple) returned null".to_string());
+        }
+
+        let tuple = unsafe {
+            queue_memory.switch_to(|_| {
+                let text = rust_str_to_text_p("two");
+                let mut values = [
+                    pg_sys::Datum::from(2_i64),
+                    pg_sys::Datum::from(text.as_ptr()),
+                ];
+                let mut nulls = [false, false];
+                pg_sys::heap_form_minimal_tuple(tuple_desc, values.as_mut_ptr(), nulls.as_mut_ptr())
+            })
+        };
+        if tuple.is_null() {
+            unsafe { pg_sys::ExecDropSingleTupleTableSlot(scan_slot) };
+            return Err("heap_form_minimal_tuple returned null".to_string());
+        }
+
+        unsafe { pg_sys::ExecStoreMinimalTuple(tuple, scan_slot, true) };
+        let flags = unsafe { (*scan_slot).tts_flags as u32 };
+        if flags & pg_sys::TTS_FLAG_SHOULDFREE == 0 {
+            unsafe { pg_sys::ExecDropSingleTupleTableSlot(scan_slot) };
+            return Err("ExecStoreMinimalTuple did not mark scan slot shouldFree".to_string());
+        }
+
+        let stored = unsafe { (*scan_slot.cast::<pg_sys::MinimalTupleTableSlot>()).mintuple };
+        if stored != tuple {
+            unsafe { pg_sys::ExecDropSingleTupleTableSlot(scan_slot) };
+            return Err("scan slot did not retain the expected minimal tuple".to_string());
+        }
+        let chunk_context = unsafe { pg_sys::GetMemoryChunkContext(stored.cast()) };
+        if chunk_context != queue_memory.value() {
+            unsafe { pg_sys::ExecDropSingleTupleTableSlot(scan_slot) };
+            return Err(format!(
+                "stored tuple context mismatch: got {:p}, expected {:p}",
+                chunk_context,
+                queue_memory.value()
+            ));
+        }
+
+        unsafe {
+            pg_sys::ExecClearTuple(scan_slot);
+            pg_sys::ExecDropSingleTupleTableSlot(scan_slot);
+        }
+        Ok(())
+    }
+
+    #[allow(dead_code)]
     pub(crate) unsafe fn single_page_result_ingress_roundtrip(
         tuple_desc: pg_sys::TupleDesc,
     ) -> Result<(), String> {
@@ -353,8 +365,8 @@ pub(crate) mod debug_repro {
         let batch = RecordBatch::try_new(
             Arc::clone(&schema),
             vec![
-                Arc::new(Int64Array::from(vec![2_i64])) as ArrayRef,
-                Arc::new(StringArray::from(vec!["two"])) as ArrayRef,
+                Arc::new(Int64Array::from(vec![2_i64, 3_i64])) as ArrayRef,
+                Arc::new(StringArray::from(vec!["two", "three"])) as ArrayRef,
             ],
         )
         .map_err(|err| err.to_string())?;
@@ -398,40 +410,76 @@ pub(crate) mod debug_repro {
             ResultIngress::new(transport_schema, tuple_desc, page_pool, issuance_pool)
                 .map_err(|err| err.to_string())?;
         let scan_slot =
-            pg_sys::MakeSingleTupleTableSlot(tuple_desc, &raw const pg_sys::TTSOpsMinimalTuple);
+            pg_sys::MakeSingleTupleTableSlot(tuple_desc, &raw const pg_sys::TTSOpsVirtual);
         if scan_slot.is_null() {
-            return Err("MakeSingleTupleTableSlot(TTSOpsMinimalTuple) returned null".to_string());
+            return Err("MakeSingleTupleTableSlot(TTSOpsVirtual) returned null".to_string());
         }
 
         while let Some(step) = producer.next_step().map_err(|err| err.to_string())? {
             match step {
                 ResultPageStep::OutboundPage(outbound) => {
                     let frame = outbound.frame();
-                    ingress
+                    let accepted = ingress
                         .accept_frame(&frame)
                         .map_err(|err| err.to_string())?;
+                    if accepted != AcceptedResultFrame::Page {
+                        return Err("expected outbound result page".to_string());
+                    }
                     outbound.mark_sent();
+                    if issuance_pool.snapshot().leased_permits != 1 {
+                        return Err(
+                            "accepted result page should keep one issuance permit".to_string()
+                        );
+                    }
                 }
                 ResultPageStep::CloseFrame(frame) => {
-                    ingress
+                    let accepted = ingress
                         .accept_frame(&frame)
                         .map_err(|err| err.to_string())?;
+                    if accepted != AcceptedResultFrame::Closed {
+                        return Err("expected result close frame".to_string());
+                    }
                 }
             }
         }
         ingress.mark_execution_complete();
 
-        let slot = ingress
+        let mut observed = Vec::new();
+        while let Some(slot) = ingress
             .store_next_into(scan_slot)
-            .ok_or_else(|| "expected one stored tuple".to_string())?;
-        if slot.is_null() {
-            return Err("ExecStoreMinimalTuple returned null slot".to_string());
+            .map_err(|err| err.to_string())?
+        {
+            if slot.is_null() {
+                return Err("next_cursor_row_into_slot returned null slot".to_string());
+            }
+            let flags = unsafe { (*slot).tts_flags as u32 };
+            if flags & pg_sys::TTS_FLAG_SHOULDFREE != 0 {
+                return Err("virtual result slot unexpectedly owns a minimal tuple".to_string());
+            }
+            let slot_ref = unsafe { &*slot };
+            let values = unsafe {
+                std::slice::from_raw_parts(slot_ref.tts_values, slot_ref.tts_nvalid as usize)
+            };
+            observed.push(values[0].value() as i64);
+            if issuance_pool.snapshot().leased_permits != 1 {
+                return Err(
+                    "active result page permit was released before slot was cleared".to_string(),
+                );
+            }
         }
-        result_diag(format!(
-            "result_ingress debug_repro clearing stored scan slot {}",
-            slot_snapshot(scan_slot),
-        ));
-        pg_sys::ExecClearTuple(scan_slot);
+        if observed != [2_i64, 3_i64] {
+            unsafe { pg_sys::ExecDropSingleTupleTableSlot(scan_slot) };
+            return Err(format!("unexpected result ids: {observed:?}"));
+        }
+        if !ingress.is_complete() {
+            unsafe { pg_sys::ExecDropSingleTupleTableSlot(scan_slot) };
+            return Err("result ingress should be complete after final cursor drain".to_string());
+        }
+        if issuance_pool.snapshot().leased_permits != 0 {
+            unsafe { pg_sys::ExecDropSingleTupleTableSlot(scan_slot) };
+            return Err("exhausted result page should release issuance permit".to_string());
+        }
+
         pg_sys::ExecDropSingleTupleTableSlot(scan_slot);
         drop(ingress);
         Ok(())

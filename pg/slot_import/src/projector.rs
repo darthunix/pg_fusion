@@ -23,7 +23,7 @@ use std::sync::atomic::{AtomicI32, Ordering};
 ///
 /// The caller owns both the `TupleDesc` and the per-tuple `MemoryContext`. Both
 /// must remain valid for the lifetime of this projector and any cursors opened
-/// from it. Only one cursor may be open from a projector at a time.
+/// from it.
 pub struct ArrowSlotProjector {
     tuple_desc: pg_sys::TupleDesc,
     per_tuple_memory: pg_sys::MemoryContext,
@@ -37,6 +37,17 @@ pub struct ArrowSlotProjector {
 /// the next call on the same cursor or until the cursor is dropped.
 pub struct PageSlotCursor<'a> {
     projector: &'a mut ArrowSlotProjector,
+    page: Option<ImportedPage>,
+    next_row: usize,
+}
+
+/// One page-backed cursor that can be stored separately from its projector.
+///
+/// The slot contents returned by
+/// [`ArrowSlotProjector::next_cursor_row_into_slot`] remain valid until the
+/// next call using the same projector/cursor pair or until this cursor is
+/// dropped.
+pub struct OwnedPageSlotCursor {
     page: Option<ImportedPage>,
     next_row: usize,
 }
@@ -160,6 +171,53 @@ impl ArrowSlotProjector {
     where
         P: OwnedPage,
     {
+        let page = self.import_page(page)?;
+        Ok(PageSlotCursor {
+            projector: self,
+            page: Some(page),
+            next_row: 0,
+        })
+    }
+
+    /// Open one owned page carrier as a cursor that can outlive this borrow.
+    pub fn open_owned_cursor<P>(&self, page: P) -> Result<OwnedPageSlotCursor, ProjectError>
+    where
+        P: OwnedPage,
+    {
+        let page = self.import_page(page)?;
+        Ok(OwnedPageSlotCursor {
+            page: Some(page),
+            next_row: 0,
+        })
+    }
+
+    /// Open one received page for row-by-row projection.
+    pub fn open_page(&mut self, page: ReceivedPage) -> Result<PageSlotCursor<'_>, ProjectError> {
+        self.open_owned_page(page)
+    }
+
+    /// Project the next row from an owned cursor into `slot`.
+    ///
+    /// This is the non-self-referential variant of [`PageSlotCursor`]. The
+    /// supplied cursor must have been opened by a projector with the same
+    /// schema/tuple descriptor/per-tuple memory contract.
+    ///
+    /// # Safety
+    ///
+    /// `slot` must be a live PostgreSQL `TTSOpsVirtual` slot whose tuple
+    /// descriptor exactly matches this projector.
+    pub unsafe fn next_cursor_row_into_slot(
+        &self,
+        cursor: &mut OwnedPageSlotCursor,
+        slot: *mut pg_sys::TupleTableSlot,
+    ) -> Result<Option<*mut pg_sys::TupleTableSlot>, ProjectError> {
+        unsafe { self.next_page_row_into_slot(&mut cursor.page, &mut cursor.next_row, slot) }
+    }
+
+    fn import_page<P>(&self, page: P) -> Result<ImportedPage, ProjectError>
+    where
+        P: OwnedPage,
+    {
         let batch = self.decoder.import_owned(page)?;
         let row_count = batch.num_rows();
         let mut columns = Vec::with_capacity(self.columns.len());
@@ -255,16 +313,7 @@ impl ArrowSlotProjector {
             columns.push(view);
         }
 
-        Ok(PageSlotCursor {
-            projector: self,
-            page: Some(ImportedPage { row_count, columns }),
-            next_row: 0,
-        })
-    }
-
-    /// Open one received page for row-by-row projection.
-    pub fn open_page(&mut self, page: ReceivedPage) -> Result<PageSlotCursor<'_>, ProjectError> {
-        self.open_owned_page(page)
+        Ok(ImportedPage { row_count, columns })
     }
 
     fn project_row(
@@ -318,6 +367,50 @@ impl ArrowSlotProjector {
 
         Ok(())
     }
+
+    unsafe fn next_page_row_into_slot(
+        &self,
+        page: &mut Option<ImportedPage>,
+        next_row: &mut usize,
+        slot: *mut pg_sys::TupleTableSlot,
+    ) -> Result<Option<*mut pg_sys::TupleTableSlot>, ProjectError> {
+        validate_slot(slot, self.tuple_desc)?;
+
+        unsafe { pg_sys::ExecClearTuple(slot) };
+        unsafe { pg_sys::MemoryContextReset(self.per_tuple_memory) };
+
+        let Some(page_ref) = page.as_ref() else {
+            return Ok(None);
+        };
+
+        if *next_row >= page_ref.row_count {
+            *page = None;
+            return Ok(None);
+        }
+
+        let slot_ref = unsafe { &mut *slot };
+        let values = unsafe { slice::from_raw_parts_mut(slot_ref.tts_values, self.columns.len()) };
+        let isnull = unsafe { slice::from_raw_parts_mut(slot_ref.tts_isnull, self.columns.len()) };
+        values.fill(pg_sys::Datum::null());
+        isnull.fill(true);
+
+        let mut per_tuple_memory = PgMemoryContexts::For(self.per_tuple_memory);
+        let project = unsafe {
+            per_tuple_memory.switch_to(|_| self.project_row(page_ref, *next_row, values, isnull))
+        };
+        if let Err(err) = project {
+            values.fill(pg_sys::Datum::null());
+            isnull.fill(true);
+            slot_ref.tts_nvalid = 0;
+            unsafe { pg_sys::ExecClearTuple(slot) };
+            unsafe { pg_sys::MemoryContextReset(self.per_tuple_memory) };
+            return Err(err);
+        }
+
+        slot_ref.tts_nvalid = self.columns.len() as pg_sys::AttrNumber;
+        *next_row += 1;
+        Ok(Some(unsafe { pg_sys::ExecStoreVirtualTuple(slot) }))
+    }
 }
 
 impl PageSlotCursor<'_> {
@@ -337,47 +430,10 @@ impl PageSlotCursor<'_> {
         &mut self,
         slot: *mut pg_sys::TupleTableSlot,
     ) -> Result<Option<*mut pg_sys::TupleTableSlot>, ProjectError> {
-        validate_slot(slot, self.projector.tuple_desc)?;
-
-        unsafe { pg_sys::ExecClearTuple(slot) };
-        unsafe { pg_sys::MemoryContextReset(self.projector.per_tuple_memory) };
-
-        let Some(page) = self.page.as_ref() else {
-            return Ok(None);
-        };
-
-        if self.next_row >= page.row_count {
-            self.page = None;
-            return Ok(None);
+        unsafe {
+            self.projector
+                .next_page_row_into_slot(&mut self.page, &mut self.next_row, slot)
         }
-
-        let slot_ref = unsafe { &mut *slot };
-        let values =
-            unsafe { slice::from_raw_parts_mut(slot_ref.tts_values, self.projector.columns.len()) };
-        let isnull =
-            unsafe { slice::from_raw_parts_mut(slot_ref.tts_isnull, self.projector.columns.len()) };
-        values.fill(pg_sys::Datum::null());
-        isnull.fill(true);
-
-        let mut per_tuple_memory = PgMemoryContexts::For(self.projector.per_tuple_memory);
-        let project = unsafe {
-            per_tuple_memory.switch_to(|_| {
-                self.projector
-                    .project_row(page, self.next_row, values, isnull)
-            })
-        };
-        if let Err(err) = project {
-            values.fill(pg_sys::Datum::null());
-            isnull.fill(true);
-            slot_ref.tts_nvalid = 0;
-            unsafe { pg_sys::ExecClearTuple(slot) };
-            unsafe { pg_sys::MemoryContextReset(self.projector.per_tuple_memory) };
-            return Err(err);
-        }
-
-        slot_ref.tts_nvalid = self.projector.columns.len() as pg_sys::AttrNumber;
-        self.next_row += 1;
-        Ok(Some(unsafe { pg_sys::ExecStoreVirtualTuple(slot) }))
     }
 }
 

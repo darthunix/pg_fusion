@@ -1693,10 +1693,6 @@ fn diagnostic_current_memory_context() -> pg_sys::MemoryContext {
 
 fn backend_diag_info(message: String) {
     backend_diag_write_file(&message);
-    #[cfg(not(test))]
-    {
-        pgrx::log!("{message}");
-    }
     #[cfg(test)]
     {
         let _ = message;
@@ -1705,10 +1701,6 @@ fn backend_diag_info(message: String) {
 
 fn backend_diag_warning(message: String) {
     backend_diag_write_file(&message);
-    #[cfg(not(test))]
-    {
-        pgrx::log!("{message}");
-    }
     #[cfg(test)]
     {
         let _ = message;
@@ -1785,13 +1777,12 @@ fn cleanup_execution(
     }
     if execution.scan_spi.is_some() {
         backend_diag_info(format!(
-            "backend_service cleanup_execution dropping shared scan SPI slot_id={} session_epoch={} current_mcxt={:p}",
+            "backend_service cleanup_execution will drop shared scan SPI after scan plans slot_id={} session_epoch={} current_mcxt={:p}",
             execution.key.slot_id,
             execution.key.session_epoch,
             diagnostic_current_memory_context()
         ));
     }
-    execution.scan_spi.take();
 
     if execution.machine.state() == &BackendExecutionState::Terminal {
         if let Err(err) =
