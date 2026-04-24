@@ -29,7 +29,7 @@
 
 ## Testing Guidelines
 - Place Rust tests in `tests/` or `mod tests { ... }` within modules.
-- For extension-level behavior, add pgrx tests in `testing/pg_test` where
+- For extension-level behavior, add pgrx tests in `pg/test` where
   possible.
 - Keep tests deterministic; prefer table-driven cases and cover error paths.
 

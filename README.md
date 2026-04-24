@@ -27,7 +27,7 @@ projected back into PostgreSQL tuple slots.
   zero-copy Arrow page layout, PostgreSQL slot encoding, and result projection.
 - `pg/plan_builder/`, `pg/df_catalog/`, `pg/scan_node/`, `pg/scan_sql/`,
   `pg/slot_scan/` - backend-side SQL planning and PostgreSQL scan execution.
-- `testing/pg_test/` - pgrx integration tests for the active runtime path and
+- `pg/test/` - pgrx integration tests for the active runtime path and
   page/slot pipeline.
 - `lockfree/` - shared-memory lock-free primitives used by the transport/page
   stack.
@@ -73,7 +73,7 @@ cargo pgrx test pg17 -p pg_test
 ```
 
 For the Postgres-side page pipeline benchmark under `pg_test`, see
-[`testing/pg_test/README.md`](testing/pg_test/README.md).
+[`pg/test/README.md`](pg/test/README.md).
 
 ## PostgreSQL Configuration
 
