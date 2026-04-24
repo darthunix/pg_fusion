@@ -51,10 +51,10 @@ mod run;
 mod types;
 
 pub use error::{ScanError, SinkError};
-pub use plan::prepare_scan;
+pub use plan::{explain_scan, prepare_scan};
 pub use types::{
-    DiagnosticLogLevel, DiagnosticsConfig, PreparedScan, ScanOptions, ScanPlanKind, ScanStats,
-    SlotSink, SlotSinkAction, SlotSinkContext, SlotSinkMethods,
+    DiagnosticLogLevel, DiagnosticsConfig, PreparedScan, ScanExplainOptions, ScanOptions,
+    ScanPlanKind, ScanStats, SlotSink, SlotSinkAction, SlotSinkContext, SlotSinkMethods,
 };
 #[doc(hidden)]
 pub use types::{ExecutionSpiContext, StreamingScanSession};

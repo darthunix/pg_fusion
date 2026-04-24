@@ -1,5 +1,6 @@
 use crate::fsm::BackendExecutionState;
 use control_transport::{AcquireError, BackendLeaseSlot, BackendRxError, BackendTxError};
+use datafusion_common::DataFusionError;
 use thiserror::Error;
 
 #[derive(Debug, Error)]
@@ -65,6 +66,8 @@ pub enum BackendServiceError {
     StateMachine(String),
     #[error("logical plan build failed: {0}")]
     PlanBuild(#[from] plan_builder::PlanBuildError),
+    #[error("physical plan build failed: {0}")]
+    PhysicalPlan(DataFusionError),
     #[error("scan preparation failed: {0}")]
     PrepareScan(#[from] slot_scan::ScanError),
     #[error("row estimator seed failed: {0}")]

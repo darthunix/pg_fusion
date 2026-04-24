@@ -178,8 +178,12 @@ if let Some(mut driver) = BackendService::open_scan(OpenScanInput {
 
 Explain stays backend-local:
 
-- `BackendService::render_explain()` builds and renders the logical plan
-  directly in the backend
+- `BackendService::render_explain()` builds the logical plan, lowers it to a
+  DataFusion physical plan, and renders that physical plan directly in the
+  backend
+- PostgreSQL scan leaves are represented by explain-only physical exec nodes
+  that include the scan soft limit/fetch hints and a multiline PostgreSQL plan
+  block for the compiled leaf SQL
 - no active execution is registered
 - no worker or `plan_flow` / `scan_flow` interaction is involved
 

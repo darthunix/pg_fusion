@@ -2,8 +2,8 @@ use arrow_array::{Int32Array, StringViewArray};
 use arrow_schema::{DataType, Field, Schema, SchemaRef};
 use backend_service::{
     ActiveScanDriver, BackendService, BackendServiceConfig, BackendServiceError,
-    BeginExecutionOutput, ExecutionKey, OpenScanInput, ScanStreamStep, ScanYieldReason,
-    StartExecutionInput,
+    BeginExecutionOutput, ExecutionKey, ExplainInput, OpenScanInput, ScanStreamStep,
+    ScanYieldReason, StartExecutionInput,
 };
 use control_transport::{BackendLeaseId, BackendLeaseSlot, TransportRegion, TransportRegionLayout};
 use datafusion_common::ScalarValue;
@@ -183,6 +183,68 @@ fn reset_backend_service_table() {
          (3, 'three')"
     ))
     .unwrap();
+}
+
+pub fn backend_service_render_explain_uses_physical_plan_and_pg_leaf() {
+    reset_backend_service_table();
+    let _snapshot = unsafe { LatestSnapshotGuard::acquire() };
+    let sql = format!("SELECT id FROM {BACKEND_SERVICE_TABLE} WHERE id > 0 LIMIT 1");
+
+    let rendered = BackendService::render_explain(ExplainInput {
+        sql: &sql,
+        params: Vec::new(),
+        options: Default::default(),
+        config: BackendServiceConfig::default(),
+    })
+    .expect("render physical explain");
+
+    assert!(
+        rendered.contains("PostgreSQL Scan:"),
+        "expected PostgreSQL scan exec in physical plan: {rendered}"
+    );
+    assert!(
+        !rendered.contains("PgFusionPgScanExec"),
+        "internal scan exec name should not be rendered in default explain: {rendered}"
+    );
+    assert!(
+        !rendered.contains("scan_id="),
+        "scan id should not be rendered in default explain: {rendered}"
+    );
+    assert!(
+        !rendered.contains("planner_fetch_hint="),
+        "planner fetch hint should not be rendered in default explain: {rendered}"
+    );
+    assert!(
+        !rendered.contains("PgScan:"),
+        "logical PgScan should not be rendered in backend explain: {rendered}"
+    );
+    assert!(
+        !rendered.contains("pg_plan=\""),
+        "PostgreSQL leaf explain should not be rendered inline: {rendered}"
+    );
+    assert!(
+        !rendered.contains("PostgreSQL Plan:"),
+        "PostgreSQL scan block should not render a redundant header: {rendered}"
+    );
+    assert!(
+        rendered.contains("Seq Scan") || rendered.contains("Index Scan"),
+        "expected PostgreSQL scan node in leaf explain: {rendered}"
+    );
+    let pg_scan_block = rendered
+        .lines()
+        .skip_while(|line| !line.contains("PostgreSQL Scan:"))
+        .skip(1);
+    assert!(
+        pg_scan_block
+            .take(4)
+            .any(|line| line.contains("Seq Scan") || line.contains("Index Scan")),
+        "expected PostgreSQL scan node on a separate line: {rendered}"
+    );
+    assert!(
+        rendered.contains("PostgreSQL Scan:")
+            && rendered.contains("(soft_limit=1, local_row_cap=1)"),
+        "expected scan limits in parentheses in leaf explain: {rendered}"
+    );
 }
 
 fn test_query() -> String {

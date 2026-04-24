@@ -182,6 +182,8 @@ fn render_explain_is_rejected_while_execution_is_active() {
     let err = BackendService::render_explain(ExplainInput {
         sql: "SELECT 1",
         params: Vec::new(),
+        options: Default::default(),
+        config: BackendServiceConfig::default(),
     })
     .unwrap_err();
     assert!(matches!(err, BackendServiceError::ExecutionAlreadyActive));

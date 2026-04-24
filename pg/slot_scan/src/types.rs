@@ -87,6 +87,22 @@ pub struct ScanOptions {
     pub diagnostics: DiagnosticsConfig,
 }
 
+/// Options used when rendering a PostgreSQL plan for trusted scan SQL.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ScanExplainOptions {
+    pub verbose: bool,
+    pub costs: bool,
+}
+
+impl Default for ScanExplainOptions {
+    fn default() -> Self {
+        Self {
+            verbose: false,
+            costs: true,
+        }
+    }
+}
+
 /// Leaf scan shape chosen by the current run-time PostgreSQL plan.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum ScanPlanKind {

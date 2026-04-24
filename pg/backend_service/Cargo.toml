@@ -18,8 +18,10 @@ pg_test = []
 arrow-schema = { workspace = true }
 arrow_layout = { path = "../../page/arrow_layout", version = "25.0" }
 control_transport = { path = "../../control_transport", version = "25.0" }
+datafusion = { workspace = true }
 datafusion-common = { workspace = true }
 datafusion-expr = { workspace = true }
+futures = "0.3"
 import = { path = "../../page/import", version = "25.0" }
 issuance = { path = "../../page/issuance", version = "25.0" }
 pgrx = { workspace = true }

@@ -39,6 +39,10 @@ The crate is meant to be used in two steps:
 1. Build a reusable prepared scan with `prepare_scan(sql, options)`.
 2. Execute it with `PreparedScan::run(sink)`.
 
+For planned-only diagnostics, `explain_scan(sql, options, explain_options)`
+uses the same cursor-planning flags and validation path, then renders
+PostgreSQL's plan tree without opening the scan cursor.
+
 `run()` opens a read-only SPI cursor, revalidates the saved plan, reads the
 current `TupleDesc` from the opened portal, and then invokes the sink.
 Every sink callback runs behind a PostgreSQL exception boundary, so callback-

@@ -6,8 +6,8 @@ use std::time::Duration;
 use arrow_schema::{Field, Schema, SchemaRef};
 use backend_service::{
     ActiveScanDriver, BackendService, BackendServiceError, BeginExecutionOutput,
-    DiagnosticLogLevel, ExecutionKey, ExplainInput, OpenScanInput, ScanStreamStep,
-    StartExecutionInput,
+    DiagnosticLogLevel, ExecutionKey, ExplainInput, ExplainRenderOptions, OpenScanInput,
+    ScanStreamStep, StartExecutionInput,
 };
 use control_transport::{BackendLeaseSlot, BackendSlotLease};
 use issuance::{
@@ -608,16 +608,51 @@ unsafe extern "C-unwind" fn explain_pg_fusion_scan(
     es: *mut pg_sys::ExplainState,
 ) {
     let state = host_state_ref(node);
+    let config = host_config().unwrap_or_else(|err| error!("pg_fusion config error: {err}"));
     let rendered = {
         let _planner_bypass = PlannerBypassGuard::enter();
         BackendService::render_explain(ExplainInput {
             sql: &state.sql,
             params: Vec::new(),
+            options: explain_render_options(es),
+            config: config.backend_service_config(),
         })
     }
     .unwrap_or_else(|err| error!("pg_fusion explain failed: {err}"));
-    let rendered = CString::new(rendered).expect("explain text must not contain NUL bytes");
-    pg_sys::ExplainPropertyText(c"pg_fusion".as_ptr(), rendered.as_ptr(), es);
+    emit_pg_fusion_explain(rendered, es);
+}
+
+unsafe fn explain_render_options(es: *mut pg_sys::ExplainState) -> ExplainRenderOptions {
+    if es.is_null() {
+        ExplainRenderOptions::default()
+    } else {
+        ExplainRenderOptions {
+            verbose: (*es).verbose,
+            costs: (*es).costs,
+        }
+    }
+}
+
+unsafe fn emit_pg_fusion_explain(rendered: String, es: *mut pg_sys::ExplainState) {
+    if !es.is_null() && (*es).format == pg_sys::ExplainFormat::EXPLAIN_FORMAT_TEXT {
+        emit_text_explain_lines(&rendered, es);
+    } else {
+        let rendered = CString::new(rendered).expect("explain text must not contain NUL bytes");
+        pg_sys::ExplainPropertyText(c"pg_fusion".as_ptr(), rendered.as_ptr(), es);
+    }
+}
+
+unsafe fn emit_text_explain_lines(rendered: &str, es: *mut pg_sys::ExplainState) {
+    if es.is_null() || (*es).str_.is_null() {
+        return;
+    }
+
+    for line in rendered.lines() {
+        pg_sys::appendStringInfoSpaces((*es).str_, (*es).indent * 2);
+        let line = CString::new(line).expect("explain text must not contain NUL bytes");
+        pg_sys::appendStringInfoString((*es).str_, line.as_ptr());
+        pg_sys::appendStringInfoChar((*es).str_, b'\n' as std::ffi::c_char);
+    }
 }
 
 fn poll_primary_peer(state: &mut HostScanState) -> Result<bool, BackendServiceError> {

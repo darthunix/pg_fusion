@@ -1,5 +1,5 @@
 use crate::error::ScanError;
-use crate::types::{OwnedSpiPlan, PreparedScan, ScanOptions, ScanPlanKind};
+use crate::types::{OwnedSpiPlan, PreparedScan, ScanExplainOptions, ScanOptions, ScanPlanKind};
 use pgrx::pg_sys;
 use pgrx::pg_sys::panic::CaughtError;
 use pgrx::PgTryBuilder;
@@ -29,15 +29,7 @@ pub fn prepare_scan(sql: &str, options: ScanOptions) -> Result<PreparedScan, Sca
     let c_sql = CString::new(sql).map_err(|_| ScanError::InvalidSql)?;
 
     with_spi(|| unsafe {
-        let mut cursor_options = pg_sys::CURSOR_OPT_PARALLEL_OK as i32;
-        if options.planner_fetch_hint.is_some() {
-            cursor_options |= pg_sys::CURSOR_OPT_FAST_PLAN as i32;
-        }
-        let plan =
-            pg_sys::SPI_prepare_cursor(c_sql.as_ptr(), 0, std::ptr::null_mut(), cursor_options);
-        if plan.is_null() {
-            return Err(spi_status_error("SPI_prepare_cursor", pg_sys::SPI_result));
-        }
+        let plan = prepare_cursor_plan(&c_sql, &options)?;
         if !pg_sys::SPI_is_cursor_plan(plan) {
             return Err(ScanError::UnsupportedPlan(
                 "prepared SQL must produce tuples for a cursor scan".into(),
@@ -58,6 +50,39 @@ pub fn prepare_scan(sql: &str, options: ScanOptions) -> Result<PreparedScan, Sca
             )),
             options,
         })
+    })
+}
+
+/// Render PostgreSQL's planned shape for trusted scan SQL without executing it.
+///
+/// The SQL is prepared with the same cursor-planning options as
+/// [`prepare_scan()`], so planner fetch hints affect the displayed leaf plan in
+/// the same way they affect the scan path used at execution time.
+pub fn explain_scan(
+    sql: &str,
+    options: ScanOptions,
+    explain_options: ScanExplainOptions,
+) -> Result<String, ScanError> {
+    let c_sql = CString::new(sql).map_err(|_| ScanError::InvalidSql)?;
+
+    with_spi(|| unsafe {
+        let plan = prepare_cursor_plan(&c_sql, &options)?;
+        let rendered = (|| -> Result<String, ScanError> {
+            if !pg_sys::SPI_is_cursor_plan(plan) {
+                return Err(ScanError::UnsupportedPlan(
+                    "prepared SQL must produce tuples for a cursor scan".into(),
+                ));
+            }
+
+            render_spi_plan_explain(plan, &c_sql, explain_options)
+        })();
+
+        let free_rc = pg_sys::SPI_freeplan(plan);
+        if rendered.is_ok() && free_rc != 0 {
+            return Err(spi_status_error("SPI_freeplan", free_rc));
+        }
+
+        rendered
     })
 }
 
@@ -89,7 +114,77 @@ pub(crate) fn with_spi<T>(f: impl FnOnce() -> Result<T, ScanError>) -> Result<T,
     result
 }
 
+unsafe fn prepare_cursor_plan(
+    c_sql: &CStr,
+    options: &ScanOptions,
+) -> Result<pg_sys::SPIPlanPtr, ScanError> {
+    let mut cursor_options = pg_sys::CURSOR_OPT_PARALLEL_OK as i32;
+    if options.planner_fetch_hint.is_some() {
+        cursor_options |= pg_sys::CURSOR_OPT_FAST_PLAN as i32;
+    }
+    let plan = pg_sys::SPI_prepare_cursor(c_sql.as_ptr(), 0, std::ptr::null_mut(), cursor_options);
+    if plan.is_null() {
+        Err(spi_status_error("SPI_prepare_cursor", pg_sys::SPI_result))
+    } else {
+        Ok(plan)
+    }
+}
+
 unsafe fn inspect_spi_plan(plan: pg_sys::SPIPlanPtr) -> Result<PlanMetadata, ScanError> {
+    with_cached_single_planned_stmt(plan, |planned_stmt| inspect_planned_stmt(planned_stmt))
+}
+
+unsafe fn render_spi_plan_explain(
+    plan: pg_sys::SPIPlanPtr,
+    query: &CStr,
+    options: ScanExplainOptions,
+) -> Result<String, ScanError> {
+    with_cached_single_planned_stmt(plan, |planned_stmt| {
+        inspect_planned_stmt(planned_stmt)?;
+
+        let es = pg_sys::NewExplainState();
+        if es.is_null() {
+            return Err(ScanError::Postgres("NewExplainState returned null".into()));
+        }
+        (*es).format = pg_sys::ExplainFormat::EXPLAIN_FORMAT_TEXT;
+        (*es).verbose = options.verbose;
+        (*es).costs = options.costs;
+        (*es).analyze = false;
+        (*es).buffers = false;
+        (*es).wal = false;
+        (*es).timing = false;
+        (*es).summary = false;
+        (*es).settings = false;
+
+        pg_sys::ExplainBeginOutput(es);
+        pg_sys::ExplainOnePlan(
+            planned_stmt,
+            std::ptr::null_mut(),
+            es,
+            query.as_ptr(),
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+            std::ptr::null(),
+            std::ptr::null(),
+            std::ptr::null(),
+        );
+        pg_sys::ExplainEndOutput(es);
+
+        let string_info = (*es).str_;
+        if string_info.is_null() || (*string_info).data.is_null() {
+            return Ok(String::new());
+        }
+
+        Ok(CStr::from_ptr((*string_info).data)
+            .to_string_lossy()
+            .into_owned())
+    })
+}
+
+unsafe fn with_cached_single_planned_stmt<T>(
+    plan: pg_sys::SPIPlanPtr,
+    f: impl FnOnce(*mut pg_sys::PlannedStmt) -> Result<T, ScanError>,
+) -> Result<T, ScanError> {
     let plan_sources = pg_sys::SPI_plan_get_plan_sources(plan);
     if plan_sources.is_null() || (*plan_sources).length != 1 {
         return Err(ScanError::MultipleStatements);
@@ -102,7 +197,7 @@ unsafe fn inspect_spi_plan(plan: pg_sys::SPIPlanPtr) -> Result<PlanMetadata, Sca
         ));
     }
 
-    let inspected = (|| -> Result<PlanMetadata, ScanError> {
+    let result = (|| -> Result<T, ScanError> {
         let stmt_list = (*cached_plan).stmt_list;
         if stmt_list.is_null() || (*stmt_list).length != 1 {
             return Err(ScanError::MultipleStatements);
@@ -113,11 +208,11 @@ unsafe fn inspect_spi_plan(plan: pg_sys::SPIPlanPtr) -> Result<PlanMetadata, Sca
             return Err(ScanError::UnsupportedPlan("null planned statement".into()));
         }
 
-        inspect_planned_stmt(planned_stmt)
+        f(planned_stmt)
     })();
 
     pg_sys::ReleaseCachedPlan(cached_plan, std::ptr::null_mut());
-    inspected
+    result
 }
 
 pub(crate) fn spi_status_error(label: &str, code: i32) -> ScanError {

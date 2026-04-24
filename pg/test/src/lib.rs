@@ -78,6 +78,11 @@ mod tests {
     }
 
     #[pg_test]
+    fn backend_service_render_explain_uses_physical_plan_and_pg_leaf() {
+        super::backend_service::backend_service_render_explain_uses_physical_plan_and_pg_leaf();
+    }
+
+    #[pg_test]
     fn backend_service_cancel_during_stream_marks_scan_used() {
         super::backend_service::backend_service_cancel_during_stream_marks_scan_used();
     }
@@ -333,6 +338,11 @@ mod tests {
     #[pg_test]
     fn slot_scan_prepare_and_run_smoke() {
         super::slot_scan::slot_scan_prepare_and_run_smoke();
+    }
+
+    #[pg_test]
+    fn slot_scan_explain_renders_postgres_plan() {
+        super::slot_scan::slot_scan_explain_renders_postgres_plan();
     }
 
     #[pg_test]

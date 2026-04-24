@@ -1,6 +1,7 @@
 #![doc = include_str!("../README.md")]
 
 mod error;
+mod explain;
 mod fsm;
 mod source;
 
@@ -216,6 +217,23 @@ pub enum ScanYieldReason {
 pub struct ExplainInput<'a> {
     pub sql: &'a str,
     pub params: Vec<ScalarValue>,
+    pub options: ExplainRenderOptions,
+    pub config: BackendServiceConfig,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ExplainRenderOptions {
+    pub verbose: bool,
+    pub costs: bool,
+}
+
+impl Default for ExplainRenderOptions {
+    fn default() -> Self {
+        Self {
+            verbose: false,
+            costs: true,
+        }
+    }
 }
 
 #[derive(Default)]
@@ -773,12 +791,7 @@ impl BackendService {
             }
             Ok(())
         })?;
-        let built = PlanBuilder::new().build(PlanBuildInput {
-            sql: input.sql,
-            params: input.params,
-        })?;
-        let rendered = built.logical_plan.display_indent().to_string();
-        Ok(rendered)
+        explain::render_physical_explain(input)
     }
 
     pub fn scan_peers() -> Result<Box<[BackendLeaseSlot]>, BackendServiceError> {

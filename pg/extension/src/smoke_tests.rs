@@ -81,6 +81,17 @@ fn simple_query_first_column_tx(tx: &mut Transaction<'_>, sql: &str) -> Option<S
         })
 }
 
+fn simple_query_first_column_rows_tx(tx: &mut Transaction<'_>, sql: &str) -> Vec<String> {
+    tx.simple_query(sql)
+        .expect("simple query must succeed")
+        .into_iter()
+        .filter_map(|message| match message {
+            SimpleQueryMessage::Row(row) => row.get(0).map(str::to_owned),
+            _ => None,
+        })
+        .collect()
+}
+
 pub(crate) fn simple_select_smoke() {
     let mut client = smoke_client();
     let mut tx = smoke_transaction(&mut client);
@@ -100,6 +111,25 @@ pub(crate) fn explain_smoke() {
     assert!(
         explain.contains("\"Plan\""),
         "unexpected EXPLAIN JSON: {explain}"
+    );
+
+    reset_heap_fixture(&mut tx, "pg_fusion_explain_smoke");
+    let text_explain = simple_query_first_column_rows_tx(
+        &mut tx,
+        "EXPLAIN SELECT * FROM pg_fusion_explain_smoke WHERE id = 1",
+    )
+    .join("\n");
+    assert!(
+        !text_explain.contains("pg_fusion:"),
+        "text EXPLAIN should not render pg_fusion property label: {text_explain}"
+    );
+    assert!(
+        text_explain.contains("PostgreSQL Scan:"),
+        "text EXPLAIN should render the DataFusion leaf on a separate line: {text_explain}"
+    );
+    assert!(
+        !text_explain.contains("PostgreSQL Plan:"),
+        "text EXPLAIN should not render a redundant nested plan header: {text_explain}"
     );
 }
 

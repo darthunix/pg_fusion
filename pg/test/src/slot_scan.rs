@@ -1,8 +1,8 @@
 use pgrx::prelude::*;
 use scan_sql::{compile_scan, CompileScanInput, LimitLowering, PgRelation};
 use slot_scan::{
-    prepare_scan, ScanError, ScanOptions, ScanPlanKind, SinkError, SlotSink, SlotSinkAction,
-    SlotSinkContext, SlotSinkMethods,
+    explain_scan, prepare_scan, ScanError, ScanExplainOptions, ScanOptions, ScanPlanKind,
+    SinkError, SlotSink, SlotSinkAction, SlotSinkContext, SlotSinkMethods,
 };
 use std::ffi::{c_void, CString};
 
@@ -327,6 +327,23 @@ pub fn slot_scan_prepare_and_run_smoke() {
     assert!(sink.finish_called);
     assert!(!sink.abort_called);
     assert_eq!(sink.tuple_desc_natts, Some(2));
+}
+
+pub fn slot_scan_explain_renders_postgres_plan() {
+    reset_slot_scan_table(32);
+    let _snapshot = unsafe { LatestSnapshotGuard::acquire() };
+
+    let rendered = explain_scan(
+        &format!("SELECT id, payload FROM {SLOT_SCAN_TABLE} WHERE id <= 10"),
+        ScanOptions::default(),
+        ScanExplainOptions::default(),
+    )
+    .expect("explain_scan");
+
+    assert!(
+        rendered.contains("Seq Scan") || rendered.contains("Index Scan"),
+        "unexpected PostgreSQL scan explain: {rendered}"
+    );
 }
 
 pub fn slot_scan_parallel_plan_metadata_smoke() {
