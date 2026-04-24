@@ -42,8 +42,6 @@
 
 #[cfg(not(unix))]
 compile_error!("control_transport currently supports Unix only");
-#[cfg(not(target_has_atomic = "128"))]
-compile_error!("control_transport currently requires targets with 128-bit atomics");
 
 mod error;
 mod process;

@@ -101,7 +101,7 @@ jobs:
                            /var/run/postgresql/
 
       - name: Run pg_test extension tests
-        working-directory: testing/pg_test
+        working-directory: pg/test
         run: |
           # Run tests with coverage tool
           source <(cargo llvm-cov show-env --export-prefix)
