@@ -24,12 +24,6 @@ members = [
   "pg/slot_import",
   "pg/host_extension",
   "worker_runtime",
-  "executor",
-  "scan",
-  "pg/extension",
-  "protocol",
-  "common",
-  "storage",
   "testing/pg_test",
 ]
 resolver = "2"

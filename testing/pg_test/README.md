@@ -1,7 +1,7 @@
 # `pg_test`
 
-`pg_test` is the pgrx-backed integration test crate for `storage` and the
-standalone page pipeline crates. It contains:
+`pg_test` is the pgrx-backed integration test crate for the active host/runtime
+path and standalone page pipeline crates. It contains:
 
 - ordinary `#[pg_test]` integration tests run inside a live PostgreSQL backend
 - a manual deformation benchmark that compares:

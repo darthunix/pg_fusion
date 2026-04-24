@@ -2,41 +2,37 @@
 id: inv-project-0001
 type: invariant
 scope: project
-tags: ["safety", "pgrx", "errors", "ipc", "datafusion", "visibility"]
-updated_at: "2026-01-09"
+tags: ["safety", "pgrx", "ipc", "datafusion", "shared-memory", "arrow"]
+updated_at: "2026-04-24"
 importance: 0.95
 ---
 
 # Project Invariants
 
-1) No panics in PG extension paths
+1. No panics in PostgreSQL extension paths.
 
-- In `pg/extension/` avoid panicking; return structured errors (`common::FusionError`).
+- In `pg/host_extension` and backend-facing pgrx code, prefer structured
+  errors and controlled PostgreSQL error reporting.
 
-2) SHM slices/buffers must stay within bounds
+2. SHM slices and page payloads must stay within bounds.
 
-- Any slice from shared memory must be clamped to the layout capacity.
-- Readers must not race writers — follow signaling/barrier order.
+- Any slice from shared memory must be clamped to the advertised layout
+  capacity.
+- Readers must follow transfer/issuance ownership and must not borrow from pages
+  after release.
 
-3) Wire tuple format strictly matches TupleDesc
+3. Arrow page layout must match the external schema.
 
-- Fields and alignment (attlen/attalign/attbyval) must match `PgAttrWire`.
+- `slot_encoder`, `page/import`, and `slot_import` must agree on
+  `arrow_layout` block shape, type tags, validity layout, and view payload
+  ownership.
 
-4) DataFusion plan executes with a single partition (for now)
+4. PostgreSQL owns physical table access.
 
-- Until partition‑aware `PgScanExec` lands, force one partition so JOINs produce rows.
+- The active runtime path scans through PostgreSQL `slot_scan`; worker code must
+  not reimplement heap visibility, tuple decoding, or TOAST semantics.
 
-5) Heap decoder treats varlena carefully
+5. Lock-free ring buffers require aligned allocation.
 
-- Inline text is OK; projected compressed/external varlena → error; non‑projected → safely skip.
-
-6) No heap allocations on hot SHM paths
-
-- Backend fills per‑page visibility bitmap directly into SHM buffers (no intermediate Vec copies).
-- Executor must copy page and bitmap out of SHM immediately upon receipt of metadata to avoid slot reuse races; do not borrow SHM slices during decode.
-- Clamp all SHM-derived lengths to layout capacities.
-
-7) Aligned ring buffers and atomics
-
-- All lock‑free ring buffers (`LockFreeBuffer`) must be constructed from regions allocated with `executor::layout::lockfree_buffer_layout` (or wrappers) to guarantee alignment for `AtomicU32` head/tail words.
-- Do not construct buffers on arbitrary `[u8]`; if unavoidable (tests), ensure proper allocation via `Layout` or guard with `debug_assert!` on alignment in debug builds.
+- Construct shared-memory rings through `control_transport`, `page/pool`, or
+  the approved `lockfree` layout helpers so atomic head/tail words are aligned.

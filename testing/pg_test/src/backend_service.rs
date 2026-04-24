@@ -216,7 +216,7 @@ fn transport_schema(schema: SchemaRef) -> SchemaRef {
 fn begin_and_finalize_execution(
     slot_id: u32,
     sql: &str,
-    config: BackendServiceConfig,
+    config: &BackendServiceConfig,
     scan_slots: &TransportRegion,
 ) -> BeginExecutionOutput {
     let plan_transport = IssuedTransportHarness::new();
@@ -227,7 +227,7 @@ fn begin_and_finalize_execution(
         params: Vec::<ScalarValue>::new(),
         plan_tx: plan_transport.tx(),
         scan_slot_region: scan_slots,
-        config,
+        config: config.clone(),
     })
     .expect("begin execution");
 
@@ -303,7 +303,7 @@ fn try_open_scan_with_runtime_protocol<'a>(
     peer: BackendLeaseSlot,
     session_epoch: u64,
     scan_id: u64,
-    config: BackendServiceConfig,
+    config: &BackendServiceConfig,
     scan_tx: IssuedTx,
 ) -> Result<Option<ActiveScanDriver>, BackendServiceError> {
     let producers = [ProducerDescriptorWire {
@@ -347,7 +347,7 @@ fn open_scan_with_runtime_protocol<'a>(
     peer: BackendLeaseSlot,
     session_epoch: u64,
     scan_id: u64,
-    config: BackendServiceConfig,
+    config: &BackendServiceConfig,
     scan_tx: IssuedTx,
 ) -> ActiveScanDriver {
     let opened = try_open_scan_with_runtime_protocol(peer, session_epoch, scan_id, config, scan_tx)
@@ -402,7 +402,7 @@ pub fn backend_service_streams_scan_under_saved_snapshot() {
     let mut config = BackendServiceConfig::default();
     config.scan_fetch_batch_rows = 2;
     let _snapshot = unsafe { LatestSnapshotGuard::acquire() };
-    let begin = begin_and_finalize_execution(TEST_SLOT_ID, &query, config, scan_slots.region());
+    let begin = begin_and_finalize_execution(TEST_SLOT_ID, &query, &config, scan_slots.region());
     let mut execution_guard = ActiveExecutionGuard::new(begin.key);
 
     Spi::run(&format!(
@@ -426,7 +426,7 @@ pub fn backend_service_streams_scan_under_saved_snapshot() {
         scan_peer,
         begin.key.session_epoch,
         spec.scan_id.get(),
-        config,
+        &config,
         scan_transport.tx(),
     );
 
@@ -493,7 +493,7 @@ pub fn backend_service_yields_for_control_on_permit_backpressure() {
     let scan_slots = ControlTransportHarness::new(8);
     let config = BackendServiceConfig::default();
     let _snapshot = unsafe { LatestSnapshotGuard::acquire() };
-    let begin = begin_and_finalize_execution(TEST_SLOT_ID, &query, config, scan_slots.region());
+    let begin = begin_and_finalize_execution(TEST_SLOT_ID, &query, &config, scan_slots.region());
     let mut execution_guard = ActiveExecutionGuard::new(begin.key);
 
     let built = PlanBuilder::new()
@@ -511,7 +511,7 @@ pub fn backend_service_yields_for_control_on_permit_backpressure() {
         scan_peer,
         begin.key.session_epoch,
         spec.scan_id.get(),
-        config,
+        &config,
         scan_transport.tx(),
     );
 
@@ -588,7 +588,7 @@ pub fn backend_service_driver_fail_execution_from_control_yield() {
     let scan_slots = ControlTransportHarness::new(8);
     let config = BackendServiceConfig::default();
     let _snapshot = unsafe { LatestSnapshotGuard::acquire() };
-    let begin = begin_and_finalize_execution(TEST_SLOT_ID, &query, config, scan_slots.region());
+    let begin = begin_and_finalize_execution(TEST_SLOT_ID, &query, &config, scan_slots.region());
     let mut execution_guard = ActiveExecutionGuard::new(begin.key);
 
     let built = PlanBuilder::new()
@@ -606,7 +606,7 @@ pub fn backend_service_driver_fail_execution_from_control_yield() {
         scan_peer,
         begin.key.session_epoch,
         spec.scan_id.get(),
-        config,
+        &config,
         scan_transport.tx(),
     );
 
@@ -655,7 +655,7 @@ pub fn backend_service_wait_interrupt_cleans_up_active_execution() {
     let scan_slots = ControlTransportHarness::new(8);
     let config = BackendServiceConfig::default();
     let _snapshot = unsafe { LatestSnapshotGuard::acquire() };
-    let begin = begin_and_finalize_execution(TEST_SLOT_ID, &query, config, scan_slots.region());
+    let begin = begin_and_finalize_execution(TEST_SLOT_ID, &query, &config, scan_slots.region());
     let mut execution_guard = ActiveExecutionGuard::new(begin.key);
 
     let built = PlanBuilder::new()
@@ -673,7 +673,7 @@ pub fn backend_service_wait_interrupt_cleans_up_active_execution() {
         scan_peer,
         begin.key.session_epoch,
         spec.scan_id.get(),
-        config,
+        &config,
         scan_transport.tx(),
     );
 
@@ -708,7 +708,8 @@ pub fn backend_service_wait_interrupt_cleans_up_active_execution() {
     );
     execution_guard.disarm();
 
-    let restarted = begin_and_finalize_execution(TEST_SLOT_ID, &query, config, scan_slots.region());
+    let restarted =
+        begin_and_finalize_execution(TEST_SLOT_ID, &query, &config, scan_slots.region());
     assert!(
         restarted.key.session_epoch > begin.key.session_epoch,
         "a fresh execution should start after wait-interrupt cleanup"
@@ -727,7 +728,7 @@ pub fn backend_service_stale_cancel_is_ignored_after_new_execution() {
     let _snapshot = unsafe { LatestSnapshotGuard::acquire() };
     let scan_slots = ControlTransportHarness::new(8);
 
-    let first = begin_and_finalize_execution(TEST_SLOT_ID, &query, config, scan_slots.region());
+    let first = begin_and_finalize_execution(TEST_SLOT_ID, &query, &config, scan_slots.region());
     let mut first_guard = ActiveExecutionGuard::new(first.key);
     assert!(
         BackendService::accept_complete_execution(TEST_SLOT_ID, first.key.session_epoch)
@@ -735,7 +736,7 @@ pub fn backend_service_stale_cancel_is_ignored_after_new_execution() {
     );
     first_guard.disarm();
 
-    let second = begin_and_finalize_execution(TEST_SLOT_ID, &query, config, scan_slots.region());
+    let second = begin_and_finalize_execution(TEST_SLOT_ID, &query, &config, scan_slots.region());
     let mut second_guard = ActiveExecutionGuard::new(second.key);
 
     assert!(
@@ -759,7 +760,7 @@ pub fn backend_service_cancel_during_stream_marks_scan_used() {
     let scan_slots = ControlTransportHarness::new(8);
     let config = BackendServiceConfig::default();
     let _snapshot = unsafe { LatestSnapshotGuard::acquire() };
-    let begin = begin_and_finalize_execution(TEST_SLOT_ID, &query, config, scan_slots.region());
+    let begin = begin_and_finalize_execution(TEST_SLOT_ID, &query, &config, scan_slots.region());
     let mut execution_guard = ActiveExecutionGuard::new(begin.key);
 
     let built = PlanBuilder::new()
@@ -777,7 +778,7 @@ pub fn backend_service_cancel_during_stream_marks_scan_used() {
         scan_peer,
         begin.key.session_epoch,
         spec.scan_id.get(),
-        config,
+        &config,
         scan_transport.tx(),
     );
 
@@ -803,7 +804,7 @@ pub fn backend_service_cancel_during_stream_marks_scan_used() {
             scan_peer,
             begin.key.session_epoch,
             spec.scan_id.get(),
-            config,
+            &config,
             scan_transport.tx(),
         ),
         Err(BackendServiceError::ScanAlreadyUsed { scan_id })
@@ -827,7 +828,7 @@ pub fn backend_service_rejects_descriptor_mismatch_without_poisoning_execution()
     let scan_transport = IssuedTransportHarness::new();
     let scan_slots = ControlTransportHarness::new(8);
     let _snapshot = unsafe { LatestSnapshotGuard::acquire() };
-    let begin = begin_and_finalize_execution(TEST_SLOT_ID, &query, config, scan_slots.region());
+    let begin = begin_and_finalize_execution(TEST_SLOT_ID, &query, &config, scan_slots.region());
     let mut execution_guard = ActiveExecutionGuard::new(begin.key);
 
     let built = PlanBuilder::new()
@@ -840,14 +841,14 @@ pub fn backend_service_rejects_descriptor_mismatch_without_poisoning_execution()
     let spec = &built.scans[0];
     let scan_peer = peer_from_scan_channels(&begin, spec.scan_id.get());
 
-    let mut mismatched = config;
+    let mut mismatched = config.clone();
     mismatched.scan_page_flags ^= 0x0001;
     assert!(matches!(
         try_open_scan_with_runtime_protocol(
             scan_peer,
             begin.key.session_epoch,
             spec.scan_id.get(),
-            mismatched,
+            &mismatched,
             scan_transport.tx(),
         ),
         Err(BackendServiceError::ProtocolViolation(message))
@@ -858,7 +859,7 @@ pub fn backend_service_rejects_descriptor_mismatch_without_poisoning_execution()
         scan_peer,
         begin.key.session_epoch,
         spec.scan_id.get(),
-        config,
+        &config,
         scan_transport.tx(),
     );
     assert!(driver
@@ -885,7 +886,7 @@ pub fn backend_service_interleaves_two_scan_portals_under_shared_spi() {
     let mut config = BackendServiceConfig::default();
     config.scan_fetch_batch_rows = 1;
     let _snapshot = unsafe { LatestSnapshotGuard::acquire() };
-    let begin = begin_and_finalize_execution(TEST_SLOT_ID, &query, config, scan_slots.region());
+    let begin = begin_and_finalize_execution(TEST_SLOT_ID, &query, &config, scan_slots.region());
     let mut execution_guard = ActiveExecutionGuard::new(begin.key);
 
     let built = PlanBuilder::new()
@@ -906,14 +907,14 @@ pub fn backend_service_interleaves_two_scan_portals_under_shared_spi() {
         left_peer,
         begin.key.session_epoch,
         left_spec.scan_id.get(),
-        config,
+        &config,
         scan_transport_left.tx(),
     );
     let mut right_driver = open_scan_with_runtime_protocol(
         right_peer,
         begin.key.session_epoch,
         right_spec.scan_id.get(),
-        config,
+        &config,
         scan_transport_right.tx(),
     );
 
@@ -949,7 +950,7 @@ pub fn backend_service_drop_finished_driver_does_not_cancel_sibling_scan() {
     let mut config = BackendServiceConfig::default();
     config.scan_fetch_batch_rows = 1;
     let _snapshot = unsafe { LatestSnapshotGuard::acquire() };
-    let begin = begin_and_finalize_execution(TEST_SLOT_ID, &query, config, scan_slots.region());
+    let begin = begin_and_finalize_execution(TEST_SLOT_ID, &query, &config, scan_slots.region());
     let mut execution_guard = ActiveExecutionGuard::new(begin.key);
 
     let built = PlanBuilder::new()
@@ -970,14 +971,14 @@ pub fn backend_service_drop_finished_driver_does_not_cancel_sibling_scan() {
         left_peer,
         begin.key.session_epoch,
         left_spec.scan_id.get(),
-        config,
+        &config,
         scan_transport_left.tx(),
     );
     let mut right_driver = open_scan_with_runtime_protocol(
         right_peer,
         begin.key.session_epoch,
         right_spec.scan_id.get(),
-        config,
+        &config,
         scan_transport_right.tx(),
     );
 

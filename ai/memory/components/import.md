@@ -31,5 +31,5 @@ importance: 0.72
   - zero-buffer batches such as empty-schema payloads decode as owned Arrow structures and may release the page before `import()` returns
 - Current status:
   - crate is implemented and tested in isolation
-  - it imports `arrow_layout` pages produced by `slot_encoder` tests and helpers
-  - executor/scan runtime paths do not use it yet
+  - it imports `arrow_layout` pages produced by `slot_encoder` and by the active
+    host/runtime scan path

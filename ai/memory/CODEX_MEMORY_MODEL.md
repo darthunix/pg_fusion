@@ -74,7 +74,7 @@ Example layout:
 /ai/memory/invariants.md
 /ai/memory/architecture.md
 /ai/memory/components/planner.md
-/ai/memory/components/storage.md
+/ai/memory/components/host_runtime.md
 /ai/memory/decisions/0001-sharding-model.md
 /ai/memory/decisions/0002-datafusion-integration.md
 ```
@@ -118,7 +118,7 @@ Start when 2–3 conditions hold:
 Initial scope only:
 
 1. public APIs,
-2. key modules (planner/storage/executor),
+2. key modules (planner/host runtime/worker runtime),
 3. doc comments and gotchas.
 
 Grow beyond this as the project scales.

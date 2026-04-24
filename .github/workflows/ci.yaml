@@ -100,24 +100,6 @@ jobs:
                            $(/usr/lib/postgresql/${{ env.PG_MAJOR }}/bin/pg_config --sharedir)/extension \
                            /var/run/postgresql/
 
-
-      - name: Run pg_fusion extension tests
-        working-directory: pg/extension
-        run: |
-          # Run tests with coverage tool
-          source <(cargo llvm-cov show-env --export-prefix)
-          cargo llvm-cov clean
-          cargo build --features "pg${{ env.PG_MAJOR }}, pg_test" --no-default-features
-          cargo pgrx test pg${{ env.PG_MAJOR }} --no-default-features
-          cargo llvm-cov report --lcov > ../../postgres_lcov.info
-
-      - name: Upload postgres coverage report to Codecov
-        uses: codecov/codecov-action@v4
-        with:
-          fail_ci_if_error: true
-          files: ./postgres_lcov.info
-          token: ${{ secrets.CODECOV_TOKEN }}
-
       - name: Run pg_test extension tests
         working-directory: testing/pg_test
         run: |
@@ -126,23 +108,22 @@ jobs:
           cargo llvm-cov clean
           cargo build --features "pg${{ env.PG_MAJOR }}, pg_test" --no-default-features
           cargo pgrx test pg${{ env.PG_MAJOR }} --no-default-features
-          cargo llvm-cov report --lcov > ../../storage_pgtest_lcov.info
+          cargo llvm-cov report --lcov > ../../pgtest_lcov.info
 
-      - name: Upload storage pg_test coverage to Codecov
+      - name: Upload pg_test coverage to Codecov
         uses: codecov/codecov-action@v4
         with:
           fail_ci_if_error: true
-          files: ./storage_pgtest_lcov.info
+          files: ./pgtest_lcov.info
           token: ${{ secrets.CODECOV_TOKEN }}
 
-      - name: Run library coverage (common, executor, protocol, storage)
+      - name: Run library coverage
         working-directory: .
         run: |
           # Run all non-extension crates with coverage
           source <(cargo llvm-cov show-env --export-prefix)
           cargo llvm-cov clean
           cargo llvm-cov --workspace \
-            --exclude pg_fusion \
             --exclude pg_test \
             --lcov --output-path core_lcov.info
 

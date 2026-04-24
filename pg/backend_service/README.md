@@ -191,4 +191,4 @@ Explain stays backend-local:
 - worker-side snapshot ownership
 - general-purpose cancellation registry beyond the current process-local active
   execution
-- integration with the legacy executor FSM
+- integration with any retired raw-heap executor FSM

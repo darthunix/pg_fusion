@@ -3,7 +3,7 @@
 Worker-side runtime stack for the new execution path.
 
 This crate intentionally owns a fresh worker-side FSM and does not depend on
-`executor::server`, `executor::fsm`, `backend_service`, `slot_scan`, or `pgrx`.
+the retired raw-heap executor stack, `backend_service`, `slot_scan`, or `pgrx`.
 It attaches to `control_transport`, consumes `runtime_protocol` control
 messages, receives logical plans through `plan_flow`, lowers `PgScanNode`
 locally, and imports scan pages through `page/import`.

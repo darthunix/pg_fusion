@@ -44,7 +44,8 @@ importance: 0.66
   - same-named custom DataFusion UDFs are out of scope; the crate is intended for our built-in expression shapes
 - Current status:
   - the crate is implemented and unit-tested in isolation
-  - `scan::HeapScanProvider` still reports `Unsupported` for filter pushdown and does not use `scan_sql` yet
-  - a future backend-side SQL scan crate can consume `CompiledScan` to run PostgreSQL planner/executor scans with pushed projection, filters, and fetch hints
-  - that future runtime path should treat `slot_scan` as a trusted executor for compiler-generated SQL, not as a defensive sandbox for arbitrary `SELECT` text
+  - `plan_builder` uses it to lower PostgreSQL scan leaves for the active
+    host/runtime path
+  - `slot_scan` consumes compiler-generated SQL as a trusted executor, not as a
+    defensive sandbox for arbitrary `SELECT` text
   - when integrated with a `TableProvider`, compiled filters should be treated as PostgreSQL pushdown results rather than proof of DataFusion `Exact` semantics

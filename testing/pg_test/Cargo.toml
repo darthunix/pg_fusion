@@ -19,14 +19,12 @@ pg_test = []
 anyhow = "1.0"
 bytes = "1"
 pgrx = { workspace = true }
-storage = { path = "../../storage", version = "25.0" }
 datafusion-common = { workspace = true }
 datafusion-expr = { workspace = true }
 df_catalog = { path = "../../pg/df_catalog", version = "25.0" }
 plan_codec = { path = "../../page/plan_codec", version = "25.0" }
 plan_builder = { path = "../../pg/plan_builder", version = "25.0" }
 scan_node = { path = "../../pg/scan_node", version = "25.0" }
-protocol = { path = "../../protocol", version = "25.0" }
 pool = { path = "../../page/pool", version = "25.0" }
 transfer = { path = "../../page/transfer", version = "25.0" }
 arrow_layout = { path = "../../page/arrow_layout", version = "25.0" }

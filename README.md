@@ -1,100 +1,99 @@
 # pg_fusion
 
-pg_fusion is a PostgreSQL extension that delegates query execution to an external Apache DataFusion runtime. The extension hooks PG planning/execution, streams heap pages via shared memory to the runtime, and streams back results as wire‑friendly MinimalTuple frames.
+pg_fusion is a PostgreSQL extension that delegates selected query execution to an
+in-process Apache DataFusion worker runtime. The active extension crate is
+`pg/host_extension` (`pg_fusion_host`).
 
-Why: PostgreSQL’s Volcano (row‑at‑a‑time) engine is great for OLTP but slow for OLAP. DataFusion provides a modern, vectorized execution engine in Rust. pg_fusion integrates it in‑process via a background worker and shared memory IPC.
+The current runtime boundary keeps PostgreSQL responsible for catalog lookup,
+planning integration, snapshots, table access, and slot materialization. Backend
+scan rows are encoded into page-backed Arrow layout blocks and streamed to the
+worker over shared-memory transport; worker results return as Arrow pages and are
+projected back into PostgreSQL tuple slots.
 
-## Architecture (high level)
+## Architecture
 
-- Extension (pgrx) sits in the backend process and drives Parse/Bind/Optimize/Translate/Begin/Exec/End.
-- Executor (runtime) runs DataFusion; `HeapScanProvider → HeapScanExec → HeapScanStream` scans heap pages from shared memory and produces Arrow RecordBatches.
-- Protocol defines control/data packets and a compact wire tuple format with explicit alignment.
-- Low-level shared-memory building blocks such as `lockfree`, `page/pool`, `page/transfer`, `page/arrow_layout`, `page/import`, `pg/slot_encoder`, and `pg/scan_sql` live in standalone workspace crates; the `page/*`, `pg/slot_encoder`, and `pg/scan_sql` crates are not yet wired into the runtime path.
+- `pg/host_extension/` - pgrx host extension, GUCs, planner/custom-scan hooks,
+  shared-memory bootstrap, background worker entrypoint.
+- `pg/backend_service/` - backend-side execution orchestration and scan page
+  production.
+- `worker_runtime/` - DataFusion worker runtime and transport-backed scan/result
+  handling.
+- `runtime_protocol/` - typed control-plane protocol for backend/worker runtime
+  messages.
+- `control_transport/` - shared-memory control rings and backend/worker leases.
+- `page/pool/`, `page/transfer/`, `page/issuance/` - fixed-page ownership and
+  page handoff infrastructure.
+- `page/arrow_layout/`, `page/import/`, `pg/slot_encoder/`, `pg/slot_import/` -
+  zero-copy Arrow page layout, PostgreSQL slot encoding, and result projection.
+- `pg/plan_builder/`, `pg/df_catalog/`, `pg/scan_node/`, `pg/scan_sql/`,
+  `pg/slot_scan/` - backend-side SQL planning and PostgreSQL scan execution.
+- `testing/pg_test/` - pgrx integration tests for the active runtime path and
+  page/slot pipeline.
+- `lockfree/` - shared-memory lock-free primitives used by the transport/page
+  stack.
 
-See: `ai/memory/architecture.md` and component notes in `ai/memory/components/`.
-
-## Repository layout
-
-- `pg/extension/` — pgrx extension (hooks, IPC, TupleTableSlot fill)
-- `executor/` — DataFusion runtime (planning/execution, SHM access, result encoding)
-- `protocol/` — shared packets and wire formats
-- `storage/` — heap page reader + zero‑allocation tuple decoder to DataFusion `ScalarValue`
-- `common/` — shared errors/types
-- `lockfree/` — standalone shared-memory lock-free primitives
-- `page/pool/` — standalone fixed-page shared-memory ownership pool
-- `page/transfer/` — standalone sans-IO page handoff protocol over `page/pool`
-- `page/arrow_layout/` — standalone shared zero-copy Arrow page layout contract
-- `page/import/` — standalone zero-copy Arrow `RecordBatch` import over `page/transfer`
-- `pg/slot_encoder/` — standalone arrow-layout-block encoder for PostgreSQL scan-slot rows
-- `pg/scan_sql/` — standalone compiler from DataFusion scan pushdown to PostgreSQL SQL
-- `testing/pg_test/` — pgrx benchmark and test crate for Postgres-side storage/page experiments
-
-## Build & test
+## Build & Test
 
 Workspace targets Rust 1.89.
 
-Basics:
-
-```
+```sh
 cargo check --workspace
 cargo test --workspace
 ```
 
 Lint/format:
 
-```
+```sh
 cargo fmt --all
 cargo clippy --all-targets --features "pg17, pg_test" --no-default-features
 ```
 
-## pgrx quickstart (PG 17)
+## pgrx Quickstart (PG 17)
 
 Install and initialize pgrx:
 
-```
-# install rustup
-curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
-
-# install cargo-pgrx
+```sh
 cargo install cargo-pgrx
-
-# configure pgrx
 cargo pgrx init --pg17 $(which pg_config)
-
-# enable extension in the dev cluster
-echo "shared_preload_libraries = 'pg_fusion'" >> ~/.pgrx/data-17/postgresql.conf
-
-# run the dev cluster and build/install the extension
-cargo pgrx run
 ```
 
-Extension‑specific commands:
+Enable the active extension in the dev cluster:
 
+```sh
+echo "shared_preload_libraries = 'pg_fusion_host'" >> ~/.pgrx/data-17/postgresql.conf
 ```
-# build only the extension crate
-cargo build -p pg_fusion
 
-# run pgrx tests for storage’s pg_test
+Build only the host extension crate:
+
+```sh
+cargo build -p pg_fusion_host
+```
+
+Run pgrx tests for the shared test extension:
+
+```sh
 cargo pgrx test pg17 -p pg_test
 ```
 
 For the Postgres-side page pipeline benchmark under `pg_test`, see
 [`testing/pg_test/README.md`](testing/pg_test/README.md).
 
-## Developer guidelines
+## Developer Guidelines
 
-- Rust 2021; keep changes small and focused; surface structured errors (no panics in extension paths).
-- Before PR: `cargo fmt`, `cargo clippy -D warnings`, `cargo test --workspace`.
-- Commit style: `area: concise change` (e.g., `executor: fix buffer rollback`).
+- Rust 2021; keep changes small and focused; avoid panics in extension paths.
+- Before PR: `cargo fmt`, `cargo clippy -D warnings`, and
+  `cargo test --workspace`.
+- Commit style: `area: concise change`.
 
-## Memory bank for agents (RAG)
+## Memory Bank For Agents
 
-We maintain a human‑readable “memory bank” for agents and humans under `/ai/memory` (Markdown + YAML frontmatter). Start with:
+We maintain a human-readable memory bank under `ai/memory`.
 
-- `/ai/memory/index.md` — how to read the bank
-- `/ai/memory/architecture.md` — overview
-- `/ai/memory/components/` — component facts
-- `/ai/memory/decisions/` — ADR‑lite decisions
-- `/ai/memory/invariants.md` — project invariants
+- `ai/memory/index.md` - how to read the bank
+- `ai/memory/architecture.md` - overview
+- `ai/memory/components/` - component facts
+- `ai/memory/decisions/` - ADR-lite decisions
+- `ai/memory/invariants.md` - project invariants
 
-Agent workflow requirement: after you implement or change behavior, update the relevant files under `/ai/memory` (components, decisions, invariants, architecture) so future agents have accurate context.
+After behavior or architecture changes, update the relevant files under
+`ai/memory` so future agents have accurate context.
