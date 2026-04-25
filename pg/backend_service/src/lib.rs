@@ -78,6 +78,7 @@ pub struct BackendServiceConfig {
     pub scan_page_flags: u16,
     pub diagnostics: DiagnosticsConfig,
     pub metrics: RuntimeMetrics,
+    pub scan_timing_detail: bool,
 }
 
 impl Default for BackendServiceConfig {
@@ -91,6 +92,7 @@ impl Default for BackendServiceConfig {
             scan_page_flags: 0,
             diagnostics: DiagnosticsConfig::default(),
             metrics: RuntimeMetrics::default(),
+            scan_timing_detail: false,
         }
     }
 }
@@ -721,6 +723,7 @@ impl BackendService {
                 fetch_batch_rows,
                 estimator,
                 execution.config.metrics,
+                execution.config.scan_timing_detail,
             );
 
             let mut coordinator = BackendScanCoordinator::new();

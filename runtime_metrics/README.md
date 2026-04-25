@@ -94,6 +94,37 @@ SELECT
 FROM pg_fusion_metrics();
 ```
 
+## Detailed Scan Timing
+
+`scan_page_fill_ns` is a coarse backend timer. It includes PostgreSQL cursor
+execution, callback dispatch, slot deform/detoast, Arrow writes, page
+initialization, and page finalization. To split that time, enable detailed scan
+timing in the session:
+
+```sql
+SELECT pg_fusion_metrics_reset();
+SET pg_fusion.scan_timing_detail = on;
+
+SELECT a FROM t2 WHERE a = 1;
+
+SELECT metric, value
+FROM pg_fusion_metrics()
+WHERE metric LIKE 'scan_%'
+ORDER BY metric;
+```
+
+Detailed timing measures the row callback on every returned slot. Keep it off
+for normal runs; the measurement itself adds overhead to fast scans.
+
+Interpretation:
+
+- `scan_postgres_read_ns` is PostgreSQL executor/heap/filter time outside the
+  pg_fusion row callback.
+- `scan_arrow_encode_ns` is callback time: slot deform/detoast plus Arrow page
+  writes.
+- `scan_postgres_read_ns >> scan_arrow_encode_ns` points at PostgreSQL scan
+  cost; the opposite points at serialization cost.
+
 ## Metric Reference
 
 | Metric | Meaning |
@@ -105,6 +136,14 @@ FROM pg_fusion_metrics();
 | `backend_wait_latch_ns` | Time the backend spent in short latch waits after an execution loop made no progress. This usually means it was waiting for worker/control/result progress. |
 | `backend_wait_latch_total` | Number of backend latch waits included in `backend_wait_latch_ns`. |
 | `scan_page_fill_ns` | Backend time spent filling successful scan pages from PostgreSQL scan output into Arrow page payloads. This includes cursor/slot draining, tuple encoding, page layout, and estimator work for emitted pages. |
+| `scan_page_prepare_ns` | Backend time spent estimating page shape, building the Arrow layout, initializing the block, and constructing the scan page encoder for emitted pages. |
+| `scan_page_finish_ns` | Backend time spent finalizing emitted scan pages and feeding their encoded size back into the row estimator. |
+| `scan_fetch_calls_total` | Number of PostgreSQL cursor drain calls issued by the backend scan page source. |
+| `scan_rows_encoded_total` | Number of PostgreSQL rows encoded into emitted backend-to-worker scan pages. |
+| `scan_postgres_read_ns` | Detailed-only time spent in `PortalRunFetch` outside the pg_fusion row callback. This approximates PostgreSQL executor/heap/filter time. |
+| `scan_arrow_encode_ns` | Detailed-only time spent inside the pg_fusion row callback, including slot deform/detoast and Arrow page writes. |
+| `scan_full_pages_total` | Number of scan pages emitted because the current Arrow page became full. |
+| `scan_eof_pages_total` | Number of partial scan pages emitted only after PostgreSQL reached EOF. |
 | `scan_pages_sent_total` | Number of scan data pages sent from backend to worker. Terminal scan close/control frames are not counted here. |
 | `scan_bytes_sent_total` | Payload bytes sent in scan data pages from backend to worker. This is page payload length, not necessarily useful row bytes. |
 | `scan_b2w_wait_ns` | Time from backend stamping a scan page after send until the worker scan thread observes the same page descriptor. This approximates backend-to-worker data-plane handoff latency. |
@@ -128,6 +167,11 @@ If `scan_page_fill_ns` dominates and `scan_pages_sent_total` is small, the
 backend is likely spending most latency inside PostgreSQL scanning and page
 encoding before the worker receives data. A selective query without an exact
 limit can still need to scan to EOF before emitting a partial page.
+
+If `scan_eof_pages_total` is positive and `scan_full_pages_total` is zero, scan
+pages are reaching the worker only after PostgreSQL exhausts the cursor. For a
+highly selective query this can explain high latency even when only one row is
+returned.
 
 If `scan_b2w_wait_ns` or `result_w2b_wait_ns` dominates, the page has already
 been produced and the delay is in data-plane handoff or receiver scheduling.

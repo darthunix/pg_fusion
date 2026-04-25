@@ -19,6 +19,7 @@ pub(crate) struct SlotScanPageSource {
     single_row_drains: bool,
     estimator: PageRowEstimator,
     metrics: RuntimeMetrics,
+    scan_timing_detail: bool,
     session: Option<StreamingScanSession>,
     overflow_slot: *mut pg_sys::TupleTableSlot,
     pending_overflow: pg_sys::HeapTuple,
@@ -35,6 +36,7 @@ impl SlotScanPageSource {
         fetch_batch_rows: usize,
         estimator: PageRowEstimator,
         metrics: RuntimeMetrics,
+        scan_timing_detail: bool,
     ) -> Self {
         let single_row_drains = estimator.has_variable_width();
         Self {
@@ -48,6 +50,7 @@ impl SlotScanPageSource {
             single_row_drains,
             estimator,
             metrics,
+            scan_timing_detail,
             session: None,
             overflow_slot: std::ptr::null_mut(),
             pending_overflow: std::ptr::null_mut(),
@@ -62,6 +65,7 @@ impl SlotScanPageSource {
             let session = self.session.as_mut().ok_or_else(|| {
                 BackendServiceError::PageSource("slot scan page source is not open".into())
             })?;
+            let prepare_start = self.metrics.now_ns();
             let estimate = self.estimator.estimate()?;
             let layout = LayoutPlan::from_arrow_schema(
                 self.schema.as_ref(),
@@ -88,14 +92,20 @@ impl SlotScanPageSource {
                     payload,
                 )
             }?;
+            let page_prepare_ns = self.metrics.now_ns().saturating_sub(prepare_start);
             let mut rows_written = 0usize;
 
             if !self.pending_overflow.is_null() {
-                match append_pending_overflow(
+                let overflow_encode_start = self.scan_timing_detail.then(|| self.metrics.now_ns());
+                let overflow_status = append_pending_overflow(
                     self.overflow_slot,
                     &mut self.pending_overflow,
                     &mut encoder,
-                )? {
+                )?;
+                if let Some(start) = overflow_encode_start {
+                    self.metrics.add_elapsed(MetricId::ScanArrowEncodeNs, start);
+                }
+                match overflow_status {
                     AppendStatus::Appended => {
                         rows_written += 1;
                     }
@@ -109,9 +119,17 @@ impl SlotScanPageSource {
 
             loop {
                 if rows_written >= max_rows {
+                    let finish_start = self.metrics.now_ns();
                     let encoded = encoder.finish()?;
                     self.estimator
                         .observe_encoded_block(&payload[..encoded.payload_len])?;
+                    self.metrics
+                        .add(MetricId::ScanPagePrepareNs, page_prepare_ns);
+                    self.metrics
+                        .add_elapsed(MetricId::ScanPageFinishNs, finish_start);
+                    self.metrics.increment(MetricId::ScanFullPagesTotal);
+                    self.metrics
+                        .add(MetricId::ScanRowsEncodedTotal, encoded.row_count as u64);
                     return Ok(SourcePageStatus::Page {
                         payload_len: encoded.payload_len,
                     });
@@ -126,37 +144,63 @@ impl SlotScanPageSource {
                 // SAFETY: this backend-only callback is controlled by pg_fusion
                 // and returns expected failures through Result. A panic here is
                 // a bug, not a recoverable row-level PostgreSQL error.
-                let drain = unsafe {
-                    session.drain_slots_without_unwind_guard::<BackendServiceError>(
-                        row_budget,
-                        |slot| match encoder.append_slot(slot)? {
-                            AppendStatus::Appended => {
-                                rows_written += 1;
-                                Ok::<SlotSinkAction, BackendServiceError>(SlotSinkAction::Continue)
-                            }
-                            AppendStatus::Full => {
-                                if row_budget != 1 {
-                                    return Err(BackendServiceError::PageSource(format!(
+                let mut append_slot = |slot| match encoder.append_slot(slot)? {
+                    AppendStatus::Appended => {
+                        rows_written += 1;
+                        Ok::<SlotSinkAction, BackendServiceError>(SlotSinkAction::Continue)
+                    }
+                    AppendStatus::Full => {
+                        if row_budget != 1 {
+                            return Err(BackendServiceError::PageSource(format!(
                                     "slot encoder filled before exhausting row budget: budget={row_budget}, rows_written={rows_written}, max_rows={max_rows}"
                                 )));
-                                }
-                                self.pending_overflow = pg_sys::ExecCopySlotHeapTuple(slot);
-                                if self.pending_overflow.is_null() {
-                                    return Err(BackendServiceError::PageSource(
-                                        "ExecCopySlotHeapTuple returned null".into(),
-                                    ));
-                                }
-                                Ok::<SlotSinkAction, BackendServiceError>(SlotSinkAction::Continue)
-                            }
-                        },
-                    )
+                        }
+                        self.pending_overflow = unsafe { pg_sys::ExecCopySlotHeapTuple(slot) };
+                        if self.pending_overflow.is_null() {
+                            return Err(BackendServiceError::PageSource(
+                                "ExecCopySlotHeapTuple returned null".into(),
+                            ));
+                        }
+                        Ok::<SlotSinkAction, BackendServiceError>(SlotSinkAction::Continue)
+                    }
+                };
+                let drain = unsafe {
+                    if self.scan_timing_detail {
+                        session.drain_slots_without_unwind_guard_profiled::<BackendServiceError>(
+                            row_budget,
+                            &mut append_slot,
+                        )
+                    } else {
+                        session.drain_slots_without_unwind_guard::<BackendServiceError>(
+                            row_budget,
+                            &mut append_slot,
+                        )
+                    }
                 }?;
+                drop(append_slot);
+                self.metrics.increment(MetricId::ScanFetchCallsTotal);
+                if self.scan_timing_detail {
+                    self.metrics
+                        .add(MetricId::ScanArrowEncodeNs, drain.callback_ns);
+                    self.metrics.add(
+                        MetricId::ScanPostgresReadNs,
+                        drain.elapsed_ns.saturating_sub(drain.callback_ns),
+                    );
+                }
 
                 if !self.pending_overflow.is_null() {
                     if rows_written > 0 {
+                        let finish_start = self.metrics.now_ns();
                         let encoded = encoder.finish()?;
                         self.estimator
                             .observe_encoded_block(&payload[..encoded.payload_len])?;
+                        self.metrics
+                            .add(MetricId::ScanPagePrepareNs, page_prepare_ns);
+                        self.metrics
+                            .add_elapsed(MetricId::ScanPageFinishNs, finish_start);
+                        self.metrics.increment(MetricId::ScanFullPagesTotal);
+                        self.metrics
+                            .add(MetricId::ScanRowsEncodedTotal, encoded.row_count as u64);
                         return Ok(SourcePageStatus::Page {
                             payload_len: encoded.payload_len,
                         });
@@ -178,9 +222,17 @@ impl SlotScanPageSource {
                         return Ok(SourcePageStatus::Eof);
                     }
 
+                    let finish_start = self.metrics.now_ns();
                     let encoded = encoder.finish()?;
                     self.estimator
                         .observe_encoded_block(&payload[..encoded.payload_len])?;
+                    self.metrics
+                        .add(MetricId::ScanPagePrepareNs, page_prepare_ns);
+                    self.metrics
+                        .add_elapsed(MetricId::ScanPageFinishNs, finish_start);
+                    self.metrics.increment(MetricId::ScanEofPagesTotal);
+                    self.metrics
+                        .add(MetricId::ScanRowsEncodedTotal, encoded.row_count as u64);
                     return Ok(SourcePageStatus::Page {
                         payload_len: encoded.payload_len,
                     });

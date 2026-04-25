@@ -313,6 +313,10 @@ pub(crate) fn metrics_smoke() {
         SELECT concat(
             coalesce(max(value) FILTER (WHERE metric = 'scan_pages_sent_total'), 0), ',',
             coalesce(max(value) FILTER (WHERE metric = 'scan_bytes_sent_total'), 0), ',',
+            coalesce(max(value) FILTER (WHERE metric = 'scan_fetch_calls_total'), 0), ',',
+            coalesce(max(value) FILTER (WHERE metric = 'scan_rows_encoded_total'), 0), ',',
+            coalesce(max(value) FILTER (WHERE metric = 'scan_postgres_read_ns'), 0), ',',
+            coalesce(max(value) FILTER (WHERE metric = 'scan_arrow_encode_ns'), 0), ',',
             coalesce(max(value) FILTER (WHERE metric = 'result_pages_read_total'), 0), ',',
             coalesce(max(value) FILTER (WHERE metric = 'backend_rows_returned_total'), 0), ',',
             coalesce(max(reset_epoch), 0)
@@ -325,7 +329,7 @@ pub(crate) fn metrics_smoke() {
         .split(',')
         .map(|part| part.parse::<i64>().expect("metric value must be integer"))
         .collect::<Vec<_>>();
-    assert_eq!(parts.len(), 5);
+    assert_eq!(parts.len(), 9);
     assert!(
         parts[0] > 0,
         "scan_pages_sent_total must be positive: {summary}"
@@ -336,18 +340,83 @@ pub(crate) fn metrics_smoke() {
     );
     assert!(
         parts[2] > 0,
-        "result_pages_read_total must be positive: {summary}"
+        "scan_fetch_calls_total must be positive: {summary}"
     );
     assert!(
         parts[3] > 0,
+        "scan_rows_encoded_total must be positive: {summary}"
+    );
+    assert_eq!(
+        parts[4], 0,
+        "scan_postgres_read_ns must stay zero without detailed timing: {summary}"
+    );
+    assert_eq!(
+        parts[5], 0,
+        "scan_arrow_encode_ns must stay zero without detailed timing: {summary}"
+    );
+    assert!(
+        parts[6] > 0,
+        "result_pages_read_total must be positive: {summary}"
+    );
+    assert!(
+        parts[7] > 0,
         "backend_rows_returned_total must be positive: {summary}"
     );
-    assert_eq!(parts[4], before_epoch);
+    assert_eq!(parts[8], before_epoch);
+
+    let detail_epoch: i64 =
+        simple_query_first_column_tx(&mut tx, "SELECT pg_fusion_metrics_reset()")
+            .expect("detailed metrics reset must return an epoch")
+            .parse()
+            .expect("detailed metrics reset epoch must be an integer");
+    tx.batch_execute("SET LOCAL pg_fusion.scan_timing_detail = on")
+        .expect("enable detailed scan timing");
+    let id: i64 = simple_query_first_column_tx(
+        &mut tx,
+        &format!("SELECT id::bigint FROM {table_name} WHERE id = 2"),
+    )
+    .expect("detailed metrics smoke query must return one row")
+    .parse()
+    .expect("detailed metrics smoke query must return one bigint value");
+    assert_eq!(id, 2);
+
+    let detailed = simple_query_first_column_tx(
+        &mut tx,
+        "\
+        SELECT concat(
+            coalesce(max(value) FILTER (WHERE metric = 'scan_fetch_calls_total'), 0), ',',
+            coalesce(max(value) FILTER (WHERE metric = 'scan_rows_encoded_total'), 0), ',',
+            coalesce(max(value) FILTER (WHERE metric = 'scan_postgres_read_ns'), 0), ',',
+            coalesce(max(value) FILTER (WHERE metric = 'scan_arrow_encode_ns'), 0), ',',
+            coalesce(max(reset_epoch), 0)
+        )
+        FROM pg_fusion_metrics()
+        ",
+    )
+    .expect("detailed metrics summary must return one row");
+    let detailed_parts = detailed
+        .split(',')
+        .map(|part| part.parse::<i64>().expect("metric value must be integer"))
+        .collect::<Vec<_>>();
+    assert_eq!(detailed_parts.len(), 5);
+    assert!(
+        detailed_parts[0] > 0,
+        "scan_fetch_calls_total must be positive with detailed timing: {detailed}"
+    );
+    assert!(
+        detailed_parts[1] > 0,
+        "scan_rows_encoded_total must be positive with detailed timing: {detailed}"
+    );
+    assert!(
+        detailed_parts[2] + detailed_parts[3] > 0,
+        "detailed scan timers must be positive with detailed timing: {detailed}"
+    );
+    assert_eq!(detailed_parts[4], detail_epoch);
 
     let after_epoch: i64 =
         simple_query_first_column_tx(&mut tx, "SELECT pg_fusion_metrics_reset()")
             .expect("second metrics reset must return an epoch")
             .parse()
             .expect("second metrics reset epoch must be an integer");
-    assert!(after_epoch > before_epoch);
+    assert!(after_epoch > detail_epoch);
 }

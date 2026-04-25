@@ -170,11 +170,21 @@ Enable pg_fusion per session or transaction:
 SET pg_fusion.enable = on;
 ```
 
+For one-off scan profiling, enable detailed scan timing in the same session.
+This adds per-row callback timing and can slow fast scans, so keep it off for
+normal runs:
+
+```sql
+SET pg_fusion.scan_timing_detail = on;
+```
+
 For scoped experiments:
 
 ```sql
 BEGIN;
 SET LOCAL pg_fusion.enable = on;
+-- Optional: only for scan latency profiling.
+SET LOCAL pg_fusion.scan_timing_detail = on;
 SELECT count(*) FROM my_table WHERE id > 100;
 COMMIT;
 ```
@@ -241,6 +251,12 @@ SELECT *
 FROM pg_fusion_metrics()
 WHERE metric IN (
   'scan_page_fill_ns',
+  'scan_page_prepare_ns',
+  'scan_page_finish_ns',
+  'scan_postgres_read_ns',
+  'scan_arrow_encode_ns',
+  'scan_fetch_calls_total',
+  'scan_rows_encoded_total',
   'scan_b2w_wait_ns',
   'scan_page_read_ns',
   'result_w2b_wait_ns',
@@ -255,6 +271,31 @@ The scan/result "slot" metrics refer to shared page-pool slots used for Arrow
 pages, not PostgreSQL `TupleTableSlot`. Backend and worker timings may overlap,
 so `backend_total_ns + worker_total_ns` is not expected to equal
 `query_total_ns`.
+
+To split backend scan latency between PostgreSQL and serialization, reset the
+metrics, enable detailed timing, run the query, then read only scan metrics:
+
+```sql
+SELECT pg_fusion_metrics_reset();
+SET pg_fusion.enable = on;
+SET pg_fusion.scan_timing_detail = on;
+
+SELECT a FROM t2 WHERE a = 1;
+
+SELECT metric, value
+FROM pg_fusion_metrics()
+WHERE metric LIKE 'scan_%'
+ORDER BY metric;
+```
+
+Interpretation:
+
+- `scan_postgres_read_ns >> scan_arrow_encode_ns` points at PostgreSQL
+  executor/heap/filter time.
+- `scan_arrow_encode_ns >> scan_postgres_read_ns` points at slot
+  deform/detoast/Arrow serialization time.
+- `scan_eof_pages_total = 1` with one returned row means the scan emitted a
+  partial page only after PostgreSQL reached EOF.
 
 ## Developer Guidelines
 

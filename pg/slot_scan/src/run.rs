@@ -10,6 +10,7 @@ use std::cell::Cell;
 use std::ffi::c_void;
 use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::rc::Rc;
+use std::time::Instant;
 
 const DEFAULT_FETCH_BATCH_ROWS: usize = 1024;
 
@@ -40,17 +41,22 @@ struct DirectSlotReceiverState<'a, E> {
     rows_consumed: usize,
     stopped: bool,
     error: Option<E>,
+    profile_callbacks: bool,
+    callback_ns: u64,
 }
 
 impl<'a, E> DirectSlotReceiverState<'a, E> {
     fn new(
         consume_slot: &'a mut dyn FnMut(*mut pg_sys::TupleTableSlot) -> Result<SlotSinkAction, E>,
+        profile_callbacks: bool,
     ) -> Self {
         Self {
             consume_slot,
             rows_consumed: 0,
             stopped: false,
             error: None,
+            profile_callbacks,
+            callback_ns: 0,
         }
     }
 }
@@ -109,7 +115,7 @@ where
         return false;
     }
 
-    match catch_unwind(AssertUnwindSafe(|| (state.consume_slot)(slot))) {
+    match catch_unwind(AssertUnwindSafe(|| receive_slot_callback(state, slot))) {
         Ok(result) => handle_receive_slot_result(state, result),
         Err(_) => {
             state.error =
@@ -133,8 +139,22 @@ where
         return false;
     }
 
-    let result = (state.consume_slot)(slot);
+    let result = receive_slot_callback(state, slot);
     handle_receive_slot_result(state, result)
+}
+
+fn receive_slot_callback<E>(
+    state: &mut DirectSlotReceiverState<'_, E>,
+    slot: *mut pg_sys::TupleTableSlot,
+) -> Result<SlotSinkAction, E> {
+    if !state.profile_callbacks {
+        return (state.consume_slot)(slot);
+    }
+
+    let start = Instant::now();
+    let result = (state.consume_slot)(slot);
+    state.callback_ns = state.callback_ns.saturating_add(elapsed_ns(start));
+    result
 }
 
 fn handle_receive_slot_result<E>(
@@ -348,6 +368,7 @@ impl StreamingScanSession {
             row_budget,
             &mut consume_slot,
             DirectSlotReceiverMode::Guarded,
+            false,
         )
     }
 
@@ -368,7 +389,37 @@ impl StreamingScanSession {
     where
         E: From<ScanError> + 'static,
     {
-        self.drain_slots_inner(row_budget, &mut consume_slot, DirectSlotReceiverMode::Fast)
+        self.drain_slots_inner(
+            row_budget,
+            &mut consume_slot,
+            DirectSlotReceiverMode::Fast,
+            false,
+        )
+    }
+
+    /// Drains one portal fetch without an unwind guard and profiles the direct
+    /// receiver callback time.
+    ///
+    /// # Safety
+    ///
+    /// The callback must not panic. Any expected failure must be returned
+    /// through `Result`; unwinding through PostgreSQL executor frames is not a
+    /// supported recovery path.
+    #[doc(hidden)]
+    pub unsafe fn drain_slots_without_unwind_guard_profiled<E>(
+        &mut self,
+        row_budget: usize,
+        mut consume_slot: impl FnMut(*mut pg_sys::TupleTableSlot) -> Result<SlotSinkAction, E>,
+    ) -> Result<SlotDrainResult, E>
+    where
+        E: From<ScanError> + 'static,
+    {
+        self.drain_slots_inner(
+            row_budget,
+            &mut consume_slot,
+            DirectSlotReceiverMode::Fast,
+            true,
+        )
     }
 
     fn drain_slots_inner<E>(
@@ -376,6 +427,7 @@ impl StreamingScanSession {
         row_budget: usize,
         consume_slot: &mut dyn FnMut(*mut pg_sys::TupleTableSlot) -> Result<SlotSinkAction, E>,
         receiver_mode: DirectSlotReceiverMode,
+        profile_callbacks: bool,
     ) -> Result<SlotDrainResult, E>
     where
         E: From<ScanError> + 'static,
@@ -389,6 +441,8 @@ impl StreamingScanSession {
                 rows_consumed: 0,
                 eof: true,
                 stopped: false,
+                elapsed_ns: 0,
+                callback_ns: 0,
             });
         }
 
@@ -401,22 +455,27 @@ impl StreamingScanSession {
 
         let fetch_rows = cursor_fetch_rows(self.fetch_batch_rows, row_budget, self.remaining);
 
-        let mut state = DirectSlotReceiverState::new(consume_slot);
+        let mut state = DirectSlotReceiverState::new(consume_slot, profile_callbacks);
         let mut receiver = match receiver_mode {
             DirectSlotReceiverMode::Guarded => DirectSlotDestReceiver::new_guarded(&mut state),
             DirectSlotReceiverMode::Fast => DirectSlotDestReceiver::new_fast(&mut state),
         };
         let portal_processed = Cell::new(0u64);
+        let portal_elapsed_ns = Cell::new(0u64);
         let previous_context = Cell::new(std::ptr::null_mut());
 
         let result = PgTryBuilder::new(AssertUnwindSafe(|| unsafe {
             previous_context.set(pg_sys::CurrentMemoryContext);
+            let start = profile_callbacks.then(Instant::now);
             let processed = pg_sys::PortalRunFetch(
                 self.portal,
                 pg_sys::FetchDirection::FETCH_FORWARD,
                 fetch_rows,
                 std::ptr::addr_of_mut!(receiver.dest),
             );
+            if let Some(start) = start {
+                portal_elapsed_ns.set(elapsed_ns(start));
+            }
             portal_processed.set(processed);
             Ok(())
         }))
@@ -441,6 +500,8 @@ impl StreamingScanSession {
             rows_consumed: state.rows_consumed,
             eof,
             stopped: state.stopped,
+            elapsed_ns: portal_elapsed_ns.get(),
+            callback_ns: state.callback_ns,
         })
     }
 
@@ -566,6 +627,10 @@ fn best_effort_sink_abort(
             Ok(())
         });
     }
+}
+
+fn elapsed_ns(start: Instant) -> u64 {
+    u64::try_from(start.elapsed().as_nanos()).unwrap_or(u64::MAX)
 }
 
 #[cfg(test)]

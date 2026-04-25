@@ -23,6 +23,9 @@ importance: 0.8
   `pg_fusion_metrics()` and reset by `pg_fusion_metrics_reset()`. Page handoff
   latency is measured with page descriptor stamps, not by instrumenting ring
   internals.
+- `pg_fusion.scan_timing_detail` enables per-row backend scan callback timing
+  so `scan_page_fill_ns` can be split into PostgreSQL read time and
+  slot-to-Arrow serialization time. It is diagnostic-only and defaults off.
 - `EXPLAIN` stays backend-local: `backend_service` lowers the planned query to
   a DataFusion physical plan, renders PostgreSQL scan leaves with present
   soft-limit/fetch-hint metadata, and prints the nested multiline `slot_scan`

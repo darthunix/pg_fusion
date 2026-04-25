@@ -33,6 +33,7 @@ pub(crate) static PAGE_COUNT: GucSetting<i32> = GucSetting::<i32>::new(256);
 pub(crate) static SCAN_FETCH_BATCH_ROWS: GucSetting<i32> = GucSetting::<i32>::new(1024);
 pub(crate) static ESTIMATOR_INITIAL_TAIL_BYTES_PER_ROW: GucSetting<i32> =
     GucSetting::<i32>::new(64);
+pub(crate) static SCAN_TIMING_DETAIL: GucSetting<bool> = GucSetting::<bool>::new(false);
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct HostConfig {
@@ -51,6 +52,7 @@ pub struct HostConfig {
     pub page_count: u32,
     pub scan_fetch_batch_rows: u32,
     pub estimator_initial_tail_bytes_per_row: u32,
+    pub scan_timing_detail: bool,
 }
 
 #[derive(Debug, Error, PartialEq, Eq)]
@@ -173,6 +175,14 @@ pub fn register_gucs() {
         c"Initial estimator prior for variable-width Arrow page tails",
         &ESTIMATOR_INITIAL_TAIL_BYTES_PER_ROW,
     );
+    GucRegistry::define_bool_guc(
+        c"pg_fusion.scan_timing_detail",
+        c"Enable detailed scan timing",
+        c"Measure per-row scan callback time to split PostgreSQL read time from Arrow serialization time",
+        &SCAN_TIMING_DETAIL,
+        GucContext::Userset,
+        GucFlags::default(),
+    );
 }
 
 pub fn host_config() -> Result<HostConfig, HostConfigError> {
@@ -226,6 +236,7 @@ pub fn host_config() -> Result<HostConfig, HostConfigError> {
             "pg_fusion.estimator_initial_tail_bytes_per_row",
             ESTIMATOR_INITIAL_TAIL_BYTES_PER_ROW.get(),
         )?,
+        scan_timing_detail: SCAN_TIMING_DETAIL.get(),
     })
 }
 
@@ -256,6 +267,7 @@ impl HostConfig {
         config.estimator_default.initial_tail_bytes_per_row =
             self.estimator_initial_tail_bytes_per_row;
         config.diagnostics = DiagnosticsConfig::new(self.backend_log_level, self.log_path.clone());
+        config.scan_timing_detail = self.scan_timing_detail;
         config
     }
 
@@ -345,6 +357,7 @@ mod tests {
             page_count: 256,
             scan_fetch_batch_rows: 77,
             estimator_initial_tail_bytes_per_row: 33,
+            scan_timing_detail: true,
         };
 
         let backend = config.backend_service_config();
@@ -352,6 +365,7 @@ mod tests {
 
         assert_eq!(backend.scan_fetch_batch_rows, 77);
         assert_eq!(backend.estimator_default.initial_tail_bytes_per_row, 33);
+        assert!(backend.scan_timing_detail);
         assert_eq!(backend.diagnostics.level, DiagnosticLogLevel::Trace);
         assert_eq!(backend.diagnostics.log_path.as_ref(), "/tmp/pg_fusion.log");
         assert_eq!(worker.control_frame_capacity, 4096);

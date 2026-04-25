@@ -142,6 +142,14 @@ pub struct SlotDrainResult {
     pub eof: bool,
     /// Whether the caller callback requested an early stop.
     pub stopped: bool,
+    /// Monotonic time spent inside `PortalRunFetch` for this drain call.
+    ///
+    /// This is zero unless the caller requested detailed profiling.
+    pub elapsed_ns: u64,
+    /// Monotonic time spent inside the row callback during this drain call.
+    ///
+    /// This is zero unless the caller requested detailed profiling.
+    pub callback_ns: u64,
 }
 
 /// Result of one sink row callback.

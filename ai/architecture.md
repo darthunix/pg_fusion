@@ -51,7 +51,9 @@ page-backed Arrow batches.
 Runtime metrics live in a separate shared-memory region. The runtime does not
 wrap control rings for v1 metrics; scan/result page senders stamp page
 descriptors, and receivers use those stamps to measure backend-to-worker and
-worker-to-backend page handoff latency.
+worker-to-backend page handoff latency. Detailed scan timing is opt-in through
+`pg_fusion.scan_timing_detail`; it splits backend scan page fill time into
+PostgreSQL cursor read time and slot-to-Arrow serialization time.
 
 ## Retired Legacy Stack
 
