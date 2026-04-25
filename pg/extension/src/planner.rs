@@ -37,6 +37,7 @@ unsafe extern "C-unwind" fn pg_fusion_planner_hook(
         if !parse.is_null()
             && (*parse).commandType == pgrx::pg_sys::CmdType::CMD_SELECT
             && !(*parse).hasModifyingCTE
+            && !is_pg_fusion_management_sql(query_string)
         {
             return build_planned_custom_scan(parse, query_string, bound_params);
         }
@@ -47,6 +48,17 @@ unsafe extern "C-unwind" fn pg_fusion_planner_hook(
     } else {
         standard_planner(parse, query_string, cursor_options, bound_params)
     }
+}
+
+unsafe fn is_pg_fusion_management_sql(query_string: *const c_char) -> bool {
+    if query_string.is_null() {
+        return false;
+    }
+    let Ok(sql) = CStr::from_ptr(query_string).to_str() else {
+        return false;
+    };
+    let sql = sql.to_ascii_lowercase();
+    sql.contains("pg_fusion_metrics(") || sql.contains("pg_fusion_metrics_reset(")
 }
 
 #[pg_guard]

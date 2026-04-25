@@ -2,6 +2,7 @@
 members = [
   "lockfree",
   "control_transport",
+  "runtime_metrics",
   "runtime_protocol",
   "page/pool",
   "page/transfer",

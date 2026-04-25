@@ -14,6 +14,7 @@ use datafusion_common::{DataFusionError, Result as DFResult};
 use futures::channel::mpsc::{channel, Receiver, Sender};
 use futures::{SinkExt, Stream};
 use issuance::{decode_issued_frame, IssuedOwnedFrame, IssuedRx};
+use runtime_metrics::{MetricId, PageDirection, RuntimeMetrics};
 use runtime_protocol::codec::{decode_backend_scan_to_worker, decode_runtime_message_family};
 use runtime_protocol::message::{
     BackendScanToWorkerRef, RuntimeMessageFamily, WorkerScanToBackend,
@@ -57,6 +58,7 @@ pub struct TransportScanBatchSource {
     region: TransportRegion,
     control_frame_capacity: usize,
     ingress: Arc<dyn ScanIngressProvider>,
+    metrics: RuntimeMetrics,
 }
 
 impl std::fmt::Debug for TransportScanBatchSource {
@@ -73,6 +75,21 @@ impl TransportScanBatchSource {
         region: TransportRegion,
         control_frame_capacity: usize,
         ingress: Arc<dyn ScanIngressProvider>,
+    ) -> Result<Self, WorkerRuntimeError> {
+        Self::new_with_metrics(
+            region,
+            control_frame_capacity,
+            ingress,
+            RuntimeMetrics::default(),
+        )
+    }
+
+    /// Build one transport-backed scan source with runtime metrics.
+    pub fn new_with_metrics(
+        region: TransportRegion,
+        control_frame_capacity: usize,
+        ingress: Arc<dyn ScanIngressProvider>,
+        metrics: RuntimeMetrics,
     ) -> Result<Self, WorkerRuntimeError> {
         let inbound_capacity = region.backend_to_worker_capacity();
         if inbound_capacity < MIN_SCAN_BACKEND_TO_WORKER_RING_CAPACITY {
@@ -103,6 +120,7 @@ impl TransportScanBatchSource {
             region,
             control_frame_capacity,
             ingress,
+            metrics,
         })
     }
 }
@@ -131,6 +149,7 @@ impl ScanBatchSource for TransportScanBatchSource {
         let stop_for_thread = Arc::clone(&stop);
         let region = self.region;
         let control_frame_capacity = self.control_frame_capacity;
+        let metrics = self.metrics;
         let thread_name = format!(
             "pgf-scan-{}-{}",
             request.session_epoch,
@@ -146,6 +165,7 @@ impl ScanBatchSource for TransportScanBatchSource {
                     issued_rx,
                     tx,
                     stop_for_thread,
+                    metrics,
                 )
             })
             .map_err(|err| {
@@ -197,6 +217,7 @@ fn run_transport_scan_thread(
     issued_rx: IssuedRx,
     mut tx: Sender<DFResult<RecordBatch>>,
     stop: Arc<AtomicBool>,
+    metrics: RuntimeMetrics,
 ) {
     if let Err(err) = run_transport_scan_thread_inner(
         region,
@@ -205,6 +226,7 @@ fn run_transport_scan_thread(
         issued_rx,
         &mut tx,
         &stop,
+        metrics,
     ) {
         warn!(
             component = "worker_scan",
@@ -225,6 +247,7 @@ fn run_transport_scan_thread_inner(
     issued_rx: IssuedRx,
     tx: &mut Sender<DFResult<RecordBatch>>,
     stop: &AtomicBool,
+    metrics: RuntimeMetrics,
 ) -> Result<(), WorkerRuntimeError> {
     let transport = WorkerTransport::attach(&region)?;
     let mut slot = transport.slot_for_backend_lease(request.peer)?;
@@ -279,7 +302,18 @@ fn run_transport_scan_thread_inner(
 
         match decode_scan_inbound(&scratch[..len])? {
             ScanInbound::Issued(frame) => {
+                if let Some(descriptor) = issued_page_descriptor(&frame) {
+                    if let Some(observation) =
+                        metrics.observe_page(PageDirection::BackendToWorker, descriptor)
+                    {
+                        metrics.add(MetricId::ScanB2wWaitNs, observation.wait_ns);
+                        metrics.increment(MetricId::ScanB2wWaitTotal);
+                    }
+                }
+                let read_start = metrics.now_ns();
                 let step = driver.accept_page_frame(SINGLE_SCAN_PRODUCER_ID, &frame)?;
+                metrics.add_elapsed(MetricId::ScanPageReadNs, read_start);
+                metrics.increment(MetricId::ScanPagesReadTotal);
                 if forward_driver_step(&mut driver, step, tx, stop)? {
                     terminal = true;
                     debug!(
@@ -327,6 +361,13 @@ fn run_transport_scan_thread_inner(
     }
 
     loop_result
+}
+
+fn issued_page_descriptor(frame: &IssuedOwnedFrame) -> Option<pool::PageDescriptor> {
+    match frame {
+        IssuedOwnedFrame::Page(frame) => Some(frame.inner.descriptor),
+        IssuedOwnedFrame::Close(_) => None,
+    }
 }
 
 fn decode_scan_inbound(bytes: &[u8]) -> Result<ScanInbound<'_>, WorkerRuntimeError> {

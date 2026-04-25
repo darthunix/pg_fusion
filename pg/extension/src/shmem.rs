@@ -5,6 +5,7 @@ use issuance::{IssuanceConfig, IssuancePool};
 use pgrx::pg_sys::AsPgCStr;
 use pgrx::prelude::*;
 use pool::{PagePool, PagePoolConfig};
+use runtime_metrics::{RuntimeMetrics, RuntimeMetricsConfig};
 
 use crate::guc::host_config;
 
@@ -12,6 +13,7 @@ const CONTROL_REGION_NAME: &str = "pg_fusion:control_transport";
 const SCAN_REGION_NAME: &str = "pg_fusion:scan_transport";
 const PAGE_POOL_NAME: &str = "pg_fusion:page_pool";
 const ISSUANCE_POOL_NAME: &str = "pg_fusion:issuance_pool";
+const RUNTIME_METRICS_NAME: &str = "pg_fusion:runtime_metrics";
 
 static mut PREV_SHMEM_REQUEST_HOOK: pgrx::pg_sys::shmem_request_hook_type = None;
 
@@ -47,12 +49,17 @@ unsafe extern "C-unwind" fn pg_fusion_shmem_request_hook() {
     let issuance_layout =
         IssuancePool::layout(IssuanceConfig::new(config.page_count).expect("issuance config"))
             .expect("issuance pool layout");
+    let metrics_layout = RuntimeMetrics::layout(
+        RuntimeMetricsConfig::new(config.page_count).expect("runtime metrics config"),
+    )
+    .expect("runtime metrics layout");
 
     let total = control_layout
         .size
         .saturating_add(scan_layout.size)
         .saturating_add(page_layout.size)
-        .saturating_add(issuance_layout.size);
+        .saturating_add(issuance_layout.size)
+        .saturating_add(metrics_layout.size);
     pgrx::pg_sys::RequestAddinShmemSpace(total);
 }
 
@@ -74,6 +81,7 @@ pub(crate) unsafe extern "C-unwind" fn init_shmem() {
     );
     init_page_pool(PAGE_POOL_NAME, config.page_size, config.page_count);
     init_issuance_pool(ISSUANCE_POOL_NAME, config.page_count);
+    init_runtime_metrics(RUNTIME_METRICS_NAME, config.page_count);
 }
 
 pub(crate) fn attach_control_region() -> TransportRegion {
@@ -110,6 +118,14 @@ pub(crate) fn attach_issuance_pool() -> IssuancePool {
     let layout = IssuancePool::layout(cfg).expect("issuance layout");
     let base = lookup_shmem(ISSUANCE_POOL_NAME, layout.size);
     unsafe { IssuancePool::attach(base, layout.size) }.expect("attach issuance pool")
+}
+
+pub(crate) fn attach_runtime_metrics() -> RuntimeMetrics {
+    let config = host_config().expect("host config");
+    let cfg = RuntimeMetricsConfig::new(config.page_count).expect("runtime metrics config");
+    let layout = RuntimeMetrics::layout(cfg).expect("runtime metrics layout");
+    let base = lookup_shmem(RUNTIME_METRICS_NAME, layout.size);
+    unsafe { RuntimeMetrics::attach(base, layout.size) }.expect("attach runtime metrics")
 }
 
 fn init_control_region(
@@ -173,6 +189,24 @@ fn init_issuance_pool(name: &str, permit_count: u32) {
         }
     };
     pool.expect("issuance pool");
+}
+
+fn init_runtime_metrics(name: &str, page_count: u32) {
+    let cfg = RuntimeMetricsConfig::new(page_count).expect("runtime metrics config");
+    let layout = RuntimeMetrics::layout(cfg).expect("runtime metrics layout");
+    let mut found = false;
+    let base = unsafe {
+        pgrx::pg_sys::ShmemInitStruct(name.as_pg_cstr(), layout.size, &mut found) as *mut u8
+    };
+    let base = NonNull::new(base).expect("runtime metrics shmem");
+    let metrics = unsafe {
+        if found {
+            RuntimeMetrics::attach(base, layout.size).map_err(|err| err.to_string())
+        } else {
+            RuntimeMetrics::init_in_place(base, layout.size, cfg).map_err(|err| err.to_string())
+        }
+    };
+    metrics.expect("runtime metrics");
 }
 
 fn attach_control_region_named(name: &str, layout: TransportRegionLayout) -> TransportRegion {

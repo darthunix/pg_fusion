@@ -26,6 +26,8 @@ page-backed Arrow batches.
 - `control_transport/`: shared-memory control rings and backend/worker leases.
 - `page/pool`, `page/transfer`, `page/issuance`: fixed-page ownership,
   transfer, and issued-frame flow.
+- `runtime_metrics`: shared-memory runtime counters and page-slot handoff
+  stamps exposed through SQL.
 - `page/arrow_layout`, `page/import`, `pg/slot_encoder`, `pg/slot_import`:
   page-backed Arrow layout, PostgreSQL slot encoding, and result projection.
 - `pg/df_catalog`, `pg/plan_builder`, `pg/scan_node`, `pg/scan_sql`,
@@ -45,6 +47,11 @@ page-backed Arrow batches.
    operators, writes Arrow result pages, and sends issued frames back.
 5. Backend imports result pages with `slot_import` and projects rows into
    PostgreSQL tuple slots.
+
+Runtime metrics live in a separate shared-memory region. The runtime does not
+wrap control rings for v1 metrics; scan/result page senders stamp page
+descriptors, and receivers use those stamps to measure backend-to-worker and
+worker-to-backend page handoff latency.
 
 ## Retired Legacy Stack
 

@@ -9,6 +9,7 @@ use issuance::{encode_issued_frame, IssuancePool, IssuedRx, IssuedTx};
 use pgrx::bgworkers::{BackgroundWorker, BackgroundWorkerBuilder, SignalWakeFlags};
 use pgrx::prelude::*;
 use pool::PagePool;
+use runtime_metrics::{MetricId, PageDirection, RuntimeMetrics};
 use runtime_protocol::{ExecutionFailureCode, WorkerExecutionToBackend};
 use tracing::{debug, info, trace, warn, Level};
 use transfer::PageTx;
@@ -21,7 +22,8 @@ use worker_runtime::{
 use crate::guc::host_config;
 use crate::logging::init_tracing_file_logger;
 use crate::shmem::{
-    attach_control_region, attach_issuance_pool, attach_page_pool, attach_scan_region,
+    attach_control_region, attach_issuance_pool, attach_page_pool, attach_runtime_metrics,
+    attach_scan_region,
 };
 
 const POLL_INTERVAL: Duration = Duration::from_millis(5);
@@ -68,6 +70,7 @@ fn run_worker_main() -> Result<(), WorkerRuntimeError> {
     let scan_region = attach_scan_region();
     let page_pool = attach_page_pool();
     let issuance_pool = attach_issuance_pool();
+    let metrics = attach_runtime_metrics();
 
     let worker_config = config.worker_runtime_config();
     let scan_transport = WorkerTransport::attach(&scan_region)?;
@@ -92,13 +95,14 @@ fn run_worker_main() -> Result<(), WorkerRuntimeError> {
         worker_pid, "activated primary control transport generation"
     );
 
-    let scan_source = Arc::new(TransportScanBatchSource::new(
+    let scan_source = Arc::new(TransportScanBatchSource::new_with_metrics(
         scan_region,
         config.scan_backend_to_worker_capacity,
         Arc::new(SharedScanIngress {
             page_pool,
             issuance_pool,
         }),
+        metrics,
     )?);
     let mut runtime = WorkerRuntimeCore::new(worker_config, scan_source);
     let mut plan_rx: Option<IssuedRx> = None;
@@ -148,6 +152,7 @@ fn run_worker_main() -> Result<(), WorkerRuntimeError> {
                 page_pool,
                 issuance_pool,
                 &mut plan_rx,
+                metrics,
                 steps,
             )?;
         }
@@ -166,6 +171,7 @@ fn handle_steps(
     page_pool: PagePool,
     issuance_pool: IssuancePool,
     plan_rx: &mut Option<IssuedRx>,
+    metrics: RuntimeMetrics,
     mut steps: VecDeque<WorkerRuntimeStep>,
 ) -> Result<(), WorkerRuntimeError> {
     while let Some(step) = steps.pop_front() {
@@ -192,11 +198,15 @@ fn handle_steps(
                     flow = ?flow,
                     "worker starting physical planning"
                 );
+                let plan_start = metrics.now_ns();
                 let result = block_on(pending.plan());
+                metrics.add_elapsed(MetricId::WorkerPhysicalPlanNs, plan_start);
+                metrics.increment(MetricId::WorkerPhysicalPlanTotal);
                 steps.push_back(runtime.finish_physical_planning(peer, flow, result)?);
             }
             WorkerRuntimeStep::PhysicalPlanReady(result) => {
                 let peer = runtime.active_peer().expect("peer");
+                let worker_start = metrics.now_ns();
                 info!(
                     component = "worker",
                     session_epoch = result.session_epoch,
@@ -224,6 +234,7 @@ fn handle_steps(
                                 initial_tail_bytes_per_row: config
                                     .estimator_initial_tail_bytes_per_row,
                             },
+                            metrics,
                             ..ResultPageProducerConfig::default()
                         },
                     )?;
@@ -236,6 +247,8 @@ fn handle_steps(
                                     peer = ?peer,
                                     "worker produced one result page"
                                 );
+                                let descriptor = outbound.descriptor();
+                                let payload_len = outbound.payload_len();
                                 let frame =
                                     encode_issued_frame(outbound.frame()).map_err(|err| {
                                         WorkerRuntimeError::ProtocolViolation(format!(
@@ -243,6 +256,14 @@ fn handle_steps(
                                         ))
                                     })?;
                                 transport.send_peer_bytes(peer, &frame)?;
+                                metrics.stamp_page(
+                                    PageDirection::WorkerToBackend,
+                                    descriptor,
+                                    payload_len,
+                                );
+                                metrics.increment(MetricId::WorkerResultPagesTotal);
+                                metrics
+                                    .add(MetricId::WorkerResultBytesSentTotal, payload_len as u64);
                                 outbound.mark_sent();
                             }
                             Some(ResultPageStep::CloseFrame(frame)) => {
@@ -279,6 +300,7 @@ fn handle_steps(
                                 session_epoch: result.session_epoch,
                             },
                         )?;
+                        metrics.add_elapsed(MetricId::WorkerTotalNs, worker_start);
                         steps.push_back(runtime.mark_execution_complete()?);
                     }
                     Err(err) => {
@@ -297,6 +319,7 @@ fn handle_steps(
                                 detail: None,
                             },
                         )?;
+                        metrics.add_elapsed(MetricId::WorkerTotalNs, worker_start);
                         steps.push_back(
                             runtime.fail_execution_locally(ExecutionFailureCode::Internal, None)?,
                         );

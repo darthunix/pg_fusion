@@ -20,6 +20,7 @@ use plan_builder::{PlanBuildInput, PlanBuilder};
 use plan_flow::{BackendPlanRole, BackendPlanStep, PlanOpen};
 use row_estimator::{EstimatorConfig, PageRowEstimator};
 use row_estimator_seed::{seed_estimator_config, ProjectedColumnRef};
+use runtime_metrics::{MetricId, RuntimeMetrics};
 use runtime_protocol::{
     BackendExecutionToWorker, BackendLeaseSlotWire, ExecutionFailureCode, PlanFlowDescriptor,
     ProducerRole, ScanChannelDescriptorWire, ScanChannelSet, ScanFlowDescriptorRef,
@@ -76,6 +77,7 @@ pub struct BackendServiceConfig {
     pub scan_page_kind: u16,
     pub scan_page_flags: u16,
     pub diagnostics: DiagnosticsConfig,
+    pub metrics: RuntimeMetrics,
 }
 
 impl Default for BackendServiceConfig {
@@ -88,6 +90,7 @@ impl Default for BackendServiceConfig {
             scan_page_kind: import::ARROW_LAYOUT_BATCH_KIND,
             scan_page_flags: 0,
             diagnostics: DiagnosticsConfig::default(),
+            metrics: RuntimeMetrics::default(),
         }
     }
 }
@@ -717,6 +720,7 @@ impl BackendService {
                 block_size,
                 fetch_batch_rows,
                 estimator,
+                execution.config.metrics,
             );
 
             let mut coordinator = BackendScanCoordinator::new();
@@ -1020,7 +1024,10 @@ fn bump_current_session_epoch() -> u64 {
     })
 }
 
-fn wait_for_scan_backpressure(blocked_loops: u32) -> Result<bool, BackendServiceError> {
+fn wait_for_scan_backpressure(
+    blocked_loops: u32,
+    metrics: RuntimeMetrics,
+) -> Result<bool, BackendServiceError> {
     #[cfg(any(test, feature = "pg_test"))]
     if let Some(err) = take_wait_for_scan_backpressure_error_for_tests() {
         return Err(err);
@@ -1036,7 +1043,10 @@ fn wait_for_scan_backpressure(blocked_loops: u32) -> Result<bool, BackendService
         }
 
         if blocked_loops == 8 {
+            let wait_start = metrics.now_ns();
             wait_latch(Some(Duration::from_millis(1)));
+            metrics.add_elapsed(MetricId::BackendWaitLatchNs, wait_start);
+            metrics.increment(MetricId::BackendWaitLatchTotal);
             return Ok(true);
         }
 
@@ -1208,7 +1218,7 @@ fn step_scan_with_driver(
 ) -> Result<ScanStreamStep, BackendServiceError> {
     ACTIVE_EXECUTION.with(|slot| {
         let mut active = slot.borrow_mut();
-        let mut active_scan = {
+        let (mut active_scan, metrics) = {
             let execution = match active.as_mut() {
                 Some(execution) => execution,
                 None => {
@@ -1226,12 +1236,13 @@ fn step_scan_with_driver(
             };
             ensure_driver_matches_execution(execution, key, scan_id, "step scan")?;
             ensure_execution_state(execution, BackendExecutionState::Running, "step scan")?;
-            execution.active_scans.remove(&scan_id).ok_or_else(|| {
+            let active_scan = execution.active_scans.remove(&scan_id).ok_or_else(|| {
                 BackendServiceError::ProtocolViolation(format!(
                     "scan driver for scan_id {} lost its active scan stream during step scan",
                     scan_id
                 ))
-            })?
+            })?;
+            (active_scan, execution.config.metrics)
         };
 
         let mut blocked_loops = 0u32;
@@ -1257,7 +1268,7 @@ fn step_scan_with_driver(
                     // session stays detached in `active_scan`. It must be
                     // reinstalled only when we yield control back to the host
                     // loop, or handed straight to fatal cleanup on error.
-                    match wait_for_scan_backpressure(blocked_loops) {
+                    match wait_for_scan_backpressure(blocked_loops, metrics) {
                         Ok(true) => {
                             blocked_loops = blocked_loops.saturating_add(1);
                         }

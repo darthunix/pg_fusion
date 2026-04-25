@@ -35,6 +35,7 @@ pgrx = { workspace = true }
 pgrx-tests = { workspace = true, optional = true }
 postgres = { version = "0.19.10", optional = true }
 runtime_protocol = { path = "../../runtime_protocol", version = "25.0" }
+runtime_metrics = { path = "../../runtime_metrics", version = "25.0" }
 slot_import = { path = "../slot_import", version = "25.0" }
 thiserror = "2.0"
 tracing = "0.1"

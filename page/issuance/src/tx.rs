@@ -23,6 +23,7 @@ pub struct IssuedOutboundPage {
     outbound: Option<transfer::OutboundPage>,
     permits: IssuancePool,
     permit_id: u32,
+    payload_len: usize,
     sent: bool,
 }
 
@@ -31,6 +32,7 @@ impl fmt::Debug for IssuedOutboundPage {
         f.debug_struct("IssuedOutboundPage")
             .field("transfer_id", &self.transfer_id())
             .field("permit_id", &self.permit_id)
+            .field("payload_len", &self.payload_len)
             .field("sent", &self.sent)
             .finish()
     }
@@ -127,6 +129,7 @@ impl IssuedWriter {
             outbound: Some(outbound),
             permits: self.permits,
             permit_id,
+            payload_len,
             sent: false,
         })
     }
@@ -158,6 +161,19 @@ impl IssuedOutboundPage {
     /// Return the permit id currently attached to this outbound page.
     pub fn permit_id(&self) -> u32 {
         self.permit_id
+    }
+
+    /// Return the payload length written into the page.
+    pub fn payload_len(&self) -> usize {
+        self.payload_len
+    }
+
+    /// Return the detached page descriptor to be carried in the frame.
+    pub fn descriptor(&self) -> pool::PageDescriptor {
+        self.outbound
+            .as_ref()
+            .expect("outbound page must exist until mark_sent")
+            .descriptor()
     }
 
     /// Build the issued control frame describing this detached page.

@@ -200,6 +200,62 @@ fast-start planning hint plus a local soft row cap. They are not documented as
 an exact global SQL `LIMIT` guarantee; exact SQL limit semantics must remain in
 the logical query plan above the scan path.
 
+## Runtime Metrics
+
+`pg_fusion` exposes cumulative runtime counters from shared memory:
+
+```sql
+SELECT pg_fusion_metrics_reset();
+
+SET pg_fusion.enable = on;
+SELECT count(*) FROM my_table WHERE id > 100;
+
+SELECT component, metric, kind, unit, value, reset_epoch
+FROM pg_fusion_metrics()
+WHERE value <> 0
+ORDER BY component, metric;
+```
+
+`pg_fusion_metrics()` returns a relational result, not JSON. This keeps psql,
+SQL filtering, and external collectors simple; JSON can be derived with
+`jsonb_object_agg()` if needed. `pg_fusion_metrics_reset()` clears the runtime
+counters and advances `reset_epoch`. In-flight page handoff stamps from an older
+epoch are ignored after reset.
+
+Metric names use a simple convention:
+
+- `*_ns` is accumulated time in nanoseconds.
+- `*_total` is an event count or cumulative counter.
+- `*_bytes_sent_total` is the payload bytes written into shared page slots.
+
+Useful latency probes:
+
+```sql
+SELECT
+  sum(value) FILTER (WHERE metric = 'backend_wait_latch_ns')::numeric
+  / nullif(sum(value) FILTER (WHERE metric = 'backend_wait_latch_total'), 0)
+    AS avg_backend_wait_latch_ns
+FROM pg_fusion_metrics();
+
+SELECT *
+FROM pg_fusion_metrics()
+WHERE metric IN (
+  'scan_page_fill_ns',
+  'scan_b2w_wait_ns',
+  'scan_page_read_ns',
+  'result_w2b_wait_ns',
+  'query_total_ns',
+  'backend_total_ns',
+  'worker_total_ns'
+)
+ORDER BY component, metric;
+```
+
+The scan/result "slot" metrics refer to shared page-pool slots used for Arrow
+pages, not PostgreSQL `TupleTableSlot`. Backend and worker timings may overlap,
+so `backend_total_ns + worker_total_ns` is not expected to equal
+`query_total_ns`.
+
 ## Developer Guidelines
 
 - Rust 2021; keep changes small and focused; avoid panics in extension paths.

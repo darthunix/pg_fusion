@@ -22,5 +22,8 @@ importance: 0.7
   `pg/test` and run them with `cargo pgrx test pg17 -p pg_test`.
 - Page-backed Arrow batches must not outlive their transfer/issuance ownership
   contract. Release pages only through the existing page/issued-frame APIs.
+- Runtime metrics reset is intended for experiments before a query. It advances
+  `reset_epoch` so old page stamps are ignored, but concurrent increments can
+  still race with a manual reset.
 - Misaligned pointer deref can panic when interpreting shared-memory bytes as
   atomics. Allocate ring regions through the established lockfree layout paths.

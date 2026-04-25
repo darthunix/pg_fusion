@@ -285,3 +285,69 @@ pub(crate) fn heap_join_two_tables_smoke() {
     .expect("filtered heap join must return one bigint value");
     assert_eq!(score, 20);
 }
+
+pub(crate) fn metrics_smoke() {
+    let mut client = smoke_client();
+    let mut tx = smoke_transaction(&mut client);
+    let table_name = "pg_temp.pgf_metrics_smoke";
+    reset_heap_fixture(&mut tx, table_name);
+
+    let before_epoch: i64 =
+        simple_query_first_column_tx(&mut tx, "SELECT pg_fusion_metrics_reset()")
+            .expect("metrics reset must return an epoch")
+            .parse()
+            .expect("metrics reset epoch must be an integer");
+
+    let id: i64 = simple_query_first_column_tx(
+        &mut tx,
+        &format!("SELECT id::bigint FROM {table_name} WHERE id = 1"),
+    )
+    .expect("metrics smoke query must return one row")
+    .parse()
+    .expect("metrics smoke query must return one bigint value");
+    assert_eq!(id, 1);
+
+    let summary = simple_query_first_column_tx(
+        &mut tx,
+        "\
+        SELECT concat(
+            coalesce(max(value) FILTER (WHERE metric = 'scan_pages_sent_total'), 0), ',',
+            coalesce(max(value) FILTER (WHERE metric = 'scan_bytes_sent_total'), 0), ',',
+            coalesce(max(value) FILTER (WHERE metric = 'result_pages_read_total'), 0), ',',
+            coalesce(max(value) FILTER (WHERE metric = 'backend_rows_returned_total'), 0), ',',
+            coalesce(max(reset_epoch), 0)
+        )
+        FROM pg_fusion_metrics()
+        ",
+    )
+    .expect("metrics summary must return one row");
+    let parts = summary
+        .split(',')
+        .map(|part| part.parse::<i64>().expect("metric value must be integer"))
+        .collect::<Vec<_>>();
+    assert_eq!(parts.len(), 5);
+    assert!(
+        parts[0] > 0,
+        "scan_pages_sent_total must be positive: {summary}"
+    );
+    assert!(
+        parts[1] > 0,
+        "scan_bytes_sent_total must be positive: {summary}"
+    );
+    assert!(
+        parts[2] > 0,
+        "result_pages_read_total must be positive: {summary}"
+    );
+    assert!(
+        parts[3] > 0,
+        "backend_rows_returned_total must be positive: {summary}"
+    );
+    assert_eq!(parts[4], before_epoch);
+
+    let after_epoch: i64 =
+        simple_query_first_column_tx(&mut tx, "SELECT pg_fusion_metrics_reset()")
+            .expect("second metrics reset must return an epoch")
+            .parse()
+            .expect("second metrics reset epoch must be an integer");
+    assert!(after_epoch > before_epoch);
+}

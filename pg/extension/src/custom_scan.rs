@@ -20,6 +20,7 @@ use pgrx::pg_sys::{
 use pgrx::prelude::*;
 use pgrx::{check_for_interrupts, pg_guard};
 use pool::PagePool;
+use runtime_metrics::{MetricId, PageDirection, RuntimeMetrics};
 use runtime_protocol::{
     decode_runtime_message_family, decode_worker_execution_to_backend,
     decode_worker_scan_to_backend, encode_backend_execution_to_worker_into,
@@ -35,7 +36,8 @@ use crate::guc::host_config;
 use crate::logging;
 use crate::result_ingress::{AcceptedResultFrame, ResultIngress};
 use crate::shmem::{
-    attach_control_region, attach_issuance_pool, attach_page_pool, attach_scan_region,
+    attach_control_region, attach_issuance_pool, attach_page_pool, attach_runtime_metrics,
+    attach_scan_region,
 };
 use crate::utility_hook::PlannerBypassGuard;
 
@@ -83,6 +85,9 @@ struct HostScanState {
     scan_scratch: Vec<u8>,
     terminal_error: Option<String>,
     owns_result_slot: bool,
+    metrics: RuntimeMetrics,
+    query_start_ns: u64,
+    query_total_recorded: bool,
 }
 
 enum PrimaryInbound {
@@ -171,6 +176,9 @@ unsafe extern "C-unwind" fn create_pg_fusion_scan_state(cscan: *mut CustomScan) 
         scan_scratch: Vec::new(),
         terminal_error: None,
         owns_result_slot: false,
+        metrics: RuntimeMetrics::default(),
+        query_start_ns: 0,
+        query_total_recorded: false,
     });
 
     let state_ptr =
@@ -315,7 +323,13 @@ unsafe extern "C-unwind" fn begin_pg_fusion_scan(
     }
 
     let config = host_config().unwrap_or_else(|err| error!("pg_fusion config error: {err}"));
-    let backend_config = config.backend_service_config();
+    let metrics = attach_runtime_metrics();
+    state.metrics = metrics;
+    state.query_start_ns = metrics.now_ns();
+    state.query_total_recorded = false;
+    let backend_start = metrics.now_ns();
+    let mut backend_config = config.backend_service_config();
+    backend_config.metrics = metrics;
     let control_region = attach_control_region();
     let scan_region = attach_scan_region();
     let page_pool = attach_page_pool();
@@ -419,6 +433,7 @@ unsafe extern "C-unwind" fn begin_pg_fusion_scan(
             host_state_snapshot(state)
         )
     });
+    metrics.add_elapsed(MetricId::BackendTotalNs, backend_start);
 }
 
 #[pg_guard]
@@ -426,6 +441,8 @@ unsafe extern "C-unwind" fn exec_pg_fusion_scan(
     node: *mut CustomScanState,
 ) -> *mut pg_sys::TupleTableSlot {
     let state = host_state_mut(node);
+    state.metrics.increment(MetricId::BackendExecCallsTotal);
+    let backend_start = state.metrics.now_ns();
     let scan_slot = (*node).ss.ss_ScanTupleSlot;
     refresh_debug_watch(node, state);
     diag::log_live_watch("pg_fusion exec entry live watch");
@@ -472,6 +489,7 @@ unsafe extern "C-unwind" fn exec_pg_fusion_scan(
                     host_state_snapshot(state)
                 )
             });
+            record_backend_row_return(state, backend_start);
             return result;
         }
 
@@ -499,6 +517,7 @@ unsafe extern "C-unwind" fn exec_pg_fusion_scan(
                     host_state_snapshot(state)
                 )
             });
+            record_backend_row_return(state, backend_start);
             return result;
         }
 
@@ -540,6 +559,7 @@ unsafe extern "C-unwind" fn exec_pg_fusion_scan(
                     host_state_snapshot(state)
                 )
             });
+            record_backend_row_return(state, backend_start);
             return result;
         }
 
@@ -558,11 +578,17 @@ unsafe extern "C-unwind" fn exec_pg_fusion_scan(
                     host_state_snapshot(state)
                 )
             });
+            record_backend_eof(state, backend_start);
             return std::ptr::null_mut();
         }
 
         if !progressed {
+            let wait_start = state.metrics.now_ns();
             wait_latch(Some(Duration::from_millis(1)));
+            state
+                .metrics
+                .add_elapsed(MetricId::BackendWaitLatchNs, wait_start);
+            state.metrics.increment(MetricId::BackendWaitLatchTotal);
         }
     }
 }
@@ -581,6 +607,7 @@ unsafe extern "C-unwind" fn end_pg_fusion_scan(node: *mut CustomScanState) {
     if let Some(key) = state.execution_key.take() {
         let _ = BackendService::accept_cancel_execution(key.slot_id, key.session_epoch);
     }
+    record_query_total(state);
     state.active_drivers.clear();
     state.pending_complete_session_epoch = None;
     let scan_slot = (*node).ss.ss_ScanTupleSlot;
@@ -677,21 +704,44 @@ fn poll_primary_peer(state: &mut HostScanState) -> Result<bool, BackendServiceEr
                 handle_primary_control(state, message)?;
             }
             PrimaryInbound::Issued(frame) => {
+                if let Some(descriptor) = issued_page_descriptor(&frame) {
+                    if let Some(observation) = state
+                        .metrics
+                        .observe_page(PageDirection::WorkerToBackend, descriptor)
+                    {
+                        state
+                            .metrics
+                            .add(MetricId::ResultW2bWaitNs, observation.wait_ns);
+                        state.metrics.increment(MetricId::ResultW2bWaitTotal);
+                    }
+                }
                 let ingress = state.result_ingress.as_mut().ok_or_else(|| {
                     BackendServiceError::ProtocolViolation(
                         "result ingress is not initialized".into(),
                     )
                 })?;
+                let read_start = state.metrics.now_ns();
                 let accepted = ingress
                     .accept_frame(&frame)
                     .map_err(|err| BackendServiceError::ProtocolViolation(err.to_string()))?;
                 if accepted == AcceptedResultFrame::Page {
+                    state
+                        .metrics
+                        .add_elapsed(MetricId::ResultPageReadNs, read_start);
+                    state.metrics.increment(MetricId::ResultPagesReadTotal);
                     break;
                 }
             }
         }
     }
     Ok(progressed)
+}
+
+fn issued_page_descriptor(frame: &IssuedOwnedFrame) -> Option<pool::PageDescriptor> {
+    match frame {
+        IssuedOwnedFrame::Page(frame) => Some(frame.inner.descriptor),
+        IssuedOwnedFrame::Close(_) => None,
+    }
 }
 
 fn handle_primary_control(
@@ -923,12 +973,21 @@ fn drive_active_scans(
                         host_state_snapshot(state)
                     )
                 });
+                let descriptor = outbound.descriptor();
+                let payload_len = outbound.payload_len();
                 let frame = encode_issued_frame(outbound.frame()).map_err(|err| {
                     BackendServiceError::ProtocolViolation(format!(
                         "failed to encode scan page header: {err}"
                     ))
                 })?;
                 let _ = BackendService::send_scan_peer_bytes(peer, &frame)?;
+                state
+                    .metrics
+                    .stamp_page(PageDirection::BackendToWorker, descriptor, payload_len);
+                state.metrics.increment(MetricId::ScanPagesSentTotal);
+                state
+                    .metrics
+                    .add(MetricId::ScanBytesSentTotal, payload_len as u64);
                 outbound.mark_sent();
                 state.active_drivers.insert(scan_id, driver);
                 host_diag(DiagnosticLogLevel::Trace, || {
@@ -1026,6 +1085,30 @@ fn result_ingress_complete(state: &HostScanState) -> bool {
         .result_ingress
         .as_ref()
         .is_none_or(ResultIngress::is_complete)
+}
+
+fn record_backend_row_return(state: &mut HostScanState, backend_start: u64) {
+    state
+        .metrics
+        .add_elapsed(MetricId::BackendTotalNs, backend_start);
+    state.metrics.increment(MetricId::BackendRowsReturnedTotal);
+}
+
+fn record_backend_eof(state: &mut HostScanState, backend_start: u64) {
+    record_query_total(state);
+    state
+        .metrics
+        .add_elapsed(MetricId::BackendTotalNs, backend_start);
+}
+
+fn record_query_total(state: &mut HostScanState) {
+    if state.query_total_recorded || state.query_start_ns == 0 {
+        return;
+    }
+    state
+        .metrics
+        .add_elapsed(MetricId::QueryTotalNs, state.query_start_ns);
+    state.query_total_recorded = true;
 }
 
 fn flush_pending_complete(

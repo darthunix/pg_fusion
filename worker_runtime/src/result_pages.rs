@@ -8,6 +8,7 @@ use datafusion::physical_plan::SendableRecordBatchStream;
 use futures::StreamExt;
 use issuance::{IssuedOutboundPage, IssuedOwnedFrame, IssuedTx};
 use row_estimator::{EstimatorConfig, PageRowEstimator};
+use runtime_metrics::{MetricId, RuntimeMetrics};
 
 use crate::WorkerRuntimeError;
 
@@ -20,6 +21,8 @@ pub struct ResultPageProducerConfig {
     pub page_flags: u16,
     /// Initial rows-per-page estimator prior for variable-width columns.
     pub estimator: EstimatorConfig,
+    /// Shared runtime metrics handle. Defaults to no-op outside pg_fusion.
+    pub metrics: RuntimeMetrics,
 }
 
 impl Default for ResultPageProducerConfig {
@@ -28,6 +31,7 @@ impl Default for ResultPageProducerConfig {
             page_kind: import::ARROW_LAYOUT_BATCH_KIND,
             page_flags: 0,
             estimator: EstimatorConfig::default(),
+            metrics: RuntimeMetrics::default(),
         }
     }
 }
@@ -144,6 +148,7 @@ impl ResultPageProducer {
     }
 
     fn encode_pending_page(&mut self) -> Result<ResultPageStep, WorkerRuntimeError> {
+        let fill_start = self.config.metrics.now_ns();
         let batch = self
             .pending_batch
             .as_ref()
@@ -174,6 +179,9 @@ impl ResultPageProducer {
             };
 
             let outbound = writer.finish_with_payload_len(encoded.payload_len)?;
+            self.config
+                .metrics
+                .add_elapsed(MetricId::WorkerResultPageFillNs, fill_start);
             self.pending_row += rows_written;
             if self.pending_row == batch.num_rows() {
                 self.pending_batch = None;

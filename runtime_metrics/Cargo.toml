@@ -1,0 +1,14 @@
+[package]
+name = "runtime_metrics"
+version = "25.0.0"
+edition = "2021"
+description = "Shared-memory runtime metrics for pg_fusion"
+readme = "README.md"
+
+[lib]
+crate-type = ["lib"]
+doctest = false
+
+[dependencies]
+libc = "0.2"
+pool = { path = "../page/pool", version = "25.0" }

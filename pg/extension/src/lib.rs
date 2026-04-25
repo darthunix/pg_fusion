@@ -9,6 +9,7 @@ mod custom_scan;
 mod diag;
 mod guc;
 mod logging;
+mod metrics;
 mod planner;
 mod result_ingress;
 #[cfg(feature = "pg_test")]
@@ -82,6 +83,11 @@ mod tests {
     #[pg_test]
     fn pg_fusion_result_ingress_roundtrip_smoke() {
         super::result_ingress_tests::result_ingress_roundtrip_smoke();
+    }
+
+    #[pg_test]
+    fn pg_fusion_metrics_smoke() {
+        super::smoke_tests::metrics_smoke();
     }
 }
 

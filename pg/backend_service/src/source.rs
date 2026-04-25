@@ -3,6 +3,7 @@ use arrow_layout::{init_block, LayoutPlan};
 use arrow_schema::SchemaRef;
 use pgrx::pg_sys;
 use row_estimator::PageRowEstimator;
+use runtime_metrics::{MetricId, RuntimeMetrics};
 use scan_flow::{BackendPageSource, FlowId, SourcePageStatus};
 use slot_encoder::{AppendStatus, PageBatchEncoder};
 use slot_scan::{ExecutionSpiContext, PreparedScan, SlotSinkAction, StreamingScanSession};
@@ -17,6 +18,7 @@ pub(crate) struct SlotScanPageSource {
     fetch_batch_rows: usize,
     single_row_drains: bool,
     estimator: PageRowEstimator,
+    metrics: RuntimeMetrics,
     session: Option<StreamingScanSession>,
     overflow_slot: *mut pg_sys::TupleTableSlot,
     pending_overflow: pg_sys::HeapTuple,
@@ -32,6 +34,7 @@ impl SlotScanPageSource {
         block_size: u32,
         fetch_batch_rows: usize,
         estimator: PageRowEstimator,
+        metrics: RuntimeMetrics,
     ) -> Self {
         let single_row_drains = estimator.has_variable_width();
         Self {
@@ -44,6 +47,7 @@ impl SlotScanPageSource {
             fetch_batch_rows,
             single_row_drains,
             estimator,
+            metrics,
             session: None,
             overflow_slot: std::ptr::null_mut(),
             pending_overflow: std::ptr::null_mut(),
@@ -233,7 +237,14 @@ impl BackendPageSource for SlotScanPageSource {
         }
         let block = &mut payload[..block_size];
 
-        with_registered_snapshot(self.snapshot, || self.fill_next_page_with_snapshot(block))
+        let fill_start = self.metrics.now_ns();
+        let result =
+            with_registered_snapshot(self.snapshot, || self.fill_next_page_with_snapshot(block));
+        if matches!(result, Ok(SourcePageStatus::Page { .. })) {
+            self.metrics
+                .add_elapsed(MetricId::ScanPageFillNs, fill_start);
+        }
+        result
     }
 
     fn close(&mut self) -> Result<(), Self::Error> {

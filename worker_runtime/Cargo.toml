@@ -24,8 +24,10 @@ futures = "0.3"
 import = { path = "../page/import", version = "25.0" }
 issuance = { path = "../page/issuance", version = "25.0" }
 plan_flow = { path = "../page/plan_flow", version = "25.0" }
+pool = { path = "../page/pool", version = "25.0" }
 row_estimator = { path = "../page/row_estimator", version = "25.0" }
 runtime_protocol = { path = "../runtime_protocol", version = "25.0" }
+runtime_metrics = { path = "../runtime_metrics", version = "25.0" }
 rust-fsm = { version = "0.7", features = ["diagram"] }
 scan_flow = { path = "../page/scan_flow", version = "25.0" }
 scan_node = { path = "../pg/scan_node", version = "25.0" }
@@ -35,5 +37,4 @@ transfer = { path = "../page/transfer", version = "25.0" }
 
 [dev-dependencies]
 libc = "0.2"
-pool = { path = "../page/pool", version = "25.0" }
 scan_sql = { path = "../pg/scan_sql", version = "25.0" }

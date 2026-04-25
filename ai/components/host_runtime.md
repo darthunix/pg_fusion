@@ -19,6 +19,10 @@ importance: 0.8
   slots through `pg/slot_import`.
 - The issuance permit pool is sized from `pg_fusion.page_count`; there is no
   separate host GUC for permit count.
+- Runtime metrics are global shared-memory counters exposed by
+  `pg_fusion_metrics()` and reset by `pg_fusion_metrics_reset()`. Page handoff
+  latency is measured with page descriptor stamps, not by instrumenting ring
+  internals.
 - `EXPLAIN` stays backend-local: `backend_service` lowers the planned query to
   a DataFusion physical plan, renders PostgreSQL scan leaves with present
   soft-limit/fetch-hint metadata, and prints the nested multiline `slot_scan`
