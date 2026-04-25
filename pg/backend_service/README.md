@@ -23,6 +23,9 @@ It owns the backend-local execution lifecycle:
   an Arrow page boundary is copied into a retry tuple
 - page boundaries are enforced by the row budget passed to `PortalRunFetch()`;
   the backend does not use `receiveSlot = false` as a resumable pause signal
+- the backend uses the hidden fast `slot_scan` receiver without per-row
+  `catch_unwind`; internal scan callbacks must return expected failures through
+  `Result`, and a Rust panic is treated as a bug
 - lower layers such as `issuance` and `scan_flow` remain non-blocking; when
   page permits are exhausted the scan driver yields explicit control back to
   the host loop with `ScanStreamStep::YieldForControl { PermitBackpressure }`

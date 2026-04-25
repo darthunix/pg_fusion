@@ -55,14 +55,36 @@ impl<'a, E> DirectSlotReceiverState<'a, E> {
     }
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum DirectSlotReceiverMode {
+    Guarded,
+    Fast,
+}
+
 impl DirectSlotDestReceiver {
-    fn new<E>(state: &mut DirectSlotReceiverState<'_, E>) -> Self
+    fn new_guarded<E>(state: &mut DirectSlotReceiverState<'_, E>) -> Self
     where
         E: From<ScanError> + 'static,
     {
         Self {
             dest: pg_sys::DestReceiver {
                 receiveSlot: Some(direct_receive_slot::<E>),
+                rStartup: Some(direct_receiver_startup),
+                rShutdown: Some(direct_receiver_shutdown),
+                rDestroy: Some(direct_receiver_destroy),
+                mydest: pg_sys::CommandDest::DestNone,
+            },
+            state: state as *mut DirectSlotReceiverState<'_, E> as *mut c_void,
+        }
+    }
+
+    fn new_fast<E>(state: &mut DirectSlotReceiverState<'_, E>) -> Self
+    where
+        E: From<ScanError> + 'static,
+    {
+        Self {
+            dest: pg_sys::DestReceiver {
+                receiveSlot: Some(direct_receive_slot_fast::<E>),
                 rStartup: Some(direct_receiver_startup),
                 rShutdown: Some(direct_receiver_shutdown),
                 rDestroy: Some(direct_receiver_destroy),
@@ -87,24 +109,50 @@ where
         return false;
     }
 
-    let result = catch_unwind(AssertUnwindSafe(|| (state.consume_slot)(slot)));
+    match catch_unwind(AssertUnwindSafe(|| (state.consume_slot)(slot))) {
+        Ok(result) => handle_receive_slot_result(state, result),
+        Err(_) => {
+            state.error =
+                Some(ScanError::Postgres("slot receiver callback panicked".into()).into());
+            false
+        }
+    }
+}
+
+unsafe extern "C-unwind" fn direct_receive_slot_fast<E>(
+    slot: *mut pg_sys::TupleTableSlot,
+    receiver: *mut pg_sys::DestReceiver,
+) -> bool
+where
+    E: From<ScanError> + 'static,
+{
+    let receiver = unsafe { &mut *(receiver.cast::<DirectSlotDestReceiver>()) };
+    let state = unsafe { &mut *(receiver.state.cast::<DirectSlotReceiverState<'static, E>>()) };
+
+    if state.error.is_some() {
+        return false;
+    }
+
+    let result = (state.consume_slot)(slot);
+    handle_receive_slot_result(state, result)
+}
+
+fn handle_receive_slot_result<E>(
+    state: &mut DirectSlotReceiverState<'_, E>,
+    result: Result<SlotSinkAction, E>,
+) -> bool {
     match result {
-        Ok(Ok(SlotSinkAction::Continue)) => {
+        Ok(SlotSinkAction::Continue) => {
             state.rows_consumed += 1;
             true
         }
-        Ok(Ok(SlotSinkAction::Stop)) => {
+        Ok(SlotSinkAction::Stop) => {
             state.rows_consumed += 1;
             state.stopped = true;
             false
         }
-        Ok(Err(error)) => {
+        Err(error) => {
             state.error = Some(error);
-            false
-        }
-        Err(_) => {
-            state.error =
-                Some(ScanError::Postgres("slot receiver callback panicked".into()).into());
             false
         }
     }
@@ -296,6 +344,42 @@ impl StreamingScanSession {
     where
         E: From<ScanError> + 'static,
     {
+        self.drain_slots_inner(
+            row_budget,
+            &mut consume_slot,
+            DirectSlotReceiverMode::Guarded,
+        )
+    }
+
+    /// Drains one portal fetch without protecting the row callback with
+    /// `catch_unwind`.
+    ///
+    /// # Safety
+    ///
+    /// The callback must not panic. Any expected failure must be returned
+    /// through `Result`; unwinding through PostgreSQL executor frames is not a
+    /// supported recovery path.
+    #[doc(hidden)]
+    pub unsafe fn drain_slots_without_unwind_guard<E>(
+        &mut self,
+        row_budget: usize,
+        mut consume_slot: impl FnMut(*mut pg_sys::TupleTableSlot) -> Result<SlotSinkAction, E>,
+    ) -> Result<SlotDrainResult, E>
+    where
+        E: From<ScanError> + 'static,
+    {
+        self.drain_slots_inner(row_budget, &mut consume_slot, DirectSlotReceiverMode::Fast)
+    }
+
+    fn drain_slots_inner<E>(
+        &mut self,
+        row_budget: usize,
+        consume_slot: &mut dyn FnMut(*mut pg_sys::TupleTableSlot) -> Result<SlotSinkAction, E>,
+        receiver_mode: DirectSlotReceiverMode,
+    ) -> Result<SlotDrainResult, E>
+    where
+        E: From<ScanError> + 'static,
+    {
         if self.closed {
             return Err(ScanError::CursorClosed.into());
         }
@@ -317,8 +401,11 @@ impl StreamingScanSession {
 
         let fetch_rows = cursor_fetch_rows(self.fetch_batch_rows, row_budget, self.remaining);
 
-        let mut state = DirectSlotReceiverState::new(&mut consume_slot);
-        let mut receiver = DirectSlotDestReceiver::new(&mut state);
+        let mut state = DirectSlotReceiverState::new(consume_slot);
+        let mut receiver = match receiver_mode {
+            DirectSlotReceiverMode::Guarded => DirectSlotDestReceiver::new_guarded(&mut state),
+            DirectSlotReceiverMode::Fast => DirectSlotDestReceiver::new_fast(&mut state),
+        };
         let portal_processed = Cell::new(0u64);
         let previous_context = Cell::new(std::ptr::null_mut());
 

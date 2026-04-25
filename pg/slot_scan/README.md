@@ -188,6 +188,9 @@ crate. That path is intentionally not part of the public contract:
 - each drain is bounded by an explicit row budget passed to `PortalRunFetch()`;
   hidden callers that need page boundaries should use that budget instead of
   returning `SlotSinkAction::Stop`
+- public `PreparedScan::run()` keeps per-row panic protection, while the hidden
+  backend streaming drain may opt into an unsafe fast receiver that expects
+  internal callbacks to return errors through `Result` and never panic
 - it exists to minimize PostgreSQL calls, `palloc` churn, and row copies when
   streaming from PostgreSQL slots into `slot_encoder`
 - callers must not interleave other SPI or planning work while such a session

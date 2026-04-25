@@ -110,28 +110,34 @@ impl SlotScanPageSource {
                 } else {
                     remaining_rows
                 };
-                let drain = session.drain_slots::<BackendServiceError>(row_budget, |slot| {
-                    match encoder.append_slot(slot)? {
-                        AppendStatus::Appended => {
-                            rows_written += 1;
-                            Ok::<SlotSinkAction, BackendServiceError>(SlotSinkAction::Continue)
-                        }
-                        AppendStatus::Full => {
-                            if row_budget != 1 {
-                                return Err(BackendServiceError::PageSource(format!(
+                // SAFETY: this backend-only callback is controlled by pg_fusion
+                // and returns expected failures through Result. A panic here is
+                // a bug, not a recoverable row-level PostgreSQL error.
+                let drain = unsafe {
+                    session.drain_slots_without_unwind_guard::<BackendServiceError>(
+                        row_budget,
+                        |slot| match encoder.append_slot(slot)? {
+                            AppendStatus::Appended => {
+                                rows_written += 1;
+                                Ok::<SlotSinkAction, BackendServiceError>(SlotSinkAction::Continue)
+                            }
+                            AppendStatus::Full => {
+                                if row_budget != 1 {
+                                    return Err(BackendServiceError::PageSource(format!(
                                     "slot encoder filled before exhausting row budget: budget={row_budget}, rows_written={rows_written}, max_rows={max_rows}"
                                 )));
+                                }
+                                self.pending_overflow = pg_sys::ExecCopySlotHeapTuple(slot);
+                                if self.pending_overflow.is_null() {
+                                    return Err(BackendServiceError::PageSource(
+                                        "ExecCopySlotHeapTuple returned null".into(),
+                                    ));
+                                }
+                                Ok::<SlotSinkAction, BackendServiceError>(SlotSinkAction::Continue)
                             }
-                            self.pending_overflow = unsafe { pg_sys::ExecCopySlotHeapTuple(slot) };
-                            if self.pending_overflow.is_null() {
-                                return Err(BackendServiceError::PageSource(
-                                    "ExecCopySlotHeapTuple returned null".into(),
-                                ));
-                            }
-                            Ok::<SlotSinkAction, BackendServiceError>(SlotSinkAction::Continue)
-                        }
-                    }
-                })?;
+                        },
+                    )
+                }?;
 
                 if !self.pending_overflow.is_null() {
                     if rows_written > 0 {
