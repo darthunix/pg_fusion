@@ -65,6 +65,16 @@ mod tests {
     }
 
     #[pg_test]
+    fn pg_fusion_heap_avg_full_scan_smoke() {
+        super::smoke_tests::heap_avg_full_scan_smoke();
+    }
+
+    #[pg_test]
+    fn pg_fusion_heap_varlena_full_scan_smoke() {
+        super::smoke_tests::heap_varlena_full_scan_smoke();
+    }
+
+    #[pg_test]
     fn pg_fusion_heap_join_two_tables_smoke() {
         super::smoke_tests::heap_join_two_tables_smoke();
     }

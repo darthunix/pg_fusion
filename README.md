@@ -182,11 +182,14 @@ SET pg_fusion.backend_log_level = 1; -- 0=off, 1=basic, 2=trace
 ```
 
 `pg_fusion.scan_fetch_batch_rows` controls how many rows the backend asks
-PostgreSQL to fetch from the scan cursor per `SPI_cursor_fetch()` call. Larger
-values reduce PostgreSQL cursor fetch calls but keep larger batches alive while
-the backend encodes them into Arrow pages. The default is `1024`; `0` is not a
-valid configured value and the internal scan path normalizes only defensive
-runtime inputs to at least one row.
+PostgreSQL to deliver from the scan portal per direct `PortalRunFetch()` call.
+Rows are encoded from executor `TupleTableSlot`s directly into Arrow pages; no
+SPI tuptable batch is materialized in the hot path. The default is `1024`; `0`
+is not a valid configured value and the internal scan path normalizes only
+defensive runtime inputs to at least one row. Page boundaries are handled by
+the fetch row budget, not by pausing the PostgreSQL receiver mid-fetch. Scans
+with variable-width transport columns use one-row drains so an overflowing row
+can be retried on the next Arrow page without losing the cursor position.
 
 DataFusion fetch/limit hints are lowered into `slot_scan` as a PostgreSQL
 fast-start planning hint plus a local soft row cap. They are not documented as

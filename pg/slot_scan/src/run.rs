@@ -1,14 +1,14 @@
 use crate::error::{ScanError, SinkError};
 use crate::plan::{inspect_planned_stmt, scan_error_from_caught_error, spi_status_error};
 use crate::types::{
-    ExecutionSpiConnection, ExecutionSpiContext, PreparedScan, ScanStats, SlotSink, SlotSinkAction,
-    SlotSinkContext, SlotSinkMethods, StreamingScanSession,
+    ExecutionSpiConnection, ExecutionSpiContext, PreparedScan, ScanStats, SlotDrainResult,
+    SlotSink, SlotSinkAction, SlotSinkContext, SlotSinkMethods, StreamingScanSession,
 };
 use pgrx::pg_sys;
 use pgrx::PgTryBuilder;
 use std::cell::Cell;
 use std::ffi::c_void;
-use std::panic::AssertUnwindSafe;
+use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::rc::Rc;
 
 const DEFAULT_FETCH_BATCH_ROWS: usize = 1024;
@@ -17,9 +17,109 @@ fn normalize_fetch_batch_rows(fetch_batch_rows: usize) -> usize {
     fetch_batch_rows.max(1)
 }
 
-fn cursor_fetch_rows(fetch_batch_rows: usize, remaining: usize) -> std::ffi::c_long {
-    fetch_batch_rows.min(remaining).try_into().unwrap()
+fn cursor_fetch_rows(
+    fetch_batch_rows: usize,
+    row_budget: usize,
+    remaining: usize,
+) -> std::ffi::c_long {
+    fetch_batch_rows
+        .min(row_budget)
+        .min(remaining)
+        .try_into()
+        .unwrap()
 }
+
+#[repr(C)]
+struct DirectSlotDestReceiver {
+    dest: pg_sys::DestReceiver,
+    state: *mut c_void,
+}
+
+struct DirectSlotReceiverState<'a, E> {
+    consume_slot: &'a mut dyn FnMut(*mut pg_sys::TupleTableSlot) -> Result<SlotSinkAction, E>,
+    rows_consumed: usize,
+    stopped: bool,
+    error: Option<E>,
+}
+
+impl<'a, E> DirectSlotReceiverState<'a, E> {
+    fn new(
+        consume_slot: &'a mut dyn FnMut(*mut pg_sys::TupleTableSlot) -> Result<SlotSinkAction, E>,
+    ) -> Self {
+        Self {
+            consume_slot,
+            rows_consumed: 0,
+            stopped: false,
+            error: None,
+        }
+    }
+}
+
+impl DirectSlotDestReceiver {
+    fn new<E>(state: &mut DirectSlotReceiverState<'_, E>) -> Self
+    where
+        E: From<ScanError> + 'static,
+    {
+        Self {
+            dest: pg_sys::DestReceiver {
+                receiveSlot: Some(direct_receive_slot::<E>),
+                rStartup: Some(direct_receiver_startup),
+                rShutdown: Some(direct_receiver_shutdown),
+                rDestroy: Some(direct_receiver_destroy),
+                mydest: pg_sys::CommandDest::DestNone,
+            },
+            state: state as *mut DirectSlotReceiverState<'_, E> as *mut c_void,
+        }
+    }
+}
+
+unsafe extern "C-unwind" fn direct_receive_slot<E>(
+    slot: *mut pg_sys::TupleTableSlot,
+    receiver: *mut pg_sys::DestReceiver,
+) -> bool
+where
+    E: From<ScanError> + 'static,
+{
+    let receiver = unsafe { &mut *(receiver.cast::<DirectSlotDestReceiver>()) };
+    let state = unsafe { &mut *(receiver.state.cast::<DirectSlotReceiverState<'static, E>>()) };
+
+    if state.error.is_some() {
+        return false;
+    }
+
+    let result = catch_unwind(AssertUnwindSafe(|| (state.consume_slot)(slot)));
+    match result {
+        Ok(Ok(SlotSinkAction::Continue)) => {
+            state.rows_consumed += 1;
+            true
+        }
+        Ok(Ok(SlotSinkAction::Stop)) => {
+            state.rows_consumed += 1;
+            state.stopped = true;
+            false
+        }
+        Ok(Err(error)) => {
+            state.error = Some(error);
+            false
+        }
+        Err(_) => {
+            state.error =
+                Some(ScanError::Postgres("slot receiver callback panicked".into()).into());
+            false
+        }
+    }
+}
+
+unsafe extern "C-unwind" fn direct_receiver_startup(
+    _receiver: *mut pg_sys::DestReceiver,
+    _operation: std::ffi::c_int,
+    _typeinfo: pg_sys::TupleDesc,
+) {
+}
+
+unsafe extern "C-unwind" fn direct_receiver_shutdown(_receiver: *mut pg_sys::DestReceiver) {}
+
+unsafe extern "C-unwind" fn direct_receiver_destroy(_receiver: *mut pg_sys::DestReceiver) {}
 
 struct SinkAbortGuard {
     ctx: *mut SlotSinkContext,
@@ -77,7 +177,6 @@ impl PreparedScan {
     ) -> Result<StreamingScanSession, ScanError> {
         let fetch_batch_rows = normalize_fetch_batch_rows(fetch_batch_rows);
         let portal = Cell::new(std::ptr::null_mut());
-        let slot = Cell::new(std::ptr::null_mut());
         let success = Cell::new(false);
         let previous_context = Cell::new(std::ptr::null_mut());
 
@@ -107,25 +206,12 @@ impl PreparedScan {
                 return Err(ScanError::MissingTupleDesc);
             }
 
-            slot.set(pg_sys::MakeSingleTupleTableSlot(
-                tuple_desc,
-                std::ptr::addr_of!(pg_sys::TTSOpsHeapTuple),
-            ));
-            if slot.get().is_null() {
-                return Err(ScanError::MissingTupleDesc);
-            }
-
             success.set(true);
             Ok(StreamingScanSession {
                 prepared: self.clone(),
                 _spi: spi.clone(),
                 portal: portal.get(),
-                slot: slot.get(),
                 fetch_batch_rows,
-                batch: std::ptr::null_mut(),
-                batch_processed: 0,
-                batch_index: 0,
-                row_loaded: false,
                 tuple_desc,
                 rows_seen: 0,
                 remaining: self.options.local_row_cap.unwrap_or(usize::MAX),
@@ -137,16 +223,9 @@ impl PreparedScan {
         }))
         .catch_others(|error| Err(scan_error_from_caught_error(error)))
         .finally(|| unsafe {
-            if !success.get() {
-                if !slot.get().is_null() {
-                    clear_slot(slot.get());
-                    pg_sys::ExecDropSingleTupleTableSlot(slot.get());
-                    slot.set(std::ptr::null_mut());
-                }
-                if !portal.get().is_null() {
-                    pg_sys::SPI_cursor_close(portal.get());
-                    portal.set(std::ptr::null_mut());
-                }
+            if !success.get() && !portal.get().is_null() {
+                pg_sys::SPI_cursor_close(portal.get());
+                portal.set(std::ptr::null_mut());
             }
             restore_current_memory_context(previous_context.get());
         })
@@ -175,20 +254,23 @@ impl PreparedScan {
         );
         let mut abort_guard = SinkAbortGuard::new(&mut ctx, sink.methods, sink.private);
 
-        let result = (|| -> Result<ScanStats, ScanError> {
+        (|| -> Result<ScanStats, ScanError> {
             if let Some(init) = sink.methods.init {
                 call_sink_callback(|| unsafe {
                     init(&mut ctx, sink.private, session.tuple_desc())
                 })?;
             }
 
-            while let Some(slot) = session.current_slot()? {
-                let action = call_sink_callback(|| unsafe {
-                    (sink.methods.consume_slot)(&mut ctx, sink.private, slot)
+            loop {
+                let drain = session.drain_slots::<ScanError>(DEFAULT_FETCH_BATCH_ROWS, |slot| {
+                    let action = call_sink_callback(|| unsafe {
+                        (sink.methods.consume_slot)(&mut ctx, sink.private, slot)
+                    })?;
+                    ctx.bump_rows();
+                    Ok::<SlotSinkAction, ScanError>(action)
                 })?;
-                session.consume_current_row()?;
-                ctx.bump_rows();
-                if action == SlotSinkAction::Stop {
+
+                if drain.eof || drain.stopped {
                     break;
                 }
             }
@@ -200,62 +282,79 @@ impl PreparedScan {
             let stats = session.close()?;
             abort_guard.disarm();
             Ok(stats)
-        })();
-
-        result
+        })()
     }
 }
 
 impl StreamingScanSession {
     #[doc(hidden)]
-    pub fn current_slot(&mut self) -> Result<Option<*mut pg_sys::TupleTableSlot>, ScanError> {
+    pub fn drain_slots<E>(
+        &mut self,
+        row_budget: usize,
+        mut consume_slot: impl FnMut(*mut pg_sys::TupleTableSlot) -> Result<SlotSinkAction, E>,
+    ) -> Result<SlotDrainResult, E>
+    where
+        E: From<ScanError> + 'static,
+    {
         if self.closed {
-            return Err(ScanError::CursorClosed);
+            return Err(ScanError::CursorClosed.into());
         }
 
         if self.remaining == 0 {
-            self.release_current_row();
-            self.release_batch();
-            return Ok(None);
+            return Ok(SlotDrainResult {
+                rows_consumed: 0,
+                eof: true,
+                stopped: false,
+            });
         }
 
-        if self.row_loaded {
-            return Ok(Some(self.slot));
-        }
-
-        loop {
-            if self.batch_index < self.batch_processed {
-                self.load_current_row()?;
-                return Ok(Some(self.slot));
-            }
-
-            self.release_batch();
-            self.fetch_next_batch()?;
-            if self.batch_processed == 0 {
-                return Ok(None);
-            }
-        }
-    }
-
-    #[doc(hidden)]
-    pub fn consume_current_row(&mut self) -> Result<(), ScanError> {
-        if self.closed {
-            return Err(ScanError::CursorClosed);
-        }
-        if !self.row_loaded {
+        if row_budget == 0 {
             return Err(ScanError::Postgres(
-                "attempted to consume a scan row when no row was loaded".into(),
-            ));
+                "slot drain row budget must be greater than zero".into(),
+            )
+            .into());
         }
 
-        self.release_current_row();
-        self.rows_seen += 1;
-        self.remaining = self.remaining.saturating_sub(1);
-        self.batch_index += 1;
-        if self.batch_index >= self.batch_processed {
-            self.release_batch();
+        let fetch_rows = cursor_fetch_rows(self.fetch_batch_rows, row_budget, self.remaining);
+
+        let mut state = DirectSlotReceiverState::new(&mut consume_slot);
+        let mut receiver = DirectSlotDestReceiver::new(&mut state);
+        let portal_processed = Cell::new(0u64);
+        let previous_context = Cell::new(std::ptr::null_mut());
+
+        let result = PgTryBuilder::new(AssertUnwindSafe(|| unsafe {
+            previous_context.set(pg_sys::CurrentMemoryContext);
+            let processed = pg_sys::PortalRunFetch(
+                self.portal,
+                pg_sys::FetchDirection::FETCH_FORWARD,
+                fetch_rows,
+                std::ptr::addr_of_mut!(receiver.dest),
+            );
+            portal_processed.set(processed);
+            Ok(())
+        }))
+        .catch_others(|error| Err(scan_error_from_caught_error(error)))
+        .finally(|| unsafe {
+            restore_current_memory_context(previous_context.get());
+        })
+        .execute()
+        .map_err(E::from);
+
+        self.rows_seen += state.rows_consumed;
+        self.remaining = self.remaining.saturating_sub(state.rows_consumed);
+
+        result?;
+        if let Some(error) = state.error {
+            return Err(error);
         }
-        Ok(())
+
+        let eof =
+            !state.stopped && (self.remaining == 0 || portal_processed.get() < fetch_rows as u64);
+        Ok(SlotDrainResult {
+            rows_consumed: state.rows_consumed,
+            eof,
+            stopped: state.stopped,
+        })
     }
 
     /// Closes the session, releases PostgreSQL resources, and returns the final
@@ -277,96 +376,17 @@ impl StreamingScanSession {
         }
     }
 
-    fn fetch_next_batch(&mut self) -> Result<(), ScanError> {
-        let fetch_rows = cursor_fetch_rows(self.fetch_batch_rows, self.remaining);
-        if fetch_rows == 0 {
-            self.batch = std::ptr::null_mut();
-            self.batch_processed = 0;
-            self.batch_index = 0;
-            self.row_loaded = false;
-            return Ok(());
-        }
-        let processed = Cell::new(0usize);
-        let batch_ptr = Cell::new(std::ptr::null_mut());
-        let previous_context = Cell::new(std::ptr::null_mut());
-        PgTryBuilder::new(AssertUnwindSafe(|| unsafe {
-            previous_context.set(pg_sys::CurrentMemoryContext);
-            pg_sys::SPI_cursor_fetch(self.portal, true, fetch_rows);
-            batch_ptr.set(pg_sys::SPI_tuptable);
-            processed.set(pg_sys::SPI_processed as usize);
-            Ok(())
-        }))
-        .catch_others(|error| Err(scan_error_from_caught_error(error)))
-        .finally(|| unsafe {
-            restore_current_memory_context(previous_context.get());
-        })
-        .execute()?;
-        self.batch = batch_ptr.get();
-        self.batch_processed = processed.get();
-        self.batch_index = 0;
-        self.row_loaded = false;
-        Ok(())
-    }
-
-    fn load_current_row(&mut self) -> Result<(), ScanError> {
-        debug_assert!(self.batch_index < self.batch_processed);
-        PgTryBuilder::new(AssertUnwindSafe(|| unsafe {
-            let tuple = *(*self.batch).vals.add(self.batch_index);
-            clear_slot(self.slot);
-            pg_sys::ExecStoreHeapTuple(tuple, self.slot, false);
-            Ok(())
-        }))
-        .catch_others(|error| Err(scan_error_from_caught_error(error)))
-        .execute()?;
-        self.row_loaded = true;
-        Ok(())
-    }
-
-    fn release_current_row(&mut self) {
-        unsafe {
-            clear_slot(self.slot);
-        }
-        self.row_loaded = false;
-    }
-
-    fn release_batch(&mut self) {
-        if !self.batch.is_null() {
-            unsafe {
-                let previous_context = pg_sys::CurrentMemoryContext;
-                pg_sys::SPI_freetuptable(self.batch);
-                restore_current_memory_context(previous_context);
-            }
-        }
-        self.batch = std::ptr::null_mut();
-        self.batch_processed = 0;
-        self.batch_index = 0;
-    }
-
     fn close_inner(&mut self) -> Result<(), ScanError> {
         if self.closed {
             return Ok(());
         }
 
         let portal = std::mem::replace(&mut self.portal, std::ptr::null_mut());
-        let slot = std::mem::replace(&mut self.slot, std::ptr::null_mut());
-        let batch = std::mem::replace(&mut self.batch, std::ptr::null_mut());
-        self.batch_processed = 0;
-        self.batch_index = 0;
-        self.row_loaded = false;
         self.tuple_desc = std::ptr::null_mut();
 
         let previous_context = Cell::new(std::ptr::null_mut());
         let result = PgTryBuilder::new(AssertUnwindSafe(|| unsafe {
             previous_context.set(pg_sys::CurrentMemoryContext);
-            if !slot.is_null() {
-                clear_slot(slot);
-            }
-            if !batch.is_null() {
-                pg_sys::SPI_freetuptable(batch);
-            }
-            if !slot.is_null() {
-                pg_sys::ExecDropSingleTupleTableSlot(slot);
-            }
             if !portal.is_null() {
                 pg_sys::SPI_cursor_close(portal);
             }
@@ -436,15 +456,6 @@ impl ExecutionSpiContext {
     }
 }
 
-unsafe fn clear_slot(slot: *mut pg_sys::TupleTableSlot) {
-    if slot.is_null() {
-        return;
-    }
-    if let Some(clear) = (*(*slot).tts_ops).clear {
-        clear(slot);
-    }
-}
-
 unsafe fn restore_current_memory_context(previous_context: pg_sys::MemoryContext) {
     if !previous_context.is_null() {
         pg_sys::MemoryContextSwitchTo(previous_context);
@@ -476,24 +487,38 @@ mod tests {
 
     #[test]
     fn cursor_fetch_rows_uses_configured_batch_size_and_remaining_budget() {
-        assert_eq!(cursor_fetch_rows(1, 0), 0 as std::ffi::c_long);
-        assert_eq!(cursor_fetch_rows(1, 1), 1 as std::ffi::c_long);
-        assert_eq!(cursor_fetch_rows(2, 1), 1 as std::ffi::c_long);
-        assert_eq!(cursor_fetch_rows(2, 7), 2 as std::ffi::c_long);
+        assert_eq!(cursor_fetch_rows(1, 1, 0), 0 as std::ffi::c_long);
+        assert_eq!(cursor_fetch_rows(1, 1, 1), 1 as std::ffi::c_long);
+        assert_eq!(cursor_fetch_rows(2, 2, 1), 1 as std::ffi::c_long);
+        assert_eq!(cursor_fetch_rows(2, 7, 7), 2 as std::ffi::c_long);
+        assert_eq!(cursor_fetch_rows(8, 3, 7), 3 as std::ffi::c_long);
+        assert_eq!(cursor_fetch_rows(8, 7, 3), 3 as std::ffi::c_long);
         assert_eq!(
-            cursor_fetch_rows(DEFAULT_FETCH_BATCH_ROWS - 1, DEFAULT_FETCH_BATCH_ROWS),
+            cursor_fetch_rows(
+                DEFAULT_FETCH_BATCH_ROWS - 1,
+                DEFAULT_FETCH_BATCH_ROWS,
+                DEFAULT_FETCH_BATCH_ROWS
+            ),
             (DEFAULT_FETCH_BATCH_ROWS - 1) as std::ffi::c_long
         );
         assert_eq!(
-            cursor_fetch_rows(DEFAULT_FETCH_BATCH_ROWS, DEFAULT_FETCH_BATCH_ROWS),
+            cursor_fetch_rows(
+                DEFAULT_FETCH_BATCH_ROWS,
+                DEFAULT_FETCH_BATCH_ROWS,
+                DEFAULT_FETCH_BATCH_ROWS
+            ),
             DEFAULT_FETCH_BATCH_ROWS as std::ffi::c_long
         );
         assert_eq!(
-            cursor_fetch_rows(DEFAULT_FETCH_BATCH_ROWS, DEFAULT_FETCH_BATCH_ROWS + 1),
+            cursor_fetch_rows(
+                DEFAULT_FETCH_BATCH_ROWS,
+                DEFAULT_FETCH_BATCH_ROWS + 1,
+                DEFAULT_FETCH_BATCH_ROWS + 1
+            ),
             DEFAULT_FETCH_BATCH_ROWS as std::ffi::c_long
         );
         assert_eq!(
-            cursor_fetch_rows(DEFAULT_FETCH_BATCH_ROWS, usize::MAX),
+            cursor_fetch_rows(DEFAULT_FETCH_BATCH_ROWS, usize::MAX, usize::MAX),
             DEFAULT_FETCH_BATCH_ROWS as std::ffi::c_long
         );
     }

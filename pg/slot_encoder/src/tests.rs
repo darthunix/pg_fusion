@@ -547,6 +547,36 @@ fn append_slot_reads_fixed_width_and_name_values() {
 #[test]
 fn append_slot_rejects_mismatched_tuple_desc() {
     let specs = [ColumnSpec::new(TypeTag::Boolean, true)];
+    let encoder_attrs = [TestAttr {
+        oid: pg_sys::BOOLOID,
+        attlen: 1,
+        attbyval: true,
+        attalign: b'c',
+    }];
+    let slot_attrs = [TestAttr {
+        oid: pg_sys::INT4OID,
+        attlen: 4,
+        attbyval: true,
+        attalign: b'i',
+    }];
+    let encoder_desc = OwnedTupleDesc::new(&encoder_attrs);
+    let slot_desc = OwnedTupleDesc::new(&slot_attrs);
+    let values = vec![pg_sys::Datum::from(true)];
+    let isnull = vec![false];
+    let mut slot = OwnedSlot::new(slot_desc.ptr, values, isnull);
+
+    let mut payload = init_payload(&specs, 2, 256);
+    let mut encoder =
+        unsafe { PageBatchEncoder::new(encoder_desc.ptr, &mut payload) }.expect("encoder");
+    let error = encoder
+        .append_slot(slot.as_mut_ptr())
+        .expect_err("mismatch");
+    assert!(matches!(error, EncodeError::SlotTupleDescMismatch));
+}
+
+#[test]
+fn append_slot_accepts_equivalent_tuple_desc_pointer() {
+    let specs = [ColumnSpec::new(TypeTag::Boolean, true)];
     let attrs = [TestAttr {
         oid: pg_sys::BOOLOID,
         attlen: 1,
@@ -562,10 +592,12 @@ fn append_slot_rejects_mismatched_tuple_desc() {
     let mut payload = init_payload(&specs, 2, 256);
     let mut encoder =
         unsafe { PageBatchEncoder::new(encoder_desc.ptr, &mut payload) }.expect("encoder");
-    let error = encoder
-        .append_slot(slot.as_mut_ptr())
-        .expect_err("mismatch");
-    assert!(matches!(error, EncodeError::SlotTupleDescMismatch));
+    assert_eq!(
+        encoder
+            .append_slot(slot.as_mut_ptr())
+            .expect("equivalent desc"),
+        AppendStatus::Appended
+    );
 }
 
 #[test]

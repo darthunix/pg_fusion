@@ -17,9 +17,12 @@ It owns the backend-local execution lifecycle:
 `backend_service` uses a stackful scan-streaming contract for the hot path:
 
 - one backend scan session keeps a PostgreSQL portal, one `SPI_connect()` frame,
-  and the current fetched batch alive until that scan reaches a terminal state
+  and a direct `DestReceiver` alive while it drains portal rows into pages
 - rows are encoded straight from PostgreSQL slots into `slot_encoder` pages
-  without per-row materialization into retry buffers
+  without per-row SPI tuptable materialization; only the rare row that crosses
+  an Arrow page boundary is copied into a retry tuple
+- page boundaries are enforced by the row budget passed to `PortalRunFetch()`;
+  the backend does not use `receiveSlot = false` as a resumable pause signal
 - lower layers such as `issuance` and `scan_flow` remain non-blocking; when
   page permits are exhausted the scan driver yields explicit control back to
   the host loop with `ScanStreamStep::YieldForControl { PermitBackpressure }`
@@ -31,10 +34,13 @@ not interleave unrelated SPI or planning work in the same backend process.
 `BackendServiceConfig` also exposes a backend-local tuning knob for scan
 streaming:
 
-- `scan_fetch_batch_rows` controls how many rows one stackful `slot_scan`
-  session asks PostgreSQL to fetch per cursor batch
+- `scan_fetch_batch_rows` controls the row budget for one direct
+  `PortalRunFetch()` drain from PostgreSQL into the slot encoder
 - the default is `1024`
 - `0` is normalized to `1`
+- scans with variable-width transport columns use one-row drains so an
+  overflowing row can be copied into the next page without losing the portal
+  position
 - public `slot_scan::ScanOptions` stay unchanged; this knob only affects the
   internal backend-service streaming path
 

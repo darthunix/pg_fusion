@@ -47,6 +47,7 @@ pub struct PageBatchEncoder<'payload> {
     block_ptr: *mut u8,
     descs_ptr: *mut ColumnDesc,
     header: BlockHeader,
+    accepted_slot_desc: Option<pg_sys::TupleDesc>,
 }
 
 impl<'payload> PageBatchEncoder<'payload> {
@@ -113,6 +114,7 @@ impl<'payload> PageBatchEncoder<'payload> {
             block_ptr,
             descs_ptr,
             header,
+            accepted_slot_desc: None,
         })
     }
 
@@ -142,9 +144,7 @@ impl<'payload> PageBatchEncoder<'payload> {
         if actual_tuple_desc.is_null() {
             return Err(EncodeError::NullSlotTupleDesc);
         }
-        if actual_tuple_desc != self.tuple_desc {
-            return Err(EncodeError::SlotTupleDescMismatch);
-        }
+        self.validate_slot_tuple_desc(actual_tuple_desc)?;
 
         let row_idx = self.header.row_count;
         if row_idx >= self.header.max_rows {
@@ -199,6 +199,38 @@ impl<'payload> PageBatchEncoder<'payload> {
 
         self.header.row_count = row_idx + 1;
         Ok(AppendStatus::Appended)
+    }
+
+    fn validate_slot_tuple_desc(
+        &mut self,
+        actual_tuple_desc: pg_sys::TupleDesc,
+    ) -> Result<(), EncodeError> {
+        if actual_tuple_desc == self.tuple_desc
+            || self.accepted_slot_desc == Some(actual_tuple_desc)
+        {
+            return Ok(());
+        }
+
+        let actual_cols = unsafe { (*actual_tuple_desc).natts as usize };
+        if actual_cols != self.col_count {
+            return Err(EncodeError::SlotTupleDescMismatch);
+        }
+
+        let actual_attrs_ptr = unsafe { (*actual_tuple_desc).attrs.as_mut_ptr() };
+        for index in 0..self.col_count {
+            let expected = unsafe { &*self.attrs_ptr.add(index) };
+            let actual = unsafe { &*actual_attrs_ptr.add(index) };
+            if actual.attisdropped
+                || actual.atttypid != expected.atttypid
+                || actual.attlen != expected.attlen
+                || actual.attbyval != expected.attbyval
+            {
+                return Err(EncodeError::SlotTupleDescMismatch);
+            }
+        }
+
+        self.accepted_slot_desc = Some(actual_tuple_desc);
+        Ok(())
     }
 
     /// Finalizes the block and returns the written row count and payload length.

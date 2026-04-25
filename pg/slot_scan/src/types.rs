@@ -132,6 +132,18 @@ pub struct ScanStats {
     pub plan_kind: ScanPlanKind,
 }
 
+/// Result of draining one direct portal fetch into a slot callback.
+#[doc(hidden)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SlotDrainResult {
+    /// Rows consumed from the PostgreSQL portal during this drain call.
+    pub rows_consumed: usize,
+    /// Whether the portal reached EOF, including a configured local row cap.
+    pub eof: bool,
+    /// Whether the caller callback requested an early stop.
+    pub stopped: bool,
+}
+
 /// Result of one sink row callback.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SlotSinkAction {
@@ -459,22 +471,18 @@ fn diagnostic_current_memory_context() -> pg_sys::MemoryContext {
 /// Internal stackful scan session used by backend-side page streaming.
 ///
 /// This type is intentionally hidden from normal crate docs. It is not a
-/// durable resumable cursor: it keeps one portal and the current fetched batch
-/// alive across calls, and it relies on an execution-scoped SPI connection
-/// remaining active for the lifetime of the session. Callers must not
-/// interleave other SPI or planning work while such sessions are active.
+/// durable resumable cursor: it keeps one portal alive across calls and drains
+/// it through a direct `DestReceiver` callback. It relies on an
+/// execution-scoped SPI connection remaining active for the lifetime of the
+/// session. Callers must not interleave other SPI or planning work while such
+/// sessions are active.
 #[doc(hidden)]
 #[derive(Debug)]
 pub struct StreamingScanSession {
     pub(crate) prepared: PreparedScan,
     pub(crate) _spi: ExecutionSpiContext,
     pub(crate) portal: pg_sys::Portal,
-    pub(crate) slot: *mut pg_sys::TupleTableSlot,
     pub(crate) fetch_batch_rows: usize,
-    pub(crate) batch: *mut pg_sys::SPITupleTable,
-    pub(crate) batch_processed: usize,
-    pub(crate) batch_index: usize,
-    pub(crate) row_loaded: bool,
     pub(crate) tuple_desc: pg_sys::TupleDesc,
     pub(crate) rows_seen: usize,
     pub(crate) remaining: usize,

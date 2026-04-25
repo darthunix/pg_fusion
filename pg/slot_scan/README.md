@@ -44,11 +44,13 @@ uses the same cursor-planning flags and validation path, then renders
 PostgreSQL's plan tree without opening the scan cursor.
 
 `run()` opens a read-only SPI cursor, revalidates the saved plan, reads the
-current `TupleDesc` from the opened portal, and then invokes the sink.
-Every sink callback runs behind a PostgreSQL exception boundary, so callback-
-side PostgreSQL errors and panics surface as ordinary `ScanError` values.
-If `run()` exits unsuccessfully after sink construction, `abort` is invoked
-best-effort exactly once.
+current `TupleDesc` from the opened portal, and drains rows with a custom
+`DestReceiver` over `PortalRunFetch()`. PostgreSQL executor slots are delivered
+directly to the sink; `slot_scan` does not materialize an intermediate SPI
+tuptable in the row path. Every sink callback runs behind a PostgreSQL
+exception boundary, so callback-side PostgreSQL errors and panics surface as
+ordinary `ScanError` values. If `run()` exits unsuccessfully after sink
+construction, `abort` is invoked best-effort exactly once.
 
 The important contract boundary is:
 
@@ -151,7 +153,8 @@ Important callback rules:
 - `SlotSink::from_raw(...)` is `unsafe` and should only be used when the caller
   can uphold the raw-pointer lifetime and type contract manually
 - return `SlotSinkAction::Stop` from `consume_slot` to stop the local scan loop
-  early
+  early; this is a terminal early stop for the current public run, not a
+  resumable page-boundary signal
 
 ## Important Semantics
 
@@ -180,10 +183,13 @@ crate. That path is intentionally not part of the public contract:
 
 - it keeps one execution-scoped `SPI_connect()` frame alive and may switch
   between multiple open portals inside that shared SPI context
-- each open portal keeps its own current fetched batch alive across
-  page-building steps
+- each open portal is drained through a custom `DestReceiver` that receives
+  executor `TupleTableSlot`s directly, without building `SPITupleTable` batches
+- each drain is bounded by an explicit row budget passed to `PortalRunFetch()`;
+  hidden callers that need page boundaries should use that budget instead of
+  returning `SlotSinkAction::Stop`
 - it exists to minimize PostgreSQL calls, `palloc` churn, and row copies when
-  streaming directly from PostgreSQL slots into `slot_encoder`
+  streaming from PostgreSQL slots into `slot_encoder`
 - callers must not interleave other SPI or planning work while such a session
   is active
 

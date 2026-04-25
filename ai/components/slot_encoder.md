@@ -20,6 +20,9 @@ importance: 0.72
   - encoder writes fixed-width values, validity bits, `ByteView` slots, and long view payload bytes directly into the target block
   - local `row_count` and tail cursor are staged in the encoder and flushed back to the block header at `finish()`
   - `append_slot` uses a slot-specific fast path over `tts_values` / `tts_isnull`
+  - executor slots may carry an equivalent but different `TupleDesc` pointer;
+    the encoder validates structural compatibility once per page before using
+    its planned output descriptor for type-specific writes
   - it calls `slot_getsomeattrs_int` when the slot is not yet sufficiently deformed
   - projected text-like and binary varlena values may be detoasted through `pg_detoast_datum_packed`
   - packed `varlena` parsing depends on PostgreSQL `varatt.h` header macros (`VARATT_IS_1B`, `VARATT_IS_1B_E`, `VARATT_IS_4B_C`, `VARSIZE_1B`, `VARSIZE_4B`)

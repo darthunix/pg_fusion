@@ -37,8 +37,9 @@ page-backed Arrow batches.
 1. Backend planning resolves PostgreSQL catalog metadata and lowers scan leaves
    to `PgScanNode`/`scan_sql` descriptors.
 2. Worker DataFusion execution opens scans through the runtime protocol.
-3. Backend executes trusted scan SQL through `slot_scan`, encodes
-   `TupleTableSlot` rows into initialized `arrow_layout` pages with
+3. Backend executes trusted scan SQL through `slot_scan`, drains PostgreSQL
+   executor slots with a custom `DestReceiver` and explicit fetch row budgets,
+   encodes `TupleTableSlot` rows into initialized `arrow_layout` pages with
    `slot_encoder`, and sends issued pages to the worker.
 4. Worker imports scan pages as Arrow `RecordBatch` values, runs DataFusion
    operators, writes Arrow result pages, and sends issued frames back.

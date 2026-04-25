@@ -60,6 +60,15 @@ fn smoke_transaction(client: &mut Client) -> Transaction<'_> {
     tx
 }
 
+fn batch_execute_pg_fusion_disabled(tx: &mut Transaction<'_>, sql: &str) {
+    tx.batch_execute("SET LOCAL pg_fusion.enable = off")
+        .expect("disable pg_fusion during fixture setup");
+    tx.batch_execute(sql)
+        .expect("fixture setup with pg_fusion disabled must succeed");
+    tx.batch_execute("SET LOCAL pg_fusion.enable = on")
+        .expect("re-enable pg_fusion after fixture setup");
+}
+
 fn simple_query_first_column_client(client: &mut Client, sql: &str) -> Option<String> {
     client
         .simple_query(sql)
@@ -174,6 +183,54 @@ pub(crate) fn heap_select_filtered_row_smoke() {
     .parse()
     .expect("filtered heap select must return one bigint value");
     assert_eq!(id, 3);
+}
+
+pub(crate) fn heap_avg_full_scan_smoke() {
+    let mut client = smoke_client();
+    let mut tx = smoke_transaction(&mut client);
+    let table_name = "pg_temp.pgf_heap_avg_full_scan_smoke";
+    batch_execute_pg_fusion_disabled(
+        &mut tx,
+        &format!(
+            "CREATE TEMP TABLE {table_name} AS \
+         SELECT generate_series(1, 50000)::bigint AS a"
+        ),
+    );
+
+    let avg: f64 =
+        simple_query_first_column_tx(&mut tx, &format!("SELECT avg(a) FROM {table_name}"))
+            .expect("heap avg full scan must return one row")
+            .parse()
+            .expect("heap avg full scan must return a numeric value");
+    assert!(
+        (avg - 25000.5).abs() < 0.001,
+        "heap avg full scan returned {avg}, expected 25000.5"
+    );
+}
+
+pub(crate) fn heap_varlena_full_scan_smoke() {
+    let mut client = smoke_client();
+    let mut tx = smoke_transaction(&mut client);
+    let table_name = "pg_temp.pgf_heap_varlena_full_scan_smoke";
+    batch_execute_pg_fusion_disabled(
+        &mut tx,
+        &format!(
+            "\
+        CREATE TEMP TABLE {table_name} AS
+        SELECT
+            g::bigint AS id,
+            repeat(md5(g::text), 16) AS payload
+        FROM generate_series(1, 5000) AS g
+        "
+        ),
+    );
+
+    let summary = simple_query_first_column_tx(
+        &mut tx,
+        &format!("SELECT concat(count(payload), ',', sum(id)) FROM {table_name}"),
+    )
+    .expect("heap varlena full scan must return one row");
+    assert_eq!(summary, "5000,12502500");
 }
 
 pub(crate) fn heap_join_two_tables_smoke() {

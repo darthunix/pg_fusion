@@ -57,4 +57,4 @@ pub use types::{
     ScanPlanKind, ScanStats, SlotSink, SlotSinkAction, SlotSinkContext, SlotSinkMethods,
 };
 #[doc(hidden)]
-pub use types::{ExecutionSpiContext, StreamingScanSession};
+pub use types::{ExecutionSpiContext, SlotDrainResult, StreamingScanSession};
