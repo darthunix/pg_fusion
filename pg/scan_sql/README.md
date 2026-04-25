@@ -78,6 +78,10 @@ For the intended `scan_sql -> slot_scan` path, use
 `slot_scan::ScanOptions.planner_fetch_hint` and
 `slot_scan::ScanOptions.local_row_cap`.
 
+Runtimes that can apply projection after receiving PostgreSQL slots may call
+`render_unprojected_scan_sql(...)` to reuse the same pushed filters and
+SQL-level limit while rendering `SELECT *`.
+
 ## Pushdown rules
 
 The compiler is whitelist-based. It currently supports:

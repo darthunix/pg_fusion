@@ -38,8 +38,12 @@ Workspace targets Rust 1.89.
 
 ```sh
 cargo check --workspace
-cargo test --workspace
+cargo test --workspace --exclude backend_service
 ```
+
+`backend_service` is intentionally excluded from standalone `cargo test`:
+through `slot_scan` it references PostgreSQL SPI symbols that only exist inside
+a PostgreSQL backend. Its regression coverage lives in the pgrx test crate.
 
 Build only the PostgreSQL extension crate:
 

@@ -89,6 +89,28 @@ fn compiles_sql_limit_when_requested() {
 }
 
 #[test]
+fn renders_unprojected_scan_sql_with_same_filters_and_sql_limit() {
+    let schema = test_schema();
+    let filters = vec![Expr::Column(Column::from_name("id")).gt(lit(10_i64))];
+
+    let compiled = compile_scan(CompileScanInput {
+        relation: &test_relation(),
+        schema: &schema,
+        identifier_max_bytes: TEST_IDENTIFIER_MAX_BYTES,
+        projection: Some(&[1]),
+        filters: &filters,
+        requested_limit: Some(7),
+        limit_lowering: LimitLowering::SqlClause,
+    })
+    .unwrap();
+
+    assert_eq!(
+        render_unprojected_scan_sql(&test_relation(), &compiled),
+        "SELECT * FROM \"public\".\"users\" WHERE (\"id\" > 10) LIMIT 7"
+    );
+}
+
+#[test]
 fn computes_filter_only_columns() {
     let schema = test_schema();
     let filters = vec![Expr::Column(Column::from_name("score")).gt(lit(1.5_f64))];

@@ -12,6 +12,7 @@ pub(crate) struct SlotScanPageSource {
     spi: ExecutionSpiContext,
     prepared: PreparedScan,
     schema: SchemaRef,
+    source_projection: Vec<usize>,
     block_size: u32,
     fetch_batch_rows: usize,
     single_row_drains: bool,
@@ -27,6 +28,7 @@ impl SlotScanPageSource {
         spi: ExecutionSpiContext,
         prepared: PreparedScan,
         schema: SchemaRef,
+        source_projection: Vec<usize>,
         block_size: u32,
         fetch_batch_rows: usize,
         estimator: PageRowEstimator,
@@ -37,6 +39,7 @@ impl SlotScanPageSource {
             spi,
             prepared,
             schema,
+            source_projection,
             block_size,
             fetch_batch_rows,
             single_row_drains,
@@ -74,7 +77,13 @@ impl SlotScanPageSource {
             }
             init_block(payload, &layout)?;
 
-            let mut encoder = unsafe { PageBatchEncoder::new(session.tuple_desc(), payload) }?;
+            let mut encoder = unsafe {
+                PageBatchEncoder::new_projected(
+                    session.tuple_desc(),
+                    &self.source_projection,
+                    payload,
+                )
+            }?;
             let mut rows_written = 0usize;
 
             if !self.pending_overflow.is_null() {

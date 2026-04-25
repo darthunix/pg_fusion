@@ -1,5 +1,5 @@
-use crate::{
-    scan_descriptor_matches, BackendExecutionState, BackendService, BackendServiceConfig,
+use backend_service::{
+    scan_descriptor_matches_for_tests, BackendExecutionState, BackendService, BackendServiceConfig,
     BackendServiceError, ExplainInput,
 };
 use datafusion_expr::logical_plan::{EmptyRelation, LogicalPlan};
@@ -113,11 +113,10 @@ fn assert_scan_descriptor_match(
         panic!("expected open scan message");
     };
 
-    assert_eq!(scan_descriptor_matches(canonical, scan), expected);
+    assert_eq!(scan_descriptor_matches_for_tests(canonical, scan), expected);
 }
 
-#[test]
-fn future_session_is_rejected_without_active_execution() {
+pub fn future_session_is_rejected_without_active_execution() {
     BackendService::reset_for_tests();
 
     let err = BackendService::accept_complete_execution(7, 1).unwrap_err();
@@ -130,8 +129,7 @@ fn future_session_is_rejected_without_active_execution() {
     ));
 }
 
-#[test]
-fn stale_session_is_ignored_for_active_execution() {
+pub fn stale_session_is_ignored_for_active_execution() {
     BackendService::reset_for_tests();
     BackendService::install_fake_execution_for_tests(3, 5, BackendExecutionState::Running);
 
@@ -140,8 +138,7 @@ fn stale_session_is_ignored_for_active_execution() {
     assert_eq!(BackendService::current_session_epoch_for_tests(), 5);
 }
 
-#[test]
-fn same_epoch_other_slot_is_ignored() {
+pub fn same_epoch_other_slot_is_ignored() {
     BackendService::reset_for_tests();
     BackendService::install_fake_execution_for_tests(3, 5, BackendExecutionState::Running);
 
@@ -150,8 +147,7 @@ fn same_epoch_other_slot_is_ignored() {
     assert_eq!(BackendService::current_session_epoch_for_tests(), 5);
 }
 
-#[test]
-fn fail_execution_is_accepted_while_starting() {
+pub fn fail_execution_is_accepted_while_starting() {
     BackendService::reset_for_tests();
     BackendService::install_fake_execution_for_tests(3, 5, BackendExecutionState::Starting);
 
@@ -163,8 +159,7 @@ fn fail_execution_is_accepted_while_starting() {
     assert!(!BackendService::accept_complete_execution(3, 5).unwrap());
 }
 
-#[test]
-fn cancel_execution_is_accepted_while_starting() {
+pub fn cancel_execution_is_accepted_while_starting() {
     BackendService::reset_for_tests();
     BackendService::install_fake_execution_for_tests(3, 5, BackendExecutionState::Starting);
 
@@ -174,8 +169,7 @@ fn cancel_execution_is_accepted_while_starting() {
     assert!(!BackendService::accept_complete_execution(3, 5).unwrap());
 }
 
-#[test]
-fn render_explain_is_rejected_while_execution_is_active() {
+pub fn render_explain_is_rejected_while_execution_is_active() {
     BackendService::reset_for_tests();
     BackendService::install_fake_execution_for_tests(3, 5, BackendExecutionState::Running);
 
@@ -189,8 +183,7 @@ fn render_explain_is_rejected_while_execution_is_active() {
     assert!(matches!(err, BackendServiceError::ExecutionAlreadyActive));
 }
 
-#[test]
-fn finalize_execution_start_error_preserves_starting_runtime() {
+pub fn finalize_execution_start_error_preserves_starting_runtime() {
     BackendService::reset_for_tests();
 
     let (_page_region, _issuance_region, plan_role) = opened_plan_role_for_tests(5);
@@ -212,8 +205,7 @@ fn finalize_execution_start_error_preserves_starting_runtime() {
     assert!(!BackendService::accept_complete_execution(3, 5).unwrap());
 }
 
-#[test]
-fn scan_descriptor_matches_accepts_exact_ordered_match() {
+pub fn scan_descriptor_matches_accepts_exact_ordered_match() {
     let canonical = canonical_scan_open();
 
     assert_scan_descriptor_match(
@@ -234,8 +226,7 @@ fn scan_descriptor_matches_accepts_exact_ordered_match() {
     );
 }
 
-#[test]
-fn scan_descriptor_matches_rejects_page_kind_mismatch() {
+pub fn scan_descriptor_matches_rejects_page_kind_mismatch() {
     let canonical = canonical_scan_open();
 
     assert_scan_descriptor_match(
@@ -256,8 +247,7 @@ fn scan_descriptor_matches_rejects_page_kind_mismatch() {
     );
 }
 
-#[test]
-fn scan_descriptor_matches_rejects_page_flags_mismatch() {
+pub fn scan_descriptor_matches_rejects_page_flags_mismatch() {
     let canonical = canonical_scan_open();
 
     assert_scan_descriptor_match(
@@ -278,8 +268,7 @@ fn scan_descriptor_matches_rejects_page_flags_mismatch() {
     );
 }
 
-#[test]
-fn scan_descriptor_matches_rejects_producer_order_mismatch() {
+pub fn scan_descriptor_matches_rejects_producer_order_mismatch() {
     let canonical = canonical_scan_open();
 
     assert_scan_descriptor_match(
@@ -300,8 +289,7 @@ fn scan_descriptor_matches_rejects_producer_order_mismatch() {
     );
 }
 
-#[test]
-fn scan_descriptor_matches_rejects_producer_role_mismatch() {
+pub fn scan_descriptor_matches_rejects_producer_role_mismatch() {
     let canonical = canonical_scan_open();
 
     assert_scan_descriptor_match(
@@ -322,8 +310,7 @@ fn scan_descriptor_matches_rejects_producer_role_mismatch() {
     );
 }
 
-#[test]
-fn scan_descriptor_matches_rejects_missing_or_extra_producers() {
+pub fn scan_descriptor_matches_rejects_missing_or_extra_producers() {
     let canonical = canonical_scan_open();
 
     assert_scan_descriptor_match(

@@ -21,6 +21,9 @@ It owns the backend-local execution lifecycle:
 - rows are encoded straight from PostgreSQL slots into `slot_encoder` pages
   without per-row SPI tuptable materialization; only the rare row that crosses
   an Arrow page boundary is copied into a retry tuple
+- for relations without dropped attributes, scans execute as unprojected
+  `SELECT *` leaves and `slot_encoder` applies the logical column projection;
+  this avoids PostgreSQL executor projection nodes in simple leaf scans
 - page boundaries are enforced by the row budget passed to `PortalRunFetch()`;
   the backend does not use `receiveSlot = false` as a resumable pause signal
 - the backend uses the hidden fast `slot_scan` receiver without per-row
@@ -58,6 +61,18 @@ The crate is intentionally backend-local:
 particular, the SQL passed into `begin_execution()` is compiled and planned by
 the backend itself, and `scan_id` lookups are resolved only against the active
 execution registered in the current PostgreSQL backend process.
+
+## Testing
+
+Standalone `cargo test -p backend_service` is disabled for this crate. The
+crate links `slot_scan`, which references PostgreSQL SPI symbols that are only
+available inside a PostgreSQL backend process. Use `cargo check -p
+backend_service` for fast type coverage and run the backend-service regression
+cases through the pgrx crate:
+
+```sh
+cargo pgrx test pg17 -p pg_test
+```
 
 ## Lifecycle
 

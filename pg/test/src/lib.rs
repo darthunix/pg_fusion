@@ -6,6 +6,8 @@ use pgrx::pg_schema;
 #[cfg(any(test, feature = "pg_test"))]
 mod backend_service;
 #[cfg(any(test, feature = "pg_test"))]
+mod backend_service_unit;
+#[cfg(any(test, feature = "pg_test"))]
 mod df_catalog;
 #[cfg(any(test, feature = "pg_test"))]
 mod page_arrow_pipeline;
@@ -100,6 +102,71 @@ mod tests {
     #[pg_test]
     fn backend_service_finished_driver_drop_keeps_sibling_alive() {
         super::backend_service::backend_service_drop_finished_driver_does_not_cancel_sibling_scan();
+    }
+
+    #[pg_test]
+    fn bs_unit_future_session_rejected() {
+        super::backend_service_unit::future_session_is_rejected_without_active_execution();
+    }
+
+    #[pg_test]
+    fn bs_unit_stale_session_ignored() {
+        super::backend_service_unit::stale_session_is_ignored_for_active_execution();
+    }
+
+    #[pg_test]
+    fn bs_unit_same_epoch_other_slot_ignored() {
+        super::backend_service_unit::same_epoch_other_slot_is_ignored();
+    }
+
+    #[pg_test]
+    fn bs_unit_fail_while_starting() {
+        super::backend_service_unit::fail_execution_is_accepted_while_starting();
+    }
+
+    #[pg_test]
+    fn bs_unit_cancel_while_starting() {
+        super::backend_service_unit::cancel_execution_is_accepted_while_starting();
+    }
+
+    #[pg_test]
+    fn bs_unit_explain_rejects_active_execution() {
+        super::backend_service_unit::render_explain_is_rejected_while_execution_is_active();
+    }
+
+    #[pg_test]
+    fn bs_unit_finalize_error_preserves_start() {
+        super::backend_service_unit::finalize_execution_start_error_preserves_starting_runtime();
+    }
+
+    #[pg_test]
+    fn bs_unit_scan_descriptor_exact_match() {
+        super::backend_service_unit::scan_descriptor_matches_accepts_exact_ordered_match();
+    }
+
+    #[pg_test]
+    fn bs_unit_scan_descriptor_page_kind_mismatch() {
+        super::backend_service_unit::scan_descriptor_matches_rejects_page_kind_mismatch();
+    }
+
+    #[pg_test]
+    fn bs_unit_scan_descriptor_page_flags_mismatch() {
+        super::backend_service_unit::scan_descriptor_matches_rejects_page_flags_mismatch();
+    }
+
+    #[pg_test]
+    fn bs_unit_scan_descriptor_order_mismatch() {
+        super::backend_service_unit::scan_descriptor_matches_rejects_producer_order_mismatch();
+    }
+
+    #[pg_test]
+    fn bs_unit_scan_descriptor_role_mismatch() {
+        super::backend_service_unit::scan_descriptor_matches_rejects_producer_role_mismatch();
+    }
+
+    #[pg_test]
+    fn bs_unit_scan_descriptor_count_mismatch() {
+        super::backend_service_unit::scan_descriptor_matches_rejects_missing_or_extra_producers();
     }
 
     #[pg_test]

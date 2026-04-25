@@ -119,6 +119,32 @@ pub fn compile_scan(input: CompileScanInput<'_>) -> Result<CompiledScan, Compile
     })
 }
 
+/// Render the same pushed PostgreSQL scan predicates without narrowing the
+/// relation projection.
+///
+/// This is intended for runtimes that can receive a raw base-relation slot and
+/// apply the logical projection themselves while still using the same pushed
+/// filters and optional SQL-level limit as [`compile_scan`].
+pub fn render_unprojected_scan_sql(relation: &PgRelation, scan: &CompiledScan) -> String {
+    let mut sql = format!("SELECT * FROM {}", relation.render_sql());
+    if !scan.pushed_filters.is_empty() {
+        sql.push_str(" WHERE ");
+        sql.push_str(
+            &scan
+                .pushed_filters
+                .iter()
+                .map(|filter| filter.sql.as_str())
+                .collect::<Vec<_>>()
+                .join(" AND "),
+        );
+    }
+    if let Some(limit) = scan.sql_limit {
+        sql.push_str(" LIMIT ");
+        sql.push_str(&limit.to_string());
+    }
+    sql
+}
+
 fn validate_scan_identifiers(
     schema: &Schema,
     relation: &PgRelation,

@@ -8,6 +8,7 @@ readme = "README.md"
 [lib]
 crate-type = ["lib"]
 doctest = false
+test = false
 
 [features]
 default = ["pg17"]
@@ -33,10 +34,7 @@ runtime_protocol = { path = "../../runtime_protocol", version = "25.0" }
 rust-fsm = { version = "0.7", features = ["diagram"] }
 scan_flow = { path = "../../page/scan_flow", version = "25.0" }
 scan_node = { path = "../scan_node", version = "25.0" }
+scan_sql = { path = "../scan_sql", version = "25.0" }
 slot_encoder = { path = "../slot_encoder", version = "25.0" }
 slot_scan = { path = "../slot_scan", version = "25.0" }
 thiserror = "2.0"
-
-[dev-dependencies]
-pool = { path = "../../page/pool", version = "25.0" }
-transfer = { path = "../../page/transfer", version = "25.0" }

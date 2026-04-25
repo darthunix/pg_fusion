@@ -60,8 +60,9 @@ fn render_pg_leaf_explains(
     let mut rendered = BTreeMap::new();
     for spec in scans {
         let scan_id = spec.scan_id.get();
+        let execution_sql = crate::scan_execution_sql(spec)?;
         let pg_plan = explain_scan(
-            &spec.compiled_scan.sql,
+            &execution_sql,
             ScanOptions {
                 planner_fetch_hint: spec.fetch_hints.planner_fetch_hint,
                 local_row_cap: spec.fetch_hints.local_row_cap,

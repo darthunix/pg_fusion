@@ -545,6 +545,83 @@ fn append_slot_reads_fixed_width_and_name_values() {
 }
 
 #[test]
+fn append_slot_projected_reads_source_columns() {
+    let specs = [
+        ColumnSpec::new(TypeTag::Float64, true),
+        ColumnSpec::new(TypeTag::Int32, true),
+    ];
+    let attrs = [
+        TestAttr {
+            oid: pg_sys::INT4OID,
+            attlen: 4,
+            attbyval: true,
+            attalign: b'i',
+        },
+        TestAttr {
+            oid: pg_sys::BOOLOID,
+            attlen: 1,
+            attbyval: true,
+            attalign: b'c',
+        },
+        TestAttr {
+            oid: pg_sys::FLOAT8OID,
+            attlen: 8,
+            attbyval: true,
+            attalign: b'd',
+        },
+    ];
+    let tuple_desc = OwnedTupleDesc::new(&attrs);
+    let values = vec![
+        pg_sys::Datum::from(42i32),
+        pg_sys::Datum::from(true),
+        pg_sys::Datum::from(7.5f64.to_bits()),
+    ];
+    let isnull = vec![false, false, false];
+    let mut slot = OwnedSlot::new(tuple_desc.ptr, values, isnull);
+    let mut payload = init_payload(&specs, 2, 512);
+    let projection = [2usize, 0usize];
+    let mut encoder =
+        unsafe { PageBatchEncoder::new_projected(tuple_desc.ptr, &projection, &mut payload) }
+            .expect("encoder");
+
+    assert_eq!(
+        encoder.append_slot(slot.as_mut_ptr()).expect("append slot"),
+        AppendStatus::Appended
+    );
+    encoder.finish().expect("finish");
+
+    let block = BlockRef::open(&payload).expect("block");
+    assert_eq!(f64_at(&block, 0, 0), 7.5);
+    assert_eq!(i32_at(&block, 1, 0), 42);
+}
+
+#[test]
+fn new_projected_rejects_invalid_projection() {
+    let specs = [ColumnSpec::new(TypeTag::Int32, true)];
+    let attrs = [TestAttr {
+        oid: pg_sys::INT4OID,
+        attlen: 4,
+        attbyval: true,
+        attalign: b'i',
+    }];
+    let tuple_desc = OwnedTupleDesc::new(&attrs);
+    let mut payload = init_payload(&specs, 2, 256);
+    let projection = [1usize];
+
+    let error =
+        unsafe { PageBatchEncoder::new_projected(tuple_desc.ptr, &projection, &mut payload) }
+            .expect_err("reject");
+    assert!(matches!(
+        error,
+        ConfigError::ProjectionIndexOutOfBounds {
+            index: 0,
+            source_index: 1,
+            tuple_desc_cols: 1
+        }
+    ));
+}
+
+#[test]
 fn append_slot_rejects_mismatched_tuple_desc() {
     let specs = [ColumnSpec::new(TypeTag::Boolean, true)];
     let encoder_attrs = [TestAttr {

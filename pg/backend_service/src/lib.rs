@@ -5,9 +5,6 @@ mod explain;
 mod fsm;
 mod source;
 
-#[cfg(test)]
-mod tests;
-
 use arrow_layout::{ColumnSpec, TypeTag};
 use arrow_schema::{DataType, Field, Schema, SchemaRef};
 use control_transport::{BackendLeaseSlot, BackendSlotLease, CommitOutcome, TransportRegion};
@@ -18,7 +15,7 @@ pub use fsm::{BackendExecutionAction, BackendExecutionEvent, BackendExecutionSta
 use issuance::IssuedTx;
 use pgrx::pg_sys;
 use pgrx::pg_sys::panic::CaughtError;
-use pgrx::PgTryBuilder;
+use pgrx::{PgRelation as PgrxRelation, PgTryBuilder};
 use plan_builder::{PlanBuildInput, PlanBuilder};
 use plan_flow::{BackendPlanRole, BackendPlanStep, PlanOpen};
 use row_estimator::{EstimatorConfig, PageRowEstimator};
@@ -32,6 +29,7 @@ use scan_flow::{
     LogicalTerminal, ProducerDescriptor, ProducerRoleKind, ScanOpen,
 };
 use scan_node::PgScanSpec;
+use scan_sql::render_unprojected_scan_sql;
 use slot_scan::{prepare_scan, ExecutionSpiContext, PreparedScan, ScanOptions};
 pub use slot_scan::{DiagnosticLogLevel, DiagnosticsConfig};
 use std::cell::{Cell, RefCell};
@@ -125,7 +123,7 @@ impl ExecutionSnapshot {
         }
     }
 
-    #[cfg(test)]
+    #[cfg(any(test, feature = "pg_test"))]
     fn unregistered_for_tests() -> Self {
         Self {
             snapshot: std::ptr::null_mut(),
@@ -275,6 +273,7 @@ struct PreparedScanEntry {
     schema: arrow_schema::SchemaRef,
     prepared_scan: PreparedScan,
     physical_columns: Vec<ColumnSpec>,
+    source_projection: Vec<usize>,
     estimator_config: EstimatorConfig,
     canonical_open: ScanOpen,
     scan_peer: BackendLeaseSlot,
@@ -652,7 +651,14 @@ impl BackendService {
             })?;
             let fetch_batch_rows =
                 normalize_scan_fetch_batch_rows(execution.config.scan_fetch_batch_rows);
-            let (prepared_scan, schema, physical_columns, estimator_config, canonical_open) = {
+            let (
+                prepared_scan,
+                schema,
+                physical_columns,
+                source_projection,
+                estimator_config,
+                canonical_open,
+            ) = {
                 let entry = execution.scans.get_mut(&input.scan_id).ok_or(
                     BackendServiceError::UnknownScanId {
                         scan_id: input.scan_id,
@@ -690,6 +696,7 @@ impl BackendService {
                     entry.prepared_scan.clone(),
                     Arc::clone(&entry.schema),
                     entry.physical_columns.clone(),
+                    entry.source_projection.clone(),
                     entry.estimator_config,
                     entry.canonical_open.clone(),
                 )
@@ -706,6 +713,7 @@ impl BackendService {
                 spi,
                 prepared_scan,
                 schema,
+                source_projection,
                 block_size,
                 fetch_batch_rows,
                 estimator,
@@ -885,13 +893,15 @@ impl BackendService {
         });
     }
 
-    #[cfg(test)]
-    pub(crate) fn current_session_epoch_for_tests() -> u64 {
+    #[cfg(any(test, feature = "pg_test"))]
+    #[doc(hidden)]
+    pub fn current_session_epoch_for_tests() -> u64 {
         current_session_epoch()
     }
 
-    #[cfg(test)]
-    pub(crate) fn reset_for_tests() {
+    #[cfg(any(test, feature = "pg_test"))]
+    #[doc(hidden)]
+    pub fn reset_for_tests() {
         CURRENT_SESSION_EPOCH.with(|epoch| epoch.set(0));
         ACTIVE_EXECUTION.with(|slot| {
             slot.borrow_mut().take();
@@ -899,8 +909,9 @@ impl BackendService {
         BackendService::clear_wait_for_scan_backpressure_error_for_tests();
     }
 
-    #[cfg(test)]
-    pub(crate) fn install_fake_execution_for_tests(
+    #[cfg(any(test, feature = "pg_test"))]
+    #[doc(hidden)]
+    pub fn install_fake_execution_for_tests(
         slot_id: u32,
         session_epoch: u64,
         state: BackendExecutionState,
@@ -940,8 +951,9 @@ impl BackendService {
         });
     }
 
-    #[cfg(test)]
-    pub(crate) fn install_starting_execution_with_plan_role_for_tests(
+    #[cfg(any(test, feature = "pg_test"))]
+    #[doc(hidden)]
+    pub fn install_starting_execution_with_plan_role_for_tests(
         slot_id: u32,
         session_epoch: u64,
         plan_role: BackendPlanRole,
@@ -1327,8 +1339,9 @@ fn prepare_scan_entry(
         &projected_columns,
         config.estimator_default,
     )?;
+    let execution_shape = scan_execution_shape(&spec)?;
     let prepared_scan = prepare_scan(
-        &spec.compiled_scan.sql,
+        &execution_shape.sql,
         ScanOptions {
             planner_fetch_hint: spec.fetch_hints.planner_fetch_hint,
             local_row_cap: spec.fetch_hints.local_row_cap,
@@ -1351,12 +1364,54 @@ fn prepare_scan_entry(
         schema,
         prepared_scan,
         physical_columns,
+        source_projection: execution_shape.source_projection,
         estimator_config: seeded_config,
         canonical_open,
         scan_peer,
         scan_lease: Some(scan_lease),
         state: ScanEntryState::Prepared,
     })
+}
+
+#[derive(Debug)]
+struct ScanExecutionShape {
+    sql: String,
+    source_projection: Vec<usize>,
+}
+
+fn scan_execution_shape(spec: &PgScanSpec) -> Result<ScanExecutionShape, BackendServiceError> {
+    if !spec.compiled_scan.output_columns.is_empty()
+        && can_use_unprojected_relation_scan(spec.table_oid.into())?
+    {
+        return Ok(ScanExecutionShape {
+            sql: render_unprojected_scan_sql(&spec.relation, &spec.compiled_scan),
+            source_projection: spec.compiled_scan.output_columns.clone(),
+        });
+    }
+
+    Ok(ScanExecutionShape {
+        sql: spec.compiled_scan.sql.clone(),
+        source_projection: (0..spec.compiled_scan.output_columns.len()).collect(),
+    })
+}
+
+fn scan_execution_sql(spec: &PgScanSpec) -> Result<String, BackendServiceError> {
+    scan_execution_shape(spec).map(|shape| shape.sql)
+}
+
+fn can_use_unprojected_relation_scan(
+    relation_oid: pg_sys::Oid,
+) -> Result<bool, BackendServiceError> {
+    PgTryBuilder::new(AssertUnwindSafe(|| unsafe {
+        let relation = PgrxRelation::with_lock(relation_oid, pg_sys::AccessShareLock as _);
+        let has_no_dropped_attributes = relation
+            .tuple_desc()
+            .iter()
+            .all(|attribute| !attribute.is_dropped());
+        Ok(has_no_dropped_attributes)
+    }))
+    .catch_others(|error| Err(backend_error_from_caught_error(error)))
+    .execute()
 }
 
 fn normalize_transport_field(
@@ -1528,6 +1583,15 @@ fn scan_descriptor_matches(canonical: &ScanOpen, incoming: ScanFlowDescriptorRef
     }
 
     expected.next().is_none()
+}
+
+#[cfg(any(test, feature = "pg_test"))]
+#[doc(hidden)]
+pub fn scan_descriptor_matches_for_tests(
+    canonical: &ScanOpen,
+    incoming: ScanFlowDescriptorRef<'_>,
+) -> bool {
+    scan_descriptor_matches(canonical, incoming)
 }
 
 fn mark_scan_terminal(

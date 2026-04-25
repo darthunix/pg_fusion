@@ -43,6 +43,8 @@ pub struct PageBatchEncoder<'payload> {
     attrs_ptr: *mut pg_sys::FormData_pg_attribute,
     col_count: usize,
     needed_attrs: i32,
+    projection_ptr: *const usize,
+    projection_len: usize,
     payload: &'payload mut [u8],
     block_ptr: *mut u8,
     descs_ptr: *mut ColumnDesc,
@@ -64,6 +66,32 @@ impl<'payload> PageBatchEncoder<'payload> {
         tuple_desc: pg_sys::TupleDesc,
         payload: &'payload mut [u8],
     ) -> Result<Self, ConfigError> {
+        unsafe { Self::new_inner(tuple_desc, None, payload) }
+    }
+
+    /// Creates a new encoder over a projected view of a PostgreSQL slot.
+    ///
+    /// `source_columns[output_index]` is the zero-based attribute index in the
+    /// incoming slot that should be written into the corresponding output
+    /// layout column. The slice must remain alive until the encoder is dropped.
+    ///
+    /// # Safety
+    ///
+    /// `tuple_desc` must point to a valid PostgreSQL `TupleDescData` whose
+    /// attribute array remains alive for the lifetime of the encoder.
+    pub unsafe fn new_projected(
+        tuple_desc: pg_sys::TupleDesc,
+        source_columns: &[usize],
+        payload: &'payload mut [u8],
+    ) -> Result<Self, ConfigError> {
+        unsafe { Self::new_inner(tuple_desc, Some(source_columns), payload) }
+    }
+
+    unsafe fn new_inner(
+        tuple_desc: pg_sys::TupleDesc,
+        source_columns: Option<&[usize]>,
+        payload: &'payload mut [u8],
+    ) -> Result<Self, ConfigError> {
         if tuple_desc.is_null() {
             return Err(ConfigError::NullTupleDesc);
         }
@@ -71,7 +99,14 @@ impl<'payload> PageBatchEncoder<'payload> {
         let block = BlockRef::open(&*payload)?;
         let layout_cols = block.column_count();
         let tuple_desc_cols = unsafe { (*tuple_desc).natts as usize };
-        if layout_cols != tuple_desc_cols {
+        if let Some(source_columns) = source_columns {
+            if layout_cols != source_columns.len() {
+                return Err(ConfigError::ProjectionLengthMismatch {
+                    layout_cols,
+                    projection_cols: source_columns.len(),
+                });
+            }
+        } else if layout_cols != tuple_desc_cols {
             return Err(ConfigError::ColumnCountMismatch {
                 layout_cols,
                 tuple_desc_cols,
@@ -83,10 +118,27 @@ impl<'payload> PageBatchEncoder<'payload> {
         let descs_ptr = unsafe { block_ptr.add(size_of::<BlockHeader>()).cast::<ColumnDesc>() };
         let header = unsafe { ptr::read_unaligned(block_ptr.cast::<BlockHeader>()) };
         let mut needs_utf8 = false;
+        let mut max_needed_attr = 0usize;
         for index in 0..layout_cols {
-            let attr = unsafe { &*attrs_ptr.add(index) };
+            let source_index = source_columns.map_or(index, |columns| columns[index]);
+            if source_index >= tuple_desc_cols {
+                return Err(ConfigError::ProjectionIndexOutOfBounds {
+                    index,
+                    source_index,
+                    tuple_desc_cols,
+                });
+            }
+
+            let attr = unsafe { &*attrs_ptr.add(source_index) };
             if attr.attisdropped {
-                return Err(ConfigError::DroppedAttribute { index });
+                return if source_columns.is_some() {
+                    Err(ConfigError::ProjectedDroppedAttribute {
+                        index,
+                        source_index,
+                    })
+                } else {
+                    Err(ConfigError::DroppedAttribute { index })
+                };
             }
 
             let desc = unsafe { ptr::read_unaligned(descs_ptr.add(index)) };
@@ -95,6 +147,7 @@ impl<'payload> PageBatchEncoder<'payload> {
             if type_tag == TypeTag::Utf8View {
                 needs_utf8 = true;
             }
+            max_needed_attr = max_needed_attr.max(source_index + 1);
         }
 
         if needs_utf8 {
@@ -108,8 +161,10 @@ impl<'payload> PageBatchEncoder<'payload> {
             tuple_desc,
             attrs_ptr,
             col_count: layout_cols,
-            needed_attrs: i32::try_from(layout_cols)
+            needed_attrs: i32::try_from(max_needed_attr)
                 .map_err(|_| arrow_layout::LayoutError::SizeOverflow)?,
+            projection_ptr: source_columns.map_or(ptr::null(), |columns| columns.as_ptr()),
+            projection_len: source_columns.map_or(0, <[usize]>::len),
             payload,
             block_ptr,
             descs_ptr,
@@ -151,8 +206,10 @@ impl<'payload> PageBatchEncoder<'payload> {
             return Ok(AppendStatus::Full);
         }
 
+        let needed_attrs = usize::try_from(self.needed_attrs)
+            .map_err(|_| arrow_layout::LayoutError::SizeOverflow)?;
         let valid = unsafe { (*slot).tts_nvalid as usize };
-        if valid < self.col_count {
+        if valid < needed_attrs {
             unsafe {
                 pg_sys::slot_getsomeattrs_int(slot, self.needed_attrs);
             }
@@ -164,13 +221,18 @@ impl<'payload> PageBatchEncoder<'payload> {
             return Err(EncodeError::InvalidSlotStorage);
         }
 
+        if let Some(status) = self.try_append_single_fixed_width_slot(row_idx, values, isnulls)? {
+            return Ok(status);
+        }
+
         let tail_before = self.header.tail_cursor;
         let mut processed_cols = 0usize;
         for col_idx in 0..self.col_count {
+            let source_idx = self.source_index(col_idx);
             let desc = self.desc(col_idx);
-            let attr = unsafe { &*self.attrs_ptr.add(col_idx) };
-            let is_null = unsafe { *isnulls.add(col_idx) };
-            let datum = unsafe { *values.add(col_idx) };
+            let attr = unsafe { &*self.attrs_ptr.add(source_idx) };
+            let is_null = unsafe { *isnulls.add(source_idx) };
+            let datum = unsafe { *values.add(source_idx) };
             let result = if is_null
                 || attr.atttypid == pg_sys::NAMEOID
                 || !pg_oid_needs_detoast(attr.atttypid)
@@ -201,6 +263,73 @@ impl<'payload> PageBatchEncoder<'payload> {
         Ok(AppendStatus::Appended)
     }
 
+    fn try_append_single_fixed_width_slot(
+        &mut self,
+        row_idx: u32,
+        values: *mut pg_sys::Datum,
+        isnulls: *mut bool,
+    ) -> Result<Option<AppendStatus>, EncodeError> {
+        if self.col_count != 1 {
+            return Ok(None);
+        }
+
+        let source_idx = self.source_index(0);
+        let desc = self.desc(0);
+        let attr = unsafe { &*self.attrs_ptr.add(source_idx) };
+        let is_null = unsafe { *isnulls.add(source_idx) };
+        if is_null {
+            self.write_null(0, row_idx, desc)?;
+            self.header.row_count = row_idx + 1;
+            return Ok(Some(AppendStatus::Appended));
+        }
+
+        let datum = unsafe { *values.add(source_idx) };
+        match desc.type_tag {
+            raw if raw == TypeTag::Boolean.to_raw() => {
+                let value = unsafe { read_bool(datum, attr.attbyval) };
+                self.write_bool(row_idx, desc, value);
+            }
+            raw if raw == TypeTag::Int16.to_raw() => {
+                let value = unsafe { read_i16(datum, attr.attbyval) };
+                self.write_validity(row_idx, desc, true);
+                self.write_fixed_bytes(row_idx, desc, &value.to_ne_bytes())?;
+            }
+            raw if raw == TypeTag::Int32.to_raw() => {
+                let value = unsafe { read_i32(datum, attr.attbyval) };
+                self.write_validity(row_idx, desc, true);
+                self.write_fixed_bytes(row_idx, desc, &value.to_ne_bytes())?;
+            }
+            raw if raw == TypeTag::Int64.to_raw() => {
+                let value = unsafe { read_i64(datum, attr.attbyval) };
+                self.write_validity(row_idx, desc, true);
+                self.write_fixed_bytes(row_idx, desc, &value.to_ne_bytes())?;
+            }
+            raw if raw == TypeTag::Float32.to_raw() => {
+                let bits = unsafe { read_f32(datum, attr.attbyval) }.to_bits();
+                self.write_validity(row_idx, desc, true);
+                self.write_fixed_bytes(row_idx, desc, &bits.to_ne_bytes())?;
+            }
+            raw if raw == TypeTag::Float64.to_raw() => {
+                let bits = unsafe { read_f64(datum, attr.attbyval) }.to_bits();
+                self.write_validity(row_idx, desc, true);
+                self.write_fixed_bytes(row_idx, desc, &bits.to_ne_bytes())?;
+            }
+            _ => return Ok(None),
+        }
+
+        self.header.row_count = row_idx + 1;
+        Ok(Some(AppendStatus::Appended))
+    }
+
+    fn source_index(&self, output_index: usize) -> usize {
+        if self.projection_len == 0 {
+            output_index
+        } else {
+            debug_assert!(output_index < self.projection_len);
+            unsafe { *self.projection_ptr.add(output_index) }
+        }
+    }
+
     fn validate_slot_tuple_desc(
         &mut self,
         actual_tuple_desc: pg_sys::TupleDesc,
@@ -212,14 +341,19 @@ impl<'payload> PageBatchEncoder<'payload> {
         }
 
         let actual_cols = unsafe { (*actual_tuple_desc).natts as usize };
-        if actual_cols != self.col_count {
+        if self.projection_len == 0 && actual_cols != self.col_count {
             return Err(EncodeError::SlotTupleDescMismatch);
         }
 
         let actual_attrs_ptr = unsafe { (*actual_tuple_desc).attrs.as_mut_ptr() };
         for index in 0..self.col_count {
-            let expected = unsafe { &*self.attrs_ptr.add(index) };
-            let actual = unsafe { &*actual_attrs_ptr.add(index) };
+            let source_index = self.source_index(index);
+            if source_index >= actual_cols {
+                return Err(EncodeError::SlotTupleDescMismatch);
+            }
+
+            let expected = unsafe { &*self.attrs_ptr.add(source_index) };
+            let actual = unsafe { &*actual_attrs_ptr.add(source_index) };
             if actual.attisdropped
                 || actual.atttypid != expected.atttypid
                 || actual.attlen != expected.attlen

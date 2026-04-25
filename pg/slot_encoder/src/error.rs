@@ -15,8 +15,23 @@ pub enum ConfigError {
         layout_cols: usize,
         tuple_desc_cols: usize,
     },
+    #[error("layout block has {layout_cols} columns but projection has {projection_cols} entries")]
+    ProjectionLengthMismatch {
+        layout_cols: usize,
+        projection_cols: usize,
+    },
+    #[error(
+        "projection column {index} references TupleDesc attribute {source_index}, but TupleDesc has {tuple_desc_cols} attributes"
+    )]
+    ProjectionIndexOutOfBounds {
+        index: usize,
+        source_index: usize,
+        tuple_desc_cols: usize,
+    },
     #[error("dropped attributes are not supported in slot_encoder v2 (column {index})")]
     DroppedAttribute { index: usize },
+    #[error("projection column {index} references dropped TupleDesc attribute {source_index}")]
+    ProjectedDroppedAttribute { index: usize, source_index: usize },
     #[error(
         "PostgreSQL type oid {oid} at column {index} is incompatible with layout type {type_tag:?}"
     )]

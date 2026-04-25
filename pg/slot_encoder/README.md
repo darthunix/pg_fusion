@@ -79,6 +79,9 @@ caller creates a fresh block whenever `AppendStatus::Full` is returned.
 
 - `PageBatchEncoder::new(tuple_desc, payload)` validates that the initialized
   block matches the PostgreSQL `TupleDesc`.
+- `PageBatchEncoder::new_projected(tuple_desc, source_columns, payload)` writes
+  the same output block shape while reading values from selected source slot
+  attributes.
 - `append_slot(slot)` accepts undeformed or partially deformed slots and asks
   PostgreSQL to deform enough attributes when needed.
 - `finish()` writes final header state back into the block and returns
@@ -87,8 +90,10 @@ caller creates a fresh block whenever `AppendStatus::Full` is returned.
 ## Constraints
 
 - The block must already be initialized by `arrow_layout`.
-- The `TupleDesc` and appended slots must match the target layout exactly.
-- Dropped PostgreSQL attributes are rejected.
+- The `TupleDesc` and appended slots must match the target layout, or the
+  supplied projection must map every output column to a compatible source
+  attribute.
+- Dropped PostgreSQL attributes are rejected when projected.
 - `Utf8View` columns require a UTF-8 PostgreSQL server encoding.
 - `AppendStatus::Full` means the current row did not fit and must be retried on a
   fresh block.
