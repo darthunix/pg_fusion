@@ -399,6 +399,33 @@ pub fn slot_scan_local_row_cap_smoke() {
     assert_eq!(sink.rows_seen, 17);
 }
 
+pub fn slot_scan_accepts_tid_range_scan() {
+    reset_slot_scan_table(100);
+    Spi::run("SET LOCAL max_parallel_workers_per_gather = 0").unwrap();
+    Spi::run("SET LOCAL enable_seqscan = off").unwrap();
+    Spi::run("SET LOCAL enable_tidscan = on").unwrap();
+    let _snapshot = unsafe { LatestSnapshotGuard::acquire() };
+
+    let prepared = prepare_scan(
+        &format!(
+            "SELECT id FROM {SLOT_SCAN_TABLE} \
+             WHERE ctid >= '(0,1)'::tid AND ctid < '(1000,1)'::tid"
+        ),
+        ScanOptions::default(),
+    )
+    .expect("prepare_scan must accept TidRangeScan");
+
+    let mut sink = CountSink::default();
+    let stats = prepared
+        .run(SlotSink::new(&COUNT_SINK_METHODS, &mut sink))
+        .expect("run TidRangeScan");
+
+    assert_eq!(stats.rows_seen, 100);
+    assert_eq!(sink.rows_seen, 100);
+    assert_eq!(stats.plan_kind, ScanPlanKind::TidRangeScan);
+    assert_eq!(sink.init_plan_kind, Some(ScanPlanKind::TidRangeScan));
+}
+
 pub fn slot_scan_rejects_limit_node() {
     reset_slot_scan_table(32);
 

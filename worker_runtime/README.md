@@ -9,17 +9,20 @@ messages, receives logical plans through `plan_flow`, lowers `PgScanNode`
 locally, and imports scan pages through `page/import`.
 
 Snapshot ownership is backend-only. The worker requests scans by `scan_id` and
-the dedicated scan peer published in `StartExecution`; it does not expose an
-explain path.
+the dedicated scan producer peers published in `StartExecution`; it does not
+expose an explain path.
 
 For a transport-backed scan data-plane, use `TransportScanBatchSource` together
 with a `ScanIngressProvider`. That source claims the dedicated scan peer for
-the lifetime of each scan stream, sends `OpenScan` / `CancelScan` on that peer,
-and consumes both issued page headers and backend-emitted scan terminal
-messages from the same slot. Dedicated scan slots must provide at least:
+the lifetime of each scan producer, sends `OpenScan` / `CancelScan` on each
+producer peer, and consumes both issued page headers and backend-emitted scan
+terminal messages from those slots. `ScanIngressProvider` returns an `IssuedRx`
+per `(session_epoch, scan_id, producer_id)` because each producer owns an
+independent ordered transfer stream that starts at `transfer_id = 1`.
+Dedicated scan slots must provide at least:
 
 - `256` bytes raw backend-to-worker ring capacity
-- `44` bytes raw worker-to-backend ring capacity
+- `256` bytes raw worker-to-backend ring capacity
 
 Typical control-path usage:
 
@@ -62,7 +65,9 @@ Typical scan-open control encoding without heap allocation:
 use worker_runtime::{ScanFlowDriver, ScanFlowOpen};
 
 let (driver, open_scan) = ScanFlowDriver::open(open, issued_rx)?;
-transport.send_peer_encoded(request.peer, |scratch| open_scan.encode_into(scratch))?;
+for producer in &request.producers {
+    transport.send_peer_encoded(producer.peer, |scratch| open_scan.encode_into(scratch))?;
+}
 # let _ = driver;
 # Ok::<(), worker_runtime::WorkerRuntimeError>(())
 ```

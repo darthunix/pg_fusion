@@ -523,9 +523,11 @@ fn worker_attach_is_exclusive_and_release_is_deferred_until_worker_drop() {
     let (_mem, region) = TestRegion::new(layout);
     let worker = attach_worker(&region);
     let mut backend = BackendSlotLease::acquire(&region).expect("backend");
+    assert!(!backend.worker_attached());
 
     let slot_id = backend.slot_id();
     let mut worker_slot = unsafe { worker.slot_unchecked(slot_id) }.expect("worker slot");
+    assert!(backend.worker_attached());
     let second_err = match unsafe { worker.slot_unchecked(slot_id) } {
         Ok(_) => panic!("second claim must fail"),
         Err(err) => err,
@@ -559,6 +561,7 @@ fn worker_attach_is_exclusive_and_release_is_deferred_until_worker_drop() {
     ));
 
     drop(worker_slot);
+    assert!(!backend.worker_attached());
     let fresh = BackendSlotLease::acquire(&region).expect("fresh backend");
     assert_eq!(fresh.slot_id(), slot_id);
 }

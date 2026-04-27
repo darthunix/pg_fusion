@@ -290,6 +290,7 @@ fn begin_and_finalize_execution(
         plan_tx: plan_transport.tx(),
         scan_slot_region: scan_slots,
         config: config.clone(),
+        scan_worker_launcher: None,
     })
     .expect("begin execution");
 

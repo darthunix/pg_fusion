@@ -8,7 +8,7 @@ use control_transport::{
     BackendRxError, BackendSlotLease, RxError, TransportRegion, TransportRegionLayout,
     WorkerTransport,
 };
-use futures::StreamExt;
+use futures::{FutureExt, StreamExt};
 use issuance::{IssuanceConfig, IssuancePool, IssuedRx};
 use pool::PagePoolConfig;
 use runtime_protocol::{
@@ -16,11 +16,12 @@ use runtime_protocol::{
     encoded_len_backend_scan_to_worker, ProducerRole, WorkerScanToBackendRef,
     MIN_SCAN_BACKEND_TO_WORKER_RING_CAPACITY, MIN_SCAN_WORKER_TO_BACKEND_RING_CAPACITY,
 };
+use scan_flow::ProducerRoleKind;
 use scan_node::PgScanId;
 use transfer::PageRx;
 use worker_runtime::{
-    OpenScanRequest, ScanBatchSource, ScanIngressProvider, TransportScanBatchSource,
-    WorkerRuntimeError,
+    OpenScanRequest, ScanBatchSource, ScanIngressProvider, ScanProducerPeer,
+    TransportScanBatchSource, WorkerRuntimeError,
 };
 
 struct OwnedRegion {
@@ -44,7 +45,7 @@ impl Drop for OwnedRegion {
 }
 
 struct TestIngress {
-    entries: Mutex<BTreeMap<(u64, u64), IssuedRx>>,
+    entries: Mutex<BTreeMap<(u64, u64, u16), IssuedRx>>,
 }
 
 impl std::fmt::Debug for TestIngress {
@@ -56,7 +57,26 @@ impl std::fmt::Debug for TestIngress {
 impl TestIngress {
     fn with_entry(session_epoch: u64, scan_id: u64, rx: IssuedRx) -> Self {
         let mut entries = BTreeMap::new();
-        entries.insert((session_epoch, scan_id), rx);
+        entries.insert((session_epoch, scan_id, 0), rx);
+        Self {
+            entries: Mutex::new(entries),
+        }
+    }
+
+    fn with_producers(
+        session_epoch: u64,
+        scan_id: u64,
+        producer_ids: impl IntoIterator<Item = u16>,
+        page_pool: pool::PagePool,
+        issuance_pool: IssuancePool,
+    ) -> Self {
+        let mut entries = BTreeMap::new();
+        for producer_id in producer_ids {
+            entries.insert(
+                (session_epoch, scan_id, producer_id),
+                IssuedRx::new(PageRx::new(page_pool), issuance_pool),
+            );
+        }
         Self {
             entries: Mutex::new(entries),
         }
@@ -64,11 +84,16 @@ impl TestIngress {
 }
 
 impl ScanIngressProvider for TestIngress {
-    fn issued_rx(&self, session_epoch: u64, scan_id: u64) -> Result<IssuedRx, WorkerRuntimeError> {
+    fn issued_rx(
+        &self,
+        session_epoch: u64,
+        scan_id: u64,
+        producer_id: u16,
+    ) -> Result<IssuedRx, WorkerRuntimeError> {
         self.entries
             .lock()
             .unwrap()
-            .get(&(session_epoch, scan_id))
+            .get(&(session_epoch, scan_id, producer_id))
             .cloned()
             .ok_or(WorkerRuntimeError::MissingScanIngress {
                 session_epoch,
@@ -129,7 +154,22 @@ fn output_schema() -> SchemaRef {
 
 fn open_request(peer: control_transport::BackendLeaseSlot) -> OpenScanRequest {
     OpenScanRequest {
-        peer,
+        producers: vec![ScanProducerPeer {
+            producer_id: 0,
+            role: ProducerRoleKind::Leader,
+            peer,
+        }],
+        session_epoch: 7,
+        scan_id: PgScanId::new(11),
+        output_schema: output_schema(),
+        page_kind: import::ARROW_LAYOUT_BATCH_KIND,
+        page_flags: 0,
+    }
+}
+
+fn open_request_with_producers(producers: Vec<ScanProducerPeer>) -> OpenScanRequest {
+    OpenScanRequest {
+        producers,
         session_epoch: 7,
         scan_id: PgScanId::new(11),
         output_schema: output_schema(),
@@ -372,4 +412,82 @@ fn dropping_transport_scan_stream_sends_cancel_scan() {
             scan_id: 11,
         }
     );
+}
+
+#[test]
+fn transport_scan_source_waits_for_all_declared_producers() {
+    ignore_sigusr1_for_tests();
+    let _guard = test_mutex().lock().unwrap();
+    let (_region_mem, region) = init_transport_region(2, 256, 256);
+    activate_generation(&region);
+    let mut leader = BackendSlotLease::acquire(&region).expect("leader lease");
+    let mut worker = BackendSlotLease::acquire(&region).expect("worker lease");
+
+    let (_page_mem, page_pool) = init_page_pool(128, 1);
+    let (_issuance_mem, issuance_pool) = init_issuance_pool(1);
+    let ingress = Arc::new(TestIngress::with_producers(
+        7,
+        11,
+        [0, 1],
+        page_pool,
+        issuance_pool,
+    ));
+    let source = TransportScanBatchSource::new(region, 256, ingress).expect("source");
+    let request = open_request_with_producers(vec![
+        ScanProducerPeer {
+            producer_id: 0,
+            role: ProducerRoleKind::Leader,
+            peer: leader.backend_lease_slot(),
+        },
+        ScanProducerPeer {
+            producer_id: 1,
+            role: ProducerRoleKind::Worker,
+            peer: worker.backend_lease_slot(),
+        },
+    ]);
+
+    let mut stream = source.open_scan(request).unwrap();
+    let leader_open = wait_for_worker_frame(&mut leader);
+    let worker_open = wait_for_worker_frame(&mut worker);
+    for frame in [&leader_open, &worker_open] {
+        let open = decode_worker_scan_to_backend(frame).expect("decode open");
+        let WorkerScanToBackendRef::OpenScan { scan, .. } = open else {
+            panic!("expected OpenScan, got {open:?}");
+        };
+        let producers: Vec<_> = scan.producers().iter().collect();
+        assert_eq!(producers.len(), 2);
+        assert_eq!(producers[0].producer_id, 0);
+        assert_eq!(producers[0].role, ProducerRole::Leader);
+        assert_eq!(producers[1].producer_id, 1);
+        assert_eq!(producers[1].role, ProducerRole::Worker);
+    }
+
+    let leader_done = runtime_protocol::BackendScanToWorker::ScanFinished {
+        session_epoch: 7,
+        scan_id: 11,
+        producer_id: 0,
+    };
+    let mut encoded = vec![0_u8; encoded_len_backend_scan_to_worker(leader_done)];
+    let written = encode_backend_scan_to_worker_into(leader_done, &mut encoded).expect("encode");
+    leader
+        .to_worker_tx()
+        .send_frame(&encoded[..written])
+        .expect("send leader finished");
+    thread::sleep(Duration::from_millis(10));
+    assert!(stream.next().now_or_never().is_none());
+
+    let worker_done = runtime_protocol::BackendScanToWorker::ScanFinished {
+        session_epoch: 7,
+        scan_id: 11,
+        producer_id: 1,
+    };
+    let mut encoded = vec![0_u8; encoded_len_backend_scan_to_worker(worker_done)];
+    let written = encode_backend_scan_to_worker_into(worker_done, &mut encoded).expect("encode");
+    worker
+        .to_worker_tx()
+        .send_frame(&encoded[..written])
+        .expect("send worker finished");
+
+    let next = futures::executor::block_on(stream.next());
+    assert!(next.is_none());
 }

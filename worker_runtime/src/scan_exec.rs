@@ -12,18 +12,27 @@ use datafusion::physical_plan::{
 use datafusion_common::{DataFusionError, Result as DFResult};
 use datafusion_execution::TaskContext;
 use datafusion_physical_expr::EquivalenceProperties;
+use scan_flow::ProducerRoleKind;
 use scan_node::{PgScanExecFactory, PgScanId, PgScanSpec};
+
+/// One producer channel owned by a backend-side scan producer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ScanProducerPeer {
+    pub producer_id: u16,
+    pub role: ProducerRoleKind,
+    pub peer: BackendLeaseSlot,
+}
 
 /// Worker request for one backend-owned scan.
 ///
 /// The worker-side physical scan only receives stable scan identity, output
-/// schema, and the dedicated scan peer published in `StartExecution`.
+/// schema, and the dedicated scan producer peers published in `StartExecution`.
 /// Backend-only state such as snapshots, compiled SQL execution, and table
 /// access remains behind `scan_id`.
 #[derive(Debug, Clone)]
 pub struct OpenScanRequest {
-    /// Dedicated scan slot chosen by the backend for this `scan_id`.
-    pub peer: BackendLeaseSlot,
+    /// Dedicated scan slots chosen by backend-side producers for this `scan_id`.
+    pub producers: Vec<ScanProducerPeer>,
     pub session_epoch: u64,
     pub scan_id: PgScanId,
     pub output_schema: SchemaRef,
@@ -34,7 +43,7 @@ pub struct OpenScanRequest {
 /// Runtime-specific source of scan batches.
 ///
 /// Production implementations are expected to send
-/// `runtime_protocol::WorkerScanToBackend::OpenScan` over `request.peer`,
+/// `runtime_protocol::WorkerScanToBackend::OpenScan` over `request.producers`,
 /// drive `scan_flow::WorkerScanRole`, and import pages with
 /// `ArrowPageDecoder`. Tests can provide an in-memory source.
 pub trait ScanBatchSource: std::fmt::Debug + Send + Sync {
@@ -45,7 +54,7 @@ pub trait ScanBatchSource: std::fmt::Debug + Send + Sync {
 pub struct WorkerPgScanExecFactory {
     session_epoch: u64,
     source: Arc<dyn ScanBatchSource>,
-    scan_peers: BTreeMap<u64, BackendLeaseSlot>,
+    scan_peers: BTreeMap<u64, Vec<ScanProducerPeer>>,
     page_kind: transfer::MessageKind,
     page_flags: u16,
 }
@@ -54,7 +63,7 @@ impl WorkerPgScanExecFactory {
     pub fn new(
         session_epoch: u64,
         source: Arc<dyn ScanBatchSource>,
-        scan_peers: BTreeMap<u64, BackendLeaseSlot>,
+        scan_peers: BTreeMap<u64, Vec<ScanProducerPeer>>,
         page_kind: transfer::MessageKind,
         page_flags: u16,
     ) -> Self {
@@ -81,10 +90,10 @@ impl std::fmt::Debug for WorkerPgScanExecFactory {
 
 impl PgScanExecFactory for WorkerPgScanExecFactory {
     fn create(&self, spec: Arc<PgScanSpec>) -> DFResult<Arc<dyn ExecutionPlan>> {
-        let peer = self
+        let producers = self
             .scan_peers
             .get(&spec.scan_id.get())
-            .copied()
+            .cloned()
             .ok_or_else(|| {
                 DataFusionError::External(Box::new(crate::WorkerRuntimeError::MissingScanPeer {
                     scan_id: spec.scan_id.get(),
@@ -94,7 +103,7 @@ impl PgScanExecFactory for WorkerPgScanExecFactory {
             .map(|(schema, _)| schema)
             .map_err(|err| DataFusionError::External(Box::new(err)))?;
         Ok(Arc::new(WorkerPgScanExec::new(
-            peer,
+            producers,
             self.session_epoch,
             spec,
             output_schema,
@@ -107,7 +116,7 @@ impl PgScanExecFactory for WorkerPgScanExecFactory {
 
 #[derive(Debug)]
 pub struct WorkerPgScanExec {
-    peer: BackendLeaseSlot,
+    producers: Vec<ScanProducerPeer>,
     session_epoch: u64,
     spec: Arc<PgScanSpec>,
     output_schema: SchemaRef,
@@ -119,7 +128,7 @@ pub struct WorkerPgScanExec {
 
 impl WorkerPgScanExec {
     pub fn new(
-        peer: BackendLeaseSlot,
+        producers: Vec<ScanProducerPeer>,
         session_epoch: u64,
         spec: Arc<PgScanSpec>,
         output_schema: SchemaRef,
@@ -134,7 +143,7 @@ impl WorkerPgScanExec {
             Boundedness::Bounded,
         );
         Self {
-            peer,
+            producers,
             session_epoch,
             spec,
             output_schema,
@@ -149,8 +158,8 @@ impl WorkerPgScanExec {
         self.spec.scan_id
     }
 
-    pub fn peer(&self) -> BackendLeaseSlot {
-        self.peer
+    pub fn producers(&self) -> &[ScanProducerPeer] {
+        &self.producers
     }
 
     pub fn session_epoch(&self) -> u64 {
@@ -218,7 +227,7 @@ impl ExecutionPlan for WorkerPgScanExec {
         }
 
         self.source.open_scan(OpenScanRequest {
-            peer: self.peer,
+            producers: self.producers.clone(),
             session_epoch: self.session_epoch,
             scan_id: self.spec.scan_id,
             output_schema: Arc::clone(&self.output_schema),
@@ -333,9 +342,14 @@ mod tests {
     fn factory_builds_worker_pg_scan_exec() {
         let source = Arc::new(RecordingSource::new());
         let mut scan_peers = BTreeMap::new();
+        let peer = BackendLeaseSlot::new(0, control_transport::BackendLeaseId::new(1, 1));
         scan_peers.insert(
             7,
-            BackendLeaseSlot::new(0, control_transport::BackendLeaseId::new(1, 1)),
+            vec![ScanProducerPeer {
+                producer_id: 0,
+                role: ProducerRoleKind::Leader,
+                peer,
+            }],
         );
         let factory = WorkerPgScanExecFactory::new(99, source, scan_peers, 0x4152, 0);
         let plan = factory.create(spec(7)).unwrap();
@@ -344,10 +358,7 @@ mod tests {
             .as_any()
             .downcast_ref::<WorkerPgScanExec>()
             .expect("worker scan exec");
-        assert_eq!(
-            exec.peer(),
-            BackendLeaseSlot::new(0, control_transport::BackendLeaseId::new(1, 1))
-        );
+        assert_eq!(exec.producers()[0].peer, peer);
         assert_eq!(exec.session_epoch(), 99);
         assert_eq!(exec.scan_id(), PgScanId::new(7));
         assert_eq!(exec.name(), "WorkerPgScanExec");
@@ -362,7 +373,11 @@ mod tests {
             .expect("transport schema")
             .0;
         let exec = WorkerPgScanExec::new(
-            peer,
+            vec![ScanProducerPeer {
+                producer_id: 0,
+                role: ProducerRoleKind::Leader,
+                peer,
+            }],
             100,
             scan_spec,
             output_schema,
@@ -376,7 +391,7 @@ mod tests {
         assert_eq!(stream.schema().fields().len(), 1);
         let requests = source.requests.lock().unwrap();
         assert_eq!(requests.len(), 1);
-        assert_eq!(requests[0].peer, peer);
+        assert_eq!(requests[0].producers[0].peer, peer);
         assert_eq!(requests[0].session_epoch, 100);
         assert_eq!(requests[0].scan_id, PgScanId::new(8));
         assert_eq!(requests[0].page_kind, 0x4152);
@@ -391,7 +406,11 @@ mod tests {
             .expect("transport schema")
             .0;
         let exec = WorkerPgScanExec::new(
-            BackendLeaseSlot::new(3, control_transport::BackendLeaseId::new(1, 4)),
+            vec![ScanProducerPeer {
+                producer_id: 0,
+                role: ProducerRoleKind::Leader,
+                peer: BackendLeaseSlot::new(3, control_transport::BackendLeaseId::new(1, 4)),
+            }],
             100,
             scan_spec,
             output_schema,

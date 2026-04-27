@@ -17,9 +17,8 @@ pub use runtime::{
     DecodedInbound, PendingPhysicalPlanning, PhysicalPlanResult, TransportWorkerRuntime,
     WorkerRuntimeConfig, WorkerRuntimeCore, WorkerRuntimeStep,
 };
-pub use scan_exec::{OpenScanRequest, ScanBatchSource, WorkerPgScanExec, WorkerPgScanExecFactory};
-pub use scan_flow_driver::{
-    ScanFlowDriver, ScanFlowDriverStep, ScanFlowOpen, SingleLeaderOpenScanControl,
-    SingleLeaderScanDescriptor,
+pub use scan_exec::{
+    OpenScanRequest, ScanBatchSource, ScanProducerPeer, WorkerPgScanExec, WorkerPgScanExecFactory,
 };
+pub use scan_flow_driver::{OpenScanControl, ScanFlowDriver, ScanFlowDriverStep, ScanFlowOpen};
 pub use transport_scan_source::{ScanIngressProvider, TransportScanBatchSource};

@@ -1,32 +1,36 @@
 use std::collections::BTreeMap;
 use std::ffi::{CStr, CString};
+use std::panic::AssertUnwindSafe;
 use std::sync::Arc;
 use std::time::Duration;
 
 use arrow_schema::{Field, Schema, SchemaRef};
 use backend_service::{
-    ActiveScanDriver, BackendService, BackendServiceError, BeginExecutionOutput,
+    ActiveScanDriver, BackendService, BackendServiceError, BeginExecutionOutput, CtidBlockRange,
     DiagnosticLogLevel, ExecutionKey, ExplainInput, ExplainRenderOptions, OpenScanInput,
-    ScanStreamStep, StartExecutionInput,
+    ScanStreamStep, ScanWorkerLaunchInput, ScanWorkerLaunchOutput, ScanWorkerLauncher,
+    ScanWorkerProducer, StartExecutionInput,
 };
-use control_transport::{BackendLeaseSlot, BackendSlotLease};
+use control_transport::{BackendLeaseSlot, BackendSlotLease, WorkerTransport};
 use issuance::{
     decode_issued_frame, encode_issued_frame, IssuancePool, IssuedOwnedFrame, IssuedTx,
 };
+use pgrx::bgworkers::BackgroundWorkerBuilder;
 use pgrx::pg_sys::{
     self, CustomExecMethods, CustomScan, CustomScanMethods, CustomScanState, ExecutorEnd_hook_type,
     List, MyLatch, Node, QueryDesc, WL_LATCH_SET, WL_POSTMASTER_DEATH, WL_TIMEOUT,
 };
 use pgrx::prelude::*;
-use pgrx::{check_for_interrupts, pg_guard};
+use pgrx::{check_for_interrupts, pg_guard, PgRelation as PgrxRelation, PgTryBuilder};
 use pool::PagePool;
 use runtime_metrics::{MetricId, PageDirection, RuntimeMetrics};
 use runtime_protocol::{
     decode_runtime_message_family, decode_worker_execution_to_backend,
     decode_worker_scan_to_backend, encode_backend_execution_to_worker_into,
-    encode_backend_scan_to_worker_into, encoded_len_backend_execution_to_worker,
-    encoded_len_backend_scan_to_worker, BackendExecutionToWorker, BackendScanToWorker,
-    RuntimeMessageFamily, WorkerExecutionToBackend, WorkerScanToBackendRef,
+    encode_backend_scan_to_worker_into, encode_worker_scan_to_backend_into,
+    encoded_len_backend_execution_to_worker, encoded_len_backend_scan_to_worker,
+    encoded_len_worker_scan_to_backend, BackendExecutionToWorker, BackendScanToWorker,
+    RuntimeMessageFamily, WorkerExecutionToBackend, WorkerScanToBackend, WorkerScanToBackendRef,
 };
 use transfer::PageTx;
 use worker_runtime::normalize_result_transport_schema;
@@ -35,9 +39,10 @@ use crate::diag;
 use crate::guc::host_config;
 use crate::logging;
 use crate::result_ingress::{AcceptedResultFrame, ResultIngress};
+use crate::scan_worker_job::{ScanWorkerJobRegistryHandle, ScanWorkerJobSpec};
 use crate::shmem::{
     attach_control_region, attach_issuance_pool, attach_page_pool, attach_runtime_metrics,
-    attach_scan_region,
+    attach_scan_region, attach_scan_worker_jobs,
 };
 use crate::utility_hook::PlannerBypassGuard;
 
@@ -332,6 +337,7 @@ unsafe extern "C-unwind" fn begin_pg_fusion_scan(
     backend_config.metrics = metrics;
     let control_region = attach_control_region();
     let scan_region = attach_scan_region();
+    let scan_worker_jobs = attach_scan_worker_jobs();
     let page_pool = attach_page_pool();
     let issuance_pool = attach_issuance_pool();
     let transport_schema = build_transport_schema(&state.sql)
@@ -347,6 +353,15 @@ unsafe extern "C-unwind" fn begin_pg_fusion_scan(
     });
 
     let plan_tx = IssuedTx::new(PageTx::new(page_pool), issuance_pool);
+    let mut scan_worker_launcher = DynamicScanWorkerLauncher {
+        config: config.clone(),
+        jobs: scan_worker_jobs,
+    };
+    let scan_worker_launcher = if config.scan_parallel_workers > 0 {
+        Some(&mut scan_worker_launcher as &mut dyn ScanWorkerLauncher)
+    } else {
+        None
+    };
     let begin = {
         let _planner_bypass = PlannerBypassGuard::enter();
         BackendService::begin_execution(StartExecutionInput {
@@ -356,6 +371,7 @@ unsafe extern "C-unwind" fn begin_pg_fusion_scan(
             plan_tx,
             scan_slot_region: &scan_region,
             config: backend_config,
+            scan_worker_launcher,
         })
     }
     .unwrap_or_else(|err| error!("pg_fusion begin execution failed: {err}"));
@@ -1295,10 +1311,214 @@ fn build_transport_schema(sql: &str) -> Result<SchemaRef, String> {
     Ok(schema)
 }
 
+struct DynamicScanWorkerLauncher {
+    config: crate::HostConfig,
+    jobs: ScanWorkerJobRegistryHandle,
+}
+
+impl ScanWorkerLauncher for DynamicScanWorkerLauncher {
+    fn launch_scan_workers(
+        &mut self,
+        input: ScanWorkerLaunchInput<'_>,
+    ) -> Result<ScanWorkerLaunchOutput, BackendServiceError> {
+        if self.config.scan_parallel_workers == 0
+            || input.spec.compiled_scan.uses_dummy_projection
+            || input.spec.compiled_scan.output_columns.is_empty()
+        {
+            return Ok(ScanWorkerLaunchOutput::default());
+        }
+
+        let storage = relation_storage_info(input.spec.table_oid)?;
+        if !storage.is_cross_backend_visible || !storage.has_no_dropped_attributes {
+            return Ok(ScanWorkerLaunchOutput::default());
+        }
+        let block_count = storage.block_count;
+        if block_count <= 1 {
+            return Ok(ScanWorkerLaunchOutput::default());
+        }
+        let requested_workers = self.config.scan_parallel_workers.min(32) as u16;
+        let total_producers = (u64::from(requested_workers) + 1)
+            .min(block_count)
+            .min(u64::from(u16::MAX)) as u16;
+        if total_producers <= 1 {
+            return Ok(ScanWorkerLaunchOutput::default());
+        }
+
+        let db_oid: u32 = unsafe { pg_sys::MyDatabaseId.into() };
+        let user_oid: u32 = unsafe { pg_sys::GetUserId().into() };
+        let mut workers = Vec::with_capacity(total_producers.saturating_sub(1) as usize);
+        for producer_id in 1..total_producers {
+            let range = producer_block_range(block_count, total_producers, producer_id);
+            let job_id = match self.jobs.allocate(ScanWorkerJobSpec {
+                sql: input.sql,
+                db_oid,
+                user_oid,
+                session_epoch: input.session_epoch,
+                scan_id: input.scan_id,
+                producer_id,
+                producer_count: total_producers,
+                ctid_range: range,
+            }) {
+                Ok(job_id) => job_id,
+                Err(err) => {
+                    cancel_launched_scan_workers(&workers, input.session_epoch, input.scan_id);
+                    return Err(BackendServiceError::ProtocolViolation(err.to_string()));
+                }
+            };
+            if let Err(err) = BackgroundWorkerBuilder::new("pg_fusion scan worker")
+                .set_function("scan_worker_main")
+                .set_library("pg_fusion")
+                .enable_spi_access()
+                .set_argument((job_id as i32).into_datum())
+                .set_notify_pid(unsafe { pg_sys::MyProcPid })
+                .load_dynamic()
+            {
+                let message = format!("failed to launch scan worker job {job_id}: {err:?}");
+                mark_scan_worker_job_failed(self.jobs, job_id, &message);
+                cancel_launched_scan_workers(&workers, input.session_epoch, input.scan_id);
+                return Err(BackendServiceError::ProtocolViolation(message));
+            }
+            let peer = match self.jobs.wait_ready(job_id, Duration::from_secs(5)) {
+                Ok(peer) => peer,
+                Err(err) => {
+                    let message = err.to_string();
+                    mark_scan_worker_job_failed(self.jobs, job_id, &message);
+                    cancel_launched_scan_workers(&workers, input.session_epoch, input.scan_id);
+                    return Err(BackendServiceError::ProtocolViolation(message));
+                }
+            };
+            workers.push(ScanWorkerProducer::worker(producer_id, peer));
+        }
+
+        Ok(ScanWorkerLaunchOutput {
+            leader_ctid_range: Some(producer_block_range(block_count, total_producers, 0)),
+            workers,
+        })
+    }
+}
+
+fn mark_scan_worker_job_failed(jobs: ScanWorkerJobRegistryHandle, job_id: usize, message: &str) {
+    if let Err(err) = jobs.mark_failed(job_id, message) {
+        host_diag(DiagnosticLogLevel::Basic, || {
+            format!("pg_fusion failed to mark scan worker job {job_id} failed during launch cleanup: {err}")
+        });
+    }
+}
+
+fn cancel_launched_scan_workers(workers: &[ScanWorkerProducer], session_epoch: u64, scan_id: u64) {
+    if workers.is_empty() {
+        return;
+    }
+
+    let scan_region = attach_scan_region();
+    let transport = match WorkerTransport::attach(&scan_region) {
+        Ok(transport) => transport,
+        Err(err) => {
+            host_diag(DiagnosticLogLevel::Basic, || {
+                format!("pg_fusion failed to attach scan transport for launch cleanup: {err}")
+            });
+            return;
+        }
+    };
+    let mut scratch = Vec::new();
+    for worker in workers {
+        if let Err(err) = send_scan_worker_cancel(
+            &transport,
+            worker.peer,
+            session_epoch,
+            scan_id,
+            &mut scratch,
+        ) {
+            host_diag(DiagnosticLogLevel::Basic, || {
+                format!(
+                    "pg_fusion failed to cancel scan worker producer_id={} peer={} during launch cleanup: {err}",
+                    worker.producer_id,
+                    peer_snapshot(worker.peer)
+                )
+            });
+        }
+    }
+}
+
+fn send_scan_worker_cancel(
+    transport: &WorkerTransport,
+    peer: BackendLeaseSlot,
+    session_epoch: u64,
+    scan_id: u64,
+    scratch: &mut Vec<u8>,
+) -> Result<(), BackendServiceError> {
+    let message = WorkerScanToBackend::CancelScan {
+        session_epoch,
+        scan_id,
+    };
+    let needed = encoded_len_worker_scan_to_backend(message);
+    if scratch.len() < needed {
+        scratch.resize(needed, 0);
+    }
+    let written = encode_worker_scan_to_backend_into(message, scratch)
+        .map_err(|err| BackendServiceError::ProtocolViolation(err.to_string()))?;
+    let mut slot = transport
+        .slot_for_backend_lease(peer)
+        .map_err(|err| BackendServiceError::ProtocolViolation(err.to_string()))?;
+    let mut tx = slot
+        .to_backend_tx()
+        .map_err(|err| BackendServiceError::ProtocolViolation(err.to_string()))?;
+    let _ = tx
+        .send_frame(&scratch[..written])
+        .map_err(|err| BackendServiceError::ProtocolViolation(err.to_string()))?;
+    Ok(())
+}
+
+struct RelationStorageInfo {
+    block_count: u64,
+    is_cross_backend_visible: bool,
+    has_no_dropped_attributes: bool,
+}
+
+fn relation_storage_info(table_oid: u32) -> Result<RelationStorageInfo, BackendServiceError> {
+    PgTryBuilder::new(AssertUnwindSafe(|| unsafe {
+        let relation = PgrxRelation::with_lock(table_oid.into(), pg_sys::AccessShareLock as _);
+        let blocks = pg_sys::RelationGetNumberOfBlocksInFork(
+            relation.as_ptr(),
+            pg_sys::ForkNumber::MAIN_FORKNUM,
+        );
+        let has_no_dropped_attributes = relation
+            .tuple_desc()
+            .iter()
+            .all(|attribute| !attribute.is_dropped());
+        let relpersistence = (*(*relation.as_ptr()).rd_rel).relpersistence as u8;
+        Ok(RelationStorageInfo {
+            block_count: u64::from(blocks),
+            is_cross_backend_visible: relpersistence != pg_sys::RELPERSISTENCE_TEMP,
+            has_no_dropped_attributes,
+        })
+    }))
+    .catch_others(|error| {
+        Err(BackendServiceError::Postgres(format!(
+            "failed to read relation block count: {error:?}"
+        )))
+    })
+    .execute()
+}
+
+fn producer_block_range(
+    block_count: u64,
+    total_producers: u16,
+    producer_id: u16,
+) -> CtidBlockRange {
+    let total = u64::from(total_producers);
+    let id = u64::from(producer_id);
+    CtidBlockRange {
+        start_block: block_count.saturating_mul(id) / total,
+        end_block: block_count.saturating_mul(id + 1) / total,
+    }
+}
+
 fn scan_peers_from_begin(begin: &BeginExecutionOutput) -> BTreeMap<u64, BackendLeaseSlot> {
     begin
         .scan_channels
         .iter()
+        .filter(|descriptor| descriptor.role == runtime_protocol::ProducerRole::Leader)
         .map(|descriptor| {
             (
                 descriptor.scan_id,

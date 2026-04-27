@@ -20,7 +20,7 @@ use thiserror::Error;
 use transfer::MessageKind;
 
 pub(crate) const PRODUCER_DESCRIPTOR_LEN: u32 = 2;
-pub(crate) const SCAN_CHANNEL_DESCRIPTOR_LEN: u32 = 4;
+pub(crate) const SCAN_CHANNEL_DESCRIPTOR_LEN: u32 = 6;
 
 /// Transport-agnostic wire identity of one backend lease slot.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -56,24 +56,40 @@ impl BackendLeaseSlotWire {
     }
 }
 
-/// One execution scan channel published up front in `StartExecution`.
+/// One execution scan producer channel published up front in `StartExecution`.
 ///
-/// Encoded channel lists must be in strictly increasing `scan_id` order.
+/// Encoded channel lists must be in strictly increasing
+/// `(scan_id, producer_id)` order.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct ScanChannelDescriptorWire {
     /// Logical scan identifier inside one execution.
     pub scan_id: u64,
-    /// Dedicated backend peer reserved for this `scan_id`.
+    /// Producer identifier scoped to `scan_id`.
+    pub producer_id: u16,
+    /// Producer role inside this logical scan.
+    pub role: ProducerRole,
+    /// Dedicated backend peer reserved for this producer.
     pub peer: BackendLeaseSlotWire,
 }
 
 /// Validation errors for one encode-side scan channel set.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Error)]
 pub enum ScanChannelSetError {
-    #[error("duplicate scan_id {scan_id} in scan channel set")]
-    DuplicateScanId { scan_id: u64 },
-    #[error("scan channel set is not sorted by scan_id: previous={previous}, current={current}")]
-    ScanIdOutOfOrder { previous: u64, current: u64 },
+    #[error("duplicate scan channel for scan_id {scan_id}, producer_id {producer_id}")]
+    DuplicateProducer { scan_id: u64, producer_id: u16 },
+    #[error(
+        "scan channel set is not sorted by scan_id/producer_id: previous=({previous_scan_id}, {previous_producer_id}), current=({current_scan_id}, {current_producer_id})"
+    )]
+    ChannelOutOfOrder {
+        previous_scan_id: u64,
+        previous_producer_id: u16,
+        current_scan_id: u64,
+        current_producer_id: u16,
+    },
+    #[error("scan channel set declares multiple leader producers for scan_id {scan_id}")]
+    MultipleLeaders { scan_id: u64 },
+    #[error("scan channel set declares no leader producer for scan_id {scan_id}")]
+    MissingLeader { scan_id: u64 },
 }
 
 /// Encode-side borrowed execution scan-channel set.
@@ -379,6 +395,8 @@ pub(crate) fn read_scan_channel_descriptor_from(
     expect_message_len(read_array_len_from(source)?, SCAN_CHANNEL_DESCRIPTOR_LEN)?;
     Ok(ScanChannelDescriptorWire {
         scan_id: read_u64_from(source)?,
+        producer_id: read_u16_from(source)?,
+        role: ProducerRole::try_from(read_u8_from(source)?)?,
         peer: BackendLeaseSlotWire::new(
             read_u32_from(source)?,
             read_u64_from(source)?,
@@ -419,6 +437,8 @@ pub(crate) fn write_scan_channel_slice_to<W: std::io::Write>(
     for channel in channels {
         write_array_len_to(sink, SCAN_CHANNEL_DESCRIPTOR_LEN)?;
         write_u64_to(sink, channel.scan_id)?;
+        write_u16_to(sink, channel.producer_id)?;
+        write_u8_to(sink, channel.role as u8)?;
         write_u32_to(sink, channel.peer.slot_id())?;
         write_u64_to(sink, channel.peer.generation())?;
         write_u64_to(sink, channel.peer.lease_epoch())?;

@@ -28,8 +28,9 @@ pub const MIN_SCAN_BACKEND_TO_WORKER_RING_CAPACITY: usize = 256;
 /// Minimum raw `control_transport` ring capacity required for dedicated
 /// worker-to-backend scan peers.
 ///
-/// This bound covers the worst-case single-leader `OpenScan` control payload.
-pub const MIN_SCAN_WORKER_TO_BACKEND_RING_CAPACITY: usize = 44;
+/// This bound covers `OpenScan` control payloads with one leader producer plus
+/// the current pg_fusion maximum of 32 additional scan worker producers.
+pub const MIN_SCAN_WORKER_TO_BACKEND_RING_CAPACITY: usize = 256;
 
 /// Maximum UTF-8 byte length allowed for `BackendScanToWorker::ScanFailed`
 /// text.

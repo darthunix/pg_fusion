@@ -9,23 +9,7 @@ use runtime_protocol::{
 use scan_flow::{FlowId, ProducerDescriptor, ProducerId, ScanOpen, WorkerScanRole, WorkerStep};
 
 use crate::error::WorkerRuntimeError;
-
-/// Fixed producer id used by the single-leader worker scan path.
-pub const SINGLE_SCAN_PRODUCER_ID: ProducerId = 0;
-
-/// Single-producer scan descriptor for the current worker implementation.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct SingleLeaderScanDescriptor {
-    pub producer_id: ProducerId,
-}
-
-impl Default for SingleLeaderScanDescriptor {
-    fn default() -> Self {
-        Self {
-            producer_id: SINGLE_SCAN_PRODUCER_ID,
-        }
-    }
-}
+use crate::scan_exec::ScanProducerPeer;
 
 /// Parameters required to open one worker-side logical scan stream.
 #[derive(Debug, Clone)]
@@ -35,17 +19,18 @@ pub struct ScanFlowOpen {
     pub page_kind: transfer::MessageKind,
     pub page_flags: u16,
     pub output_schema: SchemaRef,
-    pub producer: SingleLeaderScanDescriptor,
+    pub producers: Vec<ScanProducerPeer>,
 }
 
 impl ScanFlowOpen {
-    /// Build one single-leader scan-open descriptor.
-    pub fn single_leader(
+    /// Build one scan-open descriptor with all declared producers.
+    pub fn new(
         session_epoch: u64,
         scan_id: u64,
         page_kind: transfer::MessageKind,
         page_flags: u16,
         output_schema: SchemaRef,
+        producers: Vec<ScanProducerPeer>,
     ) -> Self {
         Self {
             session_epoch,
@@ -53,7 +38,7 @@ impl ScanFlowOpen {
             page_kind,
             page_flags,
             output_schema,
-            producer: SingleLeaderScanDescriptor::default(),
+            producers,
         }
     }
 }
@@ -84,27 +69,24 @@ pub enum ScanFlowDriverStep {
 /// scan frames into this driver as they arrive.
 pub struct ScanFlowDriver {
     flow: FlowId,
-    producer_id: ProducerId,
     role: WorkerScanRole,
-    rx: IssuedRx,
     decoder: ArrowPageDecoder,
 }
 
-/// Heap-free encoder for the single-leader `OpenScan` control payload.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct SingleLeaderOpenScanControl {
+/// Encoder for a worker `OpenScan` control payload.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct OpenScanControl {
     session_epoch: u64,
     scan_id: u64,
     page_kind: transfer::MessageKind,
     page_flags: u16,
-    producer_id: ProducerId,
+    producers: Vec<ProducerDescriptorWire>,
 }
 
 impl std::fmt::Debug for ScanFlowDriver {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("ScanFlowDriver")
             .field("flow", &self.flow)
-            .field("producer_id", &self.producer_id)
             .field("state", &self.role.state())
             .finish()
     }
@@ -112,38 +94,51 @@ impl std::fmt::Debug for ScanFlowDriver {
 
 impl ScanFlowDriver {
     /// Open one worker-side scan-flow role and return its control payload handle.
-    pub fn open(
-        open: ScanFlowOpen,
-        rx: IssuedRx,
-    ) -> Result<(Self, SingleLeaderOpenScanControl), WorkerRuntimeError> {
+    pub fn open(open: ScanFlowOpen) -> Result<(Self, OpenScanControl), WorkerRuntimeError> {
         let flow = FlowId {
             session_epoch: open.session_epoch,
             scan_id: open.scan_id,
         };
-        let producer_id = open.producer.producer_id;
+        let producers = open
+            .producers
+            .iter()
+            .map(|producer| ProducerDescriptor {
+                producer_id: producer.producer_id,
+                role: producer.role,
+            })
+            .collect::<Vec<_>>();
+        let wire_producers = open
+            .producers
+            .iter()
+            .map(|producer| ProducerDescriptorWire {
+                producer_id: producer.producer_id,
+                role: match producer.role {
+                    scan_flow::ProducerRoleKind::Leader => ProducerRole::Leader,
+                    scan_flow::ProducerRoleKind::Worker => ProducerRole::Worker,
+                },
+            })
+            .collect::<Vec<_>>();
         let mut role = WorkerScanRole::new();
         role.open(ScanOpen::new(
             flow,
             open.page_kind,
             open.page_flags,
-            vec![ProducerDescriptor::leader(producer_id)],
+            producers,
         )?)?;
 
         let decoder = ArrowPageDecoder::new(open.output_schema)?;
-        let control_payload = SingleLeaderOpenScanControl {
+        let control_payload = OpenScanControl {
             session_epoch: open.session_epoch,
             scan_id: open.scan_id,
             page_kind: open.page_kind,
             page_flags: open.page_flags,
-            producer_id,
+            producers: wire_producers,
         };
 
         Ok((
             Self {
                 flow,
-                producer_id,
                 role,
-                rx,
                 decoder,
             },
             control_payload,
@@ -159,11 +154,12 @@ impl ScanFlowDriver {
     pub fn accept_page_frame(
         &mut self,
         producer_id: ProducerId,
+        rx: &IssuedRx,
         frame: &IssuedOwnedFrame,
     ) -> Result<ScanFlowDriverStep, WorkerRuntimeError> {
         match self
             .role
-            .accept_page_frame(self.flow, producer_id, &self.rx, frame)?
+            .accept_page_frame(self.flow, producer_id, rx, frame)?
         {
             WorkerStep::Idle => Ok(ScanFlowDriverStep::Idle),
             WorkerStep::Page {
@@ -249,14 +245,10 @@ impl ScanFlowDriver {
     }
 }
 
-impl SingleLeaderOpenScanControl {
+impl OpenScanControl {
     /// Encode this `OpenScan` message into caller-provided scratch storage.
-    pub fn encode_into(self, dst: &mut [u8]) -> Result<usize, WorkerRuntimeError> {
-        let producers = [ProducerDescriptorWire {
-            producer_id: self.producer_id,
-            role: ProducerRole::Leader,
-        }];
-        let scan = ScanFlowDescriptor::new(self.page_kind, self.page_flags, &producers)?;
+    pub fn encode_into(&self, dst: &mut [u8]) -> Result<usize, WorkerRuntimeError> {
+        let scan = ScanFlowDescriptor::new(self.page_kind, self.page_flags, &self.producers)?;
         let message = WorkerScanToBackend::OpenScan {
             session_epoch: self.session_epoch,
             scan_id: self.scan_id,
@@ -277,13 +269,22 @@ mod tests {
     use runtime_protocol::{decode_worker_scan_to_backend, WorkerScanToBackendRef};
 
     #[test]
-    fn open_scan_control_payload_uses_single_leader_producer() {
-        let control = SingleLeaderOpenScanControl {
+    fn open_scan_control_payload_uses_declared_producers() {
+        let control = OpenScanControl {
             session_epoch: 11,
             scan_id: 22,
             page_kind: 0x4152,
             page_flags: 0,
-            producer_id: 0,
+            producers: vec![
+                ProducerDescriptorWire {
+                    producer_id: 0,
+                    role: ProducerRole::Leader,
+                },
+                ProducerDescriptorWire {
+                    producer_id: 1,
+                    role: ProducerRole::Worker,
+                },
+            ],
         };
         let mut encoded = [0_u8; 128];
         let written = control.encode_into(&mut encoded).unwrap();
@@ -303,8 +304,10 @@ mod tests {
         assert_eq!(scan.page_kind, 0x4152);
         assert_eq!(scan.page_flags, 0);
         let producers: Vec<_> = scan.producers().iter().collect();
-        assert_eq!(producers.len(), 1);
+        assert_eq!(producers.len(), 2);
         assert_eq!(producers[0].producer_id, 0);
         assert_eq!(producers[0].role, ProducerRole::Leader);
+        assert_eq!(producers[1].producer_id, 1);
+        assert_eq!(producers[1].role, ProducerRole::Worker);
     }
 }

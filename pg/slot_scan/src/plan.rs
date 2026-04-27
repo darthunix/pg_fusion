@@ -300,13 +300,17 @@ pub(crate) unsafe fn inspect_plan(plan: *mut pg_sys::Plan) -> Result<PlanMetadat
         }
         pg_sys::NodeTag::T_SeqScan
         | pg_sys::NodeTag::T_IndexScan
-        | pg_sys::NodeTag::T_IndexOnlyScan => Ok(PlanMetadata {
+        | pg_sys::NodeTag::T_IndexOnlyScan
+        | pg_sys::NodeTag::T_TidScan
+        | pg_sys::NodeTag::T_TidRangeScan => Ok(PlanMetadata {
             parallel_capable: false,
             planned_workers: 0,
             plan_kind: match (*plan).type_ {
                 pg_sys::NodeTag::T_SeqScan => ScanPlanKind::SeqScan,
                 pg_sys::NodeTag::T_IndexScan => ScanPlanKind::IndexScan,
                 pg_sys::NodeTag::T_IndexOnlyScan => ScanPlanKind::IndexOnlyScan,
+                pg_sys::NodeTag::T_TidScan => ScanPlanKind::TidScan,
+                pg_sys::NodeTag::T_TidRangeScan => ScanPlanKind::TidRangeScan,
                 _ => unreachable!("matched scan node must have a known plan kind"),
             },
         }),

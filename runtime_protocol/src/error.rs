@@ -45,10 +45,21 @@ pub enum DecodeError {
     InvalidFailureCode { actual: u8 },
     #[error("invalid producer role {actual}")]
     InvalidProducerRole { actual: u8 },
-    #[error("duplicate scan_id {scan_id} in scan channel set")]
-    DuplicateScanId { scan_id: u64 },
-    #[error("scan channel set is not sorted by scan_id: previous={previous}, current={current}")]
-    ScanIdOutOfOrder { previous: u64, current: u64 },
+    #[error("duplicate scan channel for scan_id {scan_id}, producer_id {producer_id}")]
+    DuplicateScanProducer { scan_id: u64, producer_id: u16 },
+    #[error(
+        "scan channel set is not sorted by scan_id/producer_id: previous=({previous_scan_id}, {previous_producer_id}), current=({current_scan_id}, {current_producer_id})"
+    )]
+    ScanChannelOutOfOrder {
+        previous_scan_id: u64,
+        previous_producer_id: u16,
+        current_scan_id: u64,
+        current_producer_id: u16,
+    },
+    #[error("scan channel set declares multiple leader producers for scan_id {scan_id}")]
+    MultipleScanChannelLeaders { scan_id: u64 },
+    #[error("scan channel set declares no leader producer for scan_id {scan_id}")]
+    MissingScanChannelLeader { scan_id: u64 },
     #[error("scan open must declare at least one producer")]
     EmptyProducerSet,
     #[error("duplicate producer id {producer_id} in scan open")]

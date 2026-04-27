@@ -111,6 +111,8 @@ pub enum ScanPlanKind {
     SeqScan,
     IndexScan,
     IndexOnlyScan,
+    TidScan,
+    TidRangeScan,
     BitmapHeapScan,
 }
 

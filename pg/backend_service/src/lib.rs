@@ -12,7 +12,7 @@ use datafusion_common::ScalarValue;
 use datafusion_expr::logical_plan::LogicalPlan;
 use fsm::backend_execution_flow::StateMachine as BackendExecutionMachine;
 pub use fsm::{BackendExecutionAction, BackendExecutionEvent, BackendExecutionState};
-use issuance::IssuedTx;
+use issuance::{encode_issued_frame, IssuedTx};
 use pgrx::pg_sys;
 use pgrx::pg_sys::panic::CaughtError;
 use pgrx::{PgRelation as PgrxRelation, PgTryBuilder};
@@ -20,17 +20,19 @@ use plan_builder::{PlanBuildInput, PlanBuilder};
 use plan_flow::{BackendPlanRole, BackendPlanStep, PlanOpen};
 use row_estimator::{EstimatorConfig, PageRowEstimator};
 use row_estimator_seed::{seed_estimator_config, ProjectedColumnRef};
-use runtime_metrics::{MetricId, RuntimeMetrics};
+use runtime_metrics::{MetricId, PageDirection, RuntimeMetrics};
 use runtime_protocol::{
-    BackendExecutionToWorker, BackendLeaseSlotWire, ExecutionFailureCode, PlanFlowDescriptor,
+    decode_worker_scan_to_backend, encode_backend_scan_to_worker_into, BackendExecutionToWorker,
+    BackendLeaseSlotWire, BackendScanToWorker, ExecutionFailureCode, PlanFlowDescriptor,
     ProducerRole, ScanChannelDescriptorWire, ScanChannelSet, ScanFlowDescriptorRef,
+    WorkerScanToBackendRef,
 };
 use scan_flow::{
     BackendProducerRole, BackendProducerStep, BackendScanCoordinator, FlowId as ScanFlowId,
     LogicalTerminal, ProducerDescriptor, ProducerRoleKind, ScanOpen,
 };
 use scan_node::PgScanSpec;
-use scan_sql::render_unprojected_scan_sql;
+use scan_sql::{render_unprojected_ctid_block_scan_sql, render_unprojected_scan_sql};
 use slot_scan::{prepare_scan, ExecutionSpiContext, PreparedScan, ScanOptions};
 pub use slot_scan::{DiagnosticLogLevel, DiagnosticsConfig};
 use std::cell::{Cell, RefCell};
@@ -45,12 +47,14 @@ use std::panic::AssertUnwindSafe;
 use std::path::Path;
 use std::rc::Rc;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 pub use error::BackendServiceError;
 
 const PLAN_ID: u64 = 1;
 const SINGLE_SCAN_PRODUCER_ID: u16 = 0;
+const STANDALONE_OPEN_SCAN_TIMEOUT: Duration = Duration::from_secs(30);
+const STANDALONE_TERMINAL_DRAIN_TIMEOUT: Duration = Duration::from_secs(30);
 
 thread_local! {
     static CURRENT_SESSION_EPOCH: Cell<u64> = const { Cell::new(0) };
@@ -162,6 +166,53 @@ pub struct StartExecutionInput<'a> {
     pub plan_tx: IssuedTx,
     pub scan_slot_region: &'a TransportRegion,
     pub config: BackendServiceConfig,
+    pub scan_worker_launcher: Option<&'a mut dyn ScanWorkerLauncher>,
+}
+
+pub trait ScanWorkerLauncher {
+    fn launch_scan_workers(
+        &mut self,
+        input: ScanWorkerLaunchInput<'_>,
+    ) -> Result<ScanWorkerLaunchOutput, BackendServiceError>;
+}
+
+pub struct ScanWorkerLaunchInput<'a> {
+    pub session_epoch: u64,
+    pub scan_id: u64,
+    pub sql: &'a str,
+    pub spec: &'a PgScanSpec,
+    pub leader_peer: BackendLeaseSlot,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ScanWorkerProducer {
+    pub producer_id: u16,
+    pub role: ProducerRoleKind,
+    pub peer: BackendLeaseSlot,
+}
+
+impl ScanWorkerProducer {
+    pub fn leader(producer_id: u16, peer: BackendLeaseSlot) -> Self {
+        Self {
+            producer_id,
+            role: ProducerRoleKind::Leader,
+            peer,
+        }
+    }
+
+    pub fn worker(producer_id: u16, peer: BackendLeaseSlot) -> Self {
+        Self {
+            producer_id,
+            role: ProducerRoleKind::Worker,
+            peer,
+        }
+    }
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct ScanWorkerLaunchOutput {
+    pub leader_ctid_range: Option<CtidBlockRange>,
+    pub workers: Vec<ScanWorkerProducer>,
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -190,6 +241,24 @@ pub struct OpenScanInput<'a> {
     pub scan_id: u64,
     pub scan: ScanFlowDescriptorRef<'a>,
     pub scan_tx: IssuedTx,
+}
+
+pub struct StandaloneScanProducerInput<'a> {
+    pub sql: &'a str,
+    pub session_epoch: u64,
+    pub scan_id: u64,
+    pub producer_id: u16,
+    pub producer_count: u16,
+    pub ctid_range: Option<CtidBlockRange>,
+    pub scan_lease: BackendSlotLease,
+    pub scan_tx: IssuedTx,
+    pub config: BackendServiceConfig,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct CtidBlockRange {
+    pub start_block: u64,
+    pub end_block: u64,
 }
 
 #[derive(Debug)]
@@ -281,8 +350,9 @@ struct PreparedScanEntry {
     source_projection: Vec<usize>,
     estimator_config: EstimatorConfig,
     canonical_open: ScanOpen,
-    scan_peer: BackendLeaseSlot,
-    scan_lease: Option<BackendSlotLease>,
+    producers: Vec<ScanWorkerProducer>,
+    leader_peer: BackendLeaseSlot,
+    leader_lease: Option<BackendSlotLease>,
     state: ScanEntryState,
 }
 
@@ -476,6 +546,8 @@ impl BackendService {
             plan_role.open(plan_open, &built.logical_plan)?;
 
             let mut scans = BTreeMap::new();
+            let mut scan_channels = Vec::new();
+            let mut scan_worker_launcher = input.scan_worker_launcher;
             for spec in built.scans.iter().cloned() {
                 let scan_lease = BackendSlotLease::acquire(input.scan_slot_region)?;
                 let scan_peer = scan_lease.backend_lease_slot();
@@ -491,23 +563,52 @@ impl BackendService {
                     std::process::id()
                     )
                 });
-                let entry =
-                    prepare_scan_entry(session_epoch, &config, spec, scan_peer, scan_lease)?;
+                let scan_id = spec.scan_id.get();
+                let mut producers = vec![ScanWorkerProducer::leader(
+                    SINGLE_SCAN_PRODUCER_ID,
+                    scan_peer,
+                )];
+                let mut leader_ctid_range = None;
+                if let Some(launcher) = scan_worker_launcher.as_deref_mut() {
+                    let mut output = launcher.launch_scan_workers(ScanWorkerLaunchInput {
+                        session_epoch,
+                        scan_id,
+                        sql: input.sql,
+                        spec: spec.as_ref(),
+                        leader_peer: scan_peer,
+                    })?;
+                    leader_ctid_range = output.leader_ctid_range.take();
+                    producers.append(&mut output.workers);
+                    producers.sort_by_key(|producer| producer.producer_id);
+                }
+                let entry = prepare_scan_entry(
+                    session_epoch,
+                    &config,
+                    spec,
+                    producers,
+                    leader_ctid_range,
+                    scan_lease,
+                )?;
+                scan_channels.extend(entry.producers.iter().map(|producer| {
+                    ScanChannelDescriptorWire {
+                        scan_id: entry.scan_id,
+                        producer_id: producer.producer_id,
+                        role: match producer.role {
+                            ProducerRoleKind::Leader => ProducerRole::Leader,
+                            ProducerRoleKind::Worker => ProducerRole::Worker,
+                        },
+                        peer: BackendLeaseSlotWire::new(
+                            producer.peer.slot_id(),
+                            producer.peer.lease_id().generation(),
+                            producer.peer.lease_id().lease_epoch(),
+                        ),
+                    }
+                }));
                 scans.insert(entry.scan_id, entry);
             }
 
-            let scan_channels = scans
-                .values()
-                .map(|entry| ScanChannelDescriptorWire {
-                    scan_id: entry.scan_id,
-                    peer: BackendLeaseSlotWire::new(
-                        entry.scan_peer.slot_id(),
-                        entry.scan_peer.lease_id().generation(),
-                        entry.scan_peer.lease_id().lease_epoch(),
-                    ),
-                })
-                .collect::<Vec<_>>()
-                .into_boxed_slice();
+            scan_channels.sort_by_key(|channel| (channel.scan_id, channel.producer_id));
+            let scan_channels = scan_channels.into_boxed_slice();
 
             let snapshot = ExecutionSnapshot::capture_current()?;
             let mut machine = BackendExecutionMachine::new();
@@ -669,10 +770,10 @@ impl BackendService {
                         scan_id: input.scan_id,
                     },
                 )?;
-                if entry.scan_peer != input.peer {
+                if entry.leader_peer != input.peer {
                     return Err(BackendServiceError::ScanPeerMismatch {
                         scan_id: input.scan_id,
-                        expected: entry.scan_peer,
+                        expected: entry.leader_peer,
                         incoming: input.peer,
                     });
                 }
@@ -727,7 +828,12 @@ impl BackendService {
             );
 
             let mut coordinator = BackendScanCoordinator::new();
-            coordinator.open(canonical_open.clone())?;
+            coordinator.open(ScanOpen::new(
+                canonical_open.flow,
+                canonical_open.page_kind,
+                canonical_open.page_flags,
+                vec![ProducerDescriptor::leader(SINGLE_SCAN_PRODUCER_ID)],
+            )?)?;
 
             let mut producer = BackendProducerRole::new(input.scan_tx);
             producer.open(&canonical_open, SINGLE_SCAN_PRODUCER_ID, source)?;
@@ -764,6 +870,12 @@ impl BackendService {
                 _thread_bound: PhantomData,
             }))
         })
+    }
+
+    pub fn run_standalone_scan_producer(
+        input: StandaloneScanProducerInput<'_>,
+    ) -> Result<(), BackendServiceError> {
+        run_standalone_scan_producer(input)
     }
 
     pub fn accept_complete_execution(
@@ -818,7 +930,7 @@ impl BackendService {
             Ok(execution
                 .scans
                 .values()
-                .map(|entry| entry.scan_peer)
+                .map(|entry| entry.leader_peer)
                 .collect::<Vec<_>>()
                 .into_boxed_slice())
         })
@@ -836,14 +948,14 @@ impl BackendService {
             let entry = execution
                 .scans
                 .values_mut()
-                .find(|entry| entry.scan_peer == peer)
+                .find(|entry| entry.leader_peer == peer)
                 .ok_or_else(|| {
                     BackendServiceError::ProtocolViolation(format!(
                         "unknown dedicated scan peer {:?}",
                         peer
                     ))
                 })?;
-            let lease = entry.scan_lease.as_mut().ok_or_else(|| {
+            let lease = entry.leader_lease.as_mut().ok_or_else(|| {
                 BackendServiceError::ProtocolViolation(format!(
                     "scan peer {:?} has no live backend lease",
                     peer
@@ -866,14 +978,14 @@ impl BackendService {
             let entry = execution
                 .scans
                 .values_mut()
-                .find(|entry| entry.scan_peer == peer)
+                .find(|entry| entry.leader_peer == peer)
                 .ok_or_else(|| {
                     BackendServiceError::ProtocolViolation(format!(
                         "unknown dedicated scan peer {:?}",
                         peer
                     ))
                 })?;
-            let lease = entry.scan_lease.as_mut().ok_or_else(|| {
+            let lease = entry.leader_lease.as_mut().ok_or_else(|| {
                 BackendServiceError::ProtocolViolation(format!(
                     "scan peer {:?} has no live backend lease",
                     peer
@@ -1324,7 +1436,8 @@ fn prepare_scan_entry(
     session_epoch: u64,
     config: &BackendServiceConfig,
     spec: Arc<PgScanSpec>,
-    scan_peer: BackendLeaseSlot,
+    producers: Vec<ScanWorkerProducer>,
+    leader_ctid_range: Option<CtidBlockRange>,
     scan_lease: BackendSlotLease,
 ) -> Result<PreparedScanEntry, BackendServiceError> {
     let scan_id = spec.scan_id.get();
@@ -1353,7 +1466,10 @@ fn prepare_scan_entry(
         &projected_columns,
         config.estimator_default,
     )?;
-    let execution_shape = scan_execution_shape(&spec)?;
+    let execution_shape = match leader_ctid_range {
+        Some(range) => scan_execution_shape_for_ctid_range(&spec, range)?,
+        None => scan_execution_shape(&spec)?,
+    };
     let prepared_scan = prepare_scan(
         &execution_shape.sql,
         ScanOptions {
@@ -1369,8 +1485,23 @@ fn prepare_scan_entry(
         },
         config.scan_page_kind,
         config.scan_page_flags,
-        vec![ProducerDescriptor::leader(SINGLE_SCAN_PRODUCER_ID)],
+        producers
+            .iter()
+            .map(|producer| ProducerDescriptor {
+                producer_id: producer.producer_id,
+                role: producer.role,
+            })
+            .collect(),
     )?;
+    let leader_peer = producers
+        .iter()
+        .find(|producer| producer.role == ProducerRoleKind::Leader)
+        .map(|producer| producer.peer)
+        .ok_or_else(|| {
+            BackendServiceError::ProtocolViolation(format!(
+                "scan_id {scan_id} has no leader producer"
+            ))
+        })?;
 
     Ok(PreparedScanEntry {
         scan_id,
@@ -1381,8 +1512,9 @@ fn prepare_scan_entry(
         source_projection: execution_shape.source_projection,
         estimator_config: seeded_config,
         canonical_open,
-        scan_peer,
-        scan_lease: Some(scan_lease),
+        producers,
+        leader_peer,
+        leader_lease: Some(scan_lease),
         state: ScanEntryState::Prepared,
     })
 }
@@ -1411,6 +1543,403 @@ fn scan_execution_shape(spec: &PgScanSpec) -> Result<ScanExecutionShape, Backend
 
 fn scan_execution_sql(spec: &PgScanSpec) -> Result<String, BackendServiceError> {
     scan_execution_shape(spec).map(|shape| shape.sql)
+}
+
+fn scan_execution_shape_for_ctid_range(
+    spec: &PgScanSpec,
+    range: CtidBlockRange,
+) -> Result<ScanExecutionShape, BackendServiceError> {
+    if spec.compiled_scan.output_columns.is_empty() {
+        return Err(BackendServiceError::UnsupportedDummyProjection {
+            scan_id: spec.scan_id.get(),
+        });
+    }
+    if !can_use_unprojected_relation_scan(spec.table_oid.into())? {
+        return Err(BackendServiceError::ProtocolViolation(format!(
+            "scan_id {} cannot use CTID chunking because the relation has dropped attributes",
+            spec.scan_id.get()
+        )));
+    }
+    Ok(ScanExecutionShape {
+        sql: render_unprojected_ctid_block_scan_sql(
+            &spec.relation,
+            &spec.compiled_scan,
+            range.start_block,
+            range.end_block,
+        ),
+        source_projection: spec.compiled_scan.output_columns.clone(),
+    })
+}
+
+fn run_standalone_scan_producer(
+    input: StandaloneScanProducerInput<'_>,
+) -> Result<(), BackendServiceError> {
+    if input.producer_count == 0 || input.producer_id >= input.producer_count {
+        return Err(BackendServiceError::ProtocolViolation(format!(
+            "invalid standalone scan producer_id={} producer_count={}",
+            input.producer_id, input.producer_count
+        )));
+    }
+
+    let canonical_open = standalone_scan_open(
+        input.session_epoch,
+        input.scan_id,
+        input.producer_count,
+        input.config.scan_page_kind,
+        input.config.scan_page_flags,
+    )?;
+    let mut scan_lease = input.scan_lease;
+    wait_for_standalone_open_scan(
+        &mut scan_lease,
+        input.session_epoch,
+        input.scan_id,
+        &canonical_open,
+    )?;
+
+    let built = match PlanBuilder::new().build(PlanBuildInput {
+        sql: input.sql,
+        params: Vec::new(),
+    }) {
+        Ok(built) => built,
+        Err(err) => {
+            send_standalone_scan_failed(
+                &mut scan_lease,
+                input.session_epoch,
+                input.scan_id,
+                input.producer_id,
+                &err,
+            );
+            return Err(err.into());
+        }
+    };
+    let spec = built
+        .scans
+        .iter()
+        .find(|spec| spec.scan_id.get() == input.scan_id)
+        .cloned()
+        .ok_or(BackendServiceError::UnknownScanId {
+            scan_id: input.scan_id,
+        });
+    let spec = match spec {
+        Ok(spec) => spec,
+        Err(err) => {
+            send_standalone_scan_failed(
+                &mut scan_lease,
+                input.session_epoch,
+                input.scan_id,
+                input.producer_id,
+                &err,
+            );
+            return Err(err);
+        }
+    };
+    if spec.compiled_scan.uses_dummy_projection {
+        let err = BackendServiceError::UnsupportedDummyProjection {
+            scan_id: input.scan_id,
+        };
+        send_standalone_scan_failed(
+            &mut scan_lease,
+            input.session_epoch,
+            input.scan_id,
+            input.producer_id,
+            &err,
+        );
+        return Err(err);
+    }
+
+    let source = match standalone_page_source(
+        input.scan_id,
+        input.ctid_range,
+        input.scan_tx.payload_capacity(),
+        &input.config,
+        &spec,
+    ) {
+        Ok(source) => source,
+        Err(err) => {
+            send_standalone_scan_failed(
+                &mut scan_lease,
+                input.session_epoch,
+                input.scan_id,
+                input.producer_id,
+                &err,
+            );
+            return Err(err);
+        }
+    };
+
+    let mut producer = BackendProducerRole::new(input.scan_tx);
+    if let Err(err) = producer.open(&canonical_open, input.producer_id, source) {
+        let err = BackendServiceError::ScanProducer(err);
+        send_standalone_scan_failed(
+            &mut scan_lease,
+            input.session_epoch,
+            input.scan_id,
+            input.producer_id,
+            &err,
+        );
+        return Err(err);
+    }
+    drive_standalone_producer(scan_lease, producer, input.config.metrics)
+}
+
+fn standalone_page_source(
+    scan_id: u64,
+    ctid_range: Option<CtidBlockRange>,
+    payload_capacity: usize,
+    config: &BackendServiceConfig,
+    spec: &PgScanSpec,
+) -> Result<source::SlotScanPageSource, BackendServiceError> {
+    let source_schema = spec.arrow_schema();
+    let mut normalized_fields = Vec::with_capacity(source_schema.fields().len());
+    let mut physical_columns = Vec::with_capacity(source_schema.fields().len());
+    let mut projected_columns = Vec::with_capacity(source_schema.fields().len());
+    for (index, field) in source_schema.fields().iter().enumerate() {
+        let (normalized_field, type_tag) =
+            normalize_transport_field(index, field.as_ref(), scan_id)?;
+        normalized_fields.push(normalized_field);
+        physical_columns.push(ColumnSpec::new(type_tag, field.is_nullable()));
+        projected_columns.push(ProjectedColumnRef::relation_attribute(
+            field.name(),
+            type_tag,
+        ));
+    }
+    let schema: SchemaRef = Arc::new(Schema::new(normalized_fields));
+    let estimator_config = seed_estimator_config(
+        spec.table_oid.into(),
+        &projected_columns,
+        config.estimator_default,
+    )?;
+    let execution_shape = match ctid_range {
+        Some(range) => scan_execution_shape_for_ctid_range(spec, range)?,
+        None => scan_execution_shape(spec)?,
+    };
+    let prepared_scan = prepare_scan(
+        &execution_shape.sql,
+        ScanOptions {
+            planner_fetch_hint: spec.fetch_hints.planner_fetch_hint,
+            local_row_cap: spec.fetch_hints.local_row_cap,
+            diagnostics: config.diagnostics.clone(),
+        },
+    )?;
+    let block_size = u32::try_from(payload_capacity).map_err(|_| {
+        BackendServiceError::ProtocolViolation("scan payload capacity exceeds u32".into())
+    })?;
+    let estimator = PageRowEstimator::new(&physical_columns, block_size, estimator_config)?;
+    let spi = ExecutionSpiContext::connect(config.diagnostics.clone())?;
+    Ok(source::SlotScanPageSource::new(
+        std::ptr::null_mut(),
+        spi,
+        prepared_scan,
+        schema,
+        execution_shape.source_projection,
+        block_size,
+        normalize_scan_fetch_batch_rows(config.scan_fetch_batch_rows),
+        estimator,
+        config.metrics,
+        config.scan_timing_detail,
+    ))
+}
+
+fn standalone_scan_open(
+    session_epoch: u64,
+    scan_id: u64,
+    producer_count: u16,
+    page_kind: u16,
+    page_flags: u16,
+) -> Result<ScanOpen, BackendServiceError> {
+    let mut producers = Vec::with_capacity(producer_count as usize);
+    producers.push(ProducerDescriptor::leader(SINGLE_SCAN_PRODUCER_ID));
+    for producer_id in 1..producer_count {
+        producers.push(ProducerDescriptor::worker(producer_id));
+    }
+    Ok(ScanOpen::new(
+        ScanFlowId {
+            session_epoch,
+            scan_id,
+        },
+        page_kind,
+        page_flags,
+        producers,
+    )?)
+}
+
+fn wait_for_standalone_open_scan(
+    scan_lease: &mut BackendSlotLease,
+    session_epoch: u64,
+    scan_id: u64,
+    canonical_open: &ScanOpen,
+) -> Result<(), BackendServiceError> {
+    let mut scratch = vec![0_u8; 1024];
+    let deadline = Instant::now() + STANDALONE_OPEN_SCAN_TIMEOUT;
+    loop {
+        let received = {
+            let mut rx = scan_lease.from_worker_rx();
+            rx.recv_frame_into(&mut scratch)?
+        };
+        let Some(len) = received else {
+            if Instant::now() >= deadline {
+                return Err(BackendServiceError::ProtocolViolation(format!(
+                    "timed out waiting for OpenScan for standalone scan_id {scan_id}"
+                )));
+            }
+            wait_latch(Some(Duration::from_millis(1)));
+            continue;
+        };
+        match decode_worker_scan_to_backend(&scratch[..len]).map_err(|err| {
+            BackendServiceError::ProtocolViolation(format!(
+                "failed to decode standalone scan control: {err}"
+            ))
+        })? {
+            WorkerScanToBackendRef::OpenScan {
+                session_epoch: incoming_epoch,
+                scan_id: incoming_scan_id,
+                scan,
+            } => {
+                if incoming_epoch != session_epoch || incoming_scan_id != scan_id {
+                    return Err(BackendServiceError::ProtocolViolation(format!(
+                        "standalone scan open targeted session_epoch={incoming_epoch}, scan_id={incoming_scan_id}; expected session_epoch={session_epoch}, scan_id={scan_id}"
+                    )));
+                }
+                if !scan_descriptor_matches(canonical_open, scan) {
+                    return Err(BackendServiceError::ProtocolViolation(format!(
+                        "standalone scan descriptor mismatch for scan_id {scan_id}"
+                    )));
+                }
+                return Ok(());
+            }
+            WorkerScanToBackendRef::CancelScan { .. } => {
+                return Err(BackendServiceError::ProtocolViolation(format!(
+                    "standalone scan_id {scan_id} was cancelled before OpenScan"
+                )));
+            }
+        }
+    }
+}
+
+fn drive_standalone_producer(
+    mut scan_lease: BackendSlotLease,
+    mut producer: BackendProducerRole<source::SlotScanPageSource>,
+    metrics: RuntimeMetrics,
+) -> Result<(), BackendServiceError> {
+    loop {
+        match producer.step()? {
+            BackendProducerStep::OutboundPage {
+                outbound,
+                flow: _,
+                producer_id: _,
+            } => {
+                let descriptor = outbound.descriptor();
+                let payload_len = outbound.payload_len();
+                let frame = encode_issued_frame(outbound.frame()).map_err(|err| {
+                    BackendServiceError::ProtocolViolation(format!(
+                        "failed to encode standalone scan page frame: {err}"
+                    ))
+                })?;
+                let _ = scan_lease.to_worker_tx().send_frame(&frame)?;
+                metrics.stamp_page(PageDirection::BackendToWorker, descriptor, payload_len);
+                metrics.increment(MetricId::ScanPagesSentTotal);
+                metrics.add(MetricId::ScanBytesSentTotal, payload_len as u64);
+                outbound.mark_sent();
+            }
+            BackendProducerStep::Blocked { .. } => {
+                wait_latch(Some(Duration::from_millis(1)));
+            }
+            BackendProducerStep::ProducerEof { flow, producer_id } => {
+                producer.close()?;
+                send_standalone_scan_terminal(
+                    &mut scan_lease,
+                    BackendScanToWorker::ScanFinished {
+                        session_epoch: flow.session_epoch,
+                        scan_id: flow.scan_id,
+                        producer_id,
+                    },
+                )?;
+                return Ok(());
+            }
+            BackendProducerStep::ProducerError {
+                flow,
+                producer_id,
+                error,
+            } => {
+                let message = error.to_string();
+                let truncated = truncate_scan_failure_message(&message);
+                let _ = producer.abort();
+                send_standalone_scan_terminal(
+                    &mut scan_lease,
+                    BackendScanToWorker::ScanFailed {
+                        session_epoch: flow.session_epoch,
+                        scan_id: flow.scan_id,
+                        producer_id,
+                        message: &truncated,
+                    },
+                )?;
+                return Err(BackendServiceError::ProtocolViolation(message));
+            }
+        }
+    }
+}
+
+fn send_standalone_scan_terminal(
+    scan_lease: &mut BackendSlotLease,
+    message: BackendScanToWorker<'_>,
+) -> Result<(), BackendServiceError> {
+    let mut encoded = vec![0_u8; runtime_protocol::encoded_len_backend_scan_to_worker(message)];
+    let written = encode_backend_scan_to_worker_into(message, &mut encoded).map_err(|err| {
+        BackendServiceError::ProtocolViolation(format!(
+            "failed to encode standalone scan terminal: {err}"
+        ))
+    })?;
+    let _ = scan_lease.to_worker_tx().send_frame(&encoded[..written])?;
+    wait_for_standalone_worker_detach(scan_lease)?;
+    Ok(())
+}
+
+fn wait_for_standalone_worker_detach(
+    scan_lease: &BackendSlotLease,
+) -> Result<(), BackendServiceError> {
+    let deadline = Instant::now() + STANDALONE_TERMINAL_DRAIN_TIMEOUT;
+    while scan_lease.worker_attached() {
+        if Instant::now() >= deadline {
+            return Err(BackendServiceError::ProtocolViolation(format!(
+                "timed out waiting for worker to detach standalone scan slot {}",
+                scan_lease.slot_id()
+            )));
+        }
+        wait_latch(Some(Duration::from_millis(1)));
+    }
+    Ok(())
+}
+
+fn send_standalone_scan_failed(
+    scan_lease: &mut BackendSlotLease,
+    session_epoch: u64,
+    scan_id: u64,
+    producer_id: u16,
+    error: &dyn std::fmt::Display,
+) {
+    let message = truncate_scan_failure_message(&error.to_string());
+    let _ = send_standalone_scan_terminal(
+        scan_lease,
+        BackendScanToWorker::ScanFailed {
+            session_epoch,
+            scan_id,
+            producer_id,
+            message: &message,
+        },
+    );
+}
+
+fn truncate_scan_failure_message(message: &str) -> String {
+    const MAX_SCAN_FAILURE_BYTES: usize = runtime_protocol::MAX_SCAN_FAILURE_MESSAGE_LEN;
+    if message.len() <= MAX_SCAN_FAILURE_BYTES {
+        return message.to_string();
+    }
+
+    let mut end = MAX_SCAN_FAILURE_BYTES;
+    while !message.is_char_boundary(end) {
+        end -= 1;
+    }
+    message[..end].to_string()
 }
 
 fn can_use_unprojected_relation_scan(
@@ -1624,10 +2153,10 @@ fn mark_scan_terminal(
             execution.key.session_epoch,
             scan_id,
             state,
-            entry.scan_peer.slot_id(),
-            entry.scan_peer.lease_id().generation(),
-            entry.scan_peer.lease_id().lease_epoch(),
-            entry.scan_lease.is_some()
+            entry.leader_peer.slot_id(),
+            entry.leader_peer.lease_id().generation(),
+            entry.leader_peer.lease_id().lease_epoch(),
+            entry.leader_lease.is_some()
         )
     });
     entry.state = state;
@@ -1949,21 +2478,21 @@ fn cleanup_execution(
     }
 
     for entry in execution.scans.values_mut() {
-        if entry.scan_lease.is_some() {
+        if entry.leader_lease.is_some() {
             backend_diag_warning(|| {
                 format!(
                     "backend_service cleanup_execution releasing remaining scan lease slot_id={} session_epoch={} scan_id={} peer_slot_id={} generation={} lease_epoch={} scan_state={:?}",
                     execution.key.slot_id,
                     execution.key.session_epoch,
                     entry.scan_id,
-                    entry.scan_peer.slot_id(),
-                    entry.scan_peer.lease_id().generation(),
-                    entry.scan_peer.lease_id().lease_epoch(),
+                    entry.leader_peer.slot_id(),
+                    entry.leader_peer.lease_id().generation(),
+                    entry.leader_peer.lease_id().lease_epoch(),
                     entry.state
                 )
             });
         }
-        entry.scan_lease.take();
+        entry.leader_lease.take();
     }
     if execution.scan_spi.is_some() {
         backend_diag_trace(|| {

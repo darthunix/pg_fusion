@@ -3,7 +3,7 @@ id: comp-host-runtime-0001
 type: fact
 scope: host_runtime
 tags: ["pgrx", "datafusion", "shared-memory", "runtime_protocol", "slot_scan"]
-updated_at: "2026-04-24"
+updated_at: "2026-04-27"
 importance: 0.8
 ---
 
@@ -13,6 +13,13 @@ importance: 0.8
 - Backend control uses `runtime_protocol` messages over `control_transport`.
 - Backend scan production uses PostgreSQL `slot_scan` plus `slot_encoder` to
   stream Arrow layout pages to the worker.
+- `pg_fusion.scan_parallel_workers` can add dynamic background-worker scan
+  producers for eligible heap scans. Each producer owns a dedicated scan slot
+  and writes pages directly to the shared page pool; the worker fan-ins all
+  producers for the same `scan_id` with a separate issued-page receiver per
+  producer stream. Dynamic worker launch is all-or-error: partial launches are
+  cleaned up by marking failed jobs and sending `CancelScan` to producers that
+  became ready before the launch failed.
 - Worker execution lives in `worker_runtime` and consumes scan pages as Arrow
   batches through `page/import`.
 - Results return as issued Arrow pages and are projected into PostgreSQL tuple

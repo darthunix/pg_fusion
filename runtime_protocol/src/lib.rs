@@ -7,7 +7,7 @@
 //! - plan and scan page streams are referenced through narrow descriptor types
 //! - decode of scan producer descriptors is borrow-friendly and allocation-free
 //! - scan terminal signals use their own dedicated wire family
-//! - dedicated scan peers require at least `256` bytes inbound and `44` bytes
+//! - dedicated scan peers require at least `256` bytes inbound and `256` bytes
 //!   outbound raw ring capacity
 //!
 //! The crate is organized into a few public modules:

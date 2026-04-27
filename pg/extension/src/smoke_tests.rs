@@ -286,6 +286,45 @@ pub(crate) fn heap_join_two_tables_smoke() {
     assert_eq!(score, 20);
 }
 
+pub(crate) fn heap_parallel_scan_smoke() {
+    let mut client = smoke_client();
+    ensure_shared_preload(&mut client);
+    let table_name = "public.pgf_parallel_scan_smoke";
+    client
+        .batch_execute(&format!(
+            "\
+            DROP TABLE IF EXISTS {table_name};
+            CREATE TABLE {table_name} AS
+            SELECT g::bigint AS id, (g * 10)::bigint AS payload
+            FROM generate_series(1, 20000) AS g;
+            ANALYZE {table_name};
+            "
+        ))
+        .expect("create committed heap table for parallel scan smoke");
+
+    let mut tx = smoke_transaction(&mut client);
+    tx.batch_execute(
+        "\
+        SET LOCAL statement_timeout = '20s';
+        SET LOCAL pg_fusion.scan_parallel_workers = 2
+        ",
+    )
+    .expect("enable dynamic scan workers");
+    let sum: i64 = simple_query_first_column_tx(
+        &mut tx,
+        &format!("SELECT sum(id)::bigint FROM {table_name} WHERE id BETWEEN 100 AND 20000"),
+    )
+    .expect("parallel heap scan must return one row")
+    .parse()
+    .expect("parallel heap scan sum must be an integer");
+    assert_eq!(sum, 20000 * 20001 / 2 - 99 * 100 / 2);
+    tx.commit()
+        .expect("commit parallel scan smoke transaction before cleanup");
+    client
+        .batch_execute(&format!("DROP TABLE IF EXISTS {table_name}"))
+        .expect("drop committed heap table for parallel scan smoke");
+}
+
 pub(crate) fn metrics_smoke() {
     let mut client = smoke_client();
     let mut tx = smoke_transaction(&mut client);

@@ -46,12 +46,13 @@ pub(crate) fn decode_scan_channel_set_ref<'a>(
 ) -> Result<ScanChannelSetRef<'a>, DecodeError> {
     let start = original.len() - source.len();
     let count = read_array_len_from(source)?;
-    let mut prev_scan_id = None;
+    let mut scan_state = ScanChannelValidationState::default();
 
     for _ in 0..count {
         let descriptor = read_scan_channel_descriptor_from(source)?;
-        observe_decode_scan_channel_order(&mut prev_scan_id, descriptor.scan_id)?;
+        observe_decode_scan_channel(&mut scan_state, descriptor)?;
     }
+    finish_decode_scan_channel_validation(&scan_state)?;
 
     let end = original.len() - source.len();
     Ok(ScanChannelSetRef {
@@ -87,42 +88,116 @@ pub(crate) fn validate_encode_producer_slice(
 pub(crate) fn validate_scan_channel_slice(
     channels: &[ScanChannelDescriptorWire],
 ) -> Result<(), ScanChannelSetError> {
-    let mut prev_scan_id = None;
+    let mut scan_state = ScanChannelValidationState::default();
     for channel in channels {
-        observe_encode_scan_channel_order(&mut prev_scan_id, channel.scan_id)?;
+        observe_encode_scan_channel(&mut scan_state, *channel)?;
     }
+    finish_encode_scan_channel_validation(&scan_state)?;
     Ok(())
 }
 
-fn observe_decode_scan_channel_order(
-    prev_scan_id: &mut Option<u64>,
-    current: u64,
+#[derive(Default)]
+struct ScanChannelValidationState {
+    previous: Option<(u64, u16)>,
+    current_scan_id: Option<u64>,
+    leader_seen: bool,
+}
+
+fn observe_decode_scan_channel(
+    state: &mut ScanChannelValidationState,
+    current: ScanChannelDescriptorWire,
 ) -> Result<(), DecodeError> {
-    if let Some(previous) = *prev_scan_id {
-        if current == previous {
-            return Err(DecodeError::DuplicateScanId { scan_id: current });
+    if let Some((previous_scan_id, previous_producer_id)) = state.previous {
+        if current.scan_id == previous_scan_id && current.producer_id == previous_producer_id {
+            return Err(DecodeError::DuplicateScanProducer {
+                scan_id: current.scan_id,
+                producer_id: current.producer_id,
+            });
         }
-        if current < previous {
-            return Err(DecodeError::ScanIdOutOfOrder { previous, current });
+        if (current.scan_id, current.producer_id) < (previous_scan_id, previous_producer_id) {
+            return Err(DecodeError::ScanChannelOutOfOrder {
+                previous_scan_id,
+                previous_producer_id,
+                current_scan_id: current.scan_id,
+                current_producer_id: current.producer_id,
+            });
         }
     }
-    *prev_scan_id = Some(current);
+
+    if state.current_scan_id != Some(current.scan_id) {
+        finish_decode_scan_channel_validation(state)?;
+        state.current_scan_id = Some(current.scan_id);
+        state.leader_seen = false;
+    }
+    if current.role == ProducerRole::Leader {
+        if state.leader_seen {
+            return Err(DecodeError::MultipleScanChannelLeaders {
+                scan_id: current.scan_id,
+            });
+        }
+        state.leader_seen = true;
+    }
+    state.previous = Some((current.scan_id, current.producer_id));
     Ok(())
 }
 
-fn observe_encode_scan_channel_order(
-    prev_scan_id: &mut Option<u64>,
-    current: u64,
-) -> Result<(), ScanChannelSetError> {
-    if let Some(previous) = *prev_scan_id {
-        if current == previous {
-            return Err(ScanChannelSetError::DuplicateScanId { scan_id: current });
-        }
-        if current < previous {
-            return Err(ScanChannelSetError::ScanIdOutOfOrder { previous, current });
+fn finish_decode_scan_channel_validation(
+    state: &ScanChannelValidationState,
+) -> Result<(), DecodeError> {
+    if let Some(scan_id) = state.current_scan_id {
+        if !state.leader_seen {
+            return Err(DecodeError::MissingScanChannelLeader { scan_id });
         }
     }
-    *prev_scan_id = Some(current);
+    Ok(())
+}
+
+fn observe_encode_scan_channel(
+    state: &mut ScanChannelValidationState,
+    current: ScanChannelDescriptorWire,
+) -> Result<(), ScanChannelSetError> {
+    if let Some((previous_scan_id, previous_producer_id)) = state.previous {
+        if current.scan_id == previous_scan_id && current.producer_id == previous_producer_id {
+            return Err(ScanChannelSetError::DuplicateProducer {
+                scan_id: current.scan_id,
+                producer_id: current.producer_id,
+            });
+        }
+        if (current.scan_id, current.producer_id) < (previous_scan_id, previous_producer_id) {
+            return Err(ScanChannelSetError::ChannelOutOfOrder {
+                previous_scan_id,
+                previous_producer_id,
+                current_scan_id: current.scan_id,
+                current_producer_id: current.producer_id,
+            });
+        }
+    }
+
+    if state.current_scan_id != Some(current.scan_id) {
+        finish_encode_scan_channel_validation(state)?;
+        state.current_scan_id = Some(current.scan_id);
+        state.leader_seen = false;
+    }
+    if current.role == ProducerRole::Leader {
+        if state.leader_seen {
+            return Err(ScanChannelSetError::MultipleLeaders {
+                scan_id: current.scan_id,
+            });
+        }
+        state.leader_seen = true;
+    }
+    state.previous = Some((current.scan_id, current.producer_id));
+    Ok(())
+}
+
+fn finish_encode_scan_channel_validation(
+    state: &ScanChannelValidationState,
+) -> Result<(), ScanChannelSetError> {
+    if let Some(scan_id) = state.current_scan_id {
+        if !state.leader_seen {
+            return Err(ScanChannelSetError::MissingLeader { scan_id });
+        }
+    }
     Ok(())
 }
 

@@ -26,10 +26,7 @@ use tracing::{debug, warn};
 
 use crate::error::WorkerRuntimeError;
 use crate::scan_exec::{OpenScanRequest, ScanBatchSource};
-use crate::scan_flow_driver::{
-    ScanFlowDriver, ScanFlowDriverStep, ScanFlowOpen, SingleLeaderOpenScanControl,
-    SINGLE_SCAN_PRODUCER_ID,
-};
+use crate::scan_flow_driver::{OpenScanControl, ScanFlowDriver, ScanFlowDriverStep, ScanFlowOpen};
 
 const IDLE_POLL_INTERVAL: Duration = Duration::from_millis(1);
 
@@ -37,11 +34,17 @@ const IDLE_POLL_INTERVAL: Duration = Duration::from_millis(1);
 ///
 /// `worker_runtime` intentionally keeps scan data-plane ownership outside
 /// `WorkerRuntimeCore`. A transport-backed scan source therefore needs an
-/// external way to obtain the `IssuedRx` bound to one `(session_epoch, scan_id)`
-/// pair before it can open a logical scan.
+/// external way to obtain the `IssuedRx` bound to one
+/// `(session_epoch, scan_id, producer_id)` stream before it can open a logical
+/// scan.
 pub trait ScanIngressProvider: std::fmt::Debug + Send + Sync {
-    /// Return the issued ingress receiver for one scan stream.
-    fn issued_rx(&self, session_epoch: u64, scan_id: u64) -> Result<IssuedRx, WorkerRuntimeError>;
+    /// Return the issued ingress receiver for one scan producer stream.
+    fn issued_rx(
+        &self,
+        session_epoch: u64,
+        scan_id: u64,
+        producer_id: u16,
+    ) -> Result<IssuedRx, WorkerRuntimeError>;
 }
 
 /// Transport-backed production `ScanBatchSource`.
@@ -135,13 +138,21 @@ impl ScanBatchSource for TransportScanBatchSource {
             component = "worker_scan",
             session_epoch = request.session_epoch,
             scan_id = request.scan_id.get(),
-            peer = ?request.peer,
+            producer_count = request.producers.len(),
             "opening transport-backed scan stream"
         );
 
-        let issued_rx = self
-            .ingress
-            .issued_rx(request.session_epoch, request.scan_id.get())
+        let producer_rxs = request
+            .producers
+            .iter()
+            .map(|producer| {
+                self.ingress.issued_rx(
+                    request.session_epoch,
+                    request.scan_id.get(),
+                    producer.producer_id,
+                )
+            })
+            .collect::<Result<Vec<_>, _>>()
             .map_err(df_external)?;
         let schema = Arc::clone(&request.output_schema);
         let (tx, rx) = channel(1);
@@ -162,7 +173,7 @@ impl ScanBatchSource for TransportScanBatchSource {
                     region,
                     control_frame_capacity,
                     request,
-                    issued_rx,
+                    producer_rxs,
                     tx,
                     stop_for_thread,
                     metrics,
@@ -214,7 +225,7 @@ fn run_transport_scan_thread(
     region: TransportRegion,
     control_frame_capacity: usize,
     request: OpenScanRequest,
-    issued_rx: IssuedRx,
+    producer_rxs: Vec<IssuedRx>,
     mut tx: Sender<DFResult<RecordBatch>>,
     stop: Arc<AtomicBool>,
     metrics: RuntimeMetrics,
@@ -223,7 +234,7 @@ fn run_transport_scan_thread(
         region,
         control_frame_capacity,
         &request,
-        issued_rx,
+        producer_rxs,
         &mut tx,
         &stop,
         metrics,
@@ -232,7 +243,7 @@ fn run_transport_scan_thread(
             component = "worker_scan",
             session_epoch = request.session_epoch,
             scan_id = request.scan_id.get(),
-            peer = ?request.peer,
+            producer_count = request.producers.len(),
             error = %err,
             "transport scan thread failed"
         );
@@ -244,37 +255,59 @@ fn run_transport_scan_thread_inner(
     region: TransportRegion,
     control_frame_capacity: usize,
     request: &OpenScanRequest,
-    issued_rx: IssuedRx,
+    producer_rxs: Vec<IssuedRx>,
     tx: &mut Sender<DFResult<RecordBatch>>,
     stop: &AtomicBool,
     metrics: RuntimeMetrics,
 ) -> Result<(), WorkerRuntimeError> {
     let transport = WorkerTransport::attach(&region)?;
-    let mut slot = transport.slot_for_backend_lease(request.peer)?;
-    let (mut driver, open_scan) = ScanFlowDriver::open(
-        ScanFlowOpen::single_leader(
-            request.session_epoch,
+    if request.producers.is_empty() {
+        return Err(WorkerRuntimeError::ProtocolViolation(format!(
+            "scan_id {} has no declared scan producers",
+            request.scan_id.get()
+        )));
+    }
+    if producer_rxs.len() != request.producers.len() {
+        return Err(WorkerRuntimeError::ProtocolViolation(format!(
+            "scan_id {} has {} producer ingress streams for {} declared producers",
             request.scan_id.get(),
-            request.page_kind,
-            request.page_flags,
-            Arc::clone(&request.output_schema),
-        ),
-        issued_rx,
-    )?;
+            producer_rxs.len(),
+            request.producers.len()
+        )));
+    }
+    let mut slots = Vec::with_capacity(request.producers.len());
+    for (producer, rx) in request.producers.iter().zip(producer_rxs) {
+        slots.push(OpenedProducerSlot {
+            producer_id: producer.producer_id,
+            peer: producer.peer,
+            slot: transport.slot_for_backend_lease(producer.peer)?,
+            rx,
+        });
+    }
+    let (mut driver, open_scan) = ScanFlowDriver::open(ScanFlowOpen::new(
+        request.session_epoch,
+        request.scan_id.get(),
+        request.page_kind,
+        request.page_flags,
+        Arc::clone(&request.output_schema),
+        request.producers.clone(),
+    ))?;
     let mut scratch = vec![0_u8; control_frame_capacity];
     debug!(
         component = "worker_scan",
         session_epoch = request.session_epoch,
         scan_id = request.scan_id.get(),
-        peer = ?request.peer,
+        producer_count = slots.len(),
         "transport scan thread sending OpenScan"
     );
-    send_open_scan(&mut slot, open_scan, &mut scratch)?;
+    for producer in &mut slots {
+        send_open_scan(&mut producer.slot, &open_scan, &mut scratch)?;
+    }
     debug!(
         component = "worker_scan",
         session_epoch = request.session_epoch,
         scan_id = request.scan_id.get(),
-        peer = ?request.peer,
+        producer_count = slots.len(),
         "transport scan thread entered receive loop"
     );
 
@@ -285,61 +318,74 @@ fn run_transport_scan_thread_inner(
                 component = "worker_scan",
                 session_epoch = request.session_epoch,
                 scan_id = request.scan_id.get(),
-                peer = ?request.peer,
+                producer_count = slots.len(),
                 "transport scan stream was dropped; terminating scan thread"
             );
             break Ok(());
         }
 
-        let received = {
-            let mut rx = slot.from_backend_rx()?;
-            rx.recv_frame_into(&mut scratch)?
-        };
-        let Some(len) = received else {
-            thread::sleep(IDLE_POLL_INTERVAL);
-            continue;
-        };
+        let mut any_frame = false;
+        for producer in &mut slots {
+            let received = {
+                let mut rx = producer.slot.from_backend_rx()?;
+                rx.recv_frame_into(&mut scratch)?
+            };
+            let Some(len) = received else {
+                continue;
+            };
+            any_frame = true;
+            let producer_id = producer.producer_id;
 
-        match decode_scan_inbound(&scratch[..len])? {
-            ScanInbound::Issued(frame) => {
-                if let Some(descriptor) = issued_page_descriptor(&frame) {
-                    if let Some(observation) =
-                        metrics.observe_page(PageDirection::BackendToWorker, descriptor)
-                    {
-                        metrics.add(MetricId::ScanB2wWaitNs, observation.wait_ns);
-                        metrics.increment(MetricId::ScanB2wWaitTotal);
+            match decode_scan_inbound(&scratch[..len])? {
+                ScanInbound::Issued(frame) => {
+                    if let Some(descriptor) = issued_page_descriptor(&frame) {
+                        if let Some(observation) =
+                            metrics.observe_page(PageDirection::BackendToWorker, descriptor)
+                        {
+                            metrics.add(MetricId::ScanB2wWaitNs, observation.wait_ns);
+                            metrics.increment(MetricId::ScanB2wWaitTotal);
+                        }
+                    }
+                    let read_start = metrics.now_ns();
+                    let step = driver.accept_page_frame(producer_id, &producer.rx, &frame)?;
+                    metrics.add_elapsed(MetricId::ScanPageReadNs, read_start);
+                    metrics.increment(MetricId::ScanPagesReadTotal);
+                    if forward_driver_step(&mut driver, step, tx, stop)? {
+                        terminal = true;
+                        debug!(
+                            component = "worker_scan",
+                            session_epoch = request.session_epoch,
+                            scan_id = request.scan_id.get(),
+                            producer_id,
+                            peer = ?producer.peer,
+                            "transport scan thread reached terminal state from issued page path"
+                        );
+                        break;
                     }
                 }
-                let read_start = metrics.now_ns();
-                let step = driver.accept_page_frame(SINGLE_SCAN_PRODUCER_ID, &frame)?;
-                metrics.add_elapsed(MetricId::ScanPageReadNs, read_start);
-                metrics.increment(MetricId::ScanPagesReadTotal);
-                if forward_driver_step(&mut driver, step, tx, stop)? {
-                    terminal = true;
-                    debug!(
-                        component = "worker_scan",
-                        session_epoch = request.session_epoch,
-                        scan_id = request.scan_id.get(),
-                        peer = ?request.peer,
-                        "transport scan thread reached terminal state from issued page path"
-                    );
-                    break Ok(());
+                ScanInbound::Control(control) => {
+                    let step = control_to_driver_step(request, &mut driver, control)?;
+                    if forward_driver_step(&mut driver, step, tx, stop)? {
+                        terminal = true;
+                        debug!(
+                            component = "worker_scan",
+                            session_epoch = request.session_epoch,
+                            scan_id = request.scan_id.get(),
+                            producer_id,
+                            peer = ?producer.peer,
+                            "transport scan thread reached terminal state from control path"
+                        );
+                        break;
+                    }
                 }
             }
-            ScanInbound::Control(control) => {
-                let step = control_to_driver_step(request, &mut driver, control)?;
-                if forward_driver_step(&mut driver, step, tx, stop)? {
-                    terminal = true;
-                    debug!(
-                        component = "worker_scan",
-                        session_epoch = request.session_epoch,
-                        scan_id = request.scan_id.get(),
-                        peer = ?request.peer,
-                        "transport scan thread reached terminal state from control path"
-                    );
-                    break Ok(());
-                }
-            }
+        }
+        if terminal {
+            break Ok(());
+        }
+        if !any_frame {
+            thread::sleep(IDLE_POLL_INTERVAL);
+            continue;
         }
     };
 
@@ -348,19 +394,28 @@ fn run_transport_scan_thread_inner(
             component = "worker_scan",
             session_epoch = request.session_epoch,
             scan_id = request.scan_id.get(),
-            peer = ?request.peer,
+            producer_count = slots.len(),
             "transport scan thread sending CancelScan during teardown"
         );
-        let _ = send_cancel_scan(
-            &mut slot,
-            request.session_epoch,
-            request.scan_id.get(),
-            &mut scratch,
-        );
+        for producer in &mut slots {
+            let _ = send_cancel_scan(
+                &mut producer.slot,
+                request.session_epoch,
+                request.scan_id.get(),
+                &mut scratch,
+            );
+        }
         driver.abort();
     }
 
     loop_result
+}
+
+struct OpenedProducerSlot<'a> {
+    producer_id: u16,
+    peer: control_transport::BackendLeaseSlot,
+    slot: control_transport::WorkerSlot<'a>,
+    rx: IssuedRx,
 }
 
 fn issued_page_descriptor(frame: &IssuedOwnedFrame) -> Option<pool::PageDescriptor> {
@@ -476,7 +531,7 @@ fn forward_driver_step(
 
 fn send_open_scan(
     slot: &mut control_transport::WorkerSlot<'_>,
-    control: SingleLeaderOpenScanControl,
+    control: &OpenScanControl,
     scratch: &mut [u8],
 ) -> Result<(), WorkerRuntimeError> {
     let written = control.encode_into(scratch)?;

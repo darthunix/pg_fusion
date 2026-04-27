@@ -126,17 +126,44 @@ pub fn compile_scan(input: CompileScanInput<'_>) -> Result<CompiledScan, Compile
 /// apply the logical projection themselves while still using the same pushed
 /// filters and optional SQL-level limit as [`compile_scan`].
 pub fn render_unprojected_scan_sql(relation: &PgRelation, scan: &CompiledScan) -> String {
+    render_unprojected_scan_sql_with_extra_predicate(relation, scan, None)
+}
+
+/// Render an unprojected relation scan constrained to one heap block range.
+///
+/// The range is half-open: `start_block <= block(ctid) < end_block`.
+/// It is intended for backend-owned parallel scan producers where each
+/// producer receives a disjoint heap block chunk.
+pub fn render_unprojected_ctid_block_scan_sql(
+    relation: &PgRelation,
+    scan: &CompiledScan,
+    start_block: u64,
+    end_block: u64,
+) -> String {
+    let predicate = format!(
+        "ctid >= '({},1)'::tid AND ctid < '({},1)'::tid",
+        start_block, end_block
+    );
+    render_unprojected_scan_sql_with_extra_predicate(relation, scan, Some(&predicate))
+}
+
+fn render_unprojected_scan_sql_with_extra_predicate(
+    relation: &PgRelation,
+    scan: &CompiledScan,
+    extra_predicate: Option<&str>,
+) -> String {
     let mut sql = format!("SELECT * FROM {}", relation.render_sql());
-    if !scan.pushed_filters.is_empty() {
+    if !scan.pushed_filters.is_empty() || extra_predicate.is_some() {
         sql.push_str(" WHERE ");
-        sql.push_str(
-            &scan
-                .pushed_filters
-                .iter()
-                .map(|filter| filter.sql.as_str())
-                .collect::<Vec<_>>()
-                .join(" AND "),
-        );
+        let mut predicates = scan
+            .pushed_filters
+            .iter()
+            .map(|filter| filter.sql.as_str())
+            .collect::<Vec<_>>();
+        if let Some(extra_predicate) = extra_predicate {
+            predicates.push(extra_predicate);
+        }
+        sql.push_str(&predicates.join(" AND "));
     }
     if let Some(limit) = scan.sql_limit {
         sql.push_str(" LIMIT ");

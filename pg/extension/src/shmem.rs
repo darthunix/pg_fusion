@@ -8,12 +8,14 @@ use pool::{PagePool, PagePoolConfig};
 use runtime_metrics::{RuntimeMetrics, RuntimeMetricsConfig};
 
 use crate::guc::host_config;
+use crate::scan_worker_job::{ScanWorkerJobRegistry, ScanWorkerJobRegistryHandle};
 
 const CONTROL_REGION_NAME: &str = "pg_fusion:control_transport";
 const SCAN_REGION_NAME: &str = "pg_fusion:scan_transport";
 const PAGE_POOL_NAME: &str = "pg_fusion:page_pool";
 const ISSUANCE_POOL_NAME: &str = "pg_fusion:issuance_pool";
 const RUNTIME_METRICS_NAME: &str = "pg_fusion:runtime_metrics";
+const SCAN_WORKER_JOBS_NAME: &str = "pg_fusion:scan_worker_jobs";
 
 static mut PREV_SHMEM_REQUEST_HOOK: pgrx::pg_sys::shmem_request_hook_type = None;
 
@@ -53,13 +55,15 @@ unsafe extern "C-unwind" fn pg_fusion_shmem_request_hook() {
         RuntimeMetricsConfig::new(config.page_count).expect("runtime metrics config"),
     )
     .expect("runtime metrics layout");
+    let scan_worker_jobs_layout = ScanWorkerJobRegistry::layout();
 
     let total = control_layout
         .size
         .saturating_add(scan_layout.size)
         .saturating_add(page_layout.size)
         .saturating_add(issuance_layout.size)
-        .saturating_add(metrics_layout.size);
+        .saturating_add(metrics_layout.size)
+        .saturating_add(scan_worker_jobs_layout.size());
     pgrx::pg_sys::RequestAddinShmemSpace(total);
 }
 
@@ -82,6 +86,7 @@ pub(crate) unsafe extern "C-unwind" fn init_shmem() {
     init_page_pool(PAGE_POOL_NAME, config.page_size, config.page_count);
     init_issuance_pool(ISSUANCE_POOL_NAME, config.page_count);
     init_runtime_metrics(RUNTIME_METRICS_NAME, config.page_count);
+    init_scan_worker_jobs(SCAN_WORKER_JOBS_NAME);
 }
 
 pub(crate) fn attach_control_region() -> TransportRegion {
@@ -126,6 +131,12 @@ pub(crate) fn attach_runtime_metrics() -> RuntimeMetrics {
     let layout = RuntimeMetrics::layout(cfg).expect("runtime metrics layout");
     let base = lookup_shmem(RUNTIME_METRICS_NAME, layout.size);
     unsafe { RuntimeMetrics::attach(base, layout.size) }.expect("attach runtime metrics")
+}
+
+pub(crate) fn attach_scan_worker_jobs() -> ScanWorkerJobRegistryHandle {
+    let layout = ScanWorkerJobRegistry::layout();
+    let base = lookup_shmem(SCAN_WORKER_JOBS_NAME, layout.size());
+    unsafe { ScanWorkerJobRegistryHandle::attach(base) }
 }
 
 fn init_control_region(
@@ -207,6 +218,18 @@ fn init_runtime_metrics(name: &str, page_count: u32) {
         }
     };
     metrics.expect("runtime metrics");
+}
+
+fn init_scan_worker_jobs(name: &str) {
+    let layout = ScanWorkerJobRegistry::layout();
+    let mut found = false;
+    let base = unsafe {
+        pgrx::pg_sys::ShmemInitStruct(name.as_pg_cstr(), layout.size(), &mut found) as *mut u8
+    };
+    let base = NonNull::new(base).expect("scan worker jobs shmem");
+    unsafe {
+        ScanWorkerJobRegistryHandle::init_or_attach(base, found);
+    }
 }
 
 fn attach_control_region_named(name: &str, layout: TransportRegionLayout) -> TransportRegion {

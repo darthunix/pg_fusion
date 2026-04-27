@@ -37,7 +37,9 @@ mod quote;
 mod render;
 mod types;
 
-pub use crate::compile::{compile_scan, render_unprojected_scan_sql};
+pub use crate::compile::{
+    compile_scan, render_unprojected_ctid_block_scan_sql, render_unprojected_scan_sql,
+};
 pub use crate::error::CompileError;
 pub use crate::types::{CompileScanInput, CompiledFilter, CompiledScan, LimitLowering, PgRelation};
 

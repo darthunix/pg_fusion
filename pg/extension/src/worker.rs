@@ -2,6 +2,8 @@ use std::collections::VecDeque;
 use std::sync::Arc;
 use std::time::Duration;
 
+use backend_service::{BackendService, StandaloneScanProducerInput};
+use control_transport::BackendSlotLease;
 use control_transport::WorkerTransport;
 use datafusion_execution::TaskContext;
 use futures::executor::block_on;
@@ -23,7 +25,7 @@ use crate::guc::host_config;
 use crate::logging::init_tracing_file_logger;
 use crate::shmem::{
     attach_control_region, attach_issuance_pool, attach_page_pool, attach_runtime_metrics,
-    attach_scan_region,
+    attach_scan_region, attach_scan_worker_jobs,
 };
 
 const POLL_INTERVAL: Duration = Duration::from_millis(5);
@@ -47,6 +49,71 @@ pub extern "C-unwind" fn worker_main(_arg: pgrx::pg_sys::Datum) {
             error = %err,
             "pg_fusion worker exited with error"
         );
+    }
+}
+
+#[pg_guard]
+#[no_mangle]
+pub extern "C-unwind" fn scan_worker_main(arg: pgrx::pg_sys::Datum) {
+    BackgroundWorker::attach_signal_handlers(SignalWakeFlags::SIGTERM | SignalWakeFlags::SIGHUP);
+    let job_id = arg.value() as usize;
+    if let Err(err) = run_scan_worker_main(job_id) {
+        let _ = init_tracing_file_logger("/tmp/pg_fusion.log", "warn");
+        warn!(
+            component = "scan_worker",
+            job_id,
+            error = %err,
+            "pg_fusion scan worker exited with error"
+        );
+    }
+}
+
+fn run_scan_worker_main(job_id: usize) -> Result<(), String> {
+    let config = host_config().map_err(|err| format!("invalid host configuration: {err}"))?;
+    init_tracing_file_logger(&config.log_path, &config.worker_log_filter);
+    let jobs = attach_scan_worker_jobs();
+    let job = jobs.snapshot(job_id).map_err(|err| err.to_string())?;
+    BackgroundWorker::connect_worker_to_spi_by_oid(
+        Some(job.db_oid.into()),
+        Some(job.user_oid.into()),
+    );
+
+    let scan_region = attach_scan_region();
+    let page_pool = attach_page_pool();
+    let issuance_pool = attach_issuance_pool();
+    let metrics = attach_runtime_metrics();
+    let scan_lease = BackendSlotLease::acquire(&scan_region).map_err(|err| err.to_string())?;
+    let peer = scan_lease.backend_lease_slot();
+    jobs.publish_ready(job_id, peer)
+        .map_err(|err| err.to_string())?;
+    jobs.mark_running(job_id).map_err(|err| err.to_string())?;
+
+    let mut backend_config = config.backend_service_config();
+    backend_config.metrics = metrics;
+    let run_result = BackgroundWorker::transaction(|| {
+        BackendService::run_standalone_scan_producer(StandaloneScanProducerInput {
+            sql: &job.sql,
+            session_epoch: job.session_epoch,
+            scan_id: job.scan_id,
+            producer_id: job.producer_id,
+            producer_count: job.producer_count,
+            ctid_range: Some(job.ctid_range),
+            scan_lease,
+            scan_tx: IssuedTx::new(transfer::PageTx::new(page_pool), issuance_pool),
+            config: backend_config,
+        })
+    });
+
+    match run_result {
+        Ok(()) => {
+            jobs.mark_done(job_id).map_err(|err| err.to_string())?;
+            Ok(())
+        }
+        Err(err) => {
+            let message = err.to_string();
+            let _ = jobs.mark_failed(job_id, &message);
+            Err(message)
+        }
     }
 }
 
@@ -397,6 +464,7 @@ impl ScanIngressProvider for SharedScanIngress {
         &self,
         _session_epoch: u64,
         _scan_id: u64,
+        _producer_id: u16,
     ) -> Result<IssuedRx, WorkerRuntimeError> {
         Ok(IssuedRx::new(
             transfer::PageRx::new(self.page_pool),

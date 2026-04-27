@@ -102,7 +102,7 @@ pg_fusion.control_worker_to_backend_capacity = 8192
 # Dedicated scan control transport.
 pg_fusion.scan_slot_count = 64
 pg_fusion.scan_backend_to_worker_capacity = 256
-pg_fusion.scan_worker_to_backend_capacity = 44
+pg_fusion.scan_worker_to_backend_capacity = 256
 
 # Shared page pool and issued-page flow.
 pg_fusion.page_size = 65536
@@ -110,14 +110,17 @@ pg_fusion.page_count = 256
 
 # Backend PostgreSQL cursor scan streaming.
 pg_fusion.scan_fetch_batch_rows = 1024
+pg_fusion.scan_parallel_workers = 0
 pg_fusion.estimator_initial_tail_bytes_per_row = 64
 EOF
 ```
 
-All settings above are `Postmaster` GUCs and require a cluster restart after
-changes. `pg_fusion.worker_threads = 0` lets the worker runtime choose its
+Most settings above are `Postmaster` GUCs and require a cluster restart after
+changes. `pg_fusion.scan_parallel_workers` is `Userset` and can be changed per
+session. `pg_fusion.worker_threads = 0` lets the worker runtime choose its
 thread count automatically. The scan ring capacities must stay at least `256`
-backend-to-worker and `44` worker-to-backend.
+bytes in each direction; the worker-to-backend scan ring carries `OpenScan`
+messages that include the full scan producer set.
 The issued-page permit pool is sized from `pg_fusion.page_count`, so each
 shared page can have one outstanding issued handoff.
 
@@ -204,6 +207,16 @@ defensive runtime inputs to at least one row. Page boundaries are handled by
 the fetch row budget, not by pausing the PostgreSQL receiver mid-fetch. Scans
 with variable-width transport columns use one-row drains so an overflowing row
 can be retried on the next Arrow page without losing the cursor position.
+
+`pg_fusion.scan_parallel_workers` enables experimental CTID block-range scan
+chunking for PostgreSQL leaf scans. `0` keeps the current single backend
+producer. A positive value launches that many additional dynamic PostgreSQL
+background workers per scan leaf; the leader backend and workers each scan a
+disjoint heap block range and write Arrow pages into the same shared page pool.
+The path is only used for heap relations that can be read as unprojected base
+relation slots without dropped attributes; other scans fall back to the single
+producer cursor path. This is meant for latency experiments around PostgreSQL
+read parallelism and may require enough `max_worker_processes` headroom.
 
 DataFusion fetch/limit hints are lowered into `slot_scan` as a PostgreSQL
 fast-start planning hint plus a local soft row cap. They are not documented as

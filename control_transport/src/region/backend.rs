@@ -127,6 +127,22 @@ impl BackendSlotLease {
         slot.backend_pid.load(Ordering::Acquire)
     }
 
+    /// Return whether a worker-side handle is still attached to this lease.
+    pub fn worker_attached(&self) -> bool {
+        if !self.active {
+            return false;
+        }
+
+        let slot = unsafe { self.region.slot_view_unchecked(self.slot_id) };
+        if slot.slot_generation.load(Ordering::Acquire) != self.incarnation.generation {
+            return false;
+        }
+        let meta = SlotMeta::from_raw(slot.slot_meta.load(Ordering::Acquire));
+        meta.is_leased()
+            && meta.lease_epoch() == self.incarnation.lease_epoch
+            && meta.has_worker_owner()
+    }
+
     #[cfg(test)]
     pub(crate) fn lease_epoch_for_tests(&self) -> u64 {
         self.incarnation.lease_epoch

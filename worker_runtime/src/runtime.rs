@@ -23,7 +23,7 @@ use scan_node::PgScanExtensionPlanner;
 use crate::error::WorkerRuntimeError;
 use crate::fsm::worker_execution_flow::StateMachine as WorkerExecutionMachine;
 use crate::fsm::{WorkerExecutionEvent, WorkerExecutionState};
-use crate::scan_exec::{ScanBatchSource, WorkerPgScanExecFactory};
+use crate::scan_exec::{ScanBatchSource, ScanProducerPeer, WorkerPgScanExecFactory};
 
 /// Static configuration for one worker-side runtime instance.
 #[derive(Clone, Debug)]
@@ -72,7 +72,7 @@ pub struct PendingPhysicalPlanning {
     flow: PlanFlowId,
     config: WorkerRuntimeConfig,
     scan_source: Arc<dyn ScanBatchSource>,
-    scan_peers: BTreeMap<u64, BackendLeaseSlot>,
+    scan_peers: BTreeMap<u64, Vec<ScanProducerPeer>>,
     logical_plan: LogicalPlan,
 }
 
@@ -128,7 +128,7 @@ pub struct WorkerRuntimeCore {
     active_session_epoch: Option<u64>,
     latest_session: Option<RetainedSession>,
     active_plan_flow: Option<PlanFlowId>,
-    scan_peers: BTreeMap<u64, BackendLeaseSlot>,
+    scan_peers: BTreeMap<u64, Vec<ScanProducerPeer>>,
     plan_role: WorkerPlanRole,
     scan_source: Arc<dyn ScanBatchSource>,
     physical_plan: Option<Arc<dyn ExecutionPlan>>,
@@ -655,18 +655,21 @@ impl PendingPhysicalPlanning {
 
 fn materialize_scan_peer_map(
     scans: runtime_protocol::ScanChannelSetRef<'_>,
-) -> Result<BTreeMap<u64, BackendLeaseSlot>, WorkerRuntimeError> {
-    let mut scan_peers = BTreeMap::new();
+) -> Result<BTreeMap<u64, Vec<ScanProducerPeer>>, WorkerRuntimeError> {
+    let mut scan_peers: BTreeMap<u64, Vec<ScanProducerPeer>> = BTreeMap::new();
     for channel in scans.iter() {
-        let previous =
-            scan_peers.insert(channel.scan_id, backend_lease_slot_from_wire(channel.peer));
-        if previous.is_some() {
-            return Err(WorkerRuntimeError::RuntimeDecode(
-                runtime_protocol::DecodeError::DuplicateScanId {
-                    scan_id: channel.scan_id,
-                },
-            ));
-        }
+        let role = match channel.role {
+            runtime_protocol::ProducerRole::Leader => scan_flow::ProducerRoleKind::Leader,
+            runtime_protocol::ProducerRole::Worker => scan_flow::ProducerRoleKind::Worker,
+        };
+        scan_peers
+            .entry(channel.scan_id)
+            .or_default()
+            .push(ScanProducerPeer {
+                producer_id: channel.producer_id,
+                role,
+                peer: backend_lease_slot_from_wire(channel.peer),
+            });
     }
     Ok(scan_peers)
 }
@@ -954,6 +957,8 @@ mod tests {
     fn scan_channel(scan_id: u64, peer: BackendLeaseSlot) -> ScanChannelDescriptorWire {
         ScanChannelDescriptorWire {
             scan_id,
+            producer_id: 0,
+            role: runtime_protocol::ProducerRole::Leader,
             peer: BackendLeaseSlotWire::new(
                 peer.slot_id(),
                 peer.lease_id().generation(),
@@ -1088,8 +1093,8 @@ mod tests {
                 plan_id: 20
             }
         ));
-        assert_eq!(core.scan_peers.get(&7), Some(&peer_a()));
-        assert_eq!(core.scan_peers.get(&8), Some(&peer_b()));
+        assert_eq!(core.scan_peers[&7][0].peer, peer_a());
+        assert_eq!(core.scan_peers[&8][0].peer, peer_b());
 
         let cancelled = accept(
             &mut core,

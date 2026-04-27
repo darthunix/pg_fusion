@@ -14,6 +14,7 @@ mod planner;
 mod result_ingress;
 #[cfg(feature = "pg_test")]
 mod result_ingress_tests;
+mod scan_worker_job;
 mod shmem;
 #[cfg(feature = "pg_test")]
 mod smoke_tests;
@@ -78,6 +79,11 @@ mod tests {
     #[pg_test]
     fn pg_fusion_heap_join_two_tables_smoke() {
         super::smoke_tests::heap_join_two_tables_smoke();
+    }
+
+    #[pg_test]
+    fn pg_fusion_heap_parallel_scan_smoke() {
+        super::smoke_tests::heap_parallel_scan_smoke();
     }
 
     #[pg_test]

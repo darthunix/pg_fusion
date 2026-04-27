@@ -25,12 +25,16 @@ The main contracts are:
 - the primary execution slot carries only execution lifecycle control
 - secondary scan slots carry only scan lifecycle control and scan terminal signals
 - dedicated scan slots must provide at least `256` bytes backend-to-worker and
-  `44` bytes worker-to-backend raw ring capacity
+  `256` bytes worker-to-backend raw ring capacity; the outbound bound covers
+  `OpenScan` with one leader plus 32 worker producers
 - `PlanFlowDescriptor` reconstructs a `plan_flow::PlanOpen` when paired with
   `session_epoch`
-- `ScanChannelDescriptorWire` publishes one dedicated scan slot for one `scan_id`
-  up front in `StartExecution`
-- `scan_channels` are encoded in strictly increasing `scan_id` order
+- `ScanChannelDescriptorWire` publishes one dedicated scan producer slot for one
+  `(scan_id, producer_id)` up front in `StartExecution`
+- `scan_channels` are encoded in strictly increasing
+  `(scan_id, producer_id)` order
+- each `scan_id` has exactly one leader producer and may have additional worker
+  producers
 - `BackendScanToWorker::ScanFailed.message` is bounded to `220` UTF-8 bytes so
   it always fits into the minimum dedicated inbound scan ring
 - `ScanFlowDescriptorRef` reconstructs a `scan_flow::ScanOpen` when paired with
@@ -44,11 +48,14 @@ Typical backend-to-worker flow:
 ```rust,ignore
 use runtime_protocol::{
     encode_backend_execution_to_worker_into, BackendExecutionToWorker,
-    BackendLeaseSlotWire, PlanFlowDescriptor, ScanChannelDescriptorWire, ScanChannelSet,
+    BackendLeaseSlotWire, PlanFlowDescriptor, ProducerRole, ScanChannelDescriptorWire,
+    ScanChannelSet,
 };
 
 let scans = [ScanChannelDescriptorWire {
     scan_id: 11,
+    producer_id: 0,
+    role: ProducerRole::Leader,
     peer: BackendLeaseSlotWire::new(7, 3, 19),
 }];
 
@@ -87,7 +94,7 @@ match msg {
         plan,
         scans,
     } => {
-        // Entries are already validated to be sorted by `scan_id`.
+        // Entries are already validated to be sorted by `(scan_id, producer_id)`.
         let scan_channels: Vec<_> = scans.iter().collect();
         let _ = (session_epoch, plan, scan_channels);
     }

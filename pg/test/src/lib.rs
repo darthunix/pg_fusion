@@ -423,6 +423,11 @@ mod tests {
     }
 
     #[pg_test]
+    fn slot_scan_accepts_tid_range_scan() {
+        super::slot_scan::slot_scan_accepts_tid_range_scan();
+    }
+
+    #[pg_test]
     fn slot_scan_rejects_limit_node() {
         super::slot_scan::slot_scan_rejects_limit_node();
     }

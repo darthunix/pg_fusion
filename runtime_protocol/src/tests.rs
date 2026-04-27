@@ -38,10 +38,14 @@ fn scan_channels() -> [ScanChannelDescriptorWire; 2] {
     [
         ScanChannelDescriptorWire {
             scan_id: 7,
+            producer_id: 0,
+            role: ProducerRole::Leader,
             peer: backend_peer(11, 22, 33),
         },
         ScanChannelDescriptorWire {
             scan_id: 8,
+            producer_id: 0,
+            role: ProducerRole::Leader,
             peer: backend_peer(12, 22, 34),
         },
     ]
@@ -138,16 +142,18 @@ fn encode_raw_producer_set_array32(entries: &[(u16, u8)]) -> Vec<u8> {
     buf
 }
 
-fn encode_raw_scan_channel_set(entries: &[(u64, BackendLeaseSlotWire)]) -> Vec<u8> {
+fn encode_raw_scan_channel_set(entries: &[(u64, u16, u8, BackendLeaseSlotWire)]) -> Vec<u8> {
     let mut buf = Vec::new();
     write_array_len_to(
         &mut buf,
         u32::try_from(entries.len()).expect("scan channel len"),
     )
     .expect("scan channel set len");
-    for &(scan_id, peer) in entries {
+    for &(scan_id, producer_id, role, peer) in entries {
         write_array_len_to(&mut buf, SCAN_CHANNEL_DESCRIPTOR_LEN).expect("scan channel len");
         write_u64_to(&mut buf, scan_id).expect("scan id");
+        write_u16_to(&mut buf, producer_id).expect("producer id");
+        write_u8_to(&mut buf, role).expect("producer role");
         write_u32_to(&mut buf, peer.slot_id()).expect("slot id");
         write_u64_to(&mut buf, peer.generation()).expect("generation");
         write_u64_to(&mut buf, peer.lease_epoch()).expect("lease epoch");
@@ -301,15 +307,25 @@ fn scan_channel_set_rejects_duplicate_scan_id() {
     let channels = [
         ScanChannelDescriptorWire {
             scan_id: 7,
+            producer_id: 0,
+            role: ProducerRole::Leader,
             peer: backend_peer(1, 2, 3),
         },
         ScanChannelDescriptorWire {
             scan_id: 7,
+            producer_id: 0,
+            role: ProducerRole::Worker,
             peer: backend_peer(4, 5, 6),
         },
     ];
     let err = ScanChannelSet::new(&channels).expect_err("duplicate scan id");
-    assert_eq!(err, ScanChannelSetError::DuplicateScanId { scan_id: 7 });
+    assert_eq!(
+        err,
+        ScanChannelSetError::DuplicateProducer {
+            scan_id: 7,
+            producer_id: 0
+        }
+    );
 }
 
 #[test]
@@ -317,21 +333,47 @@ fn scan_channel_set_rejects_out_of_order_scan_id() {
     let channels = [
         ScanChannelDescriptorWire {
             scan_id: 8,
+            producer_id: 0,
+            role: ProducerRole::Leader,
             peer: backend_peer(1, 2, 3),
         },
         ScanChannelDescriptorWire {
             scan_id: 7,
+            producer_id: 0,
+            role: ProducerRole::Leader,
             peer: backend_peer(4, 5, 6),
         },
     ];
     let err = ScanChannelSet::new(&channels).expect_err("out-of-order scan id");
     assert_eq!(
         err,
-        ScanChannelSetError::ScanIdOutOfOrder {
-            previous: 8,
-            current: 7,
+        ScanChannelSetError::ChannelOutOfOrder {
+            previous_scan_id: 8,
+            previous_producer_id: 0,
+            current_scan_id: 7,
+            current_producer_id: 0,
         }
     );
+}
+
+#[test]
+fn scan_channel_set_rejects_missing_leader() {
+    let channels = [
+        ScanChannelDescriptorWire {
+            scan_id: 7,
+            producer_id: 0,
+            role: ProducerRole::Worker,
+            peer: backend_peer(1, 2, 3),
+        },
+        ScanChannelDescriptorWire {
+            scan_id: 7,
+            producer_id: 1,
+            role: ProducerRole::Worker,
+            peer: backend_peer(4, 5, 6),
+        },
+    ];
+    let err = ScanChannelSet::new(&channels).expect_err("missing scan leader");
+    assert_eq!(err, ScanChannelSetError::MissingLeader { scan_id: 7 });
 }
 
 #[test]
@@ -339,10 +381,19 @@ fn decode_backend_start_execution_rejects_duplicate_scan_id() {
     let encoded = encode_raw_backend_start_execution(
         9,
         plan_descriptor(),
-        &encode_raw_scan_channel_set(&[(7, backend_peer(1, 2, 3)), (7, backend_peer(4, 5, 6))]),
+        &encode_raw_scan_channel_set(&[
+            (7, 0, ProducerRole::Leader as u8, backend_peer(1, 2, 3)),
+            (7, 0, ProducerRole::Worker as u8, backend_peer(4, 5, 6)),
+        ]),
     );
     let err = decode_backend_execution_to_worker(&encoded).expect_err("duplicate scan id");
-    assert_eq!(err, DecodeError::DuplicateScanId { scan_id: 7 });
+    assert_eq!(
+        err,
+        DecodeError::DuplicateScanProducer {
+            scan_id: 7,
+            producer_id: 0
+        }
+    );
 }
 
 #[test]
@@ -350,16 +401,35 @@ fn decode_backend_start_execution_rejects_out_of_order_scan_id() {
     let encoded = encode_raw_backend_start_execution(
         9,
         plan_descriptor(),
-        &encode_raw_scan_channel_set(&[(8, backend_peer(1, 2, 3)), (7, backend_peer(4, 5, 6))]),
+        &encode_raw_scan_channel_set(&[
+            (8, 0, ProducerRole::Leader as u8, backend_peer(1, 2, 3)),
+            (7, 0, ProducerRole::Leader as u8, backend_peer(4, 5, 6)),
+        ]),
     );
     let err = decode_backend_execution_to_worker(&encoded).expect_err("out-of-order scan id");
     assert_eq!(
         err,
-        DecodeError::ScanIdOutOfOrder {
-            previous: 8,
-            current: 7,
+        DecodeError::ScanChannelOutOfOrder {
+            previous_scan_id: 8,
+            previous_producer_id: 0,
+            current_scan_id: 7,
+            current_producer_id: 0,
         }
     );
+}
+
+#[test]
+fn decode_backend_start_execution_rejects_missing_leader() {
+    let encoded = encode_raw_backend_start_execution(
+        9,
+        plan_descriptor(),
+        &encode_raw_scan_channel_set(&[
+            (7, 0, ProducerRole::Worker as u8, backend_peer(1, 2, 3)),
+            (7, 1, ProducerRole::Worker as u8, backend_peer(4, 5, 6)),
+        ]),
+    );
+    let err = decode_backend_execution_to_worker(&encoded).expect_err("missing scan leader");
+    assert_eq!(err, DecodeError::MissingScanChannelLeader { scan_id: 7 });
 }
 
 #[test]
@@ -427,6 +497,35 @@ fn worker_open_scan_round_trips_many_producers() {
     assert_eq!(scan.producers().len(), 130);
     let decoded_producers: Vec<_> = scan.producers().iter().collect();
     assert_eq!(decoded_producers, producers);
+}
+
+#[test]
+fn worker_open_scan_with_max_scan_workers_fits_minimum_ring() {
+    let mut producers = Vec::with_capacity(33);
+    producers.push(ProducerDescriptorWire {
+        producer_id: 0,
+        role: ProducerRole::Leader,
+    });
+    for producer_id in 1..33u16 {
+        producers.push(ProducerDescriptorWire {
+            producer_id,
+            role: ProducerRole::Worker,
+        });
+    }
+
+    let message = WorkerScanToBackend::OpenScan {
+        session_epoch: 21,
+        scan_id: 301,
+        scan: ScanFlowDescriptor::new(0x5001, 2, &producers).expect("valid scan descriptor"),
+    };
+    let encoded = encode_worker_scan(message);
+    assert!(
+        encoded.len()
+            <= max_message_len_for_ring_capacity(MIN_SCAN_WORKER_TO_BACKEND_RING_CAPACITY),
+        "encoded OpenScan is {} bytes, minimum scan ring payload budget is {} bytes",
+        encoded.len(),
+        max_message_len_for_ring_capacity(MIN_SCAN_WORKER_TO_BACKEND_RING_CAPACITY)
+    );
 }
 
 #[test]
