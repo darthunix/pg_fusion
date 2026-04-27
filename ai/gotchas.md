@@ -17,9 +17,10 @@ importance: 0.7
   normal PostgreSQL client connection, not SPI-owned execution contexts.
 - `slot_scan` should execute trusted compiler-generated scan SQL. SQL safety and
   expression pushdown policy belong in `scan_sql`.
-- `backend_service` should not have a standalone cargo test harness: it links
-  `slot_scan`, which references PostgreSQL SPI symbols. Put those cases in
-  `pg/test` and run them with `cargo pgrx test pg17 -p pg_test`.
+- PostgreSQL-bound crates should not be included in standalone `cargo test` or
+  library coverage: they reference PostgreSQL backend symbols. Keep their
+  coverage in pgrx tests (`cargo pgrx test pg17 -p pg_test` and
+  `cargo pgrx test pg17 -p pg_fusion --features pg_test`).
 - Page-backed Arrow batches must not outlive their transfer/issuance ownership
   contract. Release pages only through the existing page/issued-frame APIs.
 - Runtime metrics reset is intended for experiments before a query. It advances

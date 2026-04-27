@@ -11,9 +11,13 @@
 - Build all crates: `cargo build --workspace` (use `--release` for optimized
   artifacts).
 - Check types fast: `cargo check --workspace`.
-- Unit/integration tests: `cargo test --workspace --exclude backend_service`.
-- `backend_service` tests run through `pg/test` because the crate references
-  PostgreSQL SPI symbols via `slot_scan`.
+- Standalone unit/integration tests exclude PostgreSQL-bound crates:
+  `cargo test --workspace --exclude backend_service --exclude df_catalog
+  --exclude pg_fusion --exclude pg_test --exclude plan_builder --exclude
+  row_estimator_seed --exclude slot_encoder --exclude slot_import --exclude
+  slot_scan`.
+- PostgreSQL-bound crate tests run through pgrx because they reference
+  PostgreSQL backend symbols.
 - Extension crate: `cargo build -p pg_fusion`.
 - pgrx setup: `cargo install cargo-pgrx` then
   `cargo pgrx init --pg17 $(which pg_config)`.
@@ -40,9 +44,8 @@
   `backend_service: fix scan cleanup`.
 - PRs: include motivation, summary of changes, testing notes, and any
   config/doc updates.
-- Before review, aim to pass `cargo fmt`, `cargo clippy -D warnings`,
-  `cargo test --workspace --exclude backend_service`, and the relevant pgrx
-  tests.
+- Before review, aim to pass `cargo fmt`, `cargo clippy -D warnings`, the
+  standalone test command above, and the relevant pgrx tests.
 
 ## Safety Notes
 - PostgreSQL must preload the extension with

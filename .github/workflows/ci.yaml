@@ -100,21 +100,21 @@ jobs:
                            $(/usr/lib/postgresql/${{ env.PG_MAJOR }}/bin/pg_config --sharedir)/extension \
                            /var/run/postgresql/
 
-      - name: Run pg_test extension tests
-        working-directory: pg/test
+      - name: Run pgrx coverage tests
+        working-directory: .
         run: |
-          # Run tests with coverage tool
+          # Run PostgreSQL-bound crates with coverage inside pgrx/PostgreSQL.
           source <(cargo llvm-cov show-env --export-prefix)
           cargo llvm-cov clean
-          cargo build --features "pg${{ env.PG_MAJOR }}, pg_test" --no-default-features
-          cargo pgrx test pg${{ env.PG_MAJOR }} --no-default-features
-          cargo llvm-cov report --lcov > ../../pgtest_lcov.info
+          cargo pgrx test pg${{ env.PG_MAJOR }} -p pg_test --no-default-features
+          cargo pgrx test pg${{ env.PG_MAJOR }} -p pg_fusion --features pg_test pg_fusion_simple_select_smoke
+          cargo llvm-cov report --lcov --output-path pgrx_lcov.info
 
-      - name: Upload pg_test coverage to Codecov
+      - name: Upload pgrx coverage to Codecov
         uses: codecov/codecov-action@v4
         with:
           fail_ci_if_error: true
-          files: ./pgtest_lcov.info
+          files: ./pgrx_lcov.info
           token: ${{ secrets.CODECOV_TOKEN }}
 
       - name: Run library coverage
@@ -124,7 +124,15 @@ jobs:
           source <(cargo llvm-cov show-env --export-prefix)
           cargo llvm-cov clean
           cargo llvm-cov --workspace \
+            --exclude backend_service \
+            --exclude df_catalog \
+            --exclude pg_fusion \
             --exclude pg_test \
+            --exclude plan_builder \
+            --exclude row_estimator_seed \
+            --exclude slot_encoder \
+            --exclude slot_import \
+            --exclude slot_scan \
             --lcov --output-path core_lcov.info
 
       - name: Upload core coverage report to Codecov

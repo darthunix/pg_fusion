@@ -38,12 +38,21 @@ Workspace targets Rust 1.89.
 
 ```sh
 cargo check --workspace
-cargo test --workspace --exclude backend_service
+cargo test --workspace \
+  --exclude backend_service \
+  --exclude df_catalog \
+  --exclude pg_fusion \
+  --exclude pg_test \
+  --exclude plan_builder \
+  --exclude row_estimator_seed \
+  --exclude slot_encoder \
+  --exclude slot_import \
+  --exclude slot_scan
 ```
 
-`backend_service` is intentionally excluded from standalone `cargo test`:
-through `slot_scan` it references PostgreSQL SPI symbols that only exist inside
-a PostgreSQL backend. Its regression coverage lives in the pgrx test crate.
+PostgreSQL-bound crates are intentionally excluded from standalone
+`cargo test`: they reference PostgreSQL backend symbols that only exist inside a
+PostgreSQL backend. Their regression coverage lives in the pgrx test crates.
 
 Build only the PostgreSQL extension crate:
 
@@ -312,8 +321,8 @@ Interpretation:
 ## Developer Guidelines
 
 - Rust 2021; keep changes small and focused; avoid panics in extension paths.
-- Before PR: `cargo fmt`, `cargo clippy -D warnings`, and
-  `cargo test --workspace`.
+- Before PR: `cargo fmt`, `cargo clippy -D warnings`, standalone tests with
+  PostgreSQL-bound crates excluded, and the relevant pgrx tests.
 - Commit style: `area: concise change`.
 
 ## Agent Context
