@@ -85,6 +85,16 @@ mod tests {
     }
 
     #[pg_test]
+    fn backend_service_explain_materializes_retaining_sort_input() {
+        super::backend_service::backend_service_render_explain_materializes_retaining_sort_input();
+    }
+
+    #[pg_test]
+    fn backend_service_explain_keeps_aggregate_scan_zero_copy() {
+        super::backend_service::backend_service_render_explain_keeps_aggregate_scan_zero_copy();
+    }
+
+    #[pg_test]
     fn backend_service_cancel_during_stream_marks_scan_used() {
         super::backend_service::backend_service_cancel_during_stream_marks_scan_used();
     }

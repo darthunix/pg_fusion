@@ -247,6 +247,62 @@ pub fn backend_service_render_explain_uses_physical_plan_and_pg_leaf() {
     );
 }
 
+pub fn backend_service_render_explain_materializes_retaining_sort_input() {
+    reset_backend_service_table();
+    let _snapshot = unsafe { LatestSnapshotGuard::acquire() };
+    let sql = format!("SELECT id, payload FROM {BACKEND_SERVICE_TABLE} ORDER BY payload");
+
+    let rendered = BackendService::render_explain(ExplainInput {
+        sql: &sql,
+        params: Vec::new(),
+        options: Default::default(),
+        config: BackendServiceConfig::default(),
+    })
+    .expect("render physical explain");
+
+    assert!(
+        rendered.contains("SortExec:"),
+        "expected a DataFusion sort in physical explain: {rendered}"
+    );
+    assert!(
+        rendered.contains("PageMaterializeExec"),
+        "retaining sort input should materialize page-backed batches: {rendered}"
+    );
+    let materialize_block = rendered
+        .lines()
+        .skip_while(|line| !line.contains("PageMaterializeExec"))
+        .skip(1);
+    assert!(
+        materialize_block
+            .take(4)
+            .any(|line| line.contains("PostgreSQL Scan:")),
+        "PageMaterializeExec should sit directly above the PostgreSQL scan subtree: {rendered}"
+    );
+}
+
+pub fn backend_service_render_explain_keeps_aggregate_scan_zero_copy() {
+    reset_backend_service_table();
+    let _snapshot = unsafe { LatestSnapshotGuard::acquire() };
+    let sql = format!("SELECT avg(id) FROM {BACKEND_SERVICE_TABLE}");
+
+    let rendered = BackendService::render_explain(ExplainInput {
+        sql: &sql,
+        params: Vec::new(),
+        options: Default::default(),
+        config: BackendServiceConfig::default(),
+    })
+    .expect("render physical explain");
+
+    assert!(
+        rendered.contains("AggregateExec:"),
+        "expected a DataFusion aggregate in physical explain: {rendered}"
+    );
+    assert!(
+        !rendered.contains("PageMaterializeExec"),
+        "plain aggregate scan should stay zero-copy in the v1 policy: {rendered}"
+    );
+}
+
 fn test_query() -> String {
     format!("SELECT id, payload FROM {BACKEND_SERVICE_TABLE} WHERE id > 0")
 }

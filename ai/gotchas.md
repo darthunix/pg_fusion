@@ -23,6 +23,13 @@ importance: 0.7
   `cargo pgrx test pg17 -p pg_fusion --features pg_test`).
 - Page-backed Arrow batches must not outlive their transfer/issuance ownership
   contract. Release pages only through the existing page/issued-frame APIs.
+- `PageMaterializeExec` is intentionally inserted above streaming scan-adjacent
+  operators and below the first retaining DataFusion operator. Keep
+  `ProjectionExec`, `FilterExec`, limits, coalescing, repartition, and plain
+  aggregates zero-copy unless metrics prove they retain page-backed batches.
+  For Arrow `Utf8View`/`BinaryView`, `MutableArrayData` alone is not a deep
+  copy because it clones variadic payload buffers; use builders or an equivalent
+  copy that owns the long-value payload.
 - Runtime metrics reset is intended for experiments before a query. It advances
   `reset_epoch` so old page stamps are ignored, but concurrent increments can
   still race with a manual reset.

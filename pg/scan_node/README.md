@@ -10,6 +10,8 @@ The crate is intentionally narrow:
 - it provides a DataFusion `UserDefinedLogicalNodeCore` implementation
 - it provides an `ExtensionPlanner` hook that delegates physical execution to a
   caller-provided factory
+- it provides `PageMaterializeExec` and a physical-plan rewrite that inserts
+  copies only before DataFusion operators that can retain page-backed batches
 
 It does not own PostgreSQL snapshots, open backend connections, run `slot_scan`,
 serialize plans, or stream pages. Those are later integration layers.
@@ -60,3 +62,10 @@ Worker-side physical planning installs `PgScanExtensionPlanner` with a runtime
 factory. The factory receives the same `PgScanSpec` and can open the backend
 scan by `scan_id`; later backend code can lower `fetch_hints` into
 `slot_scan::ScanOptions`.
+
+After physical planning, callers should run `insert_page_materializers` with a
+predicate for their concrete page-backed scan exec type. The rewrite keeps
+streaming operators zero-copy and inserts `PageMaterializeExec` at retaining
+boundaries such as `SortExec`, window operators, and join build sides. Runtime
+planning and backend EXPLAIN both use this rewrite so the rendered plan matches
+the worker plan.

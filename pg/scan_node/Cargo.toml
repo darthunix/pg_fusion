@@ -10,12 +10,14 @@ crate-type = ["lib"]
 doctest = false
 
 [dependencies]
+arrow-array = { workspace = true }
+arrow-data = { workspace = true }
 arrow-schema = { workspace = true }
 async-trait = "0.1"
 datafusion = { workspace = true }
 datafusion-common = { workspace = true }
 datafusion-expr = { workspace = true }
+futures = "0.3"
 scan_sql = { path = "../scan_sql", version = "25.0" }
 
 [dev-dependencies]
-futures = "0.3"

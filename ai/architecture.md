@@ -52,6 +52,14 @@ page-backed Arrow batches.
 5. Backend imports result pages with `slot_import` and projects rows into
    PostgreSQL tuple slots.
 
+Page-backed scan batches stay zero-copy through streaming DataFusion operators.
+After physical planning, `scan_node` inserts `PageMaterializeExec` only before
+operators that can retain input batches beyond immediate streaming, such as
+sort/window operators and join build sides. The wrapper copies Arrow arrays into
+ordinary allocations at that boundary so shared-memory pages and permits can be
+released while preserving zero-copy for simple scans, filters, projections,
+limits, and plain aggregates.
+
 Runtime metrics live in a separate shared-memory region. The runtime does not
 wrap control rings for v1 metrics; scan/result page senders stamp page
 descriptors, and receivers use those stamps to measure backend-to-worker and

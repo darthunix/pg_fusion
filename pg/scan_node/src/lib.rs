@@ -17,6 +17,8 @@
 //! node. Plan-building code must keep required residual predicates above the
 //! custom scan node.
 
+mod page_materialize;
+
 use std::cmp::Ordering;
 use std::fmt::{self, Debug};
 use std::hash::{Hash, Hasher};
@@ -33,6 +35,10 @@ use datafusion_expr::logical_plan::{
 };
 use datafusion_expr::Expr;
 use scan_sql::{CompiledScan, PgRelation};
+
+pub use page_materialize::{
+    insert_page_materializers, materialize_record_batch, PageMaterializeExec,
+};
 
 /// Stable identifier for one PostgreSQL scan leaf within one planned query.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]

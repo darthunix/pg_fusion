@@ -23,7 +23,9 @@ use scan_node::PgScanExtensionPlanner;
 use crate::error::WorkerRuntimeError;
 use crate::fsm::worker_execution_flow::StateMachine as WorkerExecutionMachine;
 use crate::fsm::{WorkerExecutionEvent, WorkerExecutionState};
-use crate::scan_exec::{ScanBatchSource, ScanProducerPeer, WorkerPgScanExecFactory};
+use crate::scan_exec::{
+    ScanBatchSource, ScanProducerPeer, WorkerPgScanExec, WorkerPgScanExecFactory,
+};
 
 /// Static configuration for one worker-side runtime instance.
 #[derive(Clone, Debug)]
@@ -647,9 +649,13 @@ impl PendingPhysicalPlanning {
         let physical_planner =
             DefaultPhysicalPlanner::with_extension_planners(vec![Arc::new(pg_scan_planner)]);
         let session_state = build_worker_planning_session_state();
-        Ok(physical_planner
+        let physical_plan = physical_planner
             .create_physical_plan(&self.logical_plan, &session_state)
-            .await?)
+            .await?;
+        Ok(scan_node::insert_page_materializers(
+            physical_plan,
+            &|plan| plan.as_any().is::<WorkerPgScanExec>(),
+        )?)
     }
 }
 

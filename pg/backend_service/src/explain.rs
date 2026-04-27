@@ -16,7 +16,7 @@ use datafusion::physical_planner::{DefaultPhysicalPlanner, PhysicalPlanner};
 use datafusion_common::{DataFusionError, Result as DFResult};
 use futures::executor::block_on;
 use plan_builder::{PlanBuildInput, PlanBuilder};
-use scan_node::{PgScanExecFactory, PgScanExtensionPlanner, PgScanSpec};
+use scan_node::{insert_page_materializers, PgScanExecFactory, PgScanExtensionPlanner, PgScanSpec};
 use slot_scan::{explain_scan, ScanExplainOptions, ScanOptions};
 
 use crate::{BackendServiceError, ExplainInput};
@@ -41,6 +41,10 @@ pub(crate) fn render_physical_explain(
     let physical_plan =
         block_on(physical_planner.create_physical_plan(&built.logical_plan, &session_state))
             .map_err(BackendServiceError::PhysicalPlan)?;
+    let physical_plan = insert_page_materializers(physical_plan, &|plan| {
+        plan.as_any().is::<ExplainPgScanExec>()
+    })
+    .map_err(BackendServiceError::PhysicalPlan)?;
 
     Ok(render_physical_plan(
         physical_plan.as_ref(),
