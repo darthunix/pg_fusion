@@ -354,7 +354,7 @@ mod tests {
     fn source_schema() -> DFSchema {
         let schema = Schema::new(vec![
             Field::new("id", DataType::Int64, false),
-            Field::new("name", DataType::Utf8, true),
+            Field::new("name", DataType::Utf8View, true),
             Field::new("score", DataType::Float64, true),
         ]);
         DFSchema::try_from_qualified_schema(TableReference::partial("public", "users"), &schema)

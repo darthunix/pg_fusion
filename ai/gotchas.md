@@ -39,6 +39,11 @@ importance: 0.7
   optimization. Subqueries that decorrelate into ordinary relational operators
   can lower PostgreSQL leaf scans; subquery nodes that survive optimization
   remain unsupported.
+- PostgreSQL text-like columns (`text`, `varchar`, `bpchar`, `name`) are
+  exposed to DataFusion as `Utf8View`, not `Utf8`. This keeps the logical scan
+  schema aligned with page-backed shared-memory batches and avoids copying
+  string payloads at the scan boundary. `scan_sql` still renders these values as
+  PostgreSQL `TEXT`.
 - The `benches/tpch` harness is diagnostic rather than official TPC-H. Its
   schema stores TPC-H decimal columns as `double precision` and date columns as
   ISO `text` so current page encoding can exercise scans, joins, and

@@ -37,7 +37,9 @@ page-backed Arrow batches.
 ## Data Path
 
 1. Backend planning resolves PostgreSQL catalog metadata and lowers scan leaves
-   to `PgScanNode`/`scan_sql` descriptors.
+   to `PgScanNode`/`scan_sql` descriptors. PostgreSQL text-like columns are
+   represented as Arrow `Utf8View` in the DataFusion logical schema so scan
+   pages can stay zero-copy for string payloads.
 2. Worker DataFusion execution opens scans through the runtime protocol.
 3. Backend executes trusted scan SQL through `slot_scan`, drains PostgreSQL
    executor slots with a custom `DestReceiver` and explicit fetch row budgets,

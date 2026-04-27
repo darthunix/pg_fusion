@@ -9,7 +9,7 @@ const TEST_IDENTIFIER_MAX_BYTES: usize = 63;
 fn test_schema() -> Schema {
     Schema::new(vec![
         Field::new("id", DataType::Int64, false),
-        Field::new("name", DataType::Utf8, true),
+        Field::new("name", DataType::Utf8View, true),
         Field::new("score", DataType::Float64, true),
         Field::new(
             "created_at",
@@ -284,6 +284,30 @@ fn renders_like_filter_without_sql_limit_by_default() {
     assert_eq!(
         compiled.sql,
         "SELECT \"name\" FROM \"public\".\"users\" WHERE (\"name\" ILIKE 'al%')"
+    );
+}
+
+#[test]
+fn renders_utf8view_string_literal_filter() {
+    let schema = test_schema();
+    let filter = Expr::Column(Column::from_name("name")).eq(Expr::Literal(
+        datafusion_common::ScalarValue::Utf8View(Some("alice".to_owned())),
+    ));
+
+    let compiled = compile_scan(CompileScanInput {
+        relation: &test_relation(),
+        schema: &schema,
+        identifier_max_bytes: TEST_IDENTIFIER_MAX_BYTES,
+        projection: Some(&[1]),
+        filters: &[filter],
+        requested_limit: None,
+        limit_lowering: LimitLowering::ExternalHint,
+    })
+    .unwrap();
+
+    assert_eq!(
+        compiled.sql,
+        "SELECT \"name\" FROM \"public\".\"users\" WHERE (\"name\" = 'alice')"
     );
 }
 

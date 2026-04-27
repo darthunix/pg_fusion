@@ -29,6 +29,9 @@
 //!
 //! - [`ResolvedTable::relation`] and [`ResolvedTable::schema`] are used for
 //!   DataFusion planning and PostgreSQL scan SQL compilation
+//! - PostgreSQL text-like columns are exposed as Arrow `Utf8View` so the
+//!   logical DataFusion schema matches page-backed scan batches without
+//!   copying string payloads
 //! - physical row execution happens later through `slot_scan`, which exposes
 //!   the live run-time `TupleDesc` for the actual cursor result
 //! - `ResolvedTable` is therefore **not** a heap-layout contract and must not
@@ -293,7 +296,7 @@ fn oid_to_arrow_type(oid: pg_sys::Oid) -> Option<arrow_schema::DataType> {
             || o == pg_sys::BPCHAROID
             || o == pg_sys::NAMEOID =>
         {
-            Some(DataType::Utf8)
+            Some(DataType::Utf8View)
         }
         o if o == pg_sys::INT2OID => Some(DataType::Int16),
         o if o == pg_sys::INT4OID => Some(DataType::Int32),
@@ -329,10 +332,10 @@ mod tests {
     fn oid_to_arrow_type_maps_supported_oids() {
         let cases = [
             (pg_sys::BOOLOID, DataType::Boolean),
-            (pg_sys::TEXTOID, DataType::Utf8),
-            (pg_sys::VARCHAROID, DataType::Utf8),
-            (pg_sys::BPCHAROID, DataType::Utf8),
-            (pg_sys::NAMEOID, DataType::Utf8),
+            (pg_sys::TEXTOID, DataType::Utf8View),
+            (pg_sys::VARCHAROID, DataType::Utf8View),
+            (pg_sys::BPCHAROID, DataType::Utf8View),
+            (pg_sys::NAMEOID, DataType::Utf8View),
             (pg_sys::INT2OID, DataType::Int16),
             (pg_sys::INT4OID, DataType::Int32),
             (pg_sys::INT8OID, DataType::Int64),

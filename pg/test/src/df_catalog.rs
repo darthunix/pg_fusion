@@ -69,6 +69,30 @@ pub fn df_catalog_resolves_schema_qualified_tables() {
     );
 }
 
+pub fn df_catalog_maps_text_like_columns_to_utf8view() {
+    Spi::run("DROP TABLE IF EXISTS public.df_catalog_text_like").unwrap();
+    Spi::run(
+        "CREATE TABLE public.df_catalog_text_like \
+         (txt text, vc varchar(16), bp bpchar(4), nm name)",
+    )
+    .unwrap();
+
+    let resolved = resolver()
+        .resolve_table(&TableReference::bare("df_catalog_text_like"))
+        .expect("resolve text-like table");
+
+    let fields = resolved.schema.fields();
+    assert_eq!(fields.len(), 4);
+    for field in fields {
+        assert_eq!(
+            field.data_type(),
+            &arrow_schema::DataType::Utf8View,
+            "{} should be planned as Utf8View",
+            field.name()
+        );
+    }
+}
+
 pub fn df_catalog_bare_lookup_prefers_temp_tables() {
     Spi::run("DROP TABLE IF EXISTS public.df_catalog_temp_shadow").unwrap();
     Spi::run("CREATE TABLE public.df_catalog_temp_shadow (id int4)").unwrap();
@@ -429,6 +453,7 @@ pub fn df_catalog_skips_dropped_columns_and_preserves_nullability() {
     assert_eq!(fields[0].name(), "id");
     assert!(!fields[0].is_nullable());
     assert_eq!(fields[1].name(), "payload");
+    assert_eq!(fields[1].data_type(), &arrow_schema::DataType::Utf8View);
     assert!(fields[1].is_nullable());
     assert_eq!(fields[2].name(), "created");
     assert!(!fields[2].is_nullable());

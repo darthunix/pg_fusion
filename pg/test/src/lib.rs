@@ -190,6 +190,11 @@ mod tests {
     }
 
     #[pg_test]
+    fn df_catalog_maps_text_like_columns_to_utf8view() {
+        super::df_catalog::df_catalog_maps_text_like_columns_to_utf8view();
+    }
+
+    #[pg_test]
     fn df_catalog_bare_lookup_prefers_temp_tables() {
         super::df_catalog::df_catalog_bare_lookup_prefers_temp_tables();
     }
@@ -350,8 +355,8 @@ mod tests {
     }
 
     #[pg_test]
-    fn plan_builder_rejects_in_subquery_predicates() {
-        super::plan_builder::plan_builder_rejects_in_subquery_predicates();
+    fn plan_builder_rewrites_in_subquery_predicates() {
+        super::plan_builder::plan_builder_rewrites_in_subquery_predicates();
     }
 
     #[pg_test]

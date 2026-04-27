@@ -447,7 +447,7 @@ pub fn slot_scan_accepts_scan_sql_external_hint_and_rejects_sql_clause() {
     reset_slot_scan_table(32);
     let schema = arrow_schema::Schema::new(vec![
         arrow_schema::Field::new("id", arrow_schema::DataType::Int32, false),
-        arrow_schema::Field::new("payload", arrow_schema::DataType::Utf8, true),
+        arrow_schema::Field::new("payload", arrow_schema::DataType::Utf8View, true),
     ]);
     let relation = PgRelation::new(None::<String>, SLOT_SCAN_TABLE);
     let filters = Vec::new();

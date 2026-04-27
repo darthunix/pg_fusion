@@ -40,7 +40,7 @@ fn user_table() -> ResolvedTable {
         relation: PgRelation::new(Some("public"), "users"),
         schema: Arc::new(Schema::new(vec![
             Field::new("id", DataType::Int64, false),
-            Field::new("name", DataType::Utf8, true),
+            Field::new("name", DataType::Utf8View, true),
             Field::new("score", DataType::Float64, true),
         ])),
     }
@@ -136,6 +136,26 @@ fn builds_simple_query_with_one_pg_scan_node() {
     assert_eq!(
         spec.compiled_scan.sql,
         "SELECT \"id\", \"name\" FROM \"public\".\"users\" WHERE (\"id\" > 10)"
+    );
+    assert_eq!(
+        spec.arrow_schema().field(1).data_type(),
+        &DataType::Utf8View
+    );
+}
+
+#[test]
+fn keeps_pg_text_columns_as_utf8view_for_string_predicates() {
+    let built = build_sql("SELECT name FROM users WHERE name = 'alice'");
+
+    assert_eq!(built.scans.len(), 1);
+    let spec = &built.scans[0];
+    assert_eq!(
+        spec.arrow_schema().field(0).data_type(),
+        &DataType::Utf8View
+    );
+    assert_eq!(
+        spec.compiled_scan.sql,
+        "SELECT \"name\" FROM \"public\".\"users\" WHERE (\"name\" = 'alice')"
     );
 }
 

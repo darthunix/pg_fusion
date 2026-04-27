@@ -178,22 +178,30 @@ pub fn plan_builder_rejects_exists_subqueries() {
     }
 }
 
-pub fn plan_builder_rejects_in_subquery_predicates() {
+pub fn plan_builder_rewrites_in_subquery_predicates() {
     Spi::run("DROP TABLE IF EXISTS public.plan_builder_in_users").unwrap();
     Spi::run("DROP TABLE IF EXISTS public.plan_builder_in_orders").unwrap();
     Spi::run("CREATE TABLE public.plan_builder_in_users (id int8 NOT NULL)").unwrap();
     Spi::run("CREATE TABLE public.plan_builder_in_orders (user_id int8 NOT NULL)").unwrap();
 
-    let error = build_err(
+    let built = build(
         "SELECT id FROM public.plan_builder_in_users \
          WHERE id IN (SELECT user_id FROM public.plan_builder_in_orders)",
         Vec::new(),
     );
 
-    match error {
-        PlanBuildError::UnsupportedSubquery(message) => {
-            assert!(message.contains("IN (SELECT"), "{message}");
-        }
-        other => panic!("expected unsupported subquery error, got {other:?}"),
-    }
+    assert_eq!(built.scans.len(), 2);
+    assert_eq!(
+        built.scans[0].compiled_scan.sql,
+        "SELECT \"id\" FROM \"public\".\"plan_builder_in_users\""
+    );
+    assert_eq!(
+        built.scans[1].compiled_scan.sql,
+        "SELECT \"user_id\" FROM \"public\".\"plan_builder_in_orders\""
+    );
+    assert!(built
+        .logical_plan
+        .display_indent()
+        .to_string()
+        .contains("LeftSemi Join"));
 }
