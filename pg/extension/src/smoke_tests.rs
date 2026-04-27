@@ -306,7 +306,7 @@ pub(crate) fn heap_parallel_scan_smoke() {
     tx.batch_execute(
         "\
         SET LOCAL statement_timeout = '20s';
-        SET LOCAL pg_fusion.scan_parallel_workers = 2
+        SET LOCAL max_parallel_workers_per_gather = 2
         ",
     )
     .expect("enable dynamic scan workers");
@@ -323,6 +323,45 @@ pub(crate) fn heap_parallel_scan_smoke() {
     client
         .batch_execute(&format!("DROP TABLE IF EXISTS {table_name}"))
         .expect("drop committed heap table for parallel scan smoke");
+}
+
+pub(crate) fn heap_leader_only_scan_smoke() {
+    let mut client = smoke_client();
+    ensure_shared_preload(&mut client);
+    let table_name = "public.pgf_leader_only_scan_smoke";
+    client
+        .batch_execute(&format!(
+            "\
+            DROP TABLE IF EXISTS {table_name};
+            CREATE TABLE {table_name} AS
+            SELECT g::bigint AS id, (g * 10)::bigint AS payload
+            FROM generate_series(1, 1000) AS g;
+            ANALYZE {table_name};
+            "
+        ))
+        .expect("create committed heap table for leader-only scan smoke");
+
+    let mut tx = smoke_transaction(&mut client);
+    tx.batch_execute(
+        "\
+        SET LOCAL statement_timeout = '20s';
+        SET LOCAL max_parallel_workers_per_gather = 0
+        ",
+    )
+    .expect("disable dynamic scan workers through PostgreSQL parallel worker GUC");
+    let sum: i64 = simple_query_first_column_tx(
+        &mut tx,
+        &format!("SELECT sum(id)::bigint FROM {table_name} WHERE id BETWEEN 10 AND 1000"),
+    )
+    .expect("leader-only heap scan must return one row")
+    .parse()
+    .expect("leader-only heap scan sum must be an integer");
+    assert_eq!(sum, 1000 * 1001 / 2 - 9 * 10 / 2);
+    tx.commit()
+        .expect("commit leader-only scan smoke transaction before cleanup");
+    client
+        .batch_execute(&format!("DROP TABLE IF EXISTS {table_name}"))
+        .expect("drop committed heap table for leader-only scan smoke");
 }
 
 pub(crate) fn metrics_smoke() {

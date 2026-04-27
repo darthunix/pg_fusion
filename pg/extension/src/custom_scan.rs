@@ -354,13 +354,7 @@ unsafe extern "C-unwind" fn begin_pg_fusion_scan(
 
     let plan_tx = IssuedTx::new(PageTx::new(page_pool), issuance_pool);
     let mut scan_worker_launcher = DynamicScanWorkerLauncher {
-        config: config.clone(),
         jobs: scan_worker_jobs,
-    };
-    let scan_worker_launcher = if config.scan_parallel_workers > 0 {
-        Some(&mut scan_worker_launcher as &mut dyn ScanWorkerLauncher)
-    } else {
-        None
     };
     let begin = {
         let _planner_bypass = PlannerBypassGuard::enter();
@@ -371,7 +365,7 @@ unsafe extern "C-unwind" fn begin_pg_fusion_scan(
             plan_tx,
             scan_slot_region: &scan_region,
             config: backend_config,
-            scan_worker_launcher,
+            scan_worker_launcher: Some(&mut scan_worker_launcher),
         })
     }
     .unwrap_or_else(|err| error!("pg_fusion begin execution failed: {err}"));
@@ -1312,7 +1306,6 @@ fn build_transport_schema(sql: &str) -> Result<SchemaRef, String> {
 }
 
 struct DynamicScanWorkerLauncher {
-    config: crate::HostConfig,
     jobs: ScanWorkerJobRegistryHandle,
 }
 
@@ -1321,7 +1314,8 @@ impl ScanWorkerLauncher for DynamicScanWorkerLauncher {
         &mut self,
         input: ScanWorkerLaunchInput<'_>,
     ) -> Result<ScanWorkerLaunchOutput, BackendServiceError> {
-        if self.config.scan_parallel_workers == 0
+        let requested_workers = postgres_max_parallel_workers_per_gather().min(32) as u16;
+        if requested_workers == 0
             || input.spec.compiled_scan.uses_dummy_projection
             || input.spec.compiled_scan.output_columns.is_empty()
         {
@@ -1336,7 +1330,6 @@ impl ScanWorkerLauncher for DynamicScanWorkerLauncher {
         if block_count <= 1 {
             return Ok(ScanWorkerLaunchOutput::default());
         }
-        let requested_workers = self.config.scan_parallel_workers.min(32) as u16;
         let total_producers = (u64::from(requested_workers) + 1)
             .min(block_count)
             .min(u64::from(u16::MAX)) as u16;
@@ -1395,6 +1388,10 @@ impl ScanWorkerLauncher for DynamicScanWorkerLauncher {
             workers,
         })
     }
+}
+
+fn postgres_max_parallel_workers_per_gather() -> u32 {
+    unsafe { pg_sys::max_parallel_workers_per_gather.max(0) as u32 }
 }
 
 fn mark_scan_worker_job_failed(jobs: ScanWorkerJobRegistryHandle, job_id: usize, message: &str) {

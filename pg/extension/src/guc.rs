@@ -31,7 +31,6 @@ pub(crate) static PAGE_SIZE: GucSetting<i32> = GucSetting::<i32>::new(64 * 1024)
 pub(crate) static PAGE_COUNT: GucSetting<i32> = GucSetting::<i32>::new(256);
 
 pub(crate) static SCAN_FETCH_BATCH_ROWS: GucSetting<i32> = GucSetting::<i32>::new(1024);
-pub(crate) static SCAN_PARALLEL_WORKERS: GucSetting<i32> = GucSetting::<i32>::new(0);
 pub(crate) static ESTIMATOR_INITIAL_TAIL_BYTES_PER_ROW: GucSetting<i32> =
     GucSetting::<i32>::new(64);
 pub(crate) static SCAN_TIMING_DETAIL: GucSetting<bool> = GucSetting::<bool>::new(false);
@@ -52,7 +51,6 @@ pub struct HostConfig {
     pub page_size: usize,
     pub page_count: u32,
     pub scan_fetch_batch_rows: u32,
-    pub scan_parallel_workers: u32,
     pub estimator_initial_tail_bytes_per_row: u32,
     pub scan_timing_detail: bool,
 }
@@ -168,18 +166,8 @@ pub fn register_gucs() {
     define_positive_int(
         c"pg_fusion.scan_fetch_batch_rows",
         c"Backend scan fetch batch rows",
-        c"Number of rows fetched per PostgreSQL cursor batch in backend scan streaming",
+        c"Number of rows fetched per PostgreSQL portal drain in backend scan streaming",
         &SCAN_FETCH_BATCH_ROWS,
-    );
-    GucRegistry::define_int_guc(
-        c"pg_fusion.scan_parallel_workers",
-        c"Dynamic scan worker count",
-        c"Additional dynamic PostgreSQL scan workers per pg_fusion scan leaf (0 disables CTID chunked scan workers)",
-        &SCAN_PARALLEL_WORKERS,
-        0,
-        32,
-        GucContext::Userset,
-        GucFlags::default(),
     );
     define_positive_int(
         c"pg_fusion.estimator_initial_tail_bytes_per_row",
@@ -244,7 +232,6 @@ pub fn host_config() -> Result<HostConfig, HostConfigError> {
             "pg_fusion.scan_fetch_batch_rows",
             SCAN_FETCH_BATCH_ROWS.get(),
         )?,
-        scan_parallel_workers: SCAN_PARALLEL_WORKERS.get().max(0) as u32,
         estimator_initial_tail_bytes_per_row: positive_u32(
             "pg_fusion.estimator_initial_tail_bytes_per_row",
             ESTIMATOR_INITIAL_TAIL_BYTES_PER_ROW.get(),
@@ -369,7 +356,6 @@ mod tests {
             page_size: 65536,
             page_count: 256,
             scan_fetch_batch_rows: 77,
-            scan_parallel_workers: 3,
             estimator_initial_tail_bytes_per_row: 33,
             scan_timing_detail: true,
         };

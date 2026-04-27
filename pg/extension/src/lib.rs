@@ -87,6 +87,11 @@ mod tests {
     }
 
     #[pg_test]
+    fn pg_fusion_heap_leader_only_scan_smoke() {
+        super::smoke_tests::heap_leader_only_scan_smoke();
+    }
+
+    #[pg_test]
     fn pg_fusion_result_ingress_roundtrip_smoke() {
         super::result_ingress_tests::result_ingress_roundtrip_smoke();
     }

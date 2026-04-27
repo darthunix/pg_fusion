@@ -27,21 +27,23 @@ importance: 0.7
   still race with a manual reset.
 - `pg_fusion.scan_timing_detail` adds per-row timing inside the backend scan
   receiver callback. Use it for diagnosis, not baseline latency measurements.
-- `pg_fusion.scan_parallel_workers` is experimental CTID block-range chunking.
-  It needs dynamic background worker capacity and currently falls back for
-  relations with dropped attributes or scan shapes that cannot use unprojected
-  base-relation slots. Standalone scan producers wait for the worker `OpenScan`
-  message with a bounded timeout; slow physical planning can therefore surface
-  as a scan-open failure while this path is experimental. The generated CTID
-  predicates normally plan as PostgreSQL `TidRangeScan`; `slot_scan` must keep
-  that node type in its allowed scan-leaf list. The worker-to-backend scan ring
-  must also be large enough for `OpenScan` with the full producer set; the
-  current minimum is 256 bytes. Standalone scan producers must keep their
-  backend lease alive after publishing `ScanFinished`/`ScanFailed` until the
-  worker detaches the slot; otherwise `control_transport` correctly rejects
-  worker-side reads after backend-owner release. Dynamic worker launch failures
-  are strict query errors, but the launcher must still mark the allocated job
-  failed and cancel already-ready producers so failed starts do not leak
-  `STARTING` jobs or workers waiting for `OpenScan`.
+- PostgreSQL `max_parallel_workers_per_gather` controls CTID block-range dynamic
+  scan workers for eligible heap scans. `0` means leader-only portal streaming;
+  positive values add that many dynamic producers, capped at `32`. The path
+  needs dynamic background worker capacity and falls back to leader-only
+  streaming for relations with dropped attributes or scan shapes that cannot use
+  unprojected base-relation slots. Standalone scan producers wait for the worker
+  `OpenScan` message with a bounded timeout; slow physical planning can surface
+  as a scan-open failure. The generated CTID predicates normally plan as
+  PostgreSQL `TidRangeScan`; `slot_scan` must keep that node type in its allowed
+  scan-leaf list. The worker-to-backend scan ring must also be large enough for
+  `OpenScan` with the full producer set; the current minimum is 256 bytes.
+  Standalone scan producers must keep their backend lease alive after publishing
+  `ScanFinished`/`ScanFailed` until the worker detaches the slot; otherwise
+  `control_transport` correctly rejects worker-side reads after backend-owner
+  release. Dynamic worker launch failures are strict query errors, but the
+  launcher must still mark the allocated job failed and cancel already-ready
+  producers so failed starts do not leak `STARTING` jobs or workers waiting for
+  `OpenScan`.
 - Misaligned pointer deref can panic when interpreting shared-memory bytes as
   atomics. Allocate ring regions through the established lockfree layout paths.

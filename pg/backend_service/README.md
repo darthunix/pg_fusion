@@ -51,15 +51,15 @@ streaming:
   internal backend-service streaming path
 
 The service can also accept externally launched scan producers through
-`ScanWorkerLauncher`. The extension uses this for experimental CTID
-block-range chunking: the leader backend keeps producer `0`, dynamic scan
-workers use producer ids `1..N`, and the worker runtime receives all producer
-channels in `StartExecution`. Standalone producers time out if `OpenScan` does
-not arrive after launch, so a failed `begin_execution` cannot leave a scan
-worker waiting forever. The extension-side launcher treats dynamic worker
-startup failures as strict query errors, but it must still mark the current job
-failed and cancel any already-ready producers before returning that error.
-After a standalone producer publishes
+`ScanWorkerLauncher`. The extension uses this for CTID block-range chunking:
+the leader backend keeps producer `0`, dynamic scan workers use producer ids
+`1..N`, and the worker runtime receives all producer channels in
+`StartExecution`. Standalone producers time out if `OpenScan` does not arrive
+after launch, so a failed `begin_execution` cannot leave a scan worker waiting
+forever. The extension-side launcher treats dynamic worker startup failures as
+strict query errors, but it must still mark the current job failed and cancel
+any already-ready producers before returning that error. After a standalone
+producer publishes
 `ScanFinished`/`ScanFailed`, it keeps its backend lease alive until the worker
 detaches that scan slot; otherwise the lower `control_transport` contract would
 make the terminal frame unreadable as soon as the backend owner is released.

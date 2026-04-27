@@ -3,7 +3,7 @@ id: arch-overview-0001
 type: fact
 scope: repo
 tags: ["architecture", "datafusion", "pgrx", "shared-memory", "ipc", "slot_scan"]
-updated_at: "2026-04-24"
+updated_at: "2026-04-27"
 importance: 0.8
 ---
 
@@ -42,10 +42,11 @@ page-backed Arrow batches.
 3. Backend executes trusted scan SQL through `slot_scan`, drains PostgreSQL
    executor slots with a custom `DestReceiver` and explicit fetch row budgets,
    encodes `TupleTableSlot` rows into initialized `arrow_layout` pages with
-   `slot_encoder`, and sends issued pages to the worker. By default each scan
-   has one backend producer. When `pg_fusion.scan_parallel_workers > 0`, eligible
-   heap scans can add dynamic background-worker producers; each producer owns a
-   dedicated scan control slot and writes its own Arrow pages into shared memory.
+   `slot_encoder`, and sends issued pages to the worker. Each scan always has a
+   leader backend producer. When PostgreSQL `max_parallel_workers_per_gather` is
+   positive, eligible heap scans can add that many dynamic background-worker
+   producers, capped at `32`; each producer owns a dedicated scan control slot
+   and writes its own Arrow pages into shared memory.
 4. Worker imports scan pages as Arrow `RecordBatch` values, runs DataFusion
    operators, writes Arrow result pages, and sends issued frames back.
 5. Backend imports result pages with `slot_import` and projects rows into
@@ -56,15 +57,15 @@ wrap control rings for v1 metrics; scan/result page senders stamp page
 descriptors, and receivers use those stamps to measure backend-to-worker and
 worker-to-backend page handoff latency. Detailed scan timing is opt-in through
 `pg_fusion.scan_timing_detail`; it splits backend scan page fill time into
-PostgreSQL cursor read time and slot-to-Arrow serialization time.
+PostgreSQL read time and slot-to-Arrow serialization time.
 
 Dynamic scan workers use CTID block-range chunking as the first parallel scan
 strategy. The leader backend scans one heap block range, additional dynamic
 background workers scan disjoint ranges, and `worker_runtime` fans all producer
 streams into one logical `PgScanExec`. Each producer has its own ordered
 issued-page receive stream because producer-local page transfer ids start at
-`1`. Relations with dropped attributes or unsupported scan shapes stay on the
-single-producer cursor path.
+`1`. Relations with dropped attributes or unsupported scan shapes stay on
+leader-only portal streaming.
 
 ## Retired Legacy Stack
 

@@ -13,10 +13,12 @@ importance: 0.8
 - Backend control uses `runtime_protocol` messages over `control_transport`.
 - Backend scan production uses PostgreSQL `slot_scan` plus `slot_encoder` to
   stream Arrow layout pages to the worker.
-- `pg_fusion.scan_parallel_workers` can add dynamic background-worker scan
-  producers for eligible heap scans. Each producer owns a dedicated scan slot
-  and writes pages directly to the shared page pool; the worker fan-ins all
-  producers for the same `scan_id` with a separate issued-page receiver per
+- PostgreSQL `max_parallel_workers_per_gather` controls dynamic
+  background-worker scan producers for eligible heap scans. Each scan always has
+  a leader backend producer; a positive `max_parallel_workers_per_gather` adds
+  that many dynamic producers, capped at `32`. Each producer owns a dedicated
+  scan slot and writes pages directly to the shared page pool; the worker fan-ins
+  all producers for the same `scan_id` with a separate issued-page receiver per
   producer stream. Dynamic worker launch is all-or-error: partial launches are
   cleaned up by marking failed jobs and sending `CancelScan` to producers that
   became ready before the launch failed.
