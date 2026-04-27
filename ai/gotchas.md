@@ -53,7 +53,10 @@ importance: 0.7
   positive values add that many dynamic producers, capped at `32`. The path
   needs dynamic background worker capacity and falls back to leader-only
   streaming for relations with dropped attributes or scan shapes that cannot use
-  unprojected base-relation slots. Standalone scan producers wait for the worker
+  unprojected base-relation slots. Dynamic scan worker jobs must use the
+  resolved standalone scan descriptor built by the leader, not the original
+  user SQL; otherwise non-public schemas fail because scan workers do not
+  inherit the backend `search_path`. Standalone scan producers wait for the worker
   `OpenScan` message with a bounded timeout; slow physical planning can surface
   as a scan-open failure. The generated CTID predicates normally plan as
   PostgreSQL `TidRangeScan`; `slot_scan` must keep that node type in its allowed

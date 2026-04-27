@@ -87,6 +87,11 @@ mod tests {
     }
 
     #[pg_test]
+    fn pg_fusion_heap_parallel_scan_search_path_smoke() {
+        super::smoke_tests::heap_parallel_scan_search_path_smoke();
+    }
+
+    #[pg_test]
     fn pg_fusion_heap_leader_only_scan_smoke() {
         super::smoke_tests::heap_leader_only_scan_smoke();
     }

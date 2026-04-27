@@ -92,12 +92,11 @@ fn run_scan_worker_main(job_id: usize) -> Result<(), String> {
     backend_config.metrics = metrics;
     let run_result = BackgroundWorker::transaction(|| {
         BackendService::run_standalone_scan_producer(StandaloneScanProducerInput {
-            sql: &job.sql,
+            descriptor: job.descriptor,
             session_epoch: job.session_epoch,
             scan_id: job.scan_id,
             producer_id: job.producer_id,
             producer_count: job.producer_count,
-            ctid_range: Some(job.ctid_range),
             scan_lease,
             scan_tx: IssuedTx::new(transfer::PageTx::new(page_pool), issuance_pool),
             config: backend_config,

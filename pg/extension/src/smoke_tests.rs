@@ -325,6 +325,47 @@ pub(crate) fn heap_parallel_scan_smoke() {
         .expect("drop committed heap table for parallel scan smoke");
 }
 
+pub(crate) fn heap_parallel_scan_search_path_smoke() {
+    let mut client = smoke_client();
+    ensure_shared_preload(&mut client);
+    let schema_name = "pgf_parallel_search_path_smoke";
+    client
+        .batch_execute(&format!(
+            "\
+            DROP SCHEMA IF EXISTS {schema_name} CASCADE;
+            CREATE SCHEMA {schema_name};
+            CREATE TABLE {schema_name}.items AS
+            SELECT g::bigint AS id, (g * 10)::bigint AS payload
+            FROM generate_series(1, 20000) AS g;
+            ANALYZE {schema_name}.items;
+            "
+        ))
+        .expect("create committed search_path fixture for parallel scan smoke");
+
+    let mut tx = smoke_transaction(&mut client);
+    tx.batch_execute(&format!(
+        "\
+        SET LOCAL statement_timeout = '20s';
+        SET LOCAL max_parallel_workers_per_gather = 2;
+        SET LOCAL search_path = {schema_name}, public
+        "
+    ))
+    .expect("enable dynamic scan workers with non-public search_path");
+    let sum: i64 = simple_query_first_column_tx(
+        &mut tx,
+        "SELECT sum(id)::bigint FROM items WHERE id BETWEEN 100 AND 20000",
+    )
+    .expect("parallel heap scan through search_path must return one row")
+    .parse()
+    .expect("parallel heap scan sum must be an integer");
+    assert_eq!(sum, 20000 * 20001 / 2 - 99 * 100 / 2);
+    tx.commit()
+        .expect("commit parallel search_path scan smoke transaction before cleanup");
+    client
+        .batch_execute(&format!("DROP SCHEMA IF EXISTS {schema_name} CASCADE"))
+        .expect("drop search_path fixture for parallel scan smoke");
+}
+
 pub(crate) fn heap_leader_only_scan_smoke() {
     let mut client = smoke_client();
     ensure_shared_preload(&mut client);

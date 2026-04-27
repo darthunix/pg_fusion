@@ -6,10 +6,10 @@ use std::time::Duration;
 
 use arrow_schema::{Field, Schema, SchemaRef};
 use backend_service::{
-    ActiveScanDriver, BackendService, BackendServiceError, BeginExecutionOutput, CtidBlockRange,
-    DiagnosticLogLevel, ExecutionKey, ExplainInput, ExplainRenderOptions, OpenScanInput,
-    ScanStreamStep, ScanWorkerLaunchInput, ScanWorkerLaunchOutput, ScanWorkerLauncher,
-    ScanWorkerProducer, StartExecutionInput,
+    build_standalone_scan_descriptor, ActiveScanDriver, BackendService, BackendServiceError,
+    BeginExecutionOutput, CtidBlockRange, DiagnosticLogLevel, ExecutionKey, ExplainInput,
+    ExplainRenderOptions, OpenScanInput, ScanStreamStep, ScanWorkerLaunchInput,
+    ScanWorkerLaunchOutput, ScanWorkerLauncher, ScanWorkerProducer, StartExecutionInput,
 };
 use control_transport::{BackendLeaseSlot, BackendSlotLease, WorkerTransport};
 use issuance::{
@@ -39,7 +39,9 @@ use crate::diag;
 use crate::guc::host_config;
 use crate::logging;
 use crate::result_ingress::{AcceptedResultFrame, ResultIngress};
-use crate::scan_worker_job::{ScanWorkerJobRegistryHandle, ScanWorkerJobSpec};
+use crate::scan_worker_job::{
+    encode_scan_worker_descriptor, ScanWorkerJobRegistryHandle, ScanWorkerJobSpec,
+};
 use crate::shmem::{
     attach_control_region, attach_issuance_pool, attach_page_pool, attach_runtime_metrics,
     attach_scan_region, attach_scan_worker_jobs,
@@ -1340,17 +1342,28 @@ impl ScanWorkerLauncher for DynamicScanWorkerLauncher {
         let db_oid: u32 = unsafe { pg_sys::MyDatabaseId.into() };
         let user_oid: u32 = unsafe { pg_sys::GetUserId().into() };
         let mut workers = Vec::with_capacity(total_producers.saturating_sub(1) as usize);
+        let mut job_payload = Vec::new();
         for producer_id in 1..total_producers {
             let range = producer_block_range(block_count, total_producers, producer_id);
+            let descriptor = match build_standalone_scan_descriptor(input.spec, Some(range)) {
+                Ok(descriptor) => descriptor,
+                Err(err) => {
+                    cancel_launched_scan_workers(&workers, input.session_epoch, input.scan_id);
+                    return Err(err);
+                }
+            };
+            if let Err(err) = encode_scan_worker_descriptor(&descriptor, &mut job_payload) {
+                cancel_launched_scan_workers(&workers, input.session_epoch, input.scan_id);
+                return Err(BackendServiceError::ProtocolViolation(err.to_string()));
+            }
             let job_id = match self.jobs.allocate(ScanWorkerJobSpec {
-                sql: input.sql,
+                payload: &job_payload,
                 db_oid,
                 user_oid,
                 session_epoch: input.session_epoch,
                 scan_id: input.scan_id,
                 producer_id,
                 producer_count: total_producers,
-                ctid_range: range,
             }) {
                 Ok(job_id) => job_id,
                 Err(err) => {

@@ -54,8 +54,11 @@ The service can also accept externally launched scan producers through
 `ScanWorkerLauncher`. The extension uses this for CTID block-range chunking:
 the leader backend keeps producer `0`, dynamic scan workers use producer ids
 `1..N`, and the worker runtime receives all producer channels in
-`StartExecution`. Standalone producers time out if `OpenScan` does not arrive
-after launch, so a failed `begin_execution` cannot leave a scan worker waiting
+`StartExecution`. The launcher builds a standalone scan descriptor from the
+already-resolved `PgScanSpec`; dynamic workers execute that descriptor directly
+instead of replanning the original SQL, so they do not depend on backend-local
+`search_path`. Standalone producers time out if `OpenScan` does not arrive after
+launch, so a failed `begin_execution` cannot leave a scan worker waiting
 forever. The extension-side launcher treats dynamic worker startup failures as
 strict query errors, but it must still mark the current job failed and cancel
 any already-ready producers before returning that error. After a standalone

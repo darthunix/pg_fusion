@@ -3,13 +3,16 @@ use std::ptr::NonNull;
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
-use backend_service::CtidBlockRange;
+use backend_service::{StandaloneScanDescriptor, StandaloneScanField};
 use control_transport::{BackendLeaseId, BackendLeaseSlot};
 
 pub(crate) const SCAN_WORKER_JOB_CAPACITY: usize = 64;
-pub(crate) const SCAN_WORKER_SQL_CAPACITY: usize = 64 * 1024;
+pub(crate) const SCAN_WORKER_PAYLOAD_CAPACITY: usize = 64 * 1024;
 const SCAN_WORKER_ERROR_CAPACITY: usize = 256;
 const REGISTRY_MAGIC: u64 = 0x5046_5343_414e_4a42;
+const DESCRIPTOR_MAGIC: &[u8; 4] = b"PFSD";
+const DESCRIPTOR_VERSION: u8 = 1;
+const NONE_U64: u64 = u64::MAX;
 
 const STATE_FREE: u32 = 0;
 const STATE_RESERVED: u32 = 1;
@@ -35,14 +38,12 @@ struct ScanWorkerJob {
     scan_id: AtomicU64,
     producer_id: AtomicU32,
     producer_count: AtomicU32,
-    start_block: AtomicU64,
-    end_block: AtomicU64,
     peer_slot_id: AtomicU32,
     peer_generation: AtomicU64,
     peer_lease_epoch: AtomicU64,
-    sql_len: AtomicU32,
+    payload_len: AtomicU32,
     error_len: AtomicU32,
-    sql: [u8; SCAN_WORKER_SQL_CAPACITY],
+    payload: [u8; SCAN_WORKER_PAYLOAD_CAPACITY],
     error: [u8; SCAN_WORKER_ERROR_CAPACITY],
 }
 
@@ -55,32 +56,34 @@ unsafe impl Send for ScanWorkerJobRegistryHandle {}
 unsafe impl Sync for ScanWorkerJobRegistryHandle {}
 
 pub(crate) struct ScanWorkerJobSpec<'a> {
-    pub(crate) sql: &'a str,
+    pub(crate) payload: &'a [u8],
     pub(crate) db_oid: u32,
     pub(crate) user_oid: u32,
     pub(crate) session_epoch: u64,
     pub(crate) scan_id: u64,
     pub(crate) producer_id: u16,
     pub(crate) producer_count: u16,
-    pub(crate) ctid_range: CtidBlockRange,
 }
 
 #[derive(Debug)]
 pub(crate) struct ScanWorkerJobSnapshot {
-    pub(crate) sql: String,
+    pub(crate) descriptor: StandaloneScanDescriptor,
     pub(crate) db_oid: u32,
     pub(crate) user_oid: u32,
     pub(crate) session_epoch: u64,
     pub(crate) scan_id: u64,
     pub(crate) producer_id: u16,
     pub(crate) producer_count: u16,
-    pub(crate) ctid_range: CtidBlockRange,
 }
 
 #[derive(Debug, thiserror::Error)]
 pub(crate) enum ScanWorkerJobError {
-    #[error("scan worker SQL is too large: {actual} bytes > {capacity} bytes")]
-    SqlTooLarge { actual: usize, capacity: usize },
+    #[error("scan worker payload is too large: {actual} bytes > {capacity} bytes")]
+    PayloadTooLarge { actual: usize, capacity: usize },
+    #[error("scan worker descriptor encode failed: {0}")]
+    DescriptorEncode(String),
+    #[error("scan worker descriptor decode failed: {0}")]
+    DescriptorDecode(String),
     #[error("no free scan worker job slots")]
     NoFreeJobSlots,
     #[error("invalid scan worker job id {job_id}")]
@@ -91,8 +94,6 @@ pub(crate) enum ScanWorkerJobError {
     ReadyTimeout { job_id: usize },
     #[error("scan worker job {job_id} is not startable; state={state}")]
     NotStartable { job_id: usize, state: u32 },
-    #[error("scan worker job {job_id} contains invalid UTF-8 SQL")]
-    InvalidSqlUtf8 { job_id: usize },
 }
 
 impl ScanWorkerJobRegistry {
@@ -123,11 +124,10 @@ impl ScanWorkerJobRegistryHandle {
         &self,
         spec: ScanWorkerJobSpec<'_>,
     ) -> Result<usize, ScanWorkerJobError> {
-        let sql = spec.sql.as_bytes();
-        if sql.len() > SCAN_WORKER_SQL_CAPACITY {
-            return Err(ScanWorkerJobError::SqlTooLarge {
-                actual: sql.len(),
-                capacity: SCAN_WORKER_SQL_CAPACITY,
+        if spec.payload.len() > SCAN_WORKER_PAYLOAD_CAPACITY {
+            return Err(ScanWorkerJobError::PayloadTooLarge {
+                actual: spec.payload.len(),
+                capacity: SCAN_WORKER_PAYLOAD_CAPACITY,
             });
         }
 
@@ -146,20 +146,16 @@ impl ScanWorkerJobRegistryHandle {
                 .store(u32::from(spec.producer_id), Ordering::Relaxed);
             job.producer_count
                 .store(u32::from(spec.producer_count), Ordering::Relaxed);
-            job.start_block
-                .store(spec.ctid_range.start_block, Ordering::Relaxed);
-            job.end_block
-                .store(spec.ctid_range.end_block, Ordering::Relaxed);
             job.peer_slot_id.store(u32::MAX, Ordering::Relaxed);
             job.peer_generation.store(0, Ordering::Relaxed);
             job.peer_lease_epoch.store(0, Ordering::Relaxed);
             job.error_len.store(0, Ordering::Relaxed);
             unsafe {
-                let dst = job.sql.as_ptr() as *mut u8;
-                std::ptr::copy_nonoverlapping(sql.as_ptr(), dst, sql.len());
+                let dst = job.payload.as_ptr() as *mut u8;
+                std::ptr::copy_nonoverlapping(spec.payload.as_ptr(), dst, spec.payload.len());
             }
-            job.sql_len
-                .store(sql.len().try_into().unwrap(), Ordering::Release);
+            job.payload_len
+                .store(spec.payload.len().try_into().unwrap(), Ordering::Release);
             job.state.store(STATE_STARTING, Ordering::Release);
             return Ok(job_id);
         }
@@ -182,22 +178,16 @@ impl ScanWorkerJobRegistryHandle {
         if state != STATE_STARTING && state != STATE_READY && state != STATE_RUNNING {
             return Err(ScanWorkerJobError::NotStartable { job_id, state });
         }
-        let sql_len = job.sql_len.load(Ordering::Acquire) as usize;
-        let sql = std::str::from_utf8(&job.sql[..sql_len])
-            .map_err(|_| ScanWorkerJobError::InvalidSqlUtf8 { job_id })?
-            .to_string();
+        let payload_len = job.payload_len.load(Ordering::Acquire) as usize;
+        let descriptor = decode_scan_worker_descriptor(&job.payload[..payload_len])?;
         Ok(ScanWorkerJobSnapshot {
-            sql,
+            descriptor,
             db_oid: job.db_oid.load(Ordering::Relaxed),
             user_oid: job.user_oid.load(Ordering::Relaxed),
             session_epoch: job.session_epoch.load(Ordering::Relaxed),
             scan_id: job.scan_id.load(Ordering::Relaxed),
             producer_id: job.producer_id.load(Ordering::Relaxed) as u16,
             producer_count: job.producer_count.load(Ordering::Relaxed) as u16,
-            ctid_range: CtidBlockRange {
-                start_block: job.start_block.load(Ordering::Relaxed),
-                end_block: job.end_block.load(Ordering::Relaxed),
-            },
         })
     }
 
@@ -358,6 +348,236 @@ fn job_error_message(job: &ScanWorkerJob) -> String {
     String::from_utf8_lossy(&job.error[..len]).into_owned()
 }
 
+pub(crate) fn encode_scan_worker_descriptor(
+    descriptor: &StandaloneScanDescriptor,
+    out: &mut Vec<u8>,
+) -> Result<(), ScanWorkerJobError> {
+    out.clear();
+    out.extend_from_slice(DESCRIPTOR_MAGIC);
+    out.push(DESCRIPTOR_VERSION);
+    put_u32(out, descriptor.table_oid);
+    put_option_usize(out, descriptor.planner_fetch_hint)?;
+    put_option_usize(out, descriptor.local_row_cap)?;
+    put_bytes(out, descriptor.sql.as_bytes(), "scan SQL")?;
+    put_len(out, descriptor.fields.len(), "field count")?;
+    for field in &descriptor.fields {
+        put_bytes(out, field.name.as_bytes(), "field name")?;
+        put_u16(out, field.type_tag);
+        out.push(u8::from(field.nullable));
+    }
+    put_len(
+        out,
+        descriptor.source_projection.len(),
+        "source projection length",
+    )?;
+    for &index in &descriptor.source_projection {
+        put_usize(out, index)?;
+    }
+    if out.len() > SCAN_WORKER_PAYLOAD_CAPACITY {
+        return Err(ScanWorkerJobError::PayloadTooLarge {
+            actual: out.len(),
+            capacity: SCAN_WORKER_PAYLOAD_CAPACITY,
+        });
+    }
+    Ok(())
+}
+
+fn decode_scan_worker_descriptor(
+    payload: &[u8],
+) -> Result<StandaloneScanDescriptor, ScanWorkerJobError> {
+    DescriptorReader::new(payload).read_descriptor()
+}
+
+fn put_u16(out: &mut Vec<u8>, value: u16) {
+    out.extend_from_slice(&value.to_le_bytes());
+}
+
+fn put_u32(out: &mut Vec<u8>, value: u32) {
+    out.extend_from_slice(&value.to_le_bytes());
+}
+
+fn put_u64(out: &mut Vec<u8>, value: u64) {
+    out.extend_from_slice(&value.to_le_bytes());
+}
+
+fn put_len(out: &mut Vec<u8>, value: usize, label: &'static str) -> Result<(), ScanWorkerJobError> {
+    let value = u32::try_from(value).map_err(|_| {
+        ScanWorkerJobError::DescriptorEncode(format!("{label} does not fit into u32"))
+    })?;
+    put_u32(out, value);
+    Ok(())
+}
+
+fn put_usize(out: &mut Vec<u8>, value: usize) -> Result<(), ScanWorkerJobError> {
+    let value = u64::try_from(value).map_err(|_| {
+        ScanWorkerJobError::DescriptorEncode("usize value does not fit into u64".into())
+    })?;
+    put_u64(out, value);
+    Ok(())
+}
+
+fn put_option_usize(out: &mut Vec<u8>, value: Option<usize>) -> Result<(), ScanWorkerJobError> {
+    match value {
+        Some(value) => put_usize(out, value),
+        None => {
+            put_u64(out, NONE_U64);
+            Ok(())
+        }
+    }
+}
+
+fn put_bytes(
+    out: &mut Vec<u8>,
+    bytes: &[u8],
+    label: &'static str,
+) -> Result<(), ScanWorkerJobError> {
+    put_len(out, bytes.len(), label)?;
+    out.extend_from_slice(bytes);
+    Ok(())
+}
+
+struct DescriptorReader<'a> {
+    payload: &'a [u8],
+    offset: usize,
+}
+
+impl<'a> DescriptorReader<'a> {
+    fn new(payload: &'a [u8]) -> Self {
+        Self { payload, offset: 0 }
+    }
+
+    fn read_descriptor(&mut self) -> Result<StandaloneScanDescriptor, ScanWorkerJobError> {
+        let magic = self.read_exact(DESCRIPTOR_MAGIC.len(), "magic")?;
+        if magic != DESCRIPTOR_MAGIC {
+            return Err(ScanWorkerJobError::DescriptorDecode(
+                "invalid descriptor magic".into(),
+            ));
+        }
+        let version = self.read_u8("version")?;
+        if version != DESCRIPTOR_VERSION {
+            return Err(ScanWorkerJobError::DescriptorDecode(format!(
+                "unsupported descriptor version {version}"
+            )));
+        }
+
+        let table_oid = self.read_u32("table oid")?;
+        let planner_fetch_hint = self.read_option_usize("planner fetch hint")?;
+        let local_row_cap = self.read_option_usize("local row cap")?;
+        let sql = self.read_string("scan SQL")?;
+        let field_count = self.read_len("field count")?;
+        let mut fields = Vec::with_capacity(field_count);
+        for _ in 0..field_count {
+            let name = self.read_string("field name")?;
+            let type_tag = self.read_u16("field type tag")?;
+            let nullable = match self.read_u8("field nullable")? {
+                0 => false,
+                1 => true,
+                other => {
+                    return Err(ScanWorkerJobError::DescriptorDecode(format!(
+                        "invalid nullable flag {other}"
+                    )));
+                }
+            };
+            fields.push(StandaloneScanField {
+                name,
+                type_tag,
+                nullable,
+            });
+        }
+        let projection_len = self.read_len("source projection length")?;
+        let mut source_projection = Vec::with_capacity(projection_len);
+        for _ in 0..projection_len {
+            source_projection.push(self.read_usize("source projection")?);
+        }
+        if self.offset != self.payload.len() {
+            return Err(ScanWorkerJobError::DescriptorDecode(format!(
+                "descriptor has {} trailing bytes",
+                self.payload.len() - self.offset
+            )));
+        }
+        Ok(StandaloneScanDescriptor {
+            sql,
+            table_oid,
+            fields,
+            source_projection,
+            planner_fetch_hint,
+            local_row_cap,
+        })
+    }
+
+    fn read_u8(&mut self, label: &'static str) -> Result<u8, ScanWorkerJobError> {
+        Ok(self.read_exact(1, label)?[0])
+    }
+
+    fn read_u16(&mut self, label: &'static str) -> Result<u16, ScanWorkerJobError> {
+        let bytes = self.read_exact(2, label)?;
+        Ok(u16::from_le_bytes([bytes[0], bytes[1]]))
+    }
+
+    fn read_u32(&mut self, label: &'static str) -> Result<u32, ScanWorkerJobError> {
+        let bytes = self.read_exact(4, label)?;
+        Ok(u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]))
+    }
+
+    fn read_u64(&mut self, label: &'static str) -> Result<u64, ScanWorkerJobError> {
+        let bytes = self.read_exact(8, label)?;
+        Ok(u64::from_le_bytes([
+            bytes[0], bytes[1], bytes[2], bytes[3], bytes[4], bytes[5], bytes[6], bytes[7],
+        ]))
+    }
+
+    fn read_len(&mut self, label: &'static str) -> Result<usize, ScanWorkerJobError> {
+        usize::try_from(self.read_u32(label)?).map_err(|_| {
+            ScanWorkerJobError::DescriptorDecode(format!("{label} does not fit into usize"))
+        })
+    }
+
+    fn read_usize(&mut self, label: &'static str) -> Result<usize, ScanWorkerJobError> {
+        let value = self.read_u64(label)?;
+        usize::try_from(value).map_err(|_| {
+            ScanWorkerJobError::DescriptorDecode(format!("{label} does not fit into usize"))
+        })
+    }
+
+    fn read_option_usize(
+        &mut self,
+        label: &'static str,
+    ) -> Result<Option<usize>, ScanWorkerJobError> {
+        match self.read_u64(label)? {
+            NONE_U64 => Ok(None),
+            value => usize::try_from(value).map(Some).map_err(|_| {
+                ScanWorkerJobError::DescriptorDecode(format!("{label} does not fit into usize"))
+            }),
+        }
+    }
+
+    fn read_string(&mut self, label: &'static str) -> Result<String, ScanWorkerJobError> {
+        let len = self.read_len(label)?;
+        let bytes = self.read_exact(len, label)?;
+        std::str::from_utf8(bytes)
+            .map(str::to_owned)
+            .map_err(|err| ScanWorkerJobError::DescriptorDecode(format!("{label}: {err}")))
+    }
+
+    fn read_exact(
+        &mut self,
+        len: usize,
+        label: &'static str,
+    ) -> Result<&'a [u8], ScanWorkerJobError> {
+        let end = self.offset.checked_add(len).ok_or_else(|| {
+            ScanWorkerJobError::DescriptorDecode(format!("{label} length overflow"))
+        })?;
+        if end > self.payload.len() {
+            return Err(ScanWorkerJobError::DescriptorDecode(format!(
+                "descriptor ended while reading {label}"
+            )));
+        }
+        let bytes = &self.payload[self.offset..end];
+        self.offset = end;
+        Ok(bytes)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -389,19 +609,36 @@ mod tests {
         }
     }
 
-    fn spec(sql: &str) -> ScanWorkerJobSpec<'_> {
+    fn descriptor(sql: &str) -> StandaloneScanDescriptor {
+        StandaloneScanDescriptor {
+            sql: sql.to_owned(),
+            table_oid: 42,
+            fields: vec![StandaloneScanField {
+                name: "id".into(),
+                type_tag: 4,
+                nullable: false,
+            }],
+            source_projection: vec![0],
+            planner_fetch_hint: Some(128),
+            local_row_cap: None,
+        }
+    }
+
+    fn encoded_descriptor(sql: &str) -> Vec<u8> {
+        let mut payload = Vec::new();
+        encode_scan_worker_descriptor(&descriptor(sql), &mut payload).expect("encode descriptor");
+        payload
+    }
+
+    fn spec(payload: &[u8]) -> ScanWorkerJobSpec<'_> {
         ScanWorkerJobSpec {
-            sql,
+            payload,
             db_oid: 1,
             user_oid: 2,
             session_epoch: 3,
             scan_id: 4,
             producer_id: 1,
             producer_count: 2,
-            ctid_range: CtidBlockRange {
-                start_block: 10,
-                end_block: 20,
-            },
         }
     }
 
@@ -413,23 +650,28 @@ mod tests {
     fn failed_starting_job_is_reused() {
         let registry = TestRegistry::new();
         let jobs = registry.handle();
+        let first_payload = encoded_descriptor("select 1");
+        let second_payload = encoded_descriptor("select 2");
 
-        let first = jobs.allocate(spec("select 1")).expect("first job");
+        let first = jobs.allocate(spec(&first_payload)).expect("first job");
         assert_eq!(first, 0);
         jobs.mark_failed(first, "launch failed")
             .expect("mark failed");
 
-        let second = jobs.allocate(spec("select 2")).expect("second job");
+        let second = jobs.allocate(spec(&second_payload)).expect("second job");
         assert_eq!(second, first);
         let snapshot = jobs.snapshot(second).expect("snapshot");
-        assert_eq!(snapshot.sql, "select 2");
+        assert_eq!(snapshot.descriptor.sql, "select 2");
+        assert_eq!(snapshot.descriptor.fields[0].name, "id");
+        assert_eq!(snapshot.descriptor.planner_fetch_hint, Some(128));
     }
 
     #[test]
     fn publish_ready_after_failure_does_not_resurrect_job() {
         let registry = TestRegistry::new();
         let jobs = registry.handle();
-        let job_id = jobs.allocate(spec("select 1")).expect("job");
+        let payload = encoded_descriptor("select 1");
+        let job_id = jobs.allocate(spec(&payload)).expect("job");
 
         jobs.mark_failed(job_id, "launch failed")
             .expect("mark failed");
@@ -453,7 +695,8 @@ mod tests {
     fn running_and_done_require_ordered_state_transitions() {
         let registry = TestRegistry::new();
         let jobs = registry.handle();
-        let job_id = jobs.allocate(spec("select 1")).expect("job");
+        let payload = encoded_descriptor("select 1");
+        let job_id = jobs.allocate(spec(&payload)).expect("job");
 
         assert!(matches!(
             jobs.mark_running(job_id).expect_err("not ready"),

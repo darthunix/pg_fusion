@@ -179,7 +179,6 @@ pub trait ScanWorkerLauncher {
 pub struct ScanWorkerLaunchInput<'a> {
     pub session_epoch: u64,
     pub scan_id: u64,
-    pub sql: &'a str,
     pub spec: &'a PgScanSpec,
     pub leader_peer: BackendLeaseSlot,
 }
@@ -243,13 +242,29 @@ pub struct OpenScanInput<'a> {
     pub scan_tx: IssuedTx,
 }
 
-pub struct StandaloneScanProducerInput<'a> {
-    pub sql: &'a str,
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct StandaloneScanField {
+    pub name: String,
+    pub type_tag: u16,
+    pub nullable: bool,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct StandaloneScanDescriptor {
+    pub sql: String,
+    pub table_oid: u32,
+    pub fields: Vec<StandaloneScanField>,
+    pub source_projection: Vec<usize>,
+    pub planner_fetch_hint: Option<usize>,
+    pub local_row_cap: Option<usize>,
+}
+
+pub struct StandaloneScanProducerInput {
+    pub descriptor: StandaloneScanDescriptor,
     pub session_epoch: u64,
     pub scan_id: u64,
     pub producer_id: u16,
     pub producer_count: u16,
-    pub ctid_range: Option<CtidBlockRange>,
     pub scan_lease: BackendSlotLease,
     pub scan_tx: IssuedTx,
     pub config: BackendServiceConfig,
@@ -573,7 +588,6 @@ impl BackendService {
                     let mut output = launcher.launch_scan_workers(ScanWorkerLaunchInput {
                         session_epoch,
                         scan_id,
-                        sql: input.sql,
                         spec: spec.as_ref(),
                         leader_peer: scan_peer,
                     })?;
@@ -873,7 +887,7 @@ impl BackendService {
     }
 
     pub fn run_standalone_scan_producer(
-        input: StandaloneScanProducerInput<'_>,
+        input: StandaloneScanProducerInput,
     ) -> Result<(), BackendServiceError> {
         run_standalone_scan_producer(input)
     }
@@ -1571,8 +1585,44 @@ fn scan_execution_shape_for_ctid_range(
     })
 }
 
+pub fn build_standalone_scan_descriptor(
+    spec: &PgScanSpec,
+    ctid_range: Option<CtidBlockRange>,
+) -> Result<StandaloneScanDescriptor, BackendServiceError> {
+    let scan_id = spec.scan_id.get();
+    if spec.compiled_scan.uses_dummy_projection {
+        return Err(BackendServiceError::UnsupportedDummyProjection { scan_id });
+    }
+
+    let source_schema = spec.arrow_schema();
+    let mut fields = Vec::with_capacity(source_schema.fields().len());
+    for (index, field) in source_schema.fields().iter().enumerate() {
+        let (normalized_field, type_tag) =
+            normalize_transport_field(index, field.as_ref(), scan_id)?;
+        fields.push(StandaloneScanField {
+            name: normalized_field.name().to_owned(),
+            type_tag: type_tag.to_raw(),
+            nullable: normalized_field.is_nullable(),
+        });
+    }
+
+    let execution_shape = match ctid_range {
+        Some(range) => scan_execution_shape_for_ctid_range(spec, range)?,
+        None => scan_execution_shape(spec)?,
+    };
+
+    Ok(StandaloneScanDescriptor {
+        sql: execution_shape.sql,
+        table_oid: spec.table_oid,
+        fields,
+        source_projection: execution_shape.source_projection,
+        planner_fetch_hint: spec.fetch_hints.planner_fetch_hint,
+        local_row_cap: spec.fetch_hints.local_row_cap,
+    })
+}
+
 fn run_standalone_scan_producer(
-    input: StandaloneScanProducerInput<'_>,
+    input: StandaloneScanProducerInput,
 ) -> Result<(), BackendServiceError> {
     if input.producer_count == 0 || input.producer_id >= input.producer_count {
         return Err(BackendServiceError::ProtocolViolation(format!(
@@ -1596,63 +1646,11 @@ fn run_standalone_scan_producer(
         &canonical_open,
     )?;
 
-    let built = match PlanBuilder::new().build(PlanBuildInput {
-        sql: input.sql,
-        params: Vec::new(),
-    }) {
-        Ok(built) => built,
-        Err(err) => {
-            send_standalone_scan_failed(
-                &mut scan_lease,
-                input.session_epoch,
-                input.scan_id,
-                input.producer_id,
-                &err,
-            );
-            return Err(err.into());
-        }
-    };
-    let spec = built
-        .scans
-        .iter()
-        .find(|spec| spec.scan_id.get() == input.scan_id)
-        .cloned()
-        .ok_or(BackendServiceError::UnknownScanId {
-            scan_id: input.scan_id,
-        });
-    let spec = match spec {
-        Ok(spec) => spec,
-        Err(err) => {
-            send_standalone_scan_failed(
-                &mut scan_lease,
-                input.session_epoch,
-                input.scan_id,
-                input.producer_id,
-                &err,
-            );
-            return Err(err);
-        }
-    };
-    if spec.compiled_scan.uses_dummy_projection {
-        let err = BackendServiceError::UnsupportedDummyProjection {
-            scan_id: input.scan_id,
-        };
-        send_standalone_scan_failed(
-            &mut scan_lease,
-            input.session_epoch,
-            input.scan_id,
-            input.producer_id,
-            &err,
-        );
-        return Err(err);
-    }
-
     let source = match standalone_page_source(
         input.scan_id,
-        input.ctid_range,
         input.scan_tx.payload_capacity(),
         &input.config,
-        &spec,
+        &input.descriptor,
     ) {
         Ok(source) => source,
         Err(err) => {
@@ -1684,40 +1682,51 @@ fn run_standalone_scan_producer(
 
 fn standalone_page_source(
     scan_id: u64,
-    ctid_range: Option<CtidBlockRange>,
     payload_capacity: usize,
     config: &BackendServiceConfig,
-    spec: &PgScanSpec,
+    descriptor: &StandaloneScanDescriptor,
 ) -> Result<source::SlotScanPageSource, BackendServiceError> {
-    let source_schema = spec.arrow_schema();
-    let mut normalized_fields = Vec::with_capacity(source_schema.fields().len());
-    let mut physical_columns = Vec::with_capacity(source_schema.fields().len());
-    let mut projected_columns = Vec::with_capacity(source_schema.fields().len());
-    for (index, field) in source_schema.fields().iter().enumerate() {
-        let (normalized_field, type_tag) =
-            normalize_transport_field(index, field.as_ref(), scan_id)?;
-        normalized_fields.push(normalized_field);
-        physical_columns.push(ColumnSpec::new(type_tag, field.is_nullable()));
+    let field_count = descriptor.fields.len();
+    if descriptor.source_projection.len() != field_count {
+        return Err(BackendServiceError::ProtocolViolation(format!(
+            "standalone scan descriptor for scan_id {scan_id} has {} fields but {} source projection entries",
+            field_count,
+            descriptor.source_projection.len()
+        )));
+    }
+
+    let mut fields = Vec::with_capacity(field_count);
+    let mut physical_columns = Vec::with_capacity(field_count);
+    let mut projected_columns = Vec::with_capacity(field_count);
+    for (index, field) in descriptor.fields.iter().enumerate() {
+        let type_tag = TypeTag::from_raw(field.type_tag).map_err(|_| {
+            BackendServiceError::ProtocolViolation(format!(
+                "standalone scan descriptor for scan_id {scan_id} has invalid type tag {} at field {index}",
+                field.type_tag
+            ))
+        })?;
+        fields.push(Field::new(
+            field.name.clone(),
+            arrow_data_type_for_type_tag(type_tag),
+            field.nullable,
+        ));
+        physical_columns.push(ColumnSpec::new(type_tag, field.nullable));
         projected_columns.push(ProjectedColumnRef::relation_attribute(
-            field.name(),
+            &field.name,
             type_tag,
         ));
     }
-    let schema: SchemaRef = Arc::new(Schema::new(normalized_fields));
+    let schema: SchemaRef = Arc::new(Schema::new(fields));
     let estimator_config = seed_estimator_config(
-        spec.table_oid.into(),
+        descriptor.table_oid.into(),
         &projected_columns,
         config.estimator_default,
     )?;
-    let execution_shape = match ctid_range {
-        Some(range) => scan_execution_shape_for_ctid_range(spec, range)?,
-        None => scan_execution_shape(spec)?,
-    };
     let prepared_scan = prepare_scan(
-        &execution_shape.sql,
+        &descriptor.sql,
         ScanOptions {
-            planner_fetch_hint: spec.fetch_hints.planner_fetch_hint,
-            local_row_cap: spec.fetch_hints.local_row_cap,
+            planner_fetch_hint: descriptor.planner_fetch_hint,
+            local_row_cap: descriptor.local_row_cap,
             diagnostics: config.diagnostics.clone(),
         },
     )?;
@@ -1731,13 +1740,27 @@ fn standalone_page_source(
         spi,
         prepared_scan,
         schema,
-        execution_shape.source_projection,
+        descriptor.source_projection.clone(),
         block_size,
         normalize_scan_fetch_batch_rows(config.scan_fetch_batch_rows),
         estimator,
         config.metrics,
         config.scan_timing_detail,
     ))
+}
+
+fn arrow_data_type_for_type_tag(type_tag: TypeTag) -> DataType {
+    match type_tag {
+        TypeTag::Boolean => DataType::Boolean,
+        TypeTag::Int16 => DataType::Int16,
+        TypeTag::Int32 => DataType::Int32,
+        TypeTag::Int64 => DataType::Int64,
+        TypeTag::Float32 => DataType::Float32,
+        TypeTag::Float64 => DataType::Float64,
+        TypeTag::Uuid => DataType::FixedSizeBinary(16),
+        TypeTag::Utf8View => DataType::Utf8View,
+        TypeTag::BinaryView => DataType::BinaryView,
+    }
 }
 
 fn standalone_scan_open(
