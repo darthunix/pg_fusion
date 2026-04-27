@@ -9,7 +9,8 @@ use backend_service::{
     build_standalone_scan_descriptor, ActiveScanDriver, BackendService, BackendServiceError,
     BeginExecutionOutput, CtidBlockRange, DiagnosticLogLevel, ExecutionKey, ExplainInput,
     ExplainRenderOptions, OpenScanInput, ScanStreamStep, ScanWorkerLaunchInput,
-    ScanWorkerLaunchOutput, ScanWorkerLauncher, ScanWorkerProducer, StartExecutionInput,
+    ScanWorkerLaunchOutput, ScanWorkerLauncher, ScanWorkerProducer, ScanWorkerQueryInput,
+    StartExecutionInput,
 };
 use control_transport::{BackendLeaseSlot, BackendSlotLease, WorkerTransport};
 use issuance::{
@@ -40,7 +41,8 @@ use crate::guc::host_config;
 use crate::logging;
 use crate::result_ingress::{AcceptedResultFrame, ResultIngress};
 use crate::scan_worker_job::{
-    encode_scan_worker_descriptor, ScanWorkerJobRegistryHandle, ScanWorkerJobSpec,
+    encode_scan_worker_descriptor, ScanWorkerJobError, ScanWorkerJobRegistryHandle,
+    ScanWorkerJobSpec,
 };
 use crate::shmem::{
     attach_control_region, attach_issuance_pool, attach_page_pool, attach_runtime_metrics,
@@ -357,6 +359,8 @@ unsafe extern "C-unwind" fn begin_pg_fusion_scan(
     let plan_tx = IssuedTx::new(PageTx::new(page_pool), issuance_pool);
     let mut scan_worker_launcher = DynamicScanWorkerLauncher {
         jobs: scan_worker_jobs,
+        budgets: BTreeMap::new(),
+        capacity_exhausted: false,
     };
     let begin = {
         let _planner_bypass = PlannerBypassGuard::enter();
@@ -1309,31 +1313,84 @@ fn build_transport_schema(sql: &str) -> Result<SchemaRef, String> {
 
 struct DynamicScanWorkerLauncher {
     jobs: ScanWorkerJobRegistryHandle,
+    budgets: BTreeMap<u64, ScanWorkerBudget>,
+    capacity_exhausted: bool,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct ScanWorkerBudget {
+    worker_count: u16,
+    block_count: u64,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct ScanWorkerBudgetCandidate {
+    scan_id: u64,
+    block_count: u64,
+    max_workers: u16,
+    assigned_workers: u16,
 }
 
 impl ScanWorkerLauncher for DynamicScanWorkerLauncher {
+    fn prepare_query(
+        &mut self,
+        input: ScanWorkerQueryInput<'_>,
+    ) -> Result<(), BackendServiceError> {
+        self.budgets.clear();
+        self.capacity_exhausted = false;
+
+        let query_budget = postgres_dynamic_scan_worker_budget();
+        if query_budget == 0 {
+            return Ok(());
+        }
+
+        let mut candidates = Vec::new();
+        for spec in input.scans {
+            if spec.compiled_scan.uses_dummy_projection
+                || spec.compiled_scan.output_columns.is_empty()
+            {
+                continue;
+            }
+
+            let storage = relation_storage_info(spec.table_oid)?;
+            if !storage.is_cross_backend_visible
+                || !storage.has_no_dropped_attributes
+                || storage.block_count <= 1
+            {
+                continue;
+            }
+
+            candidates.push(ScanWorkerBudgetCandidate {
+                scan_id: spec.scan_id.get(),
+                block_count: storage.block_count,
+                max_workers: storage
+                    .block_count
+                    .saturating_sub(1)
+                    .min(u64::from(u16::MAX - 1)) as u16,
+                assigned_workers: 0,
+            });
+        }
+
+        self.budgets = assign_scan_worker_budgets(candidates, query_budget);
+        Ok(())
+    }
+
     fn launch_scan_workers(
         &mut self,
         input: ScanWorkerLaunchInput<'_>,
     ) -> Result<ScanWorkerLaunchOutput, BackendServiceError> {
-        let requested_workers = postgres_max_parallel_workers_per_gather().min(32) as u16;
-        if requested_workers == 0
-            || input.spec.compiled_scan.uses_dummy_projection
-            || input.spec.compiled_scan.output_columns.is_empty()
-        {
+        if self.capacity_exhausted {
             return Ok(ScanWorkerLaunchOutput::default());
         }
 
-        let storage = relation_storage_info(input.spec.table_oid)?;
-        if !storage.is_cross_backend_visible || !storage.has_no_dropped_attributes {
+        let Some(budget) = self.budgets.get(&input.scan_id).copied() else {
+            return Ok(ScanWorkerLaunchOutput::default());
+        };
+        if budget.worker_count == 0 || budget.block_count <= 1 {
             return Ok(ScanWorkerLaunchOutput::default());
         }
-        let block_count = storage.block_count;
-        if block_count <= 1 {
-            return Ok(ScanWorkerLaunchOutput::default());
-        }
-        let total_producers = (u64::from(requested_workers) + 1)
-            .min(block_count)
+        let total_producers = (u64::from(budget.worker_count) + 1)
+            .min(budget.block_count)
             .min(u64::from(u16::MAX)) as u16;
         if total_producers <= 1 {
             return Ok(ScanWorkerLaunchOutput::default());
@@ -1344,7 +1401,7 @@ impl ScanWorkerLauncher for DynamicScanWorkerLauncher {
         let mut workers = Vec::with_capacity(total_producers.saturating_sub(1) as usize);
         let mut job_payload = Vec::new();
         for producer_id in 1..total_producers {
-            let range = producer_block_range(block_count, total_producers, producer_id);
+            let range = producer_block_range(budget.block_count, total_producers, producer_id);
             let descriptor = match build_standalone_scan_descriptor(input.spec, Some(range)) {
                 Ok(descriptor) => descriptor,
                 Err(err) => {
@@ -1366,6 +1423,14 @@ impl ScanWorkerLauncher for DynamicScanWorkerLauncher {
                 producer_count: total_producers,
             }) {
                 Ok(job_id) => job_id,
+                Err(ScanWorkerJobError::NoFreeJobSlots) => {
+                    return Ok(self.handle_capacity_exhausted(
+                        &workers,
+                        input.session_epoch,
+                        input.scan_id,
+                        "no free scan worker job slots",
+                    ));
+                }
                 Err(err) => {
                     cancel_launched_scan_workers(&workers, input.session_epoch, input.scan_id);
                     return Err(BackendServiceError::ProtocolViolation(err.to_string()));
@@ -1381,8 +1446,12 @@ impl ScanWorkerLauncher for DynamicScanWorkerLauncher {
             {
                 let message = format!("failed to launch scan worker job {job_id}: {err:?}");
                 mark_scan_worker_job_failed(self.jobs, job_id, &message);
-                cancel_launched_scan_workers(&workers, input.session_epoch, input.scan_id);
-                return Err(BackendServiceError::ProtocolViolation(message));
+                return Ok(self.handle_capacity_exhausted(
+                    &workers,
+                    input.session_epoch,
+                    input.scan_id,
+                    &message,
+                ));
             }
             let peer = match self.jobs.wait_ready(job_id, Duration::from_secs(5)) {
                 Ok(peer) => peer,
@@ -1397,14 +1466,90 @@ impl ScanWorkerLauncher for DynamicScanWorkerLauncher {
         }
 
         Ok(ScanWorkerLaunchOutput {
-            leader_ctid_range: Some(producer_block_range(block_count, total_producers, 0)),
+            leader_ctid_range: Some(producer_block_range(budget.block_count, total_producers, 0)),
             workers,
         })
     }
 }
 
+impl DynamicScanWorkerLauncher {
+    fn handle_capacity_exhausted(
+        &mut self,
+        workers: &[ScanWorkerProducer],
+        session_epoch: u64,
+        scan_id: u64,
+        message: &str,
+    ) -> ScanWorkerLaunchOutput {
+        self.capacity_exhausted = true;
+        cancel_launched_scan_workers(workers, session_epoch, scan_id);
+        host_diag(DiagnosticLogLevel::Basic, || {
+            format!(
+                "pg_fusion dynamic scan worker capacity exhausted for scan_id={scan_id}: {message}; continuing leader-only"
+            )
+        });
+        ScanWorkerLaunchOutput::default()
+    }
+}
+
+fn postgres_dynamic_scan_worker_budget() -> u16 {
+    let requested = postgres_max_parallel_workers_per_gather().min(32);
+    let worker_process_budget = postgres_max_worker_processes().saturating_sub(1);
+    requested
+        .min(worker_process_budget)
+        .min(u32::from(u16::MAX)) as u16
+}
+
 fn postgres_max_parallel_workers_per_gather() -> u32 {
     unsafe { pg_sys::max_parallel_workers_per_gather.max(0) as u32 }
+}
+
+fn postgres_max_worker_processes() -> u32 {
+    unsafe { pg_sys::max_worker_processes.max(0) as u32 }
+}
+
+fn assign_scan_worker_budgets(
+    mut candidates: Vec<ScanWorkerBudgetCandidate>,
+    query_budget: u16,
+) -> BTreeMap<u64, ScanWorkerBudget> {
+    candidates.sort_by(|left, right| {
+        right
+            .block_count
+            .cmp(&left.block_count)
+            .then_with(|| left.scan_id.cmp(&right.scan_id))
+    });
+
+    let mut remaining = query_budget;
+    while remaining > 0 {
+        let mut assigned_this_round = false;
+        for candidate in &mut candidates {
+            if remaining == 0 {
+                break;
+            }
+            if candidate.assigned_workers >= candidate.max_workers {
+                continue;
+            }
+            candidate.assigned_workers += 1;
+            remaining -= 1;
+            assigned_this_round = true;
+        }
+        if !assigned_this_round {
+            break;
+        }
+    }
+
+    candidates
+        .into_iter()
+        .filter(|candidate| candidate.assigned_workers > 0)
+        .map(|candidate| {
+            (
+                candidate.scan_id,
+                ScanWorkerBudget {
+                    worker_count: candidate.assigned_workers,
+                    block_count: candidate.block_count,
+                },
+            )
+        })
+        .collect()
 }
 
 fn mark_scan_worker_job_failed(jobs: ScanWorkerJobRegistryHandle, job_id: usize, message: &str) {
@@ -1688,5 +1833,59 @@ fn wait_latch(timeout: Option<Duration>) {
     check_for_interrupts!();
     if rc & WL_POSTMASTER_DEATH as i32 != 0 {
         panic!("postmaster died");
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn candidate(scan_id: u64, block_count: u64, max_workers: u16) -> ScanWorkerBudgetCandidate {
+        ScanWorkerBudgetCandidate {
+            scan_id,
+            block_count,
+            max_workers,
+            assigned_workers: 0,
+        }
+    }
+
+    fn worker_count(budgets: &BTreeMap<u64, ScanWorkerBudget>, scan_id: u64) -> u16 {
+        budgets
+            .get(&scan_id)
+            .map(|budget| budget.worker_count)
+            .unwrap_or(0)
+    }
+
+    #[test]
+    fn scan_worker_budget_assigns_single_scan_up_to_capacity() {
+        let budgets = assign_scan_worker_budgets(vec![candidate(7, 10, 9)], 4);
+
+        assert_eq!(worker_count(&budgets, 7), 4);
+        assert_eq!(budgets.get(&7).expect("budget").block_count, 10);
+    }
+
+    #[test]
+    fn scan_worker_budget_round_robins_largest_scans_first() {
+        let budgets = assign_scan_worker_budgets(
+            vec![
+                candidate(3, 20, 19),
+                candidate(1, 100, 99),
+                candidate(2, 100, 99),
+            ],
+            5,
+        );
+
+        assert_eq!(worker_count(&budgets, 1), 2);
+        assert_eq!(worker_count(&budgets, 2), 2);
+        assert_eq!(worker_count(&budgets, 3), 1);
+    }
+
+    #[test]
+    fn scan_worker_budget_skips_saturated_candidates() {
+        let budgets =
+            assign_scan_worker_budgets(vec![candidate(1, 100, 1), candidate(2, 90, 5)], 4);
+
+        assert_eq!(worker_count(&budgets, 1), 1);
+        assert_eq!(worker_count(&budgets, 2), 3);
     }
 }

@@ -170,10 +170,22 @@ pub struct StartExecutionInput<'a> {
 }
 
 pub trait ScanWorkerLauncher {
+    fn prepare_query(
+        &mut self,
+        input: ScanWorkerQueryInput<'_>,
+    ) -> Result<(), BackendServiceError> {
+        let _ = input;
+        Ok(())
+    }
+
     fn launch_scan_workers(
         &mut self,
         input: ScanWorkerLaunchInput<'_>,
     ) -> Result<ScanWorkerLaunchOutput, BackendServiceError>;
+}
+
+pub struct ScanWorkerQueryInput<'a> {
+    pub scans: &'a [Arc<PgScanSpec>],
 }
 
 pub struct ScanWorkerLaunchInput<'a> {
@@ -548,6 +560,13 @@ impl BackendService {
                 params: input.params,
             })?;
 
+            let mut scan_worker_launcher = input.scan_worker_launcher;
+            if let Some(launcher) = scan_worker_launcher.as_deref_mut() {
+                launcher.prepare_query(ScanWorkerQueryInput {
+                    scans: &built.scans,
+                })?;
+            }
+
             let plan_open = PlanOpen::new(
                 plan_flow::FlowId {
                     session_epoch,
@@ -562,7 +581,6 @@ impl BackendService {
 
             let mut scans = BTreeMap::new();
             let mut scan_channels = Vec::new();
-            let mut scan_worker_launcher = input.scan_worker_launcher;
             for spec in built.scans.iter().cloned() {
                 let scan_lease = BackendSlotLease::acquire(input.scan_slot_region)?;
                 let scan_peer = scan_lease.backend_lease_slot();

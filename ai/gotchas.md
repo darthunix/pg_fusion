@@ -48,15 +48,16 @@ importance: 0.7
   schema stores TPC-H decimal columns as `double precision` and date columns as
   ISO `text` so current page encoding can exercise scans, joins, and
   DataFusion operators before `numeric`/`date` transport support is expanded.
-- PostgreSQL `max_parallel_workers_per_gather` controls CTID block-range dynamic
-  scan workers for eligible heap scans. `0` means leader-only portal streaming;
-  positive values add that many dynamic producers, capped at `32`. The path
-  needs dynamic background worker capacity and falls back to leader-only
-  streaming for relations with dropped attributes or scan shapes that cannot use
-  unprojected base-relation slots. Dynamic scan worker jobs must use the
-  resolved standalone scan descriptor built by the leader, not the original
-  user SQL; otherwise non-public schemas fail because scan workers do not
-  inherit the backend `search_path`. Standalone scan producers wait for the worker
+- PostgreSQL `max_parallel_workers_per_gather` controls the query-wide CTID
+  block-range dynamic scan worker budget for eligible heap scans. `0` means
+  leader-only portal streaming; positive values allow up to that many dynamic
+  producers across the whole pg_fusion query, capped at `32` and bounded by
+  `max_worker_processes`. The path falls back to leader-only streaming for
+  relations with dropped attributes or scan shapes that cannot use unprojected
+  base-relation slots. Dynamic scan worker jobs must use the resolved
+  standalone scan descriptor built by the leader, not the original user SQL;
+  otherwise non-public schemas fail because scan workers do not inherit the
+  backend `search_path`. Standalone scan producers wait for the worker
   `OpenScan` message with a bounded timeout; slow physical planning can surface
   as a scan-open failure. The generated CTID predicates normally plan as
   PostgreSQL `TidRangeScan`; `slot_scan` must keep that node type in its allowed
@@ -65,9 +66,9 @@ importance: 0.7
   Standalone scan producers must keep their backend lease alive after publishing
   `ScanFinished`/`ScanFailed` until the worker detaches the slot; otherwise
   `control_transport` correctly rejects worker-side reads after backend-owner
-  release. Dynamic worker launch failures are strict query errors, but the
-  launcher must still mark the allocated job failed and cancel already-ready
-  producers so failed starts do not leak `STARTING` jobs or workers waiting for
-  `OpenScan`.
+  release. Dynamic worker capacity failures should mark the allocated job
+  failed, cancel already-ready producers, and continue leader-only for the
+  current and remaining scans; worker readiness/protocol failures remain strict
+  query errors.
 - Misaligned pointer deref can panic when interpreting shared-memory bytes as
   atomics. Allocate ring regions through the established lockfree layout paths.

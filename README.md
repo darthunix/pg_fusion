@@ -160,7 +160,7 @@ cursor_tuple_fraction = 0.1
 # Normal PostgreSQL memory and parallel scan planning knobs. These are not
 # pg_fusion settings, but they affect PostgreSQL plans that pg_fusion streams
 # through slot_scan. pg_fusion also uses max_parallel_workers_per_gather as the
-# requested number of additional dynamic scan workers for eligible scan leaves.
+# query-wide budget for additional dynamic scan workers across eligible scan leaves.
 work_mem = '64MB'
 max_parallel_workers_per_gather = 2
 min_parallel_table_scan_size = '8MB'
@@ -216,15 +216,17 @@ the fetch row budget, not by pausing the PostgreSQL receiver mid-fetch. Scans
 with variable-width transport columns use one-row drains so an overflowing row
 can be retried on the next Arrow page without losing the scan position.
 
-`max_parallel_workers_per_gather` controls dynamic PostgreSQL scan workers for
-eligible pg_fusion leaf scans. `0` keeps the scan leader-only. A positive value
-launches that many additional dynamic background-worker producers per scan
-leaf, capped at `32`; the leader backend and workers each scan a disjoint heap
-block range and write Arrow pages into the same shared page pool. The path is
-used for cross-backend-visible heap relations that can be read as unprojected
-base relation slots without dropped attributes. Other scans use leader-only
-portal streaming. Dynamic workers require enough `max_worker_processes`
-headroom.
+`max_parallel_workers_per_gather` controls the query-wide budget for dynamic
+PostgreSQL scan workers across eligible pg_fusion leaf scans. `0` keeps scans
+leader-only. A positive value allows up to that many additional dynamic
+background-worker producers for the whole pg_fusion query, capped at `32` and
+bounded by `max_worker_processes` headroom. Eligible scans share the budget; the
+leader backend and workers each scan disjoint heap block ranges and write Arrow
+pages into the same shared page pool. The path is used for cross-backend-visible
+heap relations that can be read as unprojected base relation slots without
+dropped attributes. Other scans use leader-only portal streaming. If dynamic
+worker capacity is exhausted at runtime, pg_fusion falls back to leader-only
+streaming for the affected and remaining scans instead of failing the query.
 
 DataFusion fetch/limit hints are lowered into `slot_scan` as a PostgreSQL
 fast-start planning hint plus a local soft row cap. They are not documented as

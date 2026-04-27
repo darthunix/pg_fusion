@@ -45,10 +45,11 @@ page-backed Arrow batches.
    executor slots with a custom `DestReceiver` and explicit fetch row budgets,
    encodes `TupleTableSlot` rows into initialized `arrow_layout` pages with
    `slot_encoder`, and sends issued pages to the worker. Each scan always has a
-   leader backend producer. When PostgreSQL `max_parallel_workers_per_gather` is
-   positive, eligible heap scans can add that many dynamic background-worker
-   producers, capped at `32`; each producer owns a dedicated scan control slot
-   and writes its own Arrow pages into shared memory.
+   leader backend producer. PostgreSQL `max_parallel_workers_per_gather` is a
+   query-wide budget for additional dynamic background-worker producers across
+   eligible heap scans, capped at `32` and bounded by `max_worker_processes`;
+   each producer owns a dedicated scan control slot and writes its own Arrow
+   pages into shared memory.
 4. Worker imports scan pages as Arrow `RecordBatch` values, runs DataFusion
    operators, writes Arrow result pages, and sends issued frames back.
 5. Backend imports result pages with `slot_import` and projects rows into
@@ -72,10 +73,13 @@ PostgreSQL read time and slot-to-Arrow serialization time.
 Dynamic scan workers use CTID block-range chunking as the first parallel scan
 strategy. The leader backend scans one heap block range, additional dynamic
 background workers scan disjoint ranges, and `worker_runtime` fans all producer
-streams into one logical `PgScanExec`. Each producer has its own ordered
-issued-page receive stream because producer-local page transfer ids start at
-`1`. Relations with dropped attributes or unsupported scan shapes stay on
-leader-only portal streaming. Dynamic scan worker jobs carry a resolved
+streams into one logical `PgScanExec`. The query-wide worker budget is assigned
+before execution starts; if PostgreSQL cannot launch more dynamic workers at
+runtime, pg_fusion cancels any partially launched producers for that scan and
+continues leader-only for that and later scans. Each producer has its own
+ordered issued-page receive stream because producer-local page transfer ids
+start at `1`. Relations with dropped attributes or unsupported scan shapes stay
+on leader-only portal streaming. Dynamic scan worker jobs carry a resolved
 standalone scan descriptor for one PostgreSQL leaf scan rather than the original
 user SQL, so worker startup does not depend on backend-local `search_path` or
 repeat full DataFusion planning.

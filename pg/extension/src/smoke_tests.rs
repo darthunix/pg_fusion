@@ -366,6 +366,81 @@ pub(crate) fn heap_parallel_scan_search_path_smoke() {
         .expect("drop search_path fixture for parallel scan smoke");
 }
 
+pub(crate) fn heap_parallel_worker_budget_smoke() {
+    let mut client = smoke_client();
+    ensure_shared_preload(&mut client);
+    let tables = [
+        "public.pgf_worker_budget_a",
+        "public.pgf_worker_budget_b",
+        "public.pgf_worker_budget_c",
+        "public.pgf_worker_budget_d",
+    ];
+    client
+        .batch_execute(&format!(
+            "\
+            DROP TABLE IF EXISTS {a};
+            DROP TABLE IF EXISTS {b};
+            DROP TABLE IF EXISTS {c};
+            DROP TABLE IF EXISTS {d};
+            CREATE TABLE {a} AS
+            SELECT g::bigint AS id, (g * 10)::bigint AS payload
+            FROM generate_series(1, 8000) AS g;
+            CREATE TABLE {b} AS SELECT * FROM {a};
+            CREATE TABLE {c} AS SELECT * FROM {a};
+            CREATE TABLE {d} AS SELECT * FROM {a};
+            ANALYZE {a};
+            ANALYZE {b};
+            ANALYZE {c};
+            ANALYZE {d};
+            ",
+            a = tables[0],
+            b = tables[1],
+            c = tables[2],
+            d = tables[3],
+        ))
+        .expect("create committed heap tables for worker budget smoke");
+
+    let mut tx = smoke_transaction(&mut client);
+    tx.batch_execute(
+        "\
+        SET LOCAL statement_timeout = '30s';
+        SET LOCAL max_parallel_workers_per_gather = 32
+        ",
+    )
+    .expect("request more dynamic scan workers than a small cluster can launch per leaf");
+    let count: i64 = simple_query_first_column_tx(
+        &mut tx,
+        "\
+        SELECT count(*)::bigint
+        FROM public.pgf_worker_budget_a a
+        JOIN public.pgf_worker_budget_b b ON a.id = b.id
+        JOIN public.pgf_worker_budget_c c ON a.id = c.id
+        JOIN public.pgf_worker_budget_d d ON a.id = d.id
+        WHERE a.id BETWEEN 100 AND 8000
+        ",
+    )
+    .expect("multi-scan worker budget query must return one row")
+    .parse()
+    .expect("multi-scan worker budget count must be an integer");
+    assert_eq!(count, 8000 - 99);
+    tx.commit()
+        .expect("commit worker budget smoke transaction before cleanup");
+    client
+        .batch_execute(&format!(
+            "\
+            DROP TABLE IF EXISTS {a};
+            DROP TABLE IF EXISTS {b};
+            DROP TABLE IF EXISTS {c};
+            DROP TABLE IF EXISTS {d};
+            ",
+            a = tables[0],
+            b = tables[1],
+            c = tables[2],
+            d = tables[3],
+        ))
+        .expect("drop committed heap tables for worker budget smoke");
+}
+
 pub(crate) fn heap_leader_only_scan_smoke() {
     let mut client = smoke_client();
     ensure_shared_preload(&mut client);
