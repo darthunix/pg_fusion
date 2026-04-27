@@ -1,0 +1,136 @@
+# TPC-H Diagnostic Benchmark
+
+This directory contains a small TPC-H-compatible harness for comparing vanilla
+PostgreSQL with `pg_fusion`. It is intended for local engineering diagnosis, not
+for audited TPC-H publication.
+
+The checked-in query set follows TPC-H table names and operator patterns, but it
+is adapted to the current `pg_fusion` data path:
+
+- money/decimal fields are loaded as `double precision`;
+- date fields are loaded as ISO `text` values, so range predicates still work
+  lexicographically;
+- some queries intentionally contain subqueries/CTEs to show which shapes still
+  fail or fall back.
+
+Those choices avoid measuring unsupported `numeric`/`date` page encoding before
+the benchmark reaches scan and DataFusion operator behavior.
+
+## Prerequisites
+
+Install the generator:
+
+```sh
+cargo install tpchgen-cli
+```
+
+Build and run a PostgreSQL instance that preloads `pg_fusion`:
+
+```sh
+cargo build -p pg_fusion
+cargo pgrx start pg17
+```
+
+If the extension is not already installed in the pgrx cluster, run:
+
+```sh
+cargo pgrx run pg17 -p pg_fusion
+```
+
+The benchmark script auto-detects `psql` from `$PSQL`, `PATH`, and common pgrx
+install directories such as `~/.pgrx/17.7/pgrx-install/bin/psql`.
+If a single pgrx Unix socket exists under `~/.pgrx`, the script also
+auto-detects its socket directory and port.
+
+## Quick Run
+
+From the repository root:
+
+```sh
+python3 benches/tpch/scripts/tpch_bench.py \
+  --dbname pg_fusion \
+  --scale-factor 0.01 \
+  --runs 3 \
+  --warmup 1
+```
+
+By default the script:
+
+1. generates CSV data under `benches/tpch/data/sf_0_01/`;
+2. recreates schema `tpch`;
+3. loads all TPC-H tables with `\copy`;
+4. runs each query with `pg_fusion.enable = off`;
+5. runs each query with `pg_fusion.enable = on`;
+6. writes CSV and JSON summaries under `benches/tpch/results/`.
+
+To reuse an existing loaded schema:
+
+```sh
+python3 benches/tpch/scripts/tpch_bench.py \
+  --dbname pg_fusion \
+  --no-prepare \
+  --queries q01,q03,q06
+```
+
+To only generate and load data:
+
+```sh
+python3 benches/tpch/scripts/tpch_bench.py \
+  --dbname pg_fusion \
+  --only-prepare
+```
+
+## Useful Options
+
+- `--scale-factor 0.01` controls `tpchgen-cli -s`.
+- `--schema tpch` selects the PostgreSQL schema to drop/recreate.
+- `--queries all` or `--queries q01,q06,q14` selects query files.
+- `--parallel-workers 2` sets PostgreSQL `max_parallel_workers_per_gather` for
+  both vanilla and `pg_fusion` runs.
+- `--timeout 120` caps each query/mode run.
+- `--float-abs-tolerance 1e-6` and `--float-rel-tolerance 1e-9` control
+  numeric output comparison. This avoids treating harmless `double precision`
+  display rounding differences as result mismatches.
+- `--psql /path/to/psql` and `--tpchgen /path/to/tpchgen-cli` override binary
+  detection.
+
+The script emits median latency for measured runs and compares result rows.
+It also sets PostgreSQL `statement_timeout` for each query so timed-out
+benchmarks cancel the server-side backend work instead of leaving active
+queries behind.
+If a `pg_fusion` query crashes or restarts the PostgreSQL postmaster, later
+rows in the same run are not meaningful; restart the pgrx cluster and rerun a
+smaller `--queries` subset.
+Statuses are:
+
+- `ok`: vanilla and `pg_fusion` both succeeded and returned matching rows;
+- `mismatch`: both succeeded but output rows differed beyond numeric tolerance;
+- `fusion_fail`: vanilla succeeded but `pg_fusion` failed;
+- `pg_fail`: vanilla PostgreSQL failed, so the comparison is invalid.
+
+## Interpreting Results
+
+For scan-latency experiments, start with the single-table and light-join
+queries:
+
+- `q01`, `q06`, `q14`, and `q19` stress lineitem scan/filters/aggregates.
+- `q03`, `q05`, `q10`, and `q12` add joins and grouped aggregation.
+- `q04`, `q11`, `q15`, `q17`, `q18`, `q20`, `q21`, and `q22` include
+  subqueries or CTEs and are expected to expose current planner limitations.
+
+When a query is slow, reset runtime metrics and rerun the query manually:
+
+```sql
+SELECT pg_fusion_metrics_reset();
+SET pg_fusion.enable = on;
+SET pg_fusion.scan_timing_detail = on;
+SELECT ...;
+SELECT *
+FROM pg_fusion_metrics()
+ORDER BY component, metric;
+```
+
+`scan_postgres_read_ns` isolates PostgreSQL slot production time when detailed
+scan timing is enabled. `scan_arrow_encode_ns` isolates slot-to-page encoding.
+If the benchmark ratio is poor but those counters are small, inspect page
+handoff and worker-side operator metrics next.

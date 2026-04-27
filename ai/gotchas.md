@@ -35,6 +35,10 @@ importance: 0.7
   still race with a manual reset.
 - `pg_fusion.scan_timing_detail` adds per-row timing inside the backend scan
   receiver callback. Use it for diagnosis, not baseline latency measurements.
+- The `benches/tpch` harness is diagnostic rather than official TPC-H. Its
+  schema stores TPC-H decimal columns as `double precision` and date columns as
+  ISO `text` so current page encoding can exercise scans, joins, and
+  DataFusion operators before `numeric`/`date` transport support is expanded.
 - PostgreSQL `max_parallel_workers_per_gather` controls CTID block-range dynamic
   scan workers for eligible heap scans. `0` means leader-only portal streaming;
   positive values add that many dynamic producers, capped at `32`. The path
