@@ -35,6 +35,10 @@ importance: 0.7
   still race with a manual reset.
 - `pg_fusion.scan_timing_detail` adds per-row timing inside the backend scan
   receiver callback. Use it for diagnosis, not baseline latency measurements.
+- `plan_builder` validates subquery shapes after DataFusion logical
+  optimization. Subqueries that decorrelate into ordinary relational operators
+  can lower PostgreSQL leaf scans; subquery nodes that survive optimization
+  remain unsupported.
 - The `benches/tpch` harness is diagnostic rather than official TPC-H. Its
   schema stores TPC-H decimal columns as `double precision` and date columns as
   ISO `text` so current page encoding can exercise scans, joins, and

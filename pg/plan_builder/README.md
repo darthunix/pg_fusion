@@ -11,9 +11,8 @@ The crate is intentionally a planning bridge:
 - PostgreSQL scan leaves are represented by `scan_node::PgScanSpec`
 - snapshot ownership, plan serialization, backend scan serving, and page
   transport are left to later layers
-- expr-level subqueries and correlated subqueries are intentionally rejected in
-  v1; this path only supports PostgreSQL leaf scans plus ordinary relational
-  operators above them
+- subquery expressions are accepted when DataFusion optimization rewrites them
+  into ordinary relational operators above PostgreSQL scan leaves
 
 The output logical plan is the future `plan_codec` serialization target. It is
 self-contained enough to carry the compiled scan SQL, relation identity,
@@ -33,10 +32,13 @@ lowering, `scan_sql` recompiles those filters and returns any unsupported
 predicates as residual filters. `plan_builder` restores those residual
 predicates above `PgScanNode` and projects away residual-only columns if needed.
 
-Subquery expressions such as `EXISTS (...)`, `IN (SELECT ...)`, scalar
-subqueries, and correlated subqueries are out of scope for this path. They are
+Subquery expressions are validated after DataFusion logical optimization. If
+DataFusion decorrelates or rewrites them into joins, aggregates, projections,
+and filters, `plan_builder` can lower the remaining table leaves normally.
+Residual `EXISTS (...)`, `IN (SELECT ...)`, scalar subqueries,
+`LogicalPlan::Subquery`, or correlated `OuterReferenceColumn` nodes are still
 rejected before lowering so the later `plan_codec` contract only needs to
-round-trip the supported leaf-scan subset.
+round-trip ordinary relational operators plus PostgreSQL leaf scans.
 
 ## Example
 

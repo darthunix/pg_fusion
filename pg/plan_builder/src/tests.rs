@@ -308,7 +308,7 @@ fn rejects_multiple_and_non_query_statements() {
 }
 
 #[test]
-fn rejects_exists_subqueries() {
+fn rejects_exists_projection_that_survives_optimization() {
     let error = build_err("SELECT EXISTS(SELECT 1 FROM orders) FROM users");
 
     match error {
@@ -320,27 +320,45 @@ fn rejects_exists_subqueries() {
 }
 
 #[test]
-fn rejects_in_subquery_predicates() {
-    let error = build_err("SELECT id FROM users WHERE id IN (SELECT user_id FROM orders)");
+fn rewrites_in_subquery_predicate_after_optimization() {
+    let built = build_sql("SELECT id FROM users WHERE id IN (SELECT user_id FROM orders)");
 
-    match error {
-        PlanBuildError::UnsupportedSubquery(message) => {
-            assert!(message.contains("IN (SELECT"), "{message}");
-        }
-        other => panic!("expected unsupported subquery error, got {other:?}"),
-    }
+    assert_eq!(built.scans.len(), 2);
+    assert!(!contains_table_scan(&built.logical_plan));
+    assert_eq!(count_pg_scan_nodes(&built.logical_plan), 2);
+    assert_eq!(
+        built.scans[0].compiled_scan.sql,
+        "SELECT \"id\" FROM \"public\".\"users\""
+    );
+    assert_eq!(
+        built.scans[1].compiled_scan.sql,
+        "SELECT \"user_id\" FROM \"public\".\"orders\""
+    );
+    assert!(built
+        .logical_plan
+        .display_indent()
+        .to_string()
+        .contains("LeftSemi Join"));
 }
 
 #[test]
-fn rejects_scalar_subqueries() {
-    let error = build_err("SELECT id FROM users WHERE id = (SELECT max(user_id) FROM orders)");
+fn rewrites_scalar_subquery_after_optimization() {
+    let built = build_sql("SELECT id FROM users WHERE id = (SELECT max(user_id) FROM orders)");
 
-    match error {
-        PlanBuildError::UnsupportedSubquery(message) => {
-            assert!(message.contains("scalar subquery"), "{message}");
-        }
-        other => panic!("expected unsupported subquery error, got {other:?}"),
-    }
+    assert_eq!(built.scans.len(), 2);
+    assert!(!contains_table_scan(&built.logical_plan));
+    assert_eq!(count_pg_scan_nodes(&built.logical_plan), 2);
+    assert_eq!(
+        built.scans[0].compiled_scan.sql,
+        "SELECT \"id\" FROM \"public\".\"users\""
+    );
+    assert_eq!(
+        built.scans[1].compiled_scan.sql,
+        "SELECT \"user_id\" FROM \"public\".\"orders\""
+    );
+    let rendered = built.logical_plan.display_indent().to_string();
+    assert!(rendered.contains("Inner Join"), "{rendered}");
+    assert!(rendered.contains("Aggregate"), "{rendered}");
 }
 
 #[test]

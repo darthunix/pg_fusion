@@ -11,9 +11,9 @@
 //! This is a DataFusion-level contract only: PostgreSQL-side parallel plans can
 //! still be produced later by `slot_scan`.
 //!
-//! The supported SQL subset intentionally excludes expr-level subqueries and
-//! correlated subqueries. v1 only needs plans that lower PostgreSQL leaf scans
-//! into `PgScanNode` plus ordinary DataFusion relational operators above them.
+//! Subquery expressions are accepted when DataFusion can decorrelate/rewrite
+//! them into ordinary relational operators before scan lowering. Any subquery
+//! nodes that survive optimization are rejected before `PgScanNode` lowering.
 
 use std::any::Any;
 use std::collections::HashMap;
@@ -158,8 +158,8 @@ where
         let planner = SqlToRel::new(&context);
         let plan = planner.statement_to_plan(statement)?;
         let plan = plan.with_param_values(input.params)?;
-        validate_supported_plan_shape(&plan)?;
         let optimized = optimize_logical_plan(plan, self.config.target_partitions)?;
+        validate_supported_plan_shape(&optimized)?;
 
         let mut lowerer = ScanLowerer::new(self.config);
         let logical_plan = lowerer.lower(optimized)?;

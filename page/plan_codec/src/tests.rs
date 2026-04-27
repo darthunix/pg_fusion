@@ -304,6 +304,29 @@ fn roundtrips_join_with_multiple_pg_scans() {
 }
 
 #[test]
+fn roundtrips_rewritten_in_subquery_with_multiple_pg_scans() {
+    let built = build_sql("SELECT id FROM users WHERE id IN (SELECT user_id FROM orders)");
+    let decoded = roundtrip(&built.logical_plan);
+
+    assert_eq!(
+        built.logical_plan.display_indent().to_string(),
+        decoded.display_indent().to_string()
+    );
+
+    let expected_scans = collect_pg_scans(&built.logical_plan);
+    let actual_scans = collect_pg_scans(&decoded);
+    assert_eq!(expected_scans.len(), 2);
+    assert_eq!(actual_scans.len(), 2);
+    for (expected, actual) in expected_scans.iter().zip(&actual_scans) {
+        assert_scan_specs_eq(expected, actual);
+    }
+    assert!(decoded
+        .display_indent()
+        .to_string()
+        .contains("LeftSemi Join"));
+}
+
+#[test]
 fn roundtrips_builtin_no_scan_query() {
     let built = builder()
         .build(PlanBuildInput {
