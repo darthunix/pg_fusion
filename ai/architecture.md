@@ -33,6 +33,9 @@ page-backed Arrow batches.
 - `pg/df_catalog`, `pg/plan_builder`, `pg/scan_node`, `pg/scan_sql`,
   `pg/slot_scan`: backend-side DataFusion planning and trusted PostgreSQL scan
   SQL execution.
+- `join_order`: standalone compact join-order optimizer core. It has no
+  DataFusion or PostgreSQL dependency; callers provide filtered relation
+  statistics, join edges, and opaque predicate handles.
 
 ## Data Path
 

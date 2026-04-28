@@ -1,0 +1,14 @@
+[package]
+name = "join_order"
+version = "25.0.0"
+edition = "2021"
+description = "Compact join-order optimizer core"
+
+[dependencies]
+
+[dev-dependencies]
+criterion = "0.5"
+
+[[bench]]
+name = "optimizer"
+harness = false

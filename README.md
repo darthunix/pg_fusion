@@ -27,6 +27,8 @@ projected back into PostgreSQL tuple slots.
   zero-copy Arrow page layout, PostgreSQL slot encoding, and result projection.
 - `pg/plan_builder/`, `pg/df_catalog/`, `pg/scan_node/`, `pg/scan_sql/`,
   `pg/slot_scan/` - backend-side SQL planning and PostgreSQL scan execution.
+- `join_order/` - standalone compact join-order optimizer core for future
+  DataFusion logical-plan reordering.
 - `pg/test/` - pgrx integration tests for the active runtime path and
   page/slot pipeline.
 - `lockfree/` - shared-memory lock-free primitives used by the transport/page
