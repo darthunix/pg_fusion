@@ -59,6 +59,7 @@ fn user_table() -> ResolvedTable {
     ResolvedTable {
         table_oid: 42,
         relation: PgRelation::new(Some("public"), "users"),
+        column_attnums: vec![1, 2, 3],
         schema: Arc::new(Schema::new(vec![
             Field::new("id", DataType::Int64, false),
             Field::new("name", DataType::Utf8, true),
@@ -71,6 +72,7 @@ fn order_table() -> ResolvedTable {
     ResolvedTable {
         table_oid: 77,
         relation: PgRelation::new(Some("public"), "orders"),
+        column_attnums: vec![1, 2],
         schema: Arc::new(Schema::new(vec![
             Field::new("id", DataType::Int64, false),
             Field::new("user_id", DataType::Int64, false),

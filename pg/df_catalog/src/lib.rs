@@ -92,6 +92,11 @@ pub struct ResolvedTable {
     pub table_oid: u32,
     /// PostgreSQL relation identity for downstream planning and scan SQL compilation.
     pub relation: ScanRelation,
+    /// PostgreSQL attribute numbers for [`schema`] fields in order.
+    ///
+    /// Dropped attributes are not present in [`schema`], so callers must use
+    /// this mapping when they need catalog statistics keyed by `attnum`.
+    pub column_attnums: Vec<i16>,
     /// Logical Arrow schema for downstream planning and scan SQL compilation.
     ///
     /// Relations containing unsupported PostgreSQL types, such as `timetz`,
@@ -213,6 +218,7 @@ fn resolve_relation_by_oid(
         let tuple_desc = rel.tuple_desc();
         let field_count = tuple_desc.iter().filter(|attr| !attr.is_dropped()).count();
         let mut fields = Vec::with_capacity(field_count);
+        let mut column_attnums = Vec::with_capacity(field_count);
         for attr in tuple_desc.iter() {
             if attr.is_dropped() {
                 continue;
@@ -223,11 +229,13 @@ fn resolve_relation_by_oid(
                     type_oid: attr.atttypid.to_u32(),
                 })?;
             fields.push(Field::new(attr.name(), data_type, !attr.attnotnull));
+            column_attnums.push(attr.attnum);
         }
 
         Ok(ResolvedTable {
             table_oid: rel.oid().to_u32(),
             relation,
+            column_attnums,
             schema: Arc::new(Schema::new(fields)),
         })
     }))

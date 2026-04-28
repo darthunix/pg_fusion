@@ -387,6 +387,16 @@ mod tests {
     }
 
     #[pg_test]
+    fn plan_builder_reorders_inner_joins_from_live_stats() {
+        super::plan_builder::plan_builder_reorders_inner_joins_from_live_stats();
+    }
+
+    #[pg_test]
+    fn plan_builder_join_reordering_uses_live_attnums_after_drop() {
+        super::plan_builder::plan_builder_join_reordering_uses_live_attnums_after_drop();
+    }
+
+    #[pg_test]
     fn plan_codec_roundtrips_live_pg_scan() {
         super::plan_codec::plan_codec_roundtrips_live_pg_scan();
     }

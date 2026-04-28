@@ -11,7 +11,7 @@ doctest = false
 
 [features]
 default = ["pg17"]
-pg17 = ["df_catalog/pg17", "pgrx/pg17"]
+pg17 = ["df_catalog/pg17", "pg_statistics/pg17", "pgrx/pg17"]
 
 [dependencies]
 arrow-schema = { workspace = true }
@@ -20,7 +20,9 @@ datafusion-common = { workspace = true }
 datafusion-expr = { workspace = true }
 datafusion-sql = { workspace = true }
 df_catalog = { path = "../df_catalog", version = "25.0" }
+join_order = { path = "../../join_order", version = "25.0" }
 once_cell = "1.21"
+pg_statistics = { path = "../statistics", version = "25.0" }
 pgrx = { workspace = true }
 scan_node = { path = "../scan_node", version = "25.0" }
 scan_sql = { path = "../scan_sql", version = "25.0" }

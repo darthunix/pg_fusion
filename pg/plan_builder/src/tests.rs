@@ -5,6 +5,7 @@ use datafusion_common::tree_node::TreeNodeRecursion;
 use datafusion_common::Column;
 use datafusion_expr::expr::BinaryExpr;
 use datafusion_expr::{lit, Operator};
+use pg_statistics::{PgColumnStats, PgScanEstimate, PgUniqueKey};
 use scan_sql::PgRelation;
 
 const TEST_IDENTIFIER_MAX_BYTES: usize = 63;
@@ -38,6 +39,7 @@ fn user_table() -> ResolvedTable {
     ResolvedTable {
         table_oid: 42,
         relation: PgRelation::new(Some("public"), "users"),
+        column_attnums: vec![1, 2, 3],
         schema: Arc::new(Schema::new(vec![
             Field::new("id", DataType::Int64, false),
             Field::new("name", DataType::Utf8View, true),
@@ -50,6 +52,7 @@ fn order_table() -> ResolvedTable {
     ResolvedTable {
         table_oid: 77,
         relation: PgRelation::new(Some("public"), "orders"),
+        column_attnums: vec![1, 2],
         schema: Arc::new(Schema::new(vec![
             Field::new("id", DataType::Int64, false),
             Field::new("user_id", DataType::Int64, false),
@@ -57,10 +60,79 @@ fn order_table() -> ResolvedTable {
     }
 }
 
-fn builder() -> PlanBuilder<FakeResolver> {
+fn item_table() -> ResolvedTable {
+    ResolvedTable {
+        table_oid: 88,
+        relation: PgRelation::new(Some("public"), "items"),
+        column_attnums: vec![1, 2],
+        schema: Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int64, false),
+            Field::new("user_id", DataType::Int64, false),
+        ])),
+    }
+}
+
+#[derive(Debug, Clone, Default)]
+struct FakeStatsProvider;
+
+impl JoinStatsProvider for FakeStatsProvider {
+    fn estimate_scan_sql(&self, sql: &str) -> Result<PgScanEstimate, PlanBuildError> {
+        let (rows, width) = if sql.contains("\"users\"") {
+            (1_000_000.0, 24)
+        } else if sql.contains("\"orders\"") {
+            (10.0, 16)
+        } else if sql.contains("\"items\"") {
+            (100_000.0, 16)
+        } else {
+            (100.0, 8)
+        };
+        Ok(PgScanEstimate {
+            rows,
+            width,
+            bytes: rows * f64::from(width),
+            startup_cost: 0.0,
+            total_cost: rows,
+        })
+    }
+
+    fn load_column_stats(
+        &self,
+        relation_oid: u32,
+        attnums: &[i16],
+    ) -> Result<Vec<PgColumnStats>, PlanBuildError> {
+        Ok(attnums
+            .iter()
+            .copied()
+            .map(|attnum| {
+                let ndv = match (relation_oid, attnum) {
+                    (42, 1) => Some(1_000_000.0),
+                    (77, 2) => Some(10.0),
+                    (88, 2) => Some(100_000.0),
+                    _ => None,
+                };
+                PgColumnStats {
+                    relation_oid,
+                    attnum,
+                    inherited: false,
+                    null_frac: Some(0.0),
+                    avg_width: Some(8),
+                    stadistinct: ndv,
+                    ndv,
+                }
+            })
+            .collect())
+    }
+
+    fn load_unique_keys(&self, _relation_oid: u32) -> Result<Vec<PgUniqueKey>, PlanBuildError> {
+        Ok(Vec::new())
+    }
+}
+
+fn builder() -> PlanBuilder<FakeResolver, FakeStatsProvider> {
     PlanBuilder::with_resolver(FakeResolver::new([
         (TableReference::bare("users"), user_table()),
         (TableReference::bare("orders"), order_table()),
+        (TableReference::bare("items"), item_table()),
         (
             TableReference::partial("public", "users"),
             ResolvedTable {
@@ -69,10 +141,12 @@ fn builder() -> PlanBuilder<FakeResolver> {
             },
         ),
     ]))
+    .with_stats_provider(FakeStatsProvider)
     .with_config(PlanBuilderConfig {
         target_partitions: 1,
         identifier_max_bytes: TEST_IDENTIFIER_MAX_BYTES,
         first_scan_id: 1,
+        ..PlanBuilderConfig::default()
     })
 }
 
@@ -134,6 +208,28 @@ fn count_cte_ref_nodes(plan: &LogicalPlan) -> usize {
     })
     .unwrap();
     count
+}
+
+fn bottom_join_on(plan: &LogicalPlan) -> Option<String> {
+    match plan {
+        LogicalPlan::Join(join) => {
+            let left_nested = bottom_join_on(&join.left);
+            let right_nested = bottom_join_on(&join.right);
+            left_nested.or(right_nested).or_else(|| {
+                Some(
+                    join.on
+                        .iter()
+                        .map(|(left, right)| format!("{left} = {right}"))
+                        .collect::<Vec<_>>()
+                        .join(", "),
+                )
+            })
+        }
+        LogicalPlan::Projection(projection) => bottom_join_on(&projection.input),
+        LogicalPlan::Filter(filter) => bottom_join_on(&filter.input),
+        LogicalPlan::SubqueryAlias(alias) => bottom_join_on(&alias.input),
+        _ => None,
+    }
 }
 
 #[test]
@@ -224,6 +320,7 @@ fn residual_filters_are_restored_and_extra_columns_projected_away() {
         target_partitions: 1,
         identifier_max_bytes: TEST_IDENTIFIER_MAX_BYTES,
         first_scan_id: 1,
+        ..PlanBuilderConfig::default()
     });
 
     let plan = lowerer
@@ -262,6 +359,7 @@ fn residual_filters_disable_local_row_cap_but_keep_planner_hint() {
         target_partitions: 1,
         identifier_max_bytes: TEST_IDENTIFIER_MAX_BYTES,
         first_scan_id: 1,
+        ..PlanBuilderConfig::default()
     });
 
     let _ = lowerer
@@ -393,6 +491,107 @@ fn rewrites_scalar_subquery_after_optimization() {
     let rendered = built.logical_plan.display_indent().to_string();
     assert!(rendered.contains("Inner Join"), "{rendered}");
     assert!(rendered.contains("Aggregate"), "{rendered}");
+}
+
+#[test]
+fn join_reordering_uses_filtered_statistics_for_inner_join_components() {
+    let built = build_sql(
+        "SELECT u.id, i.id, o.id \
+         FROM users u \
+         JOIN items i ON u.id = i.user_id \
+         JOIN orders o ON u.id = o.user_id",
+    );
+
+    assert_eq!(built.scans.len(), 3);
+    assert_eq!(
+        bottom_join_on(&built.logical_plan).as_deref(),
+        Some("u.id = o.user_id")
+    );
+}
+
+#[test]
+fn join_reordering_preserves_original_output_order() {
+    let built = build_sql(
+        "SELECT * \
+         FROM users u \
+         JOIN items i ON u.id = i.user_id \
+         JOIN orders o ON u.id = o.user_id",
+    );
+
+    let fields = built
+        .logical_plan
+        .schema()
+        .iter()
+        .map(|(qualifier, field)| (qualifier.map(ToString::to_string), field.name().to_owned()))
+        .collect::<Vec<_>>();
+    assert_eq!(
+        fields,
+        vec![
+            (Some("u".into()), "id".into()),
+            (Some("u".into()), "name".into()),
+            (Some("u".into()), "score".into()),
+            (Some("i".into()), "id".into()),
+            (Some("i".into()), "user_id".into()),
+            (Some("o".into()), "id".into()),
+            (Some("o".into()), "user_id".into()),
+        ]
+    );
+}
+
+#[test]
+fn join_reordering_handles_disconnected_cross_join_components() {
+    let built = build_sql(
+        "SELECT u.id, i.id, o.id \
+         FROM users u CROSS JOIN items i CROSS JOIN orders o",
+    );
+
+    assert_eq!(built.scans.len(), 3);
+    assert!(!contains_table_scan(&built.logical_plan));
+    let rendered = built.logical_plan.display_indent().to_string();
+    assert!(rendered.contains("Cross Join"), "{rendered}");
+}
+
+#[test]
+fn join_reordering_can_be_disabled() {
+    let built = builder()
+        .with_config(PlanBuilderConfig {
+            join_reordering_enabled: false,
+            ..builder().config()
+        })
+        .build(PlanBuildInput {
+            sql: "SELECT u.id, i.id, o.id \
+                  FROM users u \
+                  JOIN items i ON u.id = i.user_id \
+                  JOIN orders o ON u.id = o.user_id",
+            params: Vec::new(),
+        })
+        .unwrap();
+
+    assert_eq!(
+        bottom_join_on(&built.logical_plan).as_deref(),
+        Some("u.id = i.user_id")
+    );
+}
+
+#[test]
+fn join_reordering_skips_non_inner_and_filtered_joins() {
+    let outer = build_sql(
+        "SELECT u.id, i.id \
+         FROM users u LEFT JOIN items i ON u.id = i.user_id",
+    );
+    assert!(outer
+        .logical_plan
+        .display_indent()
+        .to_string()
+        .contains("Left Join"));
+
+    let filtered = build_sql(
+        "SELECT u.id, i.id \
+         FROM users u JOIN items i ON u.id = i.user_id AND u.score > i.id",
+    );
+    let rendered = filtered.logical_plan.display_indent().to_string();
+    assert!(rendered.contains("Inner Join"), "{rendered}");
+    assert!(rendered.contains("Filter:"), "{rendered}");
 }
 
 #[test]

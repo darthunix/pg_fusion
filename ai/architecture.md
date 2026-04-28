@@ -34,24 +34,30 @@ page-backed Arrow batches.
   `pg/slot_scan`: backend-side DataFusion planning and trusted PostgreSQL scan
   SQL execution.
 - `pg/statistics`: PostgreSQL planner/catalog statistics bridge. It is
-  PostgreSQL-specific but independent of DataFusion and `join_order`; callers
-  can use it to turn scan SQL, `pg_class`, `pg_statistic`, and unique indexes
-  into compact relation/join estimates. It reports only relation-wide unique
-  keys; partial unique indexes are skipped until predicate implication is
-  modeled explicitly.
+  PostgreSQL-specific but independent of DataFusion and `join_order`;
+  `plan_builder` uses it to turn pushed-down scan SQL, `pg_class`,
+  `pg_statistic`, and unique indexes into compact relation/join estimates. It
+  reports only relation-wide unique keys; partial unique indexes are skipped
+  until predicate implication is modeled explicitly.
 - `join_order`: standalone compact join-order optimizer core. It has no
-  DataFusion or PostgreSQL dependency; callers provide filtered relation
-  statistics, join edges, and opaque predicate handles.
+  DataFusion or PostgreSQL dependency; `plan_builder` provides filtered
+  relation statistics, join edges, and opaque predicate handles.
 
 ## Data Path
 
-1. Backend planning resolves PostgreSQL catalog metadata and lowers scan leaves
-   to `PgScanNode`/`scan_sql` descriptors. Non-recursive CTEs referenced more
-   than once are planned as `PgCteRefNode` reads over a single lowered CTE
-   producer so worker execution materializes the CTE once and reuses the owned
-   batches. PostgreSQL text-like columns are represented as Arrow `Utf8View` in
-   the DataFusion logical schema so scan pages can stay zero-copy for string
-   payloads.
+1. Backend planning resolves PostgreSQL catalog metadata, runs DataFusion
+   logical optimization, then uses `pg_statistics` plus `join_order` to reorder
+   eligible inner/cross join components before scan lowering. The reorder pass
+   estimates each PostgreSQL leaf from the same pushed-down scan SQL that will
+   later become a scan descriptor, maps join columns back to PostgreSQL attnums,
+   and uses NDV/null fractions plus relation-wide unique keys for equi-join
+   selectivity. Ineligible join shapes keep their DataFusion order. Scan leaves
+   are then lowered to `PgScanNode`/`scan_sql` descriptors. Non-recursive CTEs
+   referenced more than once are planned as `PgCteRefNode` reads over a single
+   lowered CTE producer so worker execution materializes the CTE once and
+   reuses the owned batches. PostgreSQL text-like columns are represented as
+   Arrow `Utf8View` in the DataFusion logical schema so scan pages can stay
+   zero-copy for string payloads.
 2. Worker DataFusion execution opens scans through the runtime protocol.
 3. Backend executes trusted scan SQL through `slot_scan`, drains PostgreSQL
    executor slots with a custom `DestReceiver` and explicit fetch row budgets,

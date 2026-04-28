@@ -9,6 +9,8 @@ The crate is intentionally a planning bridge:
 - relation metadata comes from `df_catalog`
 - pushdown SQL is compiled by `scan_sql`
 - PostgreSQL scan leaves are represented by `scan_node::PgScanSpec`
+- eligible inner/cross join components are reordered with PostgreSQL
+  statistics through `pg_statistics` and the standalone `join_order` optimizer
 - non-recursive CTEs referenced more than once are lowered through
   `scan_node::PgCteRefNode` so the worker can materialize them once and reuse
   the same batches
@@ -49,6 +51,40 @@ planning table sources and plans the original CTE body separately. During scan
 lowering, each synthetic source becomes a `PgCteRefNode` with the lowered CTE
 definition as its child. This preserves PostgreSQL-style "compute once, read
 many" behavior for floating aggregates and other non-bit-stable computations.
+
+## Join Ordering
+
+`PlanBuilderConfig::join_reordering_enabled` is on by default. After the normal
+DataFusion logical optimization and subquery validation pass, `plan_builder`
+searches for maximal reorderable join components and replaces them with a
+costed tree from `join_order`.
+
+A component is reorderable only when all of these are true:
+
+- joins are `INNER` joins with `ON` predicates or cross joins
+- there is no residual join filter and `null_equals_null` is false
+- leaves are PostgreSQL planning table scans, optionally wrapped in
+  `SubqueryAlias`
+- transparent column-only projections may sit above the join component
+- join predicates are simple equi-column pairs that can be mapped back to
+  PostgreSQL attnums
+
+For each leaf, the reordering pass recompiles the same pushed-down scan SQL that
+will later become `PgScanSpec`, asks `pg_statistics::estimate_scan_sql` for
+filtered rows/bytes, loads column NDV/null stats for join columns, and loads
+relation-wide unique keys. Equi-join selectivity is estimated from NDV/null
+fractions and clamped when the join columns cover a unique key. Partial unique
+indexes are deliberately ignored by `pg_statistics`, because they are not
+relation-wide keys unless predicate implication is modeled.
+
+The pass is intentionally conservative: unsupported join shapes are left
+unchanged, while statistics/optimizer errors are returned as planning errors
+when join reordering is explicitly enabled. The extension exposes this through
+`pg_fusion.join_reordering`, so runtime comparisons can use:
+
+```sql
+SET pg_fusion.join_reordering = off;
+```
 
 ## Example
 

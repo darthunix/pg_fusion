@@ -1291,7 +1291,9 @@ fn decode_primary_inbound(bytes: &[u8]) -> Result<PrimaryInbound, Box<dyn std::e
 }
 
 fn build_transport_schema(sql: &str) -> Result<SchemaRef, String> {
+    let config = crate::host_config().map_err(|err| err.to_string())?;
     let built = plan_builder::PlanBuilder::new()
+        .with_config(config.plan_builder_config())
         .build(plan_builder::PlanBuildInput {
             sql,
             params: Vec::new(),

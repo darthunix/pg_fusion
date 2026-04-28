@@ -74,7 +74,9 @@ unsafe extern "C-unwind" fn build_planned_custom_scan(
     }
 
     let sql = select_sql_from_query(parse, query_string);
+    let config = crate::host_config().unwrap_or_else(|err| error!("pg_fusion config error: {err}"));
     let built = plan_builder::PlanBuilder::new()
+        .with_config(config.plan_builder_config())
         .build(plan_builder::PlanBuildInput {
             sql: &sql,
             params: Vec::new(),

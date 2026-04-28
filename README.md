@@ -27,9 +27,9 @@ projected back into PostgreSQL tuple slots.
   zero-copy Arrow page layout, PostgreSQL slot encoding, and result projection.
 - `pg/plan_builder/`, `pg/df_catalog/`, `pg/scan_node/`, `pg/scan_sql/`,
   `pg/slot_scan/` - backend-side SQL planning and PostgreSQL scan execution.
-- `pg/statistics/` - PostgreSQL planner/catalog statistics bridge for future
+- `pg/statistics/` - PostgreSQL planner/catalog statistics bridge used by
   costed join-order planning.
-- `join_order/` - standalone compact join-order optimizer core for future
+- `join_order/` - standalone compact join-order optimizer core used by
   DataFusion logical-plan reordering.
 - `pg/test/` - pgrx integration tests for the active runtime path and
   page/slot pipeline.
@@ -127,6 +127,9 @@ pg_fusion.page_count = 256
 # Backend PostgreSQL scan streaming.
 pg_fusion.scan_fetch_batch_rows = 1024
 pg_fusion.estimator_initial_tail_bytes_per_row = 64
+
+# Logical planning.
+pg_fusion.join_reordering = on
 EOF
 ```
 
@@ -211,6 +214,24 @@ Backend diagnostics can also be enabled without restarting:
 
 ```sql
 SET pg_fusion.backend_log_level = 1; -- 0=off, 1=basic, 2=trace
+```
+
+Statistics-based join ordering is enabled by default:
+
+```sql
+SET pg_fusion.join_reordering = on;
+```
+
+When enabled, `plan_builder` uses PostgreSQL estimates, column statistics, and
+relation-wide unique keys to reorder eligible inner/cross join components before
+PostgreSQL scan leaves are lowered. It applies only to join trees whose leaves
+are pg_fusion PostgreSQL table scans and whose join predicates are simple equi
+column pairs; outer joins, residual join filters, unsupported expressions, and
+subquery shapes remain in their DataFusion-planned order. Disable it for A/B
+testing or to isolate planning issues:
+
+```sql
+SET pg_fusion.join_reordering = off;
 ```
 
 `pg_fusion.scan_fetch_batch_rows` controls how many rows the backend asks

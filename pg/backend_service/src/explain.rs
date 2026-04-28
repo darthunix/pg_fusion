@@ -30,7 +30,9 @@ pub(crate) fn render_physical_explain(
         options,
         config,
     } = input;
-    let built = PlanBuilder::new().build(PlanBuildInput { sql, params })?;
+    let built = PlanBuilder::new()
+        .with_config(config.plan_builder_config())
+        .build(PlanBuildInput { sql, params })?;
 
     let pg_leaf_explains = render_pg_leaf_explains(&built.scans, &config, options)?;
     let pg_scan_planner =

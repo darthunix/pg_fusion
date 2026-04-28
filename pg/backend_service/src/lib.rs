@@ -76,6 +76,7 @@ thread_local! {
 pub struct BackendServiceConfig {
     pub scan_fetch_batch_rows: u32,
     pub estimator_default: EstimatorConfig,
+    pub join_reordering_enabled: bool,
     pub plan_page_kind: u16,
     pub plan_page_flags: u16,
     pub scan_page_kind: u16,
@@ -90,6 +91,7 @@ impl Default for BackendServiceConfig {
         Self {
             scan_fetch_batch_rows: 1024,
             estimator_default: EstimatorConfig::default(),
+            join_reordering_enabled: true,
             plan_page_kind: 0x504c,
             plan_page_flags: 0,
             scan_page_kind: import::ARROW_LAYOUT_BATCH_KIND,
@@ -97,6 +99,15 @@ impl Default for BackendServiceConfig {
             diagnostics: DiagnosticsConfig::default(),
             metrics: RuntimeMetrics::default(),
             scan_timing_detail: false,
+        }
+    }
+}
+
+impl BackendServiceConfig {
+    pub fn plan_builder_config(&self) -> plan_builder::PlanBuilderConfig {
+        plan_builder::PlanBuilderConfig {
+            join_reordering_enabled: self.join_reordering_enabled,
+            ..plan_builder::PlanBuilderConfig::default()
         }
     }
 }
@@ -555,10 +566,12 @@ impl BackendService {
                 session_epoch,
             };
 
-            let built = PlanBuilder::new().build(PlanBuildInput {
-                sql: input.sql,
-                params: input.params,
-            })?;
+            let built = PlanBuilder::new()
+                .with_config(config.plan_builder_config())
+                .build(PlanBuildInput {
+                    sql: input.sql,
+                    params: input.params,
+                })?;
 
             let mut scan_worker_launcher = input.scan_worker_launcher;
             if let Some(launcher) = scan_worker_launcher.as_deref_mut() {

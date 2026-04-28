@@ -47,6 +47,10 @@ use scan_node::{PgCteId, PgCteRefNode, PgScanId, PgScanNode, PgScanSpec};
 use scan_sql::{compile_scan, CompileError, CompileScanInput, LimitLowering};
 use thiserror::Error;
 
+mod join_reorder;
+
+pub use join_reorder::{JoinStatsProvider, LiveJoinStatsProvider};
+
 static BUILTINS: Lazy<Arc<Builtins>> = Lazy::new(|| Arc::new(Builtins::new()));
 
 /// Input for one backend logical-plan build.
@@ -77,14 +81,24 @@ pub struct PlanBuilderConfig {
     pub identifier_max_bytes: usize,
     /// First query-local scan id to allocate.
     pub first_scan_id: u64,
+    /// Enable statistics-based join reordering for eligible inner/cross joins.
+    pub join_reordering_enabled: bool,
+    /// Search limits and cross-join policy for the compact join-order optimizer.
+    pub join_order_config: join_order::JoinOrderConfig,
 }
 
 impl Default for PlanBuilderConfig {
     fn default() -> Self {
+        let join_order_config = join_order::JoinOrderConfig {
+            allow_cross_joins: true,
+            ..join_order::JoinOrderConfig::default()
+        };
         Self {
             target_partitions: 1,
             identifier_max_bytes: pg_identifier_max_bytes(),
             first_scan_id: 1,
+            join_reordering_enabled: true,
+            join_order_config,
         }
     }
 }
@@ -104,6 +118,12 @@ pub enum PlanBuildError {
     DataFusion(#[from] DataFusionError),
     #[error("PostgreSQL scan SQL compilation failed: {0}")]
     ScanSql(#[from] CompileError),
+    #[error("PostgreSQL statistics failed: {0}")]
+    Statistics(String),
+    #[error("join order optimization failed: {0}")]
+    JoinOrder(#[from] join_order::OptimizeError),
+    #[error("join order rewrite failed: {0}")]
+    JoinReorder(String),
     #[error("unsupported SQL shape for PostgreSQL scan planning: {0}")]
     UnsupportedSubquery(String),
     #[error("{0}")]
@@ -112,30 +132,43 @@ pub enum PlanBuildError {
 
 /// Backend-side SQL-to-logical-plan builder.
 #[derive(Debug, Clone)]
-pub struct PlanBuilder<R = PgrxCatalogResolver> {
+pub struct PlanBuilder<R = PgrxCatalogResolver, S = LiveJoinStatsProvider> {
     resolver: R,
+    stats_provider: S,
     config: PlanBuilderConfig,
 }
 
-impl PlanBuilder<PgrxCatalogResolver> {
+impl PlanBuilder<PgrxCatalogResolver, LiveJoinStatsProvider> {
     /// Create a builder backed by live PostgreSQL catalogs.
     pub fn new() -> Self {
         Self::with_resolver(PgrxCatalogResolver::new())
     }
 }
 
-impl Default for PlanBuilder<PgrxCatalogResolver> {
+impl Default for PlanBuilder<PgrxCatalogResolver, LiveJoinStatsProvider> {
     fn default() -> Self {
         Self::new()
     }
 }
 
-impl<R> PlanBuilder<R> {
+impl<R> PlanBuilder<R, LiveJoinStatsProvider> {
     /// Create a builder with a custom catalog resolver.
     pub fn with_resolver(resolver: R) -> Self {
         Self {
             resolver,
+            stats_provider: LiveJoinStatsProvider,
             config: PlanBuilderConfig::default(),
+        }
+    }
+}
+
+impl<R, S> PlanBuilder<R, S> {
+    /// Override the default statistics provider.
+    pub fn with_stats_provider<T>(self, stats_provider: T) -> PlanBuilder<R, T> {
+        PlanBuilder {
+            resolver: self.resolver,
+            stats_provider,
+            config: self.config,
         }
     }
 
@@ -151,21 +184,33 @@ impl<R> PlanBuilder<R> {
     }
 }
 
-impl<R> PlanBuilder<R>
+impl<R, S> PlanBuilder<R, S>
 where
     R: CatalogResolver + Send + Sync,
+    S: JoinStatsProvider,
 {
     /// Build an optimized logical plan and lower PostgreSQL table scans.
     pub fn build(&self, input: PlanBuildInput<'_>) -> Result<BuiltPlan, PlanBuildError> {
         let mut statement = parse_one_query(input.sql)?;
         let context = PgPlanningContext::new(&self.resolver, self.config);
         let mut lowerer = ScanLowerer::new(self.config);
-        prepare_materialized_ctes(&mut statement, &context, &input.params, &mut lowerer)?;
+        prepare_materialized_ctes(
+            &mut statement,
+            &context,
+            &input.params,
+            &mut lowerer,
+            &self.stats_provider,
+        )?;
         let planner = SqlToRel::new(&context);
         let plan = planner.statement_to_plan(statement)?;
         let plan = plan.with_param_values(input.params)?;
         let optimized = optimize_logical_plan(plan, self.config.target_partitions)?;
         validate_supported_plan_shape(&optimized)?;
+        let optimized = if self.config.join_reordering_enabled {
+            join_reorder::rewrite_join_order(optimized, self.config, &self.stats_provider)?
+        } else {
+            optimized
+        };
 
         let logical_plan = lowerer.lower(optimized)?;
         Ok(BuiltPlan {
@@ -278,14 +323,16 @@ fn recover_subquery_validation_error(
     }
 }
 
-fn prepare_materialized_ctes<R>(
+fn prepare_materialized_ctes<R, S>(
     statement: &mut DFStatement,
     context: &PgPlanningContext<'_, R>,
     params: &[ScalarValue],
     lowerer: &mut ScanLowerer,
+    stats_provider: &S,
 ) -> Result<(), PlanBuildError>
 where
     R: CatalogResolver + Send + Sync,
+    S: JoinStatsProvider,
 {
     let DFStatement::Statement(statement_inner) = statement else {
         return Ok(());
@@ -332,8 +379,13 @@ where
             })?;
             let definition_statement =
                 cte_definition_statement(&with_template, &prefix_ctes, original_cte)?;
-            let definition =
-                build_materialized_cte_definition(definition_statement, context, params, lowerer)?;
+            let definition = build_materialized_cte_definition(
+                definition_statement,
+                context,
+                params,
+                lowerer,
+                stats_provider,
+            )?;
             let synthetic_table = synthetic_cte_table_name(cte_id);
             context.register_cte_source(
                 TableReference::bare(synthetic_table.clone()),
@@ -440,20 +492,27 @@ fn synthetic_cte_table_name(cte_id: PgCteId) -> String {
     format!("__pg_fusion_cte_{}", cte_id.get())
 }
 
-fn build_materialized_cte_definition<R>(
+fn build_materialized_cte_definition<R, S>(
     statement: DFStatement,
     context: &PgPlanningContext<'_, R>,
     params: &[ScalarValue],
     lowerer: &mut ScanLowerer,
+    stats_provider: &S,
 ) -> Result<LogicalPlan, PlanBuildError>
 where
     R: CatalogResolver + Send + Sync,
+    S: JoinStatsProvider,
 {
     let planner = SqlToRel::new(context);
     let plan = planner.statement_to_plan(statement)?;
     let plan = plan.with_param_values(params.to_vec())?;
     let optimized = optimize_logical_plan(plan, context.config.target_partitions)?;
     validate_supported_plan_shape(&optimized)?;
+    let optimized = if context.config.join_reordering_enabled {
+        join_reorder::rewrite_join_order(optimized, context.config, stats_provider)?
+    } else {
+        optimized
+    };
     lowerer.lower(optimized)
 }
 

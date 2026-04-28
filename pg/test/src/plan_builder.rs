@@ -1,5 +1,6 @@
-use ::plan_builder::{BuiltPlan, PlanBuildError, PlanBuildInput, PlanBuilder};
+use ::plan_builder::{BuiltPlan, PlanBuildError, PlanBuildInput, PlanBuilder, PlanBuilderConfig};
 use datafusion_common::ScalarValue;
+use datafusion_expr::logical_plan::LogicalPlan;
 use pgrx::prelude::*;
 
 fn build(sql: &str, params: Vec<ScalarValue>) -> BuiltPlan {
@@ -12,6 +13,28 @@ fn build_err(sql: &str, params: Vec<ScalarValue>) -> PlanBuildError {
     PlanBuilder::new()
         .build(PlanBuildInput { sql, params })
         .expect_err("plan build should fail")
+}
+
+fn bottom_join_on(plan: &LogicalPlan) -> Option<String> {
+    match plan {
+        LogicalPlan::Join(join) => {
+            let left_nested = bottom_join_on(&join.left);
+            let right_nested = bottom_join_on(&join.right);
+            left_nested.or(right_nested).or_else(|| {
+                Some(
+                    join.on
+                        .iter()
+                        .map(|(left, right)| format!("{left} = {right}"))
+                        .collect::<Vec<_>>()
+                        .join(", "),
+                )
+            })
+        }
+        LogicalPlan::Projection(projection) => bottom_join_on(&projection.input),
+        LogicalPlan::Filter(filter) => bottom_join_on(&filter.input),
+        LogicalPlan::SubqueryAlias(alias) => bottom_join_on(&alias.input),
+        _ => None,
+    }
 }
 
 pub fn plan_builder_lowers_live_table_scan() {
@@ -204,4 +227,95 @@ pub fn plan_builder_rewrites_in_subquery_predicates() {
         .display_indent()
         .to_string()
         .contains("LeftSemi Join"));
+}
+
+pub fn plan_builder_reorders_inner_joins_from_live_stats() {
+    Spi::run("DROP TABLE IF EXISTS public.plan_builder_jr_users").unwrap();
+    Spi::run("DROP TABLE IF EXISTS public.plan_builder_jr_items").unwrap();
+    Spi::run("DROP TABLE IF EXISTS public.plan_builder_jr_orders").unwrap();
+    Spi::run("CREATE TABLE public.plan_builder_jr_users (id int8 NOT NULL)").unwrap();
+    Spi::run("CREATE TABLE public.plan_builder_jr_items (id int8 NOT NULL, user_id int8 NOT NULL)")
+        .unwrap();
+    Spi::run(
+        "CREATE TABLE public.plan_builder_jr_orders (id int8 NOT NULL, user_id int8 NOT NULL)",
+    )
+    .unwrap();
+    Spi::run("INSERT INTO public.plan_builder_jr_users SELECT g FROM generate_series(1, 10000) g")
+        .unwrap();
+    Spi::run(
+        "INSERT INTO public.plan_builder_jr_items SELECT g, g FROM generate_series(1, 1000) g",
+    )
+    .unwrap();
+    Spi::run("INSERT INTO public.plan_builder_jr_orders SELECT g, g FROM generate_series(1, 10) g")
+        .unwrap();
+    Spi::run("ANALYZE public.plan_builder_jr_users").unwrap();
+    Spi::run("ANALYZE public.plan_builder_jr_items").unwrap();
+    Spi::run("ANALYZE public.plan_builder_jr_orders").unwrap();
+
+    let built = build(
+        "SELECT u.id, i.id, o.id \
+         FROM public.plan_builder_jr_users u \
+         JOIN public.plan_builder_jr_items i ON u.id = i.user_id \
+         JOIN public.plan_builder_jr_orders o ON u.id = o.user_id",
+        Vec::new(),
+    );
+
+    assert_eq!(built.scans.len(), 3);
+    assert_eq!(
+        bottom_join_on(&built.logical_plan).as_deref(),
+        Some("u.id = o.user_id")
+    );
+
+    let disabled = PlanBuilder::new()
+        .with_config(PlanBuilderConfig {
+            join_reordering_enabled: false,
+            ..PlanBuilderConfig::default()
+        })
+        .build(PlanBuildInput {
+            sql: "SELECT u.id, i.id, o.id \
+                  FROM public.plan_builder_jr_users u \
+                  JOIN public.plan_builder_jr_items i ON u.id = i.user_id \
+                  JOIN public.plan_builder_jr_orders o ON u.id = o.user_id",
+            params: Vec::new(),
+        })
+        .expect("build plan with join reordering disabled");
+    assert_eq!(
+        bottom_join_on(&disabled.logical_plan).as_deref(),
+        Some("u.id = i.user_id")
+    );
+}
+
+pub fn plan_builder_join_reordering_uses_live_attnums_after_drop() {
+    Spi::run("DROP TABLE IF EXISTS public.plan_builder_jr_drop_a").unwrap();
+    Spi::run("DROP TABLE IF EXISTS public.plan_builder_jr_drop_b").unwrap();
+    Spi::run("CREATE TABLE public.plan_builder_jr_drop_a (id int8, dropped int8, key int8)")
+        .unwrap();
+    Spi::run("ALTER TABLE public.plan_builder_jr_drop_a DROP COLUMN dropped").unwrap();
+    Spi::run("CREATE TABLE public.plan_builder_jr_drop_b (id int8, key int8)").unwrap();
+    Spi::run(
+        "INSERT INTO public.plan_builder_jr_drop_a (id, key) \
+         SELECT g, g FROM generate_series(1, 100) g",
+    )
+    .unwrap();
+    Spi::run(
+        "INSERT INTO public.plan_builder_jr_drop_b \
+         SELECT g, g FROM generate_series(1, 10) g",
+    )
+    .unwrap();
+    Spi::run("ANALYZE public.plan_builder_jr_drop_a").unwrap();
+    Spi::run("ANALYZE public.plan_builder_jr_drop_b").unwrap();
+
+    let built = build(
+        "SELECT a.id, b.id \
+         FROM public.plan_builder_jr_drop_a a \
+         JOIN public.plan_builder_jr_drop_b b ON a.key = b.key",
+        Vec::new(),
+    );
+
+    assert_eq!(built.scans.len(), 2);
+    assert!(built
+        .logical_plan
+        .display_indent()
+        .to_string()
+        .contains("a.key = b.key"));
 }
