@@ -21,6 +21,10 @@ importance: 0.7
   library coverage: they reference PostgreSQL backend symbols. Keep their
   coverage in pgrx tests (`cargo pgrx test pg17 -p pg_test` and
   `cargo pgrx test pg17 -p pg_fusion --features pg_test`).
+- Standalone unit-test crates should not dev-depend on PostgreSQL/SPI-backed
+  crates just for fixtures. For example, `plan_codec` tests use synthetic
+  `PgScanNode` plans; live `PlanBuilder`/catalog roundtrips belong in
+  `pg/test`.
 - Page-backed Arrow batches must not outlive their transfer/issuance ownership
   contract. Release pages only through the existing page/issued-frame APIs.
 - `PageMaterializeExec` is intentionally inserted above streaming scan-adjacent

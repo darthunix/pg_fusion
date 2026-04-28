@@ -1,7 +1,6 @@
 use super::*;
 
 use std::cmp::Ordering;
-use std::collections::HashMap;
 use std::fmt;
 use std::hash::{Hash, Hasher};
 use std::sync::Arc;
@@ -10,56 +9,30 @@ use arrow_schema::{DataType, Field, Schema};
 use bytes::BytesMut;
 use datafusion::prelude::SessionContext;
 use datafusion_common::tree_node::{TreeNode, TreeNodeRecursion};
-use datafusion_common::Column;
-use datafusion_common::DFSchema;
+use datafusion_common::{Column, DFSchema, TableReference};
 use datafusion_expr::expr::BinaryExpr;
 use datafusion_expr::logical_plan::{
-    Extension as LogicalExtension, Filter, LogicalPlan, Projection, UserDefinedLogicalNodeCore,
+    build_join_schema, EmptyRelation, Extension as LogicalExtension, Filter, Join, JoinConstraint,
+    JoinType, LogicalPlan, Projection, UserDefinedLogicalNodeCore,
 };
 use datafusion_expr::{lit, Expr, Operator};
 use datafusion_proto::protobuf::logical_plan_node::LogicalPlanType;
-use df_catalog::{CatalogResolver, ResolveError, ResolvedTable};
-use plan_builder::{BuiltPlan, PlanBuildInput, PlanBuilder, PlanBuilderConfig};
-use scan_node::{PgCteRefNode, PgScanId, PgScanNode, PgScanSpec};
+use scan_node::{PgCteId, PgCteRefNode, PgScanId, PgScanNode, PgScanSpec};
 use scan_sql::{compile_scan, CompileScanInput, LimitLowering, PgRelation};
 
 const TEST_IDENTIFIER_MAX_BYTES: usize = 63;
 
 #[derive(Debug, Clone)]
-struct FakeResolver {
-    tables: HashMap<datafusion_common::TableReference, ResolvedTable>,
+struct TestTable {
+    table_oid: u32,
+    relation: PgRelation,
+    schema: Arc<Schema>,
 }
 
-impl FakeResolver {
-    fn new(
-        tables: impl IntoIterator<Item = (datafusion_common::TableReference, ResolvedTable)>,
-    ) -> Self {
-        Self {
-            tables: tables.into_iter().collect(),
-        }
-    }
-}
-
-impl CatalogResolver for FakeResolver {
-    fn resolve_table(
-        &self,
-        table: &datafusion_common::TableReference,
-    ) -> Result<ResolvedTable, ResolveError> {
-        self.tables
-            .get(table)
-            .cloned()
-            .ok_or_else(|| ResolveError::TableNotFound {
-                schema: table.schema().map(|schema| schema.to_string()),
-                table: table.table().to_owned(),
-            })
-    }
-}
-
-fn user_table() -> ResolvedTable {
-    ResolvedTable {
+fn user_table() -> TestTable {
+    TestTable {
         table_oid: 42,
         relation: PgRelation::new(Some("public"), "users"),
-        column_attnums: vec![1, 2, 3],
         schema: Arc::new(Schema::new(vec![
             Field::new("id", DataType::Int64, false),
             Field::new("name", DataType::Utf8, true),
@@ -68,11 +41,10 @@ fn user_table() -> ResolvedTable {
     }
 }
 
-fn order_table() -> ResolvedTable {
-    ResolvedTable {
+fn order_table() -> TestTable {
+    TestTable {
         table_oid: 77,
         relation: PgRelation::new(Some("public"), "orders"),
-        column_attnums: vec![1, 2],
         schema: Arc::new(Schema::new(vec![
             Field::new("id", DataType::Int64, false),
             Field::new("user_id", DataType::Int64, false),
@@ -80,39 +52,102 @@ fn order_table() -> ResolvedTable {
     }
 }
 
-fn builder() -> PlanBuilder<FakeResolver> {
-    PlanBuilder::with_resolver(FakeResolver::new([
-        (
-            datafusion_common::TableReference::bare("users"),
-            user_table(),
+fn qualified_source_schema(table: &TestTable) -> DFSchema {
+    DFSchema::try_from_qualified_schema(
+        TableReference::partial(
+            table
+                .relation
+                .schema
+                .as_ref()
+                .expect("test relation is schema-qualified")
+                .as_str(),
+            table.relation.table.as_str(),
         ),
-        (
-            datafusion_common::TableReference::bare("orders"),
-            order_table(),
-        ),
-        (
-            datafusion_common::TableReference::partial("public", "users"),
-            ResolvedTable {
-                relation: PgRelation::new(Some("public"), "users"),
-                ..user_table()
-            },
-        ),
-    ]))
-    .with_config(PlanBuilderConfig {
-        target_partitions: 1,
+        table.schema.as_ref(),
+    )
+    .expect("dfschema")
+}
+
+fn qualified_schema(alias: &str, schema: &Schema) -> datafusion_common::DFSchemaRef {
+    Arc::new(
+        DFSchema::try_from_qualified_schema(TableReference::bare(alias), schema)
+            .expect("qualified schema"),
+    )
+}
+
+fn pg_scan_spec(
+    scan_id: u64,
+    table: TestTable,
+    projection: Option<&[usize]>,
+    filters: &[Expr],
+    requested_limit: Option<usize>,
+) -> Arc<PgScanSpec> {
+    let source_schema = qualified_source_schema(&table);
+    let compiled = compile_scan(CompileScanInput {
+        relation: &table.relation,
+        schema: table.schema.as_ref(),
         identifier_max_bytes: TEST_IDENTIFIER_MAX_BYTES,
-        first_scan_id: 1,
-        ..PlanBuilderConfig::default()
+        projection,
+        filters,
+        requested_limit,
+        limit_lowering: LimitLowering::ExternalHint,
+    })
+    .expect("compile scan");
+    Arc::new(
+        PgScanSpec::try_new(
+            PgScanId::new(scan_id),
+            table.table_oid,
+            table.relation,
+            &source_schema,
+            compiled,
+        )
+        .expect("scan spec"),
+    )
+}
+
+fn pg_scan_plan(scan_id: u64, table: TestTable, projection: Option<&[usize]>) -> LogicalPlan {
+    PgScanNode::new(pg_scan_spec(scan_id, table, projection, &[], None)).into_logical_plan()
+}
+
+fn simple_scan_plan() -> LogicalPlan {
+    pg_scan_plan(1, user_table(), Some(&[0]))
+}
+
+fn no_scan_plan() -> LogicalPlan {
+    let input = LogicalPlan::EmptyRelation(EmptyRelation {
+        produce_one_row: true,
+        schema: Arc::new(DFSchema::empty()),
+    });
+    LogicalPlan::Projection(
+        Projection::try_new(vec![lit(1_i64)], Arc::new(input)).expect("projection"),
+    )
+}
+
+fn join_plan(
+    left: LogicalPlan,
+    right: LogicalPlan,
+    left_column: Column,
+    right_column: Column,
+    join_type: JoinType,
+) -> LogicalPlan {
+    let schema = Arc::new(
+        build_join_schema(left.schema(), right.schema(), &join_type).expect("join schema"),
+    );
+    LogicalPlan::Join(Join {
+        left: Arc::new(left),
+        right: Arc::new(right),
+        on: vec![(Expr::Column(left_column), Expr::Column(right_column))],
+        filter: None,
+        join_type,
+        join_constraint: JoinConstraint::On,
+        schema,
+        null_equals_null: false,
     })
 }
 
-fn build_sql(sql: &str) -> BuiltPlan {
-    builder()
-        .build(PlanBuildInput {
-            sql,
-            params: Vec::new(),
-        })
-        .expect("build plan")
+fn column_at(plan: &LogicalPlan, index: usize) -> Column {
+    let (qualifier, field) = plan.schema().qualified_field(index);
+    Column::from((qualifier, field))
 }
 
 fn encode_all<const PAGE: usize>(plan: &LogicalPlan) -> (Vec<u8>, usize) {
@@ -295,18 +330,23 @@ fn roundtrips_pg_scan_with_residual_filters() {
 
 #[test]
 fn roundtrips_join_with_multiple_pg_scans() {
-    let built = build_sql(
-        "SELECT users.id, orders.id \
-         FROM users JOIN orders ON users.id = orders.user_id",
+    let left = pg_scan_plan(1, user_table(), Some(&[0]));
+    let right = pg_scan_plan(2, order_table(), Some(&[0, 1]));
+    let plan = join_plan(
+        left.clone(),
+        right.clone(),
+        column_at(&left, 0),
+        column_at(&right, 1),
+        JoinType::Inner,
     );
-    let decoded = roundtrip(&built.logical_plan);
+    let decoded = roundtrip(&plan);
 
     assert_eq!(
-        built.logical_plan.display_indent().to_string(),
+        plan.display_indent().to_string(),
         decoded.display_indent().to_string()
     );
 
-    let expected_scans = collect_pg_scans(&built.logical_plan);
+    let expected_scans = collect_pg_scans(&plan);
     let actual_scans = collect_pg_scans(&decoded);
     assert_eq!(expected_scans.len(), 2);
     assert_eq!(actual_scans.len(), 2);
@@ -321,16 +361,24 @@ fn roundtrips_join_with_multiple_pg_scans() {
 }
 
 #[test]
-fn roundtrips_rewritten_in_subquery_with_multiple_pg_scans() {
-    let built = build_sql("SELECT id FROM users WHERE id IN (SELECT user_id FROM orders)");
-    let decoded = roundtrip(&built.logical_plan);
+fn roundtrips_left_semi_join_with_multiple_pg_scans() {
+    let left = pg_scan_plan(1, user_table(), Some(&[0]));
+    let right = pg_scan_plan(2, order_table(), Some(&[1]));
+    let plan = join_plan(
+        left.clone(),
+        right.clone(),
+        column_at(&left, 0),
+        column_at(&right, 0),
+        JoinType::LeftSemi,
+    );
+    let decoded = roundtrip(&plan);
 
     assert_eq!(
-        built.logical_plan.display_indent().to_string(),
+        plan.display_indent().to_string(),
         decoded.display_indent().to_string()
     );
 
-    let expected_scans = collect_pg_scans(&built.logical_plan);
+    let expected_scans = collect_pg_scans(&plan);
     let actual_scans = collect_pg_scans(&decoded);
     assert_eq!(expected_scans.len(), 2);
     assert_eq!(actual_scans.len(), 2);
@@ -345,14 +393,40 @@ fn roundtrips_rewritten_in_subquery_with_multiple_pg_scans() {
 
 #[test]
 fn roundtrips_materialized_multi_use_cte() {
-    let built = build_sql(
-        "WITH u AS (SELECT id, score FROM users) \
-         SELECT a.id FROM u a JOIN u b ON a.id = b.id",
+    let producer = pg_scan_plan(1, user_table(), Some(&[0, 2]));
+    let producer_schema = Schema::new(vec![
+        Field::new("id", DataType::Int64, false),
+        Field::new("score", DataType::Float64, true),
+    ]);
+    let left = PgCteRefNode::new(
+        PgCteId::new(1),
+        "u",
+        producer.clone(),
+        qualified_schema("a", &producer_schema),
+        None,
+        None,
+    )
+    .into_logical_plan();
+    let right = PgCteRefNode::new(
+        PgCteId::new(1),
+        "u",
+        producer,
+        qualified_schema("b", &producer_schema),
+        None,
+        None,
+    )
+    .into_logical_plan();
+    let plan = join_plan(
+        left.clone(),
+        right.clone(),
+        column_at(&left, 0),
+        column_at(&right, 0),
+        JoinType::Inner,
     );
-    let decoded = roundtrip(&built.logical_plan);
+    let decoded = roundtrip(&plan);
 
     assert_eq!(
-        built.logical_plan.display_indent().to_string(),
+        plan.display_indent().to_string(),
         decoded.display_indent().to_string()
     );
     assert_eq!(count_cte_refs(&decoded), 2);
@@ -364,16 +438,11 @@ fn roundtrips_materialized_multi_use_cte() {
 
 #[test]
 fn roundtrips_builtin_no_scan_query() {
-    let built = builder()
-        .build(PlanBuildInput {
-            sql: "SELECT extract(day from now())",
-            params: Vec::new(),
-        })
-        .expect("build no-scan plan");
-    let decoded = roundtrip(&built.logical_plan);
+    let plan = no_scan_plan();
+    let decoded = roundtrip(&plan);
 
     assert_eq!(
-        built.logical_plan.display_indent().to_string(),
+        plan.display_indent().to_string(),
         decoded.display_indent().to_string()
     );
     assert!(collect_pg_scans(&decoded).is_empty());
@@ -455,7 +524,7 @@ fn rejects_unsupported_extension_nodes() {
 
 #[test]
 fn encoder_rejects_empty_output_chunk() {
-    let plan = build_sql("SELECT id FROM users").logical_plan;
+    let plan = simple_scan_plan();
     let mut session = PlanEncodeSession::new(&plan).expect("encode session");
     let err = session
         .write_chunk(&mut [])
@@ -473,8 +542,8 @@ fn decoder_empty_chunk_waits_for_more_input() {
 
 #[test]
 fn decoder_reports_unexpected_eof_for_truncated_input() {
-    let built = build_sql("SELECT id FROM users");
-    let bytes = encode_bytes(&built.logical_plan);
+    let plan = simple_scan_plan();
+    let bytes = encode_bytes(&plan);
     let truncated = &bytes[..bytes.len() - 1];
     let mut session = PlanDecodeSession::new();
 
@@ -496,8 +565,8 @@ fn decoder_reports_unexpected_eof_for_truncated_input() {
 
 #[test]
 fn decoder_requires_eof_before_returning_done() {
-    let built = build_sql("SELECT id FROM users");
-    let bytes = encode_bytes(&built.logical_plan);
+    let expected = simple_scan_plan();
+    let bytes = encode_bytes(&expected);
     let mut session = PlanDecodeSession::new();
 
     let progress = session
@@ -512,7 +581,7 @@ fn decoder_requires_eof_before_returning_done() {
     {
         DecodeProgress::Done(plan) => {
             assert_eq!(
-                built.logical_plan.display_indent().to_string(),
+                expected.display_indent().to_string(),
                 plan.display_indent().to_string()
             );
             assert!(session.is_finished());
@@ -523,8 +592,8 @@ fn decoder_requires_eof_before_returning_done() {
 
 #[test]
 fn decoder_rejects_trailing_bytes_after_plan_boundary_before_eof() {
-    let built = build_sql("SELECT id FROM users");
-    let bytes = encode_bytes(&built.logical_plan);
+    let plan = simple_scan_plan();
+    let bytes = encode_bytes(&plan);
     let mut session = PlanDecodeSession::new();
 
     let progress = session
@@ -545,33 +614,9 @@ fn decoder_rejects_trailing_bytes_after_plan_boundary_before_eof() {
 
 #[test]
 fn decoder_poisoned_after_build_stage_failure() {
-    let built = build_sql("SELECT extract(day from now())");
-    let mut envelope = collect_plan_envelope(&built.logical_plan).expect("collect envelope");
-    let source_schema = DFSchema::try_from_qualified_schema(
-        datafusion_common::TableReference::partial("public", "users"),
-        user_table().schema.as_ref(),
-    )
-    .expect("dfschema");
-    let compiled = compile_scan(CompileScanInput {
-        relation: &PgRelation::new(Some("public"), "users"),
-        schema: user_table().schema.as_ref(),
-        identifier_max_bytes: TEST_IDENTIFIER_MAX_BYTES,
-        projection: Some(&[0]),
-        filters: &[],
-        requested_limit: None,
-        limit_lowering: LimitLowering::ExternalHint,
-    })
-    .expect("compile scan");
-    let orphan = Arc::new(
-        PgScanSpec::try_new(
-            PgScanId::new(42),
-            42,
-            PgRelation::new(Some("public"), "users"),
-            &source_schema,
-            compiled,
-        )
-        .expect("orphan spec"),
-    );
+    let plan = no_scan_plan();
+    let mut envelope = collect_plan_envelope(&plan).expect("collect envelope");
+    let orphan = pg_scan_spec(42, user_table(), Some(&[0]), &[], None);
     envelope.pg_scan_specs.insert(orphan.scan_id, orphan);
 
     let mut bytes = BytesMut::new();
@@ -614,8 +659,8 @@ fn rejects_bad_magic_and_version() {
 
 #[test]
 fn rejects_missing_pg_scan_spec_reference() {
-    let built = build_sql("SELECT id FROM users");
-    let bytes = encode_bytes(&built.logical_plan);
+    let plan = simple_scan_plan();
+    let bytes = encode_bytes(&plan);
     let ctx = SessionContext::new();
     let mut source = Bytes::from(bytes);
     let mut envelope = decode_envelope_from(&mut source, &ctx).expect("decode envelope");
@@ -629,33 +674,9 @@ fn rejects_missing_pg_scan_spec_reference() {
 
 #[test]
 fn rejects_orphan_pg_scan_spec() {
-    let built = build_sql("SELECT extract(day from now())");
-    let mut envelope = collect_plan_envelope(&built.logical_plan).expect("collect envelope");
-    let source_schema = DFSchema::try_from_qualified_schema(
-        datafusion_common::TableReference::partial("public", "users"),
-        user_table().schema.as_ref(),
-    )
-    .expect("dfschema");
-    let compiled = compile_scan(CompileScanInput {
-        relation: &PgRelation::new(Some("public"), "users"),
-        schema: user_table().schema.as_ref(),
-        identifier_max_bytes: TEST_IDENTIFIER_MAX_BYTES,
-        projection: Some(&[0]),
-        filters: &[],
-        requested_limit: None,
-        limit_lowering: LimitLowering::ExternalHint,
-    })
-    .expect("compile scan");
-    let orphan = Arc::new(
-        PgScanSpec::try_new(
-            PgScanId::new(42),
-            42,
-            PgRelation::new(Some("public"), "users"),
-            &source_schema,
-            compiled,
-        )
-        .expect("orphan spec"),
-    );
+    let plan = no_scan_plan();
+    let mut envelope = collect_plan_envelope(&plan).expect("collect envelope");
+    let orphan = pg_scan_spec(42, user_table(), Some(&[0]), &[], None);
     envelope.pg_scan_specs.insert(orphan.scan_id, orphan);
 
     let mut sink = BytesMut::new();
