@@ -19,6 +19,7 @@ pub use runtime::{
 };
 pub use scan_exec::{
     OpenScanRequest, ScanBatchSource, ScanProducerPeer, WorkerPgScanExec, WorkerPgScanExecFactory,
+    WorkerScanTuning,
 };
 pub use scan_flow_driver::{OpenScanControl, ScanFlowDriver, ScanFlowDriverStep, ScanFlowOpen};
 pub use transport_scan_source::{ScanIngressProvider, TransportScanBatchSource};

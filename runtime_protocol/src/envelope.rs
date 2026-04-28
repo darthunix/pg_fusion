@@ -3,7 +3,7 @@ use crate::message::RuntimeMessageFamily;
 use std::io::Write;
 
 const RUNTIME_PROTOCOL_MAGIC: u32 = 0x5046_5232;
-const RUNTIME_PROTOCOL_VERSION: u16 = 3;
+const RUNTIME_PROTOCOL_VERSION: u16 = 4;
 pub const RUNTIME_ENVELOPE_HEADER_LEN: usize = 8;
 
 pub(crate) const BACKEND_EXECUTION_START_TAG: u8 = 1;

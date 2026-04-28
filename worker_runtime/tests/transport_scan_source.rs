@@ -21,7 +21,7 @@ use scan_node::PgScanId;
 use transfer::PageRx;
 use worker_runtime::{
     OpenScanRequest, ScanBatchSource, ScanIngressProvider, ScanProducerPeer,
-    TransportScanBatchSource, WorkerRuntimeError,
+    TransportScanBatchSource, WorkerRuntimeError, WorkerScanTuning,
 };
 
 struct OwnedRegion {
@@ -164,6 +164,7 @@ fn open_request(peer: control_transport::BackendLeaseSlot) -> OpenScanRequest {
         output_schema: output_schema(),
         page_kind: import::ARROW_LAYOUT_BATCH_KIND,
         page_flags: 0,
+        tuning: WorkerScanTuning::default(),
     }
 }
 
@@ -175,6 +176,7 @@ fn open_request_with_producers(producers: Vec<ScanProducerPeer>) -> OpenScanRequ
         output_schema: output_schema(),
         page_kind: import::ARROW_LAYOUT_BATCH_KIND,
         page_flags: 0,
+        tuning: WorkerScanTuning::default(),
     }
 }
 

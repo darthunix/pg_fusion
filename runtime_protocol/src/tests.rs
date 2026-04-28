@@ -177,6 +177,8 @@ fn encode_raw_backend_start_execution(
     write_u64_to(&mut buf, plan.plan_id).expect("plan id");
     write_u16_to(&mut buf, plan.page_kind).expect("page kind");
     write_u16_to(&mut buf, plan.page_flags).expect("page flags");
+    write_u32_to(&mut buf, 8).expect("scan batch channel capacity");
+    write_u32_to(&mut buf, 100).expect("scan idle poll interval");
     buf.extend_from_slice(scan_channel_bytes);
     buf
 }
@@ -264,6 +266,7 @@ fn backend_start_execution_round_trips_with_empty_scan_map() {
     let message = BackendExecutionToWorker::StartExecution {
         session_epoch: 9,
         plan: plan_descriptor(),
+        options: ExecutionOptionsWire::default(),
         scans: ScanChannelSet::empty(),
     };
     let encoded = encode_backend(message);
@@ -273,6 +276,7 @@ fn backend_start_execution_round_trips_with_empty_scan_map() {
         BackendExecutionToWorkerRef::StartExecution {
             session_epoch: 9,
             plan: plan_descriptor(),
+            options: ExecutionOptionsWire::default(),
             scans: ScanChannelSetRef::empty(),
         }
     );
@@ -281,9 +285,14 @@ fn backend_start_execution_round_trips_with_empty_scan_map() {
 #[test]
 fn backend_start_execution_round_trips_with_scan_channels() {
     let channels = scan_channels();
+    let options = ExecutionOptionsWire {
+        scan_batch_channel_capacity: 16,
+        scan_idle_poll_interval_us: 250,
+    };
     let message = BackendExecutionToWorker::StartExecution {
         session_epoch: 9,
         plan: plan_descriptor(),
+        options,
         scans: ScanChannelSet::new(&channels).expect("valid scan set"),
     };
     let encoded = encode_backend(message);
@@ -291,6 +300,7 @@ fn backend_start_execution_round_trips_with_scan_channels() {
     let BackendExecutionToWorkerRef::StartExecution {
         session_epoch,
         plan,
+        options: decoded_options,
         scans,
     } = decoded
     else {
@@ -298,6 +308,7 @@ fn backend_start_execution_round_trips_with_scan_channels() {
     };
     assert_eq!(session_epoch, 9);
     assert_eq!(plan, plan_descriptor());
+    assert_eq!(decoded_options, options);
     let decoded_channels: Vec<_> = scans.iter().collect();
     assert_eq!(decoded_channels.as_slice(), &channels);
 }

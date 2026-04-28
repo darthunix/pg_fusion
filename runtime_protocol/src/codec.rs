@@ -14,13 +14,13 @@ use crate::envelope::{
 use crate::error::{DecodeError, EncodeError};
 use crate::message::{
     BackendExecutionToWorker, BackendExecutionToWorkerRef, BackendScanToWorker,
-    BackendScanToWorkerRef, ExecutionFailureCode, RuntimeMessageFamily, WorkerExecutionToBackend,
-    WorkerScanToBackend, WorkerScanToBackendRef,
+    BackendScanToWorkerRef, ExecutionFailureCode, ExecutionOptionsWire, RuntimeMessageFamily,
+    WorkerExecutionToBackend, WorkerScanToBackend, WorkerScanToBackendRef,
 };
 use crate::msgpack::{
     encode_into_with_len, encoded_len_with, read_optional_u64_from, read_str_from, read_u16_from,
-    read_u64_from, read_u8_from, write_optional_u64_to, write_str_to, write_u16_to, write_u64_to,
-    write_u8_to,
+    read_u32_from, read_u64_from, read_u8_from, write_optional_u64_to, write_str_to, write_u16_to,
+    write_u32_to, write_u64_to, write_u8_to,
 };
 use crate::scan::{
     write_producer_slice_to, write_scan_channel_slice_to, PlanFlowDescriptor, ScanFlowDescriptorRef,
@@ -126,10 +126,15 @@ pub fn decode_backend_execution_to_worker(
                 page_kind: read_u16_from(&mut source)?,
                 page_flags: read_u16_from(&mut source)?,
             };
+            let options = ExecutionOptionsWire {
+                scan_batch_channel_capacity: read_u32_from(&mut source)?,
+                scan_idle_poll_interval_us: read_u32_from(&mut source)?,
+            };
             let scans = decode_scan_channel_set_ref(original, &mut source)?;
             BackendExecutionToWorkerRef::StartExecution {
                 session_epoch,
                 plan,
+                options,
                 scans,
             }
         }
@@ -273,6 +278,7 @@ fn encode_backend_execution_to_worker_to<W: std::io::Write>(
         BackendExecutionToWorker::StartExecution {
             session_epoch,
             plan,
+            options,
             scans,
         } => {
             write_runtime_header_to(
@@ -284,6 +290,8 @@ fn encode_backend_execution_to_worker_to<W: std::io::Write>(
             write_u64_to(sink, plan.plan_id)?;
             write_u16_to(sink, plan.page_kind)?;
             write_u16_to(sink, plan.page_flags)?;
+            write_u32_to(sink, options.scan_batch_channel_capacity)?;
+            write_u32_to(sink, options.scan_idle_poll_interval_us)?;
             write_scan_channel_slice_to(sink, scans.channels())?;
         }
         BackendExecutionToWorker::CancelExecution { session_epoch } => {

@@ -3,7 +3,6 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::task::{Context, Poll};
 use std::thread;
-use std::time::Duration;
 
 use arrow_array::RecordBatch;
 use arrow_schema::SchemaRef;
@@ -27,8 +26,6 @@ use tracing::{debug, warn};
 use crate::error::WorkerRuntimeError;
 use crate::scan_exec::{OpenScanRequest, ScanBatchSource};
 use crate::scan_flow_driver::{OpenScanControl, ScanFlowDriver, ScanFlowDriverStep, ScanFlowOpen};
-
-const IDLE_POLL_INTERVAL: Duration = Duration::from_millis(1);
 
 /// External provider of per-scan issued ingress bindings.
 ///
@@ -155,7 +152,7 @@ impl ScanBatchSource for TransportScanBatchSource {
             .collect::<Result<Vec<_>, _>>()
             .map_err(df_external)?;
         let schema = Arc::clone(&request.output_schema);
-        let (tx, rx) = channel(1);
+        let (tx, rx) = channel(request.tuning.batch_channel_capacity);
         let stop = Arc::new(AtomicBool::new(false));
         let stop_for_thread = Arc::clone(&stop);
         let region = self.region;
@@ -395,7 +392,7 @@ fn run_transport_scan_thread_inner(
         }
         if !any_frame {
             let idle_start = metrics.now_ns();
-            thread::sleep(IDLE_POLL_INTERVAL);
+            thread::sleep(request.tuning.idle_poll_interval);
             let idle_end = metrics.now_ns();
             metrics.add(
                 MetricId::ScanIdleSleepNs,

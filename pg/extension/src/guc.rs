@@ -31,6 +31,8 @@ pub(crate) static PAGE_SIZE: GucSetting<i32> = GucSetting::<i32>::new(64 * 1024)
 pub(crate) static PAGE_COUNT: GucSetting<i32> = GucSetting::<i32>::new(256);
 
 pub(crate) static SCAN_FETCH_BATCH_ROWS: GucSetting<i32> = GucSetting::<i32>::new(1024);
+pub(crate) static SCAN_BATCH_CHANNEL_CAPACITY: GucSetting<i32> = GucSetting::<i32>::new(8);
+pub(crate) static SCAN_IDLE_POLL_INTERVAL_US: GucSetting<i32> = GucSetting::<i32>::new(100);
 pub(crate) static ESTIMATOR_INITIAL_TAIL_BYTES_PER_ROW: GucSetting<i32> =
     GucSetting::<i32>::new(64);
 pub(crate) static SCAN_TIMING_DETAIL: GucSetting<bool> = GucSetting::<bool>::new(false);
@@ -52,6 +54,8 @@ pub struct HostConfig {
     pub page_size: usize,
     pub page_count: u32,
     pub scan_fetch_batch_rows: u32,
+    pub scan_batch_channel_capacity: u32,
+    pub scan_idle_poll_interval_us: u32,
     pub estimator_initial_tail_bytes_per_row: u32,
     pub scan_timing_detail: bool,
     pub join_reordering: bool,
@@ -171,6 +175,22 @@ pub fn register_gucs() {
         c"Number of rows fetched per PostgreSQL portal drain in backend scan streaming",
         &SCAN_FETCH_BATCH_ROWS,
     );
+    define_userset_int(
+        c"pg_fusion.scan_batch_channel_capacity",
+        c"Worker scan batch channel capacity",
+        c"Bounded DataFusion batch channel capacity per PostgreSQL scan stream",
+        &SCAN_BATCH_CHANNEL_CAPACITY,
+        1,
+        1024,
+    );
+    define_userset_int(
+        c"pg_fusion.scan_idle_poll_interval_us",
+        c"Worker scan idle poll interval",
+        c"Microseconds a worker scan thread sleeps when no scan frames are ready",
+        &SCAN_IDLE_POLL_INTERVAL_US,
+        1,
+        1_000_000,
+    );
     define_positive_int(
         c"pg_fusion.estimator_initial_tail_bytes_per_row",
         c"Initial variable-width tail bytes per row",
@@ -242,6 +262,14 @@ pub fn host_config() -> Result<HostConfig, HostConfigError> {
             "pg_fusion.scan_fetch_batch_rows",
             SCAN_FETCH_BATCH_ROWS.get(),
         )?,
+        scan_batch_channel_capacity: positive_u32(
+            "pg_fusion.scan_batch_channel_capacity",
+            SCAN_BATCH_CHANNEL_CAPACITY.get(),
+        )?,
+        scan_idle_poll_interval_us: positive_u32(
+            "pg_fusion.scan_idle_poll_interval_us",
+            SCAN_IDLE_POLL_INTERVAL_US.get(),
+        )?,
         estimator_initial_tail_bytes_per_row: positive_u32(
             "pg_fusion.estimator_initial_tail_bytes_per_row",
             ESTIMATOR_INITIAL_TAIL_BYTES_PER_ROW.get(),
@@ -275,6 +303,8 @@ impl HostConfig {
     pub fn backend_service_config(&self) -> BackendServiceConfig {
         let mut config = BackendServiceConfig::default();
         config.scan_fetch_batch_rows = self.scan_fetch_batch_rows;
+        config.scan_batch_channel_capacity = self.scan_batch_channel_capacity;
+        config.scan_idle_poll_interval_us = self.scan_idle_poll_interval_us;
         config.estimator_default.initial_tail_bytes_per_row =
             self.estimator_initial_tail_bytes_per_row;
         config.diagnostics = DiagnosticsConfig::new(self.backend_log_level, self.log_path.clone());
@@ -312,6 +342,26 @@ fn define_positive_int(
         1,
         i32::MAX,
         GucContext::Postmaster,
+        GucFlags::default(),
+    );
+}
+
+fn define_userset_int(
+    name: &'static std::ffi::CStr,
+    short_desc: &'static std::ffi::CStr,
+    long_desc: &'static std::ffi::CStr,
+    setting: &'static GucSetting<i32>,
+    min: i32,
+    max: i32,
+) {
+    GucRegistry::define_int_guc(
+        name,
+        short_desc,
+        long_desc,
+        setting,
+        min,
+        max,
+        GucContext::Userset,
         GucFlags::default(),
     );
 }
@@ -375,6 +425,8 @@ mod tests {
             page_size: 65536,
             page_count: 256,
             scan_fetch_batch_rows: 77,
+            scan_batch_channel_capacity: 9,
+            scan_idle_poll_interval_us: 123,
             estimator_initial_tail_bytes_per_row: 33,
             scan_timing_detail: true,
             join_reordering: false,
@@ -384,6 +436,8 @@ mod tests {
         let worker = config.worker_runtime_config();
 
         assert_eq!(backend.scan_fetch_batch_rows, 77);
+        assert_eq!(backend.scan_batch_channel_capacity, 9);
+        assert_eq!(backend.scan_idle_poll_interval_us, 123);
         assert_eq!(backend.estimator_default.initial_tail_bytes_per_row, 33);
         assert!(backend.scan_timing_detail);
         assert!(!backend.join_reordering_enabled);

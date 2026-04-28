@@ -1,5 +1,6 @@
 use std::collections::BTreeMap;
 use std::sync::Arc;
+use std::time::Duration;
 
 use control_transport::{
     BackendLeaseId, BackendLeaseSlot, CommitOutcome, TransportRegion, WorkerTransport,
@@ -24,7 +25,7 @@ use crate::error::WorkerRuntimeError;
 use crate::fsm::worker_execution_flow::StateMachine as WorkerExecutionMachine;
 use crate::fsm::{WorkerExecutionEvent, WorkerExecutionState};
 use crate::scan_exec::{
-    ScanBatchSource, ScanProducerPeer, WorkerPgScanExec, WorkerPgScanExecFactory,
+    ScanBatchSource, ScanProducerPeer, WorkerPgScanExec, WorkerPgScanExecFactory, WorkerScanTuning,
 };
 
 /// Static configuration for one worker-side runtime instance.
@@ -73,6 +74,7 @@ pub struct PendingPhysicalPlanning {
     peer: BackendLeaseSlot,
     flow: PlanFlowId,
     config: WorkerRuntimeConfig,
+    scan_tuning: WorkerScanTuning,
     scan_source: Arc<dyn ScanBatchSource>,
     scan_peers: BTreeMap<u64, Vec<ScanProducerPeer>>,
     logical_plan: LogicalPlan,
@@ -130,6 +132,7 @@ pub struct WorkerRuntimeCore {
     active_session_epoch: Option<u64>,
     latest_session: Option<RetainedSession>,
     active_plan_flow: Option<PlanFlowId>,
+    active_scan_tuning: Option<WorkerScanTuning>,
     scan_peers: BTreeMap<u64, Vec<ScanProducerPeer>>,
     plan_role: WorkerPlanRole,
     scan_source: Arc<dyn ScanBatchSource>,
@@ -160,6 +163,7 @@ impl WorkerRuntimeCore {
             active_session_epoch: None,
             latest_session: None,
             active_plan_flow: None,
+            active_scan_tuning: None,
             scan_peers: BTreeMap::new(),
             plan_role: WorkerPlanRole::new(),
             scan_source,
@@ -241,8 +245,9 @@ impl WorkerRuntimeCore {
             BackendToWorkerRef::StartExecution {
                 session_epoch,
                 plan,
+                options,
                 scans,
-            } => self.start_execution(peer, session_epoch, plan, scans),
+            } => self.start_execution(peer, session_epoch, plan, options, scans),
             BackendToWorkerRef::CancelExecution { session_epoch } => {
                 self.cancel_execution(peer, session_epoch)
             }
@@ -400,6 +405,9 @@ impl WorkerRuntimeCore {
                 .expect("physical planning only starts with an active peer"),
             flow,
             config: self.config.clone(),
+            scan_tuning: self
+                .active_scan_tuning
+                .expect("physical planning only starts with active execution options"),
             scan_source: Arc::clone(&self.scan_source),
             scan_peers: self.scan_peers.clone(),
             logical_plan,
@@ -443,6 +451,7 @@ impl WorkerRuntimeCore {
         peer: BackendLeaseSlot,
         session_epoch: u64,
         plan: runtime_protocol::PlanFlowDescriptor,
+        options: runtime_protocol::ExecutionOptionsWire,
         scans: runtime_protocol::ScanChannelSetRef<'_>,
     ) -> Result<WorkerRuntimeStep, WorkerRuntimeError> {
         if self.state() != WorkerExecutionState::Idle {
@@ -466,6 +475,7 @@ impl WorkerRuntimeCore {
             session_epoch,
             plan_id: plan.plan_id,
         };
+        let scan_tuning = worker_scan_tuning_from_options(options)?;
         let scan_peers = materialize_scan_peer_map(scans)?;
         self.plan_role
             .open(PlanOpen::new(flow, plan.page_kind, plan.page_flags))?;
@@ -476,6 +486,7 @@ impl WorkerRuntimeCore {
             session_epoch,
         });
         self.active_plan_flow = Some(flow);
+        self.active_scan_tuning = Some(scan_tuning);
         self.scan_peers = scan_peers;
         self.physical_plan = None;
         Ok(WorkerRuntimeStep::PlanOpened {
@@ -586,6 +597,7 @@ impl WorkerRuntimeCore {
         self.active_peer = None;
         self.active_session_epoch = None;
         self.active_plan_flow = None;
+        self.active_scan_tuning = None;
         self.scan_peers.clear();
         self.plan_role.abort();
         self.physical_plan = None;
@@ -644,6 +656,7 @@ impl PendingPhysicalPlanning {
             self.scan_peers,
             self.config.scan_page_kind,
             self.config.scan_page_flags,
+            self.scan_tuning,
         );
         let pg_scan_planner = PgScanExtensionPlanner::new(Arc::new(factory));
         let physical_planner =
@@ -678,6 +691,25 @@ fn materialize_scan_peer_map(
             });
     }
     Ok(scan_peers)
+}
+
+fn worker_scan_tuning_from_options(
+    options: runtime_protocol::ExecutionOptionsWire,
+) -> Result<WorkerScanTuning, WorkerRuntimeError> {
+    if options.scan_batch_channel_capacity == 0 {
+        return Err(WorkerRuntimeError::ProtocolViolation(
+            "scan_batch_channel_capacity must be positive".into(),
+        ));
+    }
+    if options.scan_idle_poll_interval_us == 0 {
+        return Err(WorkerRuntimeError::ProtocolViolation(
+            "scan_idle_poll_interval_us must be positive".into(),
+        ));
+    }
+    Ok(WorkerScanTuning {
+        batch_channel_capacity: options.scan_batch_channel_capacity as usize,
+        idle_poll_interval: Duration::from_micros(options.scan_idle_poll_interval_us as u64),
+    })
 }
 
 fn backend_lease_slot_from_wire(peer: runtime_protocol::BackendLeaseSlotWire) -> BackendLeaseSlot {
@@ -1062,6 +1094,7 @@ mod tests {
             BackendToWorker::StartExecution {
                 session_epoch: 10,
                 plan: plan_descriptor(20),
+                options: runtime_protocol::ExecutionOptionsWire::default(),
                 scans: ScanChannelSet::empty(),
             },
         )
@@ -1087,6 +1120,7 @@ mod tests {
             BackendToWorker::StartExecution {
                 session_epoch: 10,
                 plan: plan_descriptor(20),
+                options: runtime_protocol::ExecutionOptionsWire::default(),
                 scans: ScanChannelSet::new(&channels).unwrap(),
             },
         )
@@ -1119,6 +1153,38 @@ mod tests {
     }
 
     #[test]
+    fn start_execution_retains_scan_tuning_options_for_planning() {
+        let mut core = core();
+        let options = runtime_protocol::ExecutionOptionsWire {
+            scan_batch_channel_capacity: 17,
+            scan_idle_poll_interval_us: 250,
+        };
+        accept(
+            &mut core,
+            BackendToWorker::StartExecution {
+                session_epoch: 10,
+                plan: plan_descriptor(20),
+                options,
+                scans: ScanChannelSet::empty(),
+            },
+        )
+        .unwrap();
+        let flow = core.active_plan_flow.expect("active flow");
+        core.consume_event(WorkerExecutionEvent::PlanDecoded)
+            .unwrap();
+
+        let pending = core.begin_physical_planning(flow, empty_plan());
+
+        assert_eq!(
+            pending.scan_tuning,
+            WorkerScanTuning {
+                batch_channel_capacity: 17,
+                idle_poll_interval: Duration::from_micros(250),
+            }
+        );
+    }
+
+    #[test]
     fn stale_cancel_is_ignored() {
         let mut core = core();
         accept(
@@ -1126,6 +1192,7 @@ mod tests {
             BackendToWorker::StartExecution {
                 session_epoch: 10,
                 plan: plan_descriptor(20),
+                options: runtime_protocol::ExecutionOptionsWire::default(),
                 scans: ScanChannelSet::empty(),
             },
         )
@@ -1155,6 +1222,7 @@ mod tests {
             BackendToWorker::StartExecution {
                 session_epoch: 10,
                 plan: plan_descriptor(20),
+                options: runtime_protocol::ExecutionOptionsWire::default(),
                 scans: ScanChannelSet::empty(),
             },
         )
@@ -1185,6 +1253,7 @@ mod tests {
             BackendToWorker::StartExecution {
                 session_epoch: 10,
                 plan: plan_descriptor(20),
+                options: runtime_protocol::ExecutionOptionsWire::default(),
                 scans: ScanChannelSet::empty(),
             },
         )
@@ -1216,6 +1285,7 @@ mod tests {
             BackendToWorker::StartExecution {
                 session_epoch: 11,
                 plan: plan_descriptor(21),
+                options: runtime_protocol::ExecutionOptionsWire::default(),
                 scans: ScanChannelSet::empty(),
             },
         )
@@ -1237,6 +1307,7 @@ mod tests {
             BackendToWorker::StartExecution {
                 session_epoch: 10,
                 plan: plan_descriptor(20),
+                options: runtime_protocol::ExecutionOptionsWire::default(),
                 scans: ScanChannelSet::empty(),
             },
         )
@@ -1293,6 +1364,7 @@ mod tests {
             BackendToWorker::StartExecution {
                 session_epoch: 10,
                 plan: plan_descriptor(20),
+                options: runtime_protocol::ExecutionOptionsWire::default(),
                 scans: ScanChannelSet::empty(),
             },
         )
@@ -1329,6 +1401,7 @@ mod tests {
             BackendToWorker::StartExecution {
                 session_epoch: 10,
                 plan: plan_descriptor(20),
+                options: runtime_protocol::ExecutionOptionsWire::default(),
                 scans: ScanChannelSet::empty(),
             },
         )
@@ -1373,6 +1446,7 @@ mod tests {
             BackendToWorker::StartExecution {
                 session_epoch: 10,
                 plan: plan_descriptor(20),
+                options: runtime_protocol::ExecutionOptionsWire::default(),
                 scans: ScanChannelSet::empty(),
             },
         )
@@ -1401,6 +1475,7 @@ mod tests {
             BackendToWorker::StartExecution {
                 session_epoch: 10,
                 plan: plan_descriptor(20),
+                options: runtime_protocol::ExecutionOptionsWire::default(),
                 scans: ScanChannelSet::empty(),
             },
         )
@@ -1437,6 +1512,7 @@ mod tests {
             BackendToWorker::StartExecution {
                 session_epoch: 10,
                 plan: plan_descriptor(20),
+                options: runtime_protocol::ExecutionOptionsWire::default(),
                 scans: ScanChannelSet::empty(),
             },
         )
@@ -1453,6 +1529,7 @@ mod tests {
             BackendToWorker::StartExecution {
                 session_epoch: 10,
                 plan: plan_descriptor(21),
+                options: runtime_protocol::ExecutionOptionsWire::default(),
                 scans: ScanChannelSet::empty(),
             },
         )
@@ -1471,6 +1548,7 @@ mod tests {
             BackendToWorker::StartExecution {
                 session_epoch: 9,
                 plan: plan_descriptor(22),
+                options: runtime_protocol::ExecutionOptionsWire::default(),
                 scans: ScanChannelSet::empty(),
             },
         )
@@ -1489,6 +1567,7 @@ mod tests {
             BackendToWorker::StartExecution {
                 session_epoch: 11,
                 plan: plan_descriptor(23),
+                options: runtime_protocol::ExecutionOptionsWire::default(),
                 scans: ScanChannelSet::empty(),
             },
         )
@@ -1606,6 +1685,7 @@ mod tests {
             BackendToWorker::StartExecution {
                 session_epoch: 10,
                 plan: plan_descriptor(20),
+                options: runtime_protocol::ExecutionOptionsWire::default(),
                 scans: ScanChannelSet::empty(),
             },
         )
@@ -1659,6 +1739,7 @@ mod tests {
             BackendToWorker::StartExecution {
                 session_epoch: 11,
                 plan: plan_descriptor(21),
+                options: runtime_protocol::ExecutionOptionsWire::default(),
                 scans: ScanChannelSet::empty(),
             },
         )
@@ -1680,6 +1761,7 @@ mod tests {
             BackendToWorker::StartExecution {
                 session_epoch: 10,
                 plan: plan_descriptor(20),
+                options: runtime_protocol::ExecutionOptionsWire::default(),
                 scans: ScanChannelSet::empty(),
             },
         )
@@ -1721,6 +1803,7 @@ mod tests {
             BackendToWorker::StartExecution {
                 session_epoch: 11,
                 plan: plan_descriptor(21),
+                options: runtime_protocol::ExecutionOptionsWire::default(),
                 scans: ScanChannelSet::empty(),
             },
         )
@@ -1742,6 +1825,7 @@ mod tests {
             BackendToWorker::StartExecution {
                 session_epoch: 10,
                 plan: plan_descriptor(20),
+                options: runtime_protocol::ExecutionOptionsWire::default(),
                 scans: ScanChannelSet::empty(),
             },
         )
@@ -1787,6 +1871,7 @@ mod tests {
             BackendToWorker::StartExecution {
                 session_epoch: 11,
                 plan: plan_descriptor(21),
+                options: runtime_protocol::ExecutionOptionsWire::default(),
                 scans: ScanChannelSet::empty(),
             },
         )
@@ -1808,6 +1893,7 @@ mod tests {
             BackendToWorker::StartExecution {
                 session_epoch: 10,
                 plan: plan_descriptor(20),
+                options: runtime_protocol::ExecutionOptionsWire::default(),
                 scans: ScanChannelSet::empty(),
             },
         )
@@ -1830,6 +1916,7 @@ mod tests {
             BackendToWorker::StartExecution {
                 session_epoch: 10,
                 plan: plan_descriptor(20),
+                options: runtime_protocol::ExecutionOptionsWire::default(),
                 scans: ScanChannelSet::empty(),
             },
         )
@@ -1873,6 +1960,7 @@ mod tests {
             BackendToWorker::StartExecution {
                 session_epoch: 10,
                 plan: plan_descriptor(20),
+                options: runtime_protocol::ExecutionOptionsWire::default(),
                 scans: ScanChannelSet::empty(),
             },
         )
@@ -1908,6 +1996,7 @@ mod tests {
             BackendToWorker::StartExecution {
                 session_epoch: 10,
                 plan: plan_descriptor(20),
+                options: runtime_protocol::ExecutionOptionsWire::default(),
                 scans: ScanChannelSet::empty(),
             },
         )
@@ -1936,6 +2025,7 @@ mod tests {
             BackendToWorker::StartExecution {
                 session_epoch: 10,
                 plan: plan_descriptor(20),
+                options: runtime_protocol::ExecutionOptionsWire::default(),
                 scans: ScanChannelSet::empty(),
             },
         )
@@ -1974,6 +2064,7 @@ mod tests {
         let start_a = BackendToWorker::StartExecution {
             session_epoch: 5,
             plan: plan_descriptor(20),
+            options: runtime_protocol::ExecutionOptionsWire::default(),
             scans: ScanChannelSet::empty(),
         };
         let mut encoded_a =
@@ -2046,6 +2137,7 @@ mod tests {
         let start_b = BackendToWorker::StartExecution {
             session_epoch: 1,
             plan: plan_descriptor(21),
+            options: runtime_protocol::ExecutionOptionsWire::default(),
             scans: ScanChannelSet::empty(),
         };
         let mut encoded_b =

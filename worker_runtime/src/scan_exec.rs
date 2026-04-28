@@ -1,6 +1,7 @@
 use std::any::Any;
 use std::collections::BTreeMap;
 use std::sync::Arc;
+use std::time::Duration;
 
 use arrow_schema::SchemaRef;
 use control_transport::BackendLeaseSlot;
@@ -23,6 +24,21 @@ pub struct ScanProducerPeer {
     pub peer: BackendLeaseSlot,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct WorkerScanTuning {
+    pub batch_channel_capacity: usize,
+    pub idle_poll_interval: Duration,
+}
+
+impl Default for WorkerScanTuning {
+    fn default() -> Self {
+        Self {
+            batch_channel_capacity: 8,
+            idle_poll_interval: Duration::from_micros(100),
+        }
+    }
+}
+
 /// Worker request for one backend-owned scan.
 ///
 /// The worker-side physical scan only receives stable scan identity, output
@@ -38,6 +54,7 @@ pub struct OpenScanRequest {
     pub output_schema: SchemaRef,
     pub page_kind: transfer::MessageKind,
     pub page_flags: u16,
+    pub tuning: WorkerScanTuning,
 }
 
 /// Runtime-specific source of scan batches.
@@ -57,6 +74,7 @@ pub struct WorkerPgScanExecFactory {
     scan_peers: BTreeMap<u64, Vec<ScanProducerPeer>>,
     page_kind: transfer::MessageKind,
     page_flags: u16,
+    tuning: WorkerScanTuning,
 }
 
 impl WorkerPgScanExecFactory {
@@ -66,6 +84,7 @@ impl WorkerPgScanExecFactory {
         scan_peers: BTreeMap<u64, Vec<ScanProducerPeer>>,
         page_kind: transfer::MessageKind,
         page_flags: u16,
+        tuning: WorkerScanTuning,
     ) -> Self {
         Self {
             session_epoch,
@@ -73,6 +92,7 @@ impl WorkerPgScanExecFactory {
             scan_peers,
             page_kind,
             page_flags,
+            tuning,
         }
     }
 }
@@ -84,6 +104,7 @@ impl std::fmt::Debug for WorkerPgScanExecFactory {
             .field("scan_peer_count", &self.scan_peers.len())
             .field("page_kind", &self.page_kind)
             .field("page_flags", &self.page_flags)
+            .field("tuning", &self.tuning)
             .finish_non_exhaustive()
     }
 }
@@ -110,6 +131,7 @@ impl PgScanExecFactory for WorkerPgScanExecFactory {
             Arc::clone(&self.source),
             self.page_kind,
             self.page_flags,
+            self.tuning,
         )))
     }
 }
@@ -123,6 +145,7 @@ pub struct WorkerPgScanExec {
     source: Arc<dyn ScanBatchSource>,
     page_kind: transfer::MessageKind,
     page_flags: u16,
+    tuning: WorkerScanTuning,
     props: PlanProperties,
 }
 
@@ -135,6 +158,7 @@ impl WorkerPgScanExec {
         source: Arc<dyn ScanBatchSource>,
         page_kind: transfer::MessageKind,
         page_flags: u16,
+        tuning: WorkerScanTuning,
     ) -> Self {
         let props = PlanProperties::new(
             EquivalenceProperties::new(Arc::clone(&output_schema)),
@@ -150,6 +174,7 @@ impl WorkerPgScanExec {
             source,
             page_kind,
             page_flags,
+            tuning,
             props,
         }
     }
@@ -233,6 +258,7 @@ impl ExecutionPlan for WorkerPgScanExec {
             output_schema: Arc::clone(&self.output_schema),
             page_kind: self.page_kind,
             page_flags: self.page_flags,
+            tuning: self.tuning,
         })
     }
 
@@ -351,7 +377,14 @@ mod tests {
                 peer,
             }],
         );
-        let factory = WorkerPgScanExecFactory::new(99, source, scan_peers, 0x4152, 0);
+        let factory = WorkerPgScanExecFactory::new(
+            99,
+            source,
+            scan_peers,
+            0x4152,
+            0,
+            WorkerScanTuning::default(),
+        );
         let plan = factory.create(spec(7)).unwrap();
 
         let exec = plan
@@ -384,6 +417,7 @@ mod tests {
             source.clone(),
             0x4152,
             0,
+            WorkerScanTuning::default(),
         );
         let ctx = Arc::new(TaskContext::default());
         let stream = exec.execute(0, ctx).unwrap();
@@ -396,6 +430,7 @@ mod tests {
         assert_eq!(requests[0].scan_id, PgScanId::new(8));
         assert_eq!(requests[0].page_kind, 0x4152);
         assert_eq!(requests[0].page_flags, 0);
+        assert_eq!(requests[0].tuning, WorkerScanTuning::default());
     }
 
     #[test]
@@ -417,6 +452,7 @@ mod tests {
             source,
             0x4152,
             0,
+            WorkerScanTuning::default(),
         );
         let err = match exec.execute(1, Arc::new(TaskContext::default())) {
             Ok(_) => panic!("nonzero partition should fail"),
@@ -429,9 +465,16 @@ mod tests {
     #[test]
     fn factory_rejects_missing_scan_peer_mapping() {
         let source = Arc::new(RecordingSource::new());
-        let err = WorkerPgScanExecFactory::new(99, source, BTreeMap::new(), 0x4152, 0)
-            .create(spec(7))
-            .expect_err("missing scan peer mapping should fail");
+        let err = WorkerPgScanExecFactory::new(
+            99,
+            source,
+            BTreeMap::new(),
+            0x4152,
+            0,
+            WorkerScanTuning::default(),
+        )
+        .create(spec(7))
+        .expect_err("missing scan peer mapping should fail");
 
         assert!(err
             .to_string()

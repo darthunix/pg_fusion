@@ -75,6 +75,8 @@ thread_local! {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct BackendServiceConfig {
     pub scan_fetch_batch_rows: u32,
+    pub scan_batch_channel_capacity: u32,
+    pub scan_idle_poll_interval_us: u32,
     pub estimator_default: EstimatorConfig,
     pub join_reordering_enabled: bool,
     pub plan_page_kind: u16,
@@ -90,6 +92,8 @@ impl Default for BackendServiceConfig {
     fn default() -> Self {
         Self {
             scan_fetch_batch_rows: 1024,
+            scan_batch_channel_capacity: 8,
+            scan_idle_poll_interval_us: 100,
             estimator_default: EstimatorConfig::default(),
             join_reordering_enabled: true,
             plan_page_kind: 0x504c,
@@ -241,6 +245,7 @@ pub struct ScanWorkerLaunchOutput {
 pub struct BeginExecutionOutput {
     pub key: ExecutionKey,
     pub plan: PlanFlowDescriptor,
+    pub options: runtime_protocol::ExecutionOptionsWire,
     pub scan_channels: Box<[ScanChannelDescriptorWire]>,
 }
 
@@ -249,6 +254,7 @@ impl BeginExecutionOutput {
         BackendExecutionToWorker::StartExecution {
             session_epoch: self.key.session_epoch,
             plan: self.plan,
+            options: self.options,
             scans: ScanChannelSet::new(&self.scan_channels)
                 .expect("begin_execution scan channels must remain unique"),
         }
@@ -668,6 +674,10 @@ impl BackendService {
                 page_kind: config.plan_page_kind,
                 page_flags: config.plan_page_flags,
             };
+            let options = runtime_protocol::ExecutionOptionsWire {
+                scan_batch_channel_capacity: config.scan_batch_channel_capacity,
+                scan_idle_poll_interval_us: config.scan_idle_poll_interval_us,
+            };
 
             *slot.borrow_mut() = Some(ActiveExecution {
                 key,
@@ -692,6 +702,7 @@ impl BackendService {
             Ok(BeginExecutionOutput {
                 key,
                 plan,
+                options,
                 scan_channels,
             })
         })

@@ -126,6 +126,8 @@ pg_fusion.page_count = 256
 
 # Backend PostgreSQL scan streaming.
 pg_fusion.scan_fetch_batch_rows = 1024
+pg_fusion.scan_batch_channel_capacity = 8
+pg_fusion.scan_idle_poll_interval_us = 100
 pg_fusion.estimator_initial_tail_bytes_per_row = 64
 
 # Logical planning.
@@ -140,6 +142,12 @@ bytes in each direction; the worker-to-backend scan ring carries `OpenScan`
 messages that include the full scan producer set used by dynamic scan workers.
 The issued-page permit pool is sized from `pg_fusion.page_count`, so each
 shared page can have one outstanding issued handoff.
+
+`pg_fusion.scan_batch_channel_capacity` and
+`pg_fusion.scan_idle_poll_interval_us` are `Userset` GUCs despite being shown in
+the sample config. The backend captures their current session values when a
+query starts and sends them to the worker in `StartExecution`; changing them
+mid-query does not affect already-open scan streams.
 
 After configuring the pgrx cluster, install the extension and open `psql`:
 
@@ -243,6 +251,18 @@ defensive runtime inputs to at least one row. Page boundaries are handled by
 the fetch row budget, not by pausing the PostgreSQL receiver mid-fetch. Scans
 with variable-width transport columns use one-row drains so an overflowing row
 can be retried on the next Arrow page without losing the scan position.
+
+`pg_fusion.scan_batch_channel_capacity` controls the bounded channel between a
+worker scan thread and the DataFusion stream consumer. The default is `8`,
+which lets scan threads absorb short downstream polling gaps without retaining
+unbounded Arrow batches. Lower values make backpressure visible sooner; very
+large values can pin more page-backed batches before materialization operators
+copy them.
+
+`pg_fusion.scan_idle_poll_interval_us` controls how long a worker scan thread
+sleeps when no dedicated scan frame is ready. The default is `100` microseconds.
+Higher values reduce polling overhead but can add page handoff latency; lower
+values are useful when `scan_idle_sleep_ns` dominates metrics.
 
 `max_parallel_workers_per_gather` controls the query-wide budget for dynamic
 PostgreSQL scan workers across eligible pg_fusion leaf scans. `0` keeps scans

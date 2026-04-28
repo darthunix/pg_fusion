@@ -70,6 +70,22 @@ impl TryFrom<u8> for ExecutionFailureCode {
     }
 }
 
+/// Query-scoped worker execution options captured by the backend at start.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ExecutionOptionsWire {
+    pub scan_batch_channel_capacity: u32,
+    pub scan_idle_poll_interval_us: u32,
+}
+
+impl Default for ExecutionOptionsWire {
+    fn default() -> Self {
+        Self {
+            scan_batch_channel_capacity: 8,
+            scan_idle_poll_interval_us: 100,
+        }
+    }
+}
+
 /// Encode-side backend execution control messages carried on the primary slot.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum BackendExecutionToWorker<'a> {
@@ -77,6 +93,7 @@ pub enum BackendExecutionToWorker<'a> {
     StartExecution {
         session_epoch: u64,
         plan: PlanFlowDescriptor,
+        options: ExecutionOptionsWire,
         scans: ScanChannelSet<'a>,
     },
     /// Cancel one execution identified by `session_epoch`.
@@ -107,6 +124,7 @@ pub enum BackendExecutionToWorkerRef<'a> {
     StartExecution {
         session_epoch: u64,
         plan: PlanFlowDescriptor,
+        options: ExecutionOptionsWire,
         scans: ScanChannelSetRef<'a>,
     },
     /// Borrowed `CancelExecution` view.

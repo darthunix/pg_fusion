@@ -37,7 +37,7 @@ This is intentionally a strong invariant: once scan streaming starts, the
 backend must keep driving that scan through its `ActiveScanDriver` and must
 not interleave unrelated SPI or planning work in the same backend process.
 
-`BackendServiceConfig` also exposes a backend-local tuning knob for scan
+`BackendServiceConfig` also exposes backend-local tuning knobs for scan
 streaming:
 
 - `scan_fetch_batch_rows` controls the row budget for one direct
@@ -47,7 +47,11 @@ streaming:
 - scans with variable-width transport columns use one-row drains so an
   overflowing row can be copied into the next page without losing the portal
   position
-- public `slot_scan::ScanOptions` stay unchanged; this knob only affects the
+- `scan_batch_channel_capacity` and `scan_idle_poll_interval_us` are captured
+  into `StartExecution` so session-level extension GUCs affect the worker scan
+  stream even though dynamic background workers do not inherit backend-local
+  `SET LOCAL` state
+- public `slot_scan::ScanOptions` stay unchanged; these knobs only affect the
   internal backend-service streaming path
 
 The service can also accept externally launched scan producers through

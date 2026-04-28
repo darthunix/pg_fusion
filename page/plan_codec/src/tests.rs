@@ -102,6 +102,7 @@ fn builder() -> PlanBuilder<FakeResolver> {
         target_partitions: 1,
         identifier_max_bytes: TEST_IDENTIFIER_MAX_BYTES,
         first_scan_id: 1,
+        ..PlanBuilderConfig::default()
     })
 }
 

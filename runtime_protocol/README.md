@@ -29,6 +29,9 @@ The main contracts are:
   `OpenScan` with one leader plus 32 worker producers
 - `PlanFlowDescriptor` reconstructs a `plan_flow::PlanOpen` when paired with
   `session_epoch`
+- `ExecutionOptionsWire` carries query-scoped worker scan tuning captured by
+  the backend at `StartExecution`; it keeps session-level GUC values visible to
+  background workers without relying on their local GUC state
 - `ScanChannelDescriptorWire` publishes one dedicated scan producer slot for one
   `(scan_id, producer_id)` up front in `StartExecution`
 - `scan_channels` are encoded in strictly increasing
@@ -48,8 +51,8 @@ Typical backend-to-worker flow:
 ```rust,ignore
 use runtime_protocol::{
     encode_backend_execution_to_worker_into, BackendExecutionToWorker,
-    BackendLeaseSlotWire, PlanFlowDescriptor, ProducerRole, ScanChannelDescriptorWire,
-    ScanChannelSet,
+    BackendLeaseSlotWire, ExecutionOptionsWire, PlanFlowDescriptor, ProducerRole,
+    ScanChannelDescriptorWire, ScanChannelSet,
 };
 
 let scans = [ScanChannelDescriptorWire {
@@ -66,6 +69,7 @@ let msg = BackendExecutionToWorker::StartExecution {
         page_kind: 0x4152,
         page_flags: 0,
     },
+    options: ExecutionOptionsWire::default(),
     scans: ScanChannelSet::new(&scans)?,
 };
 
@@ -92,11 +96,12 @@ match msg {
     BackendExecutionToWorkerRef::StartExecution {
         session_epoch,
         plan,
+        options,
         scans,
     } => {
         // Entries are already validated to be sorted by `(scan_id, producer_id)`.
         let scan_channels: Vec<_> = scans.iter().collect();
-        let _ = (session_epoch, plan, scan_channels);
+        let _ = (session_epoch, plan, options, scan_channels);
     }
     BackendExecutionToWorkerRef::CancelExecution { .. }
     | BackendExecutionToWorkerRef::FailExecution { .. } => {}

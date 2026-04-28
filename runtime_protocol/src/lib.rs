@@ -28,7 +28,7 @@
 //! ```rust,ignore
 //! use runtime_protocol::{
 //!     decode_backend_execution_to_worker, encode_backend_execution_to_worker_into,
-//!     BackendExecutionToWorker, PlanFlowDescriptor, ScanChannelSet,
+//!     BackendExecutionToWorker, ExecutionOptionsWire, PlanFlowDescriptor, ScanChannelSet,
 //! };
 //!
 //! let message = BackendExecutionToWorker::StartExecution {
@@ -38,6 +38,7 @@
 //!         page_kind: 0x4152,
 //!         page_flags: 0,
 //!     },
+//!     options: ExecutionOptionsWire::default(),
 //!     scans: ScanChannelSet::empty(),
 //! };
 //!
@@ -96,8 +97,8 @@ pub use crate::envelope::RUNTIME_ENVELOPE_HEADER_LEN;
 pub use crate::error::{DecodeError, EncodeError};
 pub use crate::message::{
     BackendExecutionToWorker, BackendExecutionToWorkerRef, BackendScanToWorker,
-    BackendScanToWorkerRef, ExecutionFailureCode, RuntimeMessageFamily, WorkerExecutionToBackend,
-    WorkerScanToBackend, WorkerScanToBackendRef,
+    BackendScanToWorkerRef, ExecutionFailureCode, ExecutionOptionsWire, RuntimeMessageFamily,
+    WorkerExecutionToBackend, WorkerScanToBackend, WorkerScanToBackendRef,
 };
 pub use crate::scan::{
     BackendLeaseSlotWire, PlanFlowDescriptor, ProducerDescriptorWire, ProducerIter, ProducerRole,

@@ -353,11 +353,20 @@ fn begin_and_finalize_execution(
     let BackendToWorker::StartExecution {
         session_epoch,
         plan,
+        options,
         scans,
     } = begin.control()
     else {
         panic!("begin execution must emit StartExecution");
     };
+    assert_eq!(
+        options.scan_batch_channel_capacity,
+        config.scan_batch_channel_capacity
+    );
+    assert_eq!(
+        options.scan_idle_poll_interval_us,
+        config.scan_idle_poll_interval_us
+    );
     assert_eq!(scans.len(), begin.scan_channels.len());
 
     let open = PlanOpen::new(

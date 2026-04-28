@@ -19,6 +19,9 @@ producer peer, and consumes both issued page headers and backend-emitted scan
 terminal messages from those slots. `ScanIngressProvider` returns an `IssuedRx`
 per `(session_epoch, scan_id, producer_id)` because each producer owns an
 independent ordered transfer stream that starts at `transfer_id = 1`.
+`OpenScanRequest.tuning` controls the bounded worker scan batch channel and the
+idle poll sleep used by the scan thread; production values come from
+`runtime_protocol::ExecutionOptionsWire` captured at `StartExecution`.
 Dedicated scan slots must provide at least:
 
 - `256` bytes raw backend-to-worker ring capacity
