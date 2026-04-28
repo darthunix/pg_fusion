@@ -5,7 +5,7 @@ use pgrx::pg_sys;
 use row_estimator::PageRowEstimator;
 use runtime_metrics::{MetricId, RuntimeMetrics};
 use scan_flow::{BackendPageSource, FlowId, SourcePageStatus};
-use slot_encoder::{AppendStatus, PageBatchEncoder};
+use slot_encoder::{AppendStatus, EncodeProfile, PageBatchEncoder};
 use slot_scan::{ExecutionSpiContext, PreparedScan, SlotSinkAction, StreamingScanSession};
 
 pub(crate) struct SlotScanPageSource {
@@ -36,6 +36,19 @@ struct ScanFillTiming {
     fill_post_drain_ns: u64,
     fill_overflow_encode_ns: u64,
     fill_emit_ns: u64,
+}
+
+#[derive(Clone, Copy, Default)]
+struct AppendStatusProfile {
+    elapsed_ns: u64,
+    total: u64,
+}
+
+impl AppendStatusProfile {
+    fn record(&mut self, elapsed_ns: u64) {
+        self.elapsed_ns = self.elapsed_ns.saturating_add(elapsed_ns);
+        self.total = self.total.saturating_add(1);
+    }
 }
 
 impl ScanFillTiming {
@@ -141,14 +154,26 @@ impl SlotScanPageSource {
 
             if !self.pending_overflow.is_null() {
                 let overflow_encode_start = self.scan_timing_detail.then(|| self.metrics.now_ns());
+                let mut encode_profile = EncodeProfile::default();
+                let mut append_status_profile = AppendStatusProfile::default();
                 let overflow_status = append_pending_overflow(
                     self.overflow_slot,
                     &mut self.pending_overflow,
                     &mut encoder,
+                    self.scan_timing_detail.then_some(&mut encode_profile),
+                    self.scan_timing_detail
+                        .then_some(&mut append_status_profile),
+                    metrics,
                 )?;
                 if let Some(start) = overflow_encode_start {
                     let elapsed_ns = self.metrics.now_ns().saturating_sub(start);
                     self.metrics.add(MetricId::ScanArrowEncodeNs, elapsed_ns);
+                    record_encode_profile(
+                        self.metrics,
+                        encode_profile,
+                        append_status_profile,
+                        elapsed_ns,
+                    );
                     pending_overflow_encode_ns = elapsed_ns;
                 }
                 match overflow_status {
@@ -198,31 +223,8 @@ impl SlotScanPageSource {
                 // SAFETY: this backend-only callback is controlled by pg_fusion
                 // and returns expected failures through Result. A panic here is
                 // a bug, not a recoverable row-level PostgreSQL error.
-                let mut append_slot = |slot| match encoder.append_slot(slot)? {
-                    AppendStatus::Appended => {
-                        rows_written += 1;
-                        Ok::<SlotSinkAction, BackendServiceError>(SlotSinkAction::Continue)
-                    }
-                    AppendStatus::Full => {
-                        if row_budget != 1 {
-                            return Err(BackendServiceError::PageSource(format!(
-                                    "slot encoder filled before exhausting row budget: budget={row_budget}, rows_written={rows_written}, max_rows={max_rows}"
-                                )));
-                        }
-                        let overflow_copy_start = self.scan_timing_detail.then(|| metrics.now_ns());
-                        self.pending_overflow = unsafe { pg_sys::ExecCopySlotHeapTuple(slot) };
-                        if let Some(start) = overflow_copy_start {
-                            let elapsed_ns = metrics.now_ns().saturating_sub(start);
-                            metrics.add(MetricId::ScanOverflowCopyNs, elapsed_ns);
-                        }
-                        if self.pending_overflow.is_null() {
-                            return Err(BackendServiceError::PageSource(
-                                "ExecCopySlotHeapTuple returned null".into(),
-                            ));
-                        }
-                        Ok::<SlotSinkAction, BackendServiceError>(SlotSinkAction::Continue)
-                    }
-                };
+                let mut encode_profile = EncodeProfile::default();
+                let mut append_status_profile = AppendStatusProfile::default();
                 let mut attempt_pre_drain_ns = 0_u64;
                 if let Some(start) = pre_drain_start {
                     attempt_pre_drain_ns = metrics.now_ns().saturating_sub(start);
@@ -233,18 +235,44 @@ impl SlotScanPageSource {
                 let drain_start = self.scan_timing_detail.then(|| metrics.now_ns());
                 let drain_result = unsafe {
                     if self.scan_timing_detail {
+                        let mut append_slot = |slot| {
+                            let status = encoder.append_slot_profiled(slot, &mut encode_profile)?;
+                            handle_append_slot_status_profiled(
+                                status,
+                                row_budget,
+                                &mut rows_written,
+                                max_rows,
+                                slot,
+                                &mut self.pending_overflow,
+                                self.scan_timing_detail,
+                                metrics,
+                                &mut append_status_profile,
+                            )
+                        };
                         session.drain_slots_without_unwind_guard_profiled::<BackendServiceError>(
                             row_budget,
                             &mut append_slot,
                         )
                     } else {
+                        let mut append_slot = |slot| {
+                            let status = encoder.append_slot(slot)?;
+                            handle_append_slot_status(
+                                status,
+                                row_budget,
+                                &mut rows_written,
+                                max_rows,
+                                slot,
+                                &mut self.pending_overflow,
+                                self.scan_timing_detail,
+                                metrics,
+                            )
+                        };
                         session.drain_slots_without_unwind_guard::<BackendServiceError>(
                             row_budget,
                             &mut append_slot,
                         )
                     }
                 };
-                drop(append_slot);
                 let mut attempt_slot_drain_ns = 0_u64;
                 if let Some(start) = drain_start {
                     attempt_slot_drain_ns = metrics.now_ns().saturating_sub(start);
@@ -258,6 +286,12 @@ impl SlotScanPageSource {
                 if self.scan_timing_detail {
                     self.metrics
                         .add(MetricId::ScanArrowEncodeNs, drain.callback_ns);
+                    record_encode_profile(
+                        self.metrics,
+                        encode_profile,
+                        append_status_profile,
+                        drain.callback_ns,
+                    );
                     self.metrics.add(
                         MetricId::ScanPostgresReadNs,
                         drain.elapsed_ns.saturating_sub(drain.callback_ns),
@@ -386,6 +420,115 @@ fn record_page_retry(metrics: RuntimeMetrics, retry_start: Option<u64>) -> u64 {
     }
 }
 
+fn record_encode_profile(
+    metrics: RuntimeMetrics,
+    profile: EncodeProfile,
+    append_status: AppendStatusProfile,
+    callback_ns: u64,
+) {
+    metrics.add(MetricId::ScanAppendPrecheckNs, profile.append_precheck_ns);
+    metrics.add(
+        MetricId::ScanAppendPrecheckTotal,
+        profile.append_precheck_total,
+    );
+    metrics.add(MetricId::ScanTupledescCheckNs, profile.tupledesc_check_ns);
+    metrics.add(
+        MetricId::ScanTupledescCheckTotal,
+        profile.tupledesc_check_total,
+    );
+    metrics.add(MetricId::ScanSlotDeformNs, profile.slot_deform_ns);
+    metrics.add(MetricId::ScanSlotDeformTotal, profile.slot_deform_total);
+    metrics.add(MetricId::ScanCellExtractNs, profile.cell_extract_ns);
+    metrics.add(
+        MetricId::ScanCellsExtractedTotal,
+        profile.cells_extracted_total,
+    );
+    metrics.add(MetricId::ScanVarlenaDetoastNs, profile.varlena_detoast_ns);
+    metrics.add(
+        MetricId::ScanVarlenaDetoastTotal,
+        profile.varlena_detoast_total,
+    );
+    metrics.add(MetricId::ScanPageWriteNs, profile.page_write_ns);
+    metrics.add(MetricId::ScanRowEncodeOuterNs, profile.row_encode_outer_ns);
+    metrics.add(
+        MetricId::ScanRowEncodeOuterTotal,
+        profile.row_encode_outer_total,
+    );
+    metrics.add(MetricId::ScanAppendStatusNs, append_status.elapsed_ns);
+    metrics.add(MetricId::ScanAppendStatusTotal, append_status.total);
+    let classified_ns = profile
+        .classified_ns()
+        .saturating_add(append_status.elapsed_ns);
+    metrics.add(
+        MetricId::ScanEncodeUnclassifiedNs,
+        callback_ns.saturating_sub(classified_ns),
+    );
+}
+
+fn handle_append_slot_status_profiled(
+    status: AppendStatus,
+    row_budget: usize,
+    rows_written: &mut usize,
+    max_rows: usize,
+    slot: *mut pg_sys::TupleTableSlot,
+    pending_overflow: &mut pg_sys::HeapTuple,
+    scan_timing_detail: bool,
+    metrics: RuntimeMetrics,
+    profile: &mut AppendStatusProfile,
+) -> Result<SlotSinkAction, BackendServiceError> {
+    let start = metrics.now_ns();
+    let result = handle_append_slot_status(
+        status,
+        row_budget,
+        rows_written,
+        max_rows,
+        slot,
+        pending_overflow,
+        scan_timing_detail,
+        metrics,
+    );
+    profile.record(metrics.now_ns().saturating_sub(start));
+    result
+}
+
+fn handle_append_slot_status(
+    status: AppendStatus,
+    row_budget: usize,
+    rows_written: &mut usize,
+    max_rows: usize,
+    slot: *mut pg_sys::TupleTableSlot,
+    pending_overflow: &mut pg_sys::HeapTuple,
+    scan_timing_detail: bool,
+    metrics: RuntimeMetrics,
+) -> Result<SlotSinkAction, BackendServiceError> {
+    match status {
+        AppendStatus::Appended => {
+            *rows_written += 1;
+            Ok(SlotSinkAction::Continue)
+        }
+        AppendStatus::Full => {
+            if row_budget != 1 {
+                return Err(BackendServiceError::PageSource(format!(
+                    "slot encoder filled before exhausting row budget: budget={row_budget}, rows_written={}, max_rows={max_rows}",
+                    *rows_written
+                )));
+            }
+            let overflow_copy_start = scan_timing_detail.then(|| metrics.now_ns());
+            *pending_overflow = unsafe { pg_sys::ExecCopySlotHeapTuple(slot) };
+            if let Some(start) = overflow_copy_start {
+                let elapsed_ns = metrics.now_ns().saturating_sub(start);
+                metrics.add(MetricId::ScanOverflowCopyNs, elapsed_ns);
+            }
+            if (*pending_overflow).is_null() {
+                return Err(BackendServiceError::PageSource(
+                    "ExecCopySlotHeapTuple returned null".into(),
+                ));
+            }
+            Ok(SlotSinkAction::Continue)
+        }
+    }
+}
+
 impl BackendPageSource for SlotScanPageSource {
     type Error = BackendServiceError;
 
@@ -489,6 +632,9 @@ fn append_pending_overflow(
     slot: *mut pg_sys::TupleTableSlot,
     pending: &mut pg_sys::HeapTuple,
     encoder: &mut PageBatchEncoder<'_>,
+    profile: Option<&mut EncodeProfile>,
+    status_profile: Option<&mut AppendStatusProfile>,
+    metrics: RuntimeMetrics,
 ) -> Result<AppendStatus, BackendServiceError> {
     if slot.is_null() {
         return Err(BackendServiceError::PageSource(
@@ -500,13 +646,21 @@ fn append_pending_overflow(
         pg_sys::ExecStoreHeapTuple(*pending, slot, false);
     }
 
-    let status = encoder.append_slot(slot)?;
+    let status = if let Some(profile) = profile {
+        encoder.append_slot_profiled(slot, profile)?
+    } else {
+        encoder.append_slot(slot)?
+    };
+    let status_start = status_profile.as_ref().map(|_| metrics.now_ns());
     if status == AppendStatus::Appended {
         unsafe {
             clear_slot(slot);
             pg_sys::heap_freetuple(*pending);
         }
         *pending = std::ptr::null_mut();
+    }
+    if let (Some(profile), Some(start)) = (status_profile, status_start) {
+        profile.record(metrics.now_ns().saturating_sub(start));
     }
     Ok(status)
 }

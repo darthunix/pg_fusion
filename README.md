@@ -336,6 +336,22 @@ WHERE metric IN (
   'scan_fill_unclassified_ns',
   'scan_postgres_read_ns',
   'scan_arrow_encode_ns',
+  'scan_append_precheck_ns',
+  'scan_append_precheck_total',
+  'scan_tupledesc_check_ns',
+  'scan_tupledesc_check_total',
+  'scan_slot_deform_ns',
+  'scan_slot_deform_total',
+  'scan_cell_extract_ns',
+  'scan_cells_extracted_total',
+  'scan_varlena_detoast_ns',
+  'scan_varlena_detoast_total',
+  'scan_page_write_ns',
+  'scan_row_encode_outer_ns',
+  'scan_row_encode_outer_total',
+  'scan_append_status_ns',
+  'scan_append_status_total',
+  'scan_encode_unclassified_ns',
   'scan_fetch_calls_total',
   'scan_rows_encoded_total',
   'scan_b2w_wait_ns',
@@ -382,6 +398,12 @@ Interpretation:
   executor/heap/filter time.
 - `scan_arrow_encode_ns >> scan_postgres_read_ns` points at slot
   deform/detoast/Arrow serialization time.
+- `scan_append_precheck_ns`, `scan_tupledesc_check_ns`,
+  `scan_slot_deform_ns`, `scan_cell_extract_ns`,
+  `scan_varlena_detoast_ns`, `scan_page_write_ns`,
+  `scan_row_encode_outer_ns`, `scan_append_status_ns`, and
+  `scan_encode_unclassified_ns` split `scan_arrow_encode_ns`; compare
+  `scan_page_write_ns` with `cargo bench -p row_encoder --bench q05_encode`.
 - `scan_slot_drain_ns - scan_postgres_read_ns - scan_arrow_encode_ns`
   approximates PostgreSQL direct receiver/SPI wrapper overhead.
 - `scan_fill_pre_drain_ns`, `scan_fill_post_drain_ns`,

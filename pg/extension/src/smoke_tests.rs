@@ -618,6 +618,22 @@ pub(crate) fn metrics_smoke() {
             coalesce(max(value) FILTER (WHERE metric = 'scan_rows_encoded_total'), 0), ',',
             coalesce(max(value) FILTER (WHERE metric = 'scan_postgres_read_ns'), 0), ',',
             coalesce(max(value) FILTER (WHERE metric = 'scan_arrow_encode_ns'), 0), ',',
+            coalesce(max(value) FILTER (WHERE metric = 'scan_append_precheck_ns'), 0), ',',
+            coalesce(max(value) FILTER (WHERE metric = 'scan_append_precheck_total'), 0), ',',
+            coalesce(max(value) FILTER (WHERE metric = 'scan_tupledesc_check_ns'), 0), ',',
+            coalesce(max(value) FILTER (WHERE metric = 'scan_tupledesc_check_total'), 0), ',',
+            coalesce(max(value) FILTER (WHERE metric = 'scan_slot_deform_ns'), 0), ',',
+            coalesce(max(value) FILTER (WHERE metric = 'scan_slot_deform_total'), 0), ',',
+            coalesce(max(value) FILTER (WHERE metric = 'scan_cell_extract_ns'), 0), ',',
+            coalesce(max(value) FILTER (WHERE metric = 'scan_cells_extracted_total'), 0), ',',
+            coalesce(max(value) FILTER (WHERE metric = 'scan_varlena_detoast_ns'), 0), ',',
+            coalesce(max(value) FILTER (WHERE metric = 'scan_varlena_detoast_total'), 0), ',',
+            coalesce(max(value) FILTER (WHERE metric = 'scan_page_write_ns'), 0), ',',
+            coalesce(max(value) FILTER (WHERE metric = 'scan_row_encode_outer_ns'), 0), ',',
+            coalesce(max(value) FILTER (WHERE metric = 'scan_row_encode_outer_total'), 0), ',',
+            coalesce(max(value) FILTER (WHERE metric = 'scan_append_status_ns'), 0), ',',
+            coalesce(max(value) FILTER (WHERE metric = 'scan_append_status_total'), 0), ',',
+            coalesce(max(value) FILTER (WHERE metric = 'scan_encode_unclassified_ns'), 0), ',',
             coalesce(max(value) FILTER (WHERE metric = 'scan_slot_drain_ns'), 0), ',',
             coalesce(max(value) FILTER (WHERE metric = 'scan_page_snapshot_ns'), 0), ',',
             coalesce(max(value) FILTER (WHERE metric = 'scan_overflow_copy_ns'), 0), ',',
@@ -651,7 +667,7 @@ pub(crate) fn metrics_smoke() {
         .split(',')
         .map(|part| part.parse::<i64>().expect("metric value must be integer"))
         .collect::<Vec<_>>();
-    assert_eq!(parts.len(), 23);
+    assert_eq!(parts.len(), 39);
     assert!(
         parts[0] > 0,
         "scan_pages_sent_total must be positive: {summary}"
@@ -678,65 +694,129 @@ pub(crate) fn metrics_smoke() {
     );
     assert_eq!(
         parts[6], 0,
-        "scan_slot_drain_ns must stay zero without detailed timing: {summary}"
+        "scan_append_precheck_ns must stay zero without detailed timing: {summary}"
     );
     assert_eq!(
         parts[7], 0,
-        "scan_page_snapshot_ns must stay zero without detailed timing: {summary}"
+        "scan_append_precheck_total must stay zero without detailed timing: {summary}"
     );
     assert_eq!(
         parts[8], 0,
-        "scan_overflow_copy_ns must stay zero without detailed timing: {summary}"
+        "scan_tupledesc_check_ns must stay zero without detailed timing: {summary}"
     );
     assert_eq!(
         parts[9], 0,
-        "scan_page_retry_ns must stay zero without detailed timing: {summary}"
+        "scan_tupledesc_check_total must stay zero without detailed timing: {summary}"
     );
     assert_eq!(
         parts[10], 0,
-        "scan_page_retry_total must stay zero without detailed timing: {summary}"
+        "scan_slot_deform_ns must stay zero without detailed timing: {summary}"
     );
     assert_eq!(
         parts[11], 0,
-        "scan_fill_pre_drain_ns must stay zero without detailed timing: {summary}"
+        "scan_slot_deform_total must stay zero without detailed timing: {summary}"
     );
     assert_eq!(
         parts[12], 0,
-        "scan_fill_post_drain_ns must stay zero without detailed timing: {summary}"
+        "scan_cell_extract_ns must stay zero without detailed timing: {summary}"
     );
     assert_eq!(
         parts[13], 0,
-        "scan_fill_overflow_encode_ns must stay zero without detailed timing: {summary}"
+        "scan_cells_extracted_total must stay zero without detailed timing: {summary}"
     );
     assert_eq!(
         parts[14], 0,
-        "scan_fill_emit_ns must stay zero without detailed timing: {summary}"
+        "scan_varlena_detoast_ns must stay zero without detailed timing: {summary}"
     );
     assert_eq!(
         parts[15], 0,
+        "scan_varlena_detoast_total must stay zero without detailed timing: {summary}"
+    );
+    assert_eq!(
+        parts[16], 0,
+        "scan_page_write_ns must stay zero without detailed timing: {summary}"
+    );
+    assert_eq!(
+        parts[17], 0,
+        "scan_row_encode_outer_ns must stay zero without detailed timing: {summary}"
+    );
+    assert_eq!(
+        parts[18], 0,
+        "scan_row_encode_outer_total must stay zero without detailed timing: {summary}"
+    );
+    assert_eq!(
+        parts[19], 0,
+        "scan_append_status_ns must stay zero without detailed timing: {summary}"
+    );
+    assert_eq!(
+        parts[20], 0,
+        "scan_append_status_total must stay zero without detailed timing: {summary}"
+    );
+    assert_eq!(
+        parts[21], 0,
+        "scan_encode_unclassified_ns must stay zero without detailed timing: {summary}"
+    );
+    assert_eq!(
+        parts[22], 0,
+        "scan_slot_drain_ns must stay zero without detailed timing: {summary}"
+    );
+    assert_eq!(
+        parts[23], 0,
+        "scan_page_snapshot_ns must stay zero without detailed timing: {summary}"
+    );
+    assert_eq!(
+        parts[24], 0,
+        "scan_overflow_copy_ns must stay zero without detailed timing: {summary}"
+    );
+    assert_eq!(
+        parts[25], 0,
+        "scan_page_retry_ns must stay zero without detailed timing: {summary}"
+    );
+    assert_eq!(
+        parts[26], 0,
+        "scan_page_retry_total must stay zero without detailed timing: {summary}"
+    );
+    assert_eq!(
+        parts[27], 0,
+        "scan_fill_pre_drain_ns must stay zero without detailed timing: {summary}"
+    );
+    assert_eq!(
+        parts[28], 0,
+        "scan_fill_post_drain_ns must stay zero without detailed timing: {summary}"
+    );
+    assert_eq!(
+        parts[29], 0,
+        "scan_fill_overflow_encode_ns must stay zero without detailed timing: {summary}"
+    );
+    assert_eq!(
+        parts[30], 0,
+        "scan_fill_emit_ns must stay zero without detailed timing: {summary}"
+    );
+    assert_eq!(
+        parts[31], 0,
         "scan_fill_unclassified_ns must stay zero without detailed timing: {summary}"
     );
     assert!(
-        parts[16] > 0,
+        parts[32] > 0,
         "scan_batch_send_total must be positive: {summary}"
     );
     assert!(
-        parts[17] > 0,
+        parts[33] > 0,
         "scan_batch_delivery_total must be positive: {summary}"
     );
     assert_eq!(
-        parts[19], 6,
+        parts[35], 6,
         "all worker scan-thread metric rows must be present: {summary}"
     );
     assert!(
-        parts[20] > 0,
+        parts[36] > 0,
         "result_pages_read_total must be positive: {summary}"
     );
     assert!(
-        parts[21] > 0,
+        parts[37] > 0,
         "backend_rows_returned_total must be positive: {summary}"
     );
-    assert_eq!(parts[22], before_epoch);
+    assert_eq!(parts[38], before_epoch);
 
     let detail_epoch: i64 =
         simple_query_first_column_tx(&mut tx, "SELECT pg_fusion_metrics_reset()")
@@ -762,6 +842,40 @@ pub(crate) fn metrics_smoke() {
             coalesce(max(value) FILTER (WHERE metric = 'scan_rows_encoded_total'), 0), ',',
             coalesce(max(value) FILTER (WHERE metric = 'scan_postgres_read_ns'), 0), ',',
             coalesce(max(value) FILTER (WHERE metric = 'scan_arrow_encode_ns'), 0), ',',
+            coalesce(max(value) FILTER (WHERE metric = 'scan_append_precheck_ns'), 0), ',',
+            coalesce(max(value) FILTER (WHERE metric = 'scan_append_precheck_total'), 0), ',',
+            coalesce(max(value) FILTER (WHERE metric = 'scan_tupledesc_check_ns'), 0), ',',
+            coalesce(max(value) FILTER (WHERE metric = 'scan_tupledesc_check_total'), 0), ',',
+            coalesce(max(value) FILTER (WHERE metric = 'scan_slot_deform_ns'), 0), ',',
+            coalesce(max(value) FILTER (WHERE metric = 'scan_slot_deform_total'), 0), ',',
+            coalesce(max(value) FILTER (WHERE metric = 'scan_cell_extract_ns'), 0), ',',
+            coalesce(max(value) FILTER (WHERE metric = 'scan_cells_extracted_total'), 0), ',',
+            coalesce(max(value) FILTER (WHERE metric = 'scan_varlena_detoast_ns'), 0), ',',
+            coalesce(max(value) FILTER (WHERE metric = 'scan_varlena_detoast_total'), 0), ',',
+            coalesce(max(value) FILTER (WHERE metric = 'scan_page_write_ns'), 0), ',',
+            coalesce(max(value) FILTER (WHERE metric = 'scan_row_encode_outer_ns'), 0), ',',
+            coalesce(max(value) FILTER (WHERE metric = 'scan_row_encode_outer_total'), 0), ',',
+            coalesce(max(value) FILTER (WHERE metric = 'scan_append_status_ns'), 0), ',',
+            coalesce(max(value) FILTER (WHERE metric = 'scan_append_status_total'), 0), ',',
+            coalesce(max(value) FILTER (WHERE metric = 'scan_encode_unclassified_ns'), 0), ',',
+            count(*) FILTER (WHERE metric IN (
+                'scan_append_precheck_ns',
+                'scan_append_precheck_total',
+                'scan_tupledesc_check_ns',
+                'scan_tupledesc_check_total',
+                'scan_slot_deform_ns',
+                'scan_slot_deform_total',
+                'scan_cell_extract_ns',
+                'scan_cells_extracted_total',
+                'scan_varlena_detoast_ns',
+                'scan_varlena_detoast_total',
+                'scan_page_write_ns',
+                'scan_row_encode_outer_ns',
+                'scan_row_encode_outer_total',
+                'scan_append_status_ns',
+                'scan_append_status_total',
+                'scan_encode_unclassified_ns'
+            )), ',',
             coalesce(max(value) FILTER (WHERE metric = 'scan_slot_drain_ns'), 0), ',',
             coalesce(max(value) FILTER (WHERE metric = 'scan_page_snapshot_ns'), 0), ',',
             coalesce(max(value) FILTER (WHERE metric = 'scan_overflow_copy_ns'), 0), ',',
@@ -789,7 +903,7 @@ pub(crate) fn metrics_smoke() {
         .split(',')
         .map(|part| part.parse::<i64>().expect("metric value must be integer"))
         .collect::<Vec<_>>();
-    assert_eq!(detailed_parts.len(), 16);
+    assert_eq!(detailed_parts.len(), 33);
     assert!(
         detailed_parts[0] > 0,
         "scan_fetch_calls_total must be positive with detailed timing: {detailed}"
@@ -803,14 +917,26 @@ pub(crate) fn metrics_smoke() {
         "detailed scan timers must be positive with detailed timing: {detailed}"
     );
     assert!(
-        detailed_parts[4] > 0,
+        detailed_parts[11] > 0,
+        "scan_cells_extracted_total must be positive with detailed timing: {detailed}"
+    );
+    assert!(
+        detailed_parts[14] > 0,
+        "scan_page_write_ns must be positive with detailed timing: {detailed}"
+    );
+    assert_eq!(
+        detailed_parts[20], 16,
+        "all scan encode detail metric rows must be present: {detailed}"
+    );
+    assert!(
+        detailed_parts[21] > 0,
         "scan_slot_drain_ns must be positive with detailed timing: {detailed}"
     );
     assert_eq!(
-        detailed_parts[14], 5,
+        detailed_parts[31], 5,
         "all scan fill residual metric rows must be present: {detailed}"
     );
-    assert_eq!(detailed_parts[15], detail_epoch);
+    assert_eq!(detailed_parts[32], detail_epoch);
 
     let after_epoch: i64 =
         simple_query_first_column_tx(&mut tx, "SELECT pg_fusion_metrics_reset()")

@@ -129,6 +129,16 @@ Interpretation:
   pg_fusion row callback.
 - `scan_arrow_encode_ns` is callback time: slot deform/detoast plus Arrow page
   writes.
+- `scan_append_precheck_ns`, `scan_tupledesc_check_ns`,
+  `scan_slot_deform_ns`, `scan_cell_extract_ns`,
+  `scan_varlena_detoast_ns`, `scan_page_write_ns`,
+  `scan_row_encode_outer_ns`, and `scan_append_status_ns` split that callback
+  into append setup, slot descriptor checks, PostgreSQL slot deformation,
+  adapter extraction, detoasting, page writes, row-encoder outer bookkeeping,
+  and append status handling.
+- `scan_encode_unclassified_ns` is the remaining callback time after those
+  buckets; high values now mostly point at direct receiver/callback glue or
+  detailed-timing overhead.
 - `scan_fill_pre_drain_ns`, `scan_fill_post_drain_ns`,
   `scan_fill_overflow_encode_ns`, and `scan_fill_emit_ns` split Rust-side
   page-fill bookkeeping around the PostgreSQL drain and page emission paths.
@@ -164,6 +174,22 @@ Interpretation:
 | `scan_rows_encoded_total` | Number of PostgreSQL rows encoded into emitted backend-to-worker scan pages. |
 | `scan_postgres_read_ns` | Detailed-only time spent in `PortalRunFetch` outside the pg_fusion row callback. This approximates PostgreSQL executor/heap/filter time. |
 | `scan_arrow_encode_ns` | Detailed-only time spent inside the pg_fusion row callback, including slot deform/detoast and Arrow page writes. |
+| `scan_append_precheck_ns` | Detailed-only time spent in per-slot append setup before tuple descriptor checks, deformation, or row encoding. This includes slot pointer checks, needed-attribute bookkeeping, and `tts_values` / `tts_isnull` pointer checks. |
+| `scan_append_precheck_total` | Number of profiled slot append calls included in `scan_append_precheck_ns`. |
+| `scan_tupledesc_check_ns` | Detailed-only time spent validating the slot `TupleDesc` against the planned output descriptor. Cache hits are included and should be cheap. |
+| `scan_tupledesc_check_total` | Number of tuple descriptor checks included in `scan_tupledesc_check_ns`. |
+| `scan_slot_deform_ns` | Detailed-only time spent in PostgreSQL `slot_getsomeattrs_int()` while deforming slots before encoding. |
+| `scan_slot_deform_total` | Number of slot deformation calls included in `scan_slot_deform_ns`. |
+| `scan_cell_extract_ns` | Detailed-only time spent mapping projected output columns to source attributes, reading `tts_values` / `tts_isnull`, dispatching PostgreSQL OIDs, and extracting fixed-width or varlena pointers. |
+| `scan_cells_extracted_total` | Number of output cells extracted from PostgreSQL slots, including cells from rows that later report `AppendStatus::Full`. |
+| `scan_varlena_detoast_ns` | Detailed-only time spent entering PostgreSQL `pg_detoast_datum_packed()` for text-like and binary varlena values. |
+| `scan_varlena_detoast_total` | Number of varlena detoast calls included in `scan_varlena_detoast_ns`. |
+| `scan_page_write_ns` | Detailed-only time spent inside `row_encoder` writing already extracted cells into the Arrow page layout. Compare this with the PostgreSQL-free `row_encoder` Criterion benchmark. |
+| `scan_row_encode_outer_ns` | Detailed-only time spent inside `PageRowEncoder::append_row` outside cell extraction, detoasting, and page writes. This covers row-loop, capacity, full-page, and rollback bookkeeping. |
+| `scan_row_encode_outer_total` | Number of profiled row-encoder append calls included in `scan_row_encode_outer_ns`. |
+| `scan_append_status_ns` | Detailed-only time spent handling `AppendStatus` after a slot append, including row counters and the overflow-copy path when a row does not fit. |
+| `scan_append_status_total` | Number of append status handling calls included in `scan_append_status_ns`. |
+| `scan_encode_unclassified_ns` | Detailed-only remainder of `scan_arrow_encode_ns` after all published encode buckets are subtracted. This should usually be small; high values suggest callback glue or detailed-timing overhead. |
 | `scan_full_pages_total` | Number of scan pages emitted because the current Arrow page became full. |
 | `scan_eof_pages_total` | Number of partial scan pages emitted only after PostgreSQL reached EOF. |
 | `scan_pages_sent_total` | Number of scan data pages sent from backend to worker. Terminal scan close/control frames are not counted here. |
@@ -215,6 +241,24 @@ SELECT
     - coalesce(max(value) FILTER (WHERE metric = 'scan_postgres_read_ns'), 0)
     - coalesce(max(value) FILTER (WHERE metric = 'scan_arrow_encode_ns'), 0)
     AS scan_drain_wrapper_ns,
+  coalesce(max(value) FILTER (WHERE metric = 'scan_append_precheck_ns'), 0)
+    AS scan_append_precheck_ns,
+  coalesce(max(value) FILTER (WHERE metric = 'scan_tupledesc_check_ns'), 0)
+    AS scan_tupledesc_check_ns,
+  coalesce(max(value) FILTER (WHERE metric = 'scan_slot_deform_ns'), 0)
+    AS scan_slot_deform_ns,
+  coalesce(max(value) FILTER (WHERE metric = 'scan_cell_extract_ns'), 0)
+    AS scan_cell_extract_ns,
+  coalesce(max(value) FILTER (WHERE metric = 'scan_varlena_detoast_ns'), 0)
+    AS scan_varlena_detoast_ns,
+  coalesce(max(value) FILTER (WHERE metric = 'scan_page_write_ns'), 0)
+    AS scan_page_write_ns,
+  coalesce(max(value) FILTER (WHERE metric = 'scan_row_encode_outer_ns'), 0)
+    AS scan_row_encode_outer_ns,
+  coalesce(max(value) FILTER (WHERE metric = 'scan_append_status_ns'), 0)
+    AS scan_append_status_ns,
+  coalesce(max(value) FILTER (WHERE metric = 'scan_encode_unclassified_ns'), 0)
+    AS scan_encode_unclassified_ns,
   coalesce(max(value) FILTER (WHERE metric = 'scan_fill_pre_drain_ns'), 0)
     AS scan_fill_pre_drain_ns,
   coalesce(max(value) FILTER (WHERE metric = 'scan_fill_post_drain_ns'), 0)
@@ -229,9 +273,14 @@ FROM m;
 ```
 
 `scan_drain_wrapper_ns` points at `PortalRunFetch` receiver/SPI wrapper
-overhead outside PostgreSQL executor work and Arrow encoding. The `scan_fill_*`
-metrics split the old residual page-fill bookkeeping bucket; a large
-`scan_fill_unclassified_ns` means the fill path still needs finer metrics.
+overhead outside PostgreSQL executor work and Arrow encoding. The
+`scan_append_precheck_*`, `scan_tupledesc_check_*`, `scan_slot_deform_*`,
+`scan_cell_extract_*`, `scan_varlena_detoast_*`, `scan_page_write_ns`,
+`scan_row_encode_outer_*`, and `scan_append_status_*` buckets explain
+`scan_arrow_encode_ns`. The `scan_fill_*` metrics split the old residual
+page-fill bookkeeping bucket; a large
+`scan_encode_unclassified_ns` or `scan_fill_unclassified_ns` means the
+corresponding path still needs finer metrics.
 `scan_overflow_copy_ns` is nested inside the drain callback path, so inspect it
 separately instead of subtracting it again from the residual.
 
