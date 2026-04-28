@@ -334,14 +334,17 @@ fn run_transport_scan_thread_inner(
                 continue;
             };
             any_frame = true;
+            let frame_read_ns = metrics.now_ns();
             let producer_id = producer.producer_id;
 
             match decode_scan_inbound(&scratch[..len])? {
                 ScanInbound::Issued(frame) => {
                     if let Some(descriptor) = issued_page_descriptor(&frame) {
-                        if let Some(observation) =
-                            metrics.observe_page(PageDirection::BackendToWorker, descriptor)
-                        {
+                        if let Some(observation) = metrics.observe_page_at(
+                            PageDirection::BackendToWorker,
+                            descriptor,
+                            frame_read_ns,
+                        ) {
                             metrics.add(MetricId::ScanB2wWaitNs, observation.wait_ns);
                             metrics.increment(MetricId::ScanB2wWaitTotal);
                         }
@@ -350,7 +353,14 @@ fn run_transport_scan_thread_inner(
                     let step = driver.accept_page_frame(producer_id, &producer.rx, &frame)?;
                     metrics.add_elapsed(MetricId::ScanPageReadNs, read_start);
                     metrics.increment(MetricId::ScanPagesReadTotal);
-                    if forward_driver_step(&mut driver, step, tx, stop)? {
+                    if forward_driver_step(
+                        &mut driver,
+                        step,
+                        tx,
+                        stop,
+                        metrics,
+                        Some(frame_read_ns),
+                    )? {
                         terminal = true;
                         debug!(
                             component = "worker_scan",
@@ -365,7 +375,7 @@ fn run_transport_scan_thread_inner(
                 }
                 ScanInbound::Control(control) => {
                     let step = control_to_driver_step(request, &mut driver, control)?;
-                    if forward_driver_step(&mut driver, step, tx, stop)? {
+                    if forward_driver_step(&mut driver, step, tx, stop, metrics, None)? {
                         terminal = true;
                         debug!(
                             component = "worker_scan",
@@ -384,7 +394,14 @@ fn run_transport_scan_thread_inner(
             break Ok(());
         }
         if !any_frame {
+            let idle_start = metrics.now_ns();
             thread::sleep(IDLE_POLL_INTERVAL);
+            let idle_end = metrics.now_ns();
+            metrics.add(
+                MetricId::ScanIdleSleepNs,
+                idle_end.saturating_sub(idle_start),
+            );
+            metrics.increment(MetricId::ScanIdleSleepTotal);
             continue;
         }
     };
@@ -508,11 +525,28 @@ fn forward_driver_step(
     step: ScanFlowDriverStep,
     tx: &mut Sender<DFResult<RecordBatch>>,
     stop: &AtomicBool,
+    metrics: RuntimeMetrics,
+    batch_delivery_start_ns: Option<u64>,
 ) -> Result<bool, WorkerRuntimeError> {
     match step {
         ScanFlowDriverStep::Idle => Ok(false),
         ScanFlowDriverStep::Batch { batch, .. } => {
-            if futures::executor::block_on(tx.send(Ok(batch))).is_err() {
+            let send_start = metrics.now_ns();
+            let send_result = futures::executor::block_on(tx.send(Ok(batch)));
+            let send_end = metrics.now_ns();
+            metrics.add(
+                MetricId::ScanBatchSendNs,
+                send_end.saturating_sub(send_start),
+            );
+            metrics.increment(MetricId::ScanBatchSendTotal);
+            if let Some(start_ns) = batch_delivery_start_ns {
+                metrics.add(
+                    MetricId::ScanBatchDeliveryNs,
+                    send_end.saturating_sub(start_ns),
+                );
+                metrics.increment(MetricId::ScanBatchDeliveryTotal);
+            }
+            if send_result.is_err() {
                 stop.store(true, Ordering::Release);
             }
             Ok(false)

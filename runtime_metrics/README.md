@@ -12,6 +12,11 @@ elapsed monotonic time when that descriptor arrives. This keeps the first versio
 focused on the data-plane delays that matter for scan/result latency without
 wrapping every transport operation.
 
+Worker scan threads also record the local delivery path after a backend page is
+visible: idle polling sleeps, page import, and the blocking send into
+DataFusion's scan channel. These timers help distinguish backend-to-worker page
+handoff from DataFusion-side backpressure.
+
 ## Region Lifecycle
 
 Use `RuntimeMetricsConfig` to size the shared region. `page_count` must match the
@@ -148,8 +153,14 @@ Interpretation:
 | `scan_bytes_sent_total` | Payload bytes sent in scan data pages from backend to worker. This is page payload length, not necessarily useful row bytes. |
 | `scan_b2w_wait_ns` | Time from backend stamping a scan page after send until the worker scan thread observes the same page descriptor. This approximates backend-to-worker data-plane handoff latency. |
 | `scan_b2w_wait_total` | Number of scan page observations included in `scan_b2w_wait_ns`. |
-| `scan_page_read_ns` | Worker-side time spent accepting/importing a scan page frame into the scan flow and forwarding the resulting `RecordBatch` toward DataFusion. |
+| `scan_page_read_ns` | Worker-side time spent accepting/importing a scan page frame into the scan flow before any DataFusion channel send. |
 | `scan_pages_read_total` | Number of scan pages read by the worker scan path. |
+| `scan_batch_send_ns` | Worker scan-thread time spent inside `tx.send(Ok(batch))` when handing scan batches to DataFusion. High values indicate channel backpressure or uneven DataFusion polling. |
+| `scan_batch_send_total` | Number of scan batch sends included in `scan_batch_send_ns`. |
+| `scan_batch_delivery_ns` | Worker scan-thread time from reading a backend scan frame from the ring until the resulting batch send into DataFusion returns. This includes page import plus `scan_batch_send_ns`. |
+| `scan_batch_delivery_total` | Number of scan batch deliveries included in `scan_batch_delivery_ns`. |
+| `scan_idle_sleep_ns` | Worker scan-thread time spent sleeping after polling all scan producers and finding no frame ready. The value is measured around the sleep call, so scheduler delay is included. |
+| `scan_idle_sleep_total` | Number of idle sleeps included in `scan_idle_sleep_ns`. |
 | `worker_total_ns` | Worker-side wall-clock time spent executing one physical plan after it becomes ready, including time blocked on scan input. It overlaps with backend scan time. |
 | `worker_physical_plan_ns` | Time spent converting the logical plan into a DataFusion physical plan. |
 | `worker_physical_plan_total` | Number of physical planning operations included in `worker_physical_plan_ns`. |
@@ -175,6 +186,16 @@ returned.
 
 If `scan_b2w_wait_ns` or `result_w2b_wait_ns` dominates, the page has already
 been produced and the delay is in data-plane handoff or receiver scheduling.
+
+If `scan_b2w_wait_ns` is high but `scan_batch_send_ns` is low, the worker scan
+thread is not reading frames promptly. Check `scan_idle_sleep_ns` and scheduler
+or producer wakeup behavior. If `scan_batch_send_ns` is high, the worker scan
+thread is blocked handing batches to DataFusion, usually because the downstream
+physical plan is not polling that scan stream fast enough.
+
+`scan_batch_delivery_ns` should be read with `scan_page_read_ns` and
+`scan_batch_send_ns`: delivery minus send approximates worker-local frame
+decode/import overhead, while send isolates DataFusion channel backpressure.
 
 If `worker_total_ns` is high but `worker_result_page_fill_ns` and physical
 planning are low, the worker may mostly be waiting on scan input. Compare it

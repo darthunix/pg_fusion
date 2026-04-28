@@ -587,6 +587,17 @@ pub(crate) fn metrics_smoke() {
             coalesce(max(value) FILTER (WHERE metric = 'scan_rows_encoded_total'), 0), ',',
             coalesce(max(value) FILTER (WHERE metric = 'scan_postgres_read_ns'), 0), ',',
             coalesce(max(value) FILTER (WHERE metric = 'scan_arrow_encode_ns'), 0), ',',
+            coalesce(max(value) FILTER (WHERE metric = 'scan_batch_send_total'), 0), ',',
+            coalesce(max(value) FILTER (WHERE metric = 'scan_batch_delivery_total'), 0), ',',
+            coalesce(max(value) FILTER (WHERE metric = 'scan_idle_sleep_total'), 0), ',',
+            count(*) FILTER (WHERE metric IN (
+                'scan_batch_send_ns',
+                'scan_batch_send_total',
+                'scan_batch_delivery_ns',
+                'scan_batch_delivery_total',
+                'scan_idle_sleep_ns',
+                'scan_idle_sleep_total'
+            )), ',',
             coalesce(max(value) FILTER (WHERE metric = 'result_pages_read_total'), 0), ',',
             coalesce(max(value) FILTER (WHERE metric = 'backend_rows_returned_total'), 0), ',',
             coalesce(max(reset_epoch), 0)
@@ -599,7 +610,7 @@ pub(crate) fn metrics_smoke() {
         .split(',')
         .map(|part| part.parse::<i64>().expect("metric value must be integer"))
         .collect::<Vec<_>>();
-    assert_eq!(parts.len(), 9);
+    assert_eq!(parts.len(), 13);
     assert!(
         parts[0] > 0,
         "scan_pages_sent_total must be positive: {summary}"
@@ -626,13 +637,25 @@ pub(crate) fn metrics_smoke() {
     );
     assert!(
         parts[6] > 0,
-        "result_pages_read_total must be positive: {summary}"
+        "scan_batch_send_total must be positive: {summary}"
     );
     assert!(
         parts[7] > 0,
+        "scan_batch_delivery_total must be positive: {summary}"
+    );
+    assert_eq!(
+        parts[9], 6,
+        "all worker scan-thread metric rows must be present: {summary}"
+    );
+    assert!(
+        parts[10] > 0,
+        "result_pages_read_total must be positive: {summary}"
+    );
+    assert!(
+        parts[11] > 0,
         "backend_rows_returned_total must be positive: {summary}"
     );
-    assert_eq!(parts[8], before_epoch);
+    assert_eq!(parts[12], before_epoch);
 
     let detail_epoch: i64 =
         simple_query_first_column_tx(&mut tx, "SELECT pg_fusion_metrics_reset()")

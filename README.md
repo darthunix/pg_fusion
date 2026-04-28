@@ -310,6 +310,9 @@ WHERE metric IN (
   'scan_rows_encoded_total',
   'scan_b2w_wait_ns',
   'scan_page_read_ns',
+  'scan_batch_send_ns',
+  'scan_batch_delivery_ns',
+  'scan_idle_sleep_ns',
   'result_w2b_wait_ns',
   'query_total_ns',
   'backend_total_ns',
@@ -347,6 +350,12 @@ Interpretation:
   deform/detoast/Arrow serialization time.
 - `scan_eof_pages_total = 1` with one returned row means the scan emitted a
   partial page only after PostgreSQL reached EOF.
+- `scan_b2w_wait_ns` is backend stamp to worker scan-thread frame read.
+  Compare it with `scan_idle_sleep_ns` to identify idle polling/scheduling.
+- `scan_batch_send_ns` is time blocked inside the DataFusion scan channel send;
+  high values point at downstream DataFusion backpressure.
+- `scan_batch_delivery_ns` is frame read to accepted DataFusion batch; subtract
+  `scan_batch_send_ns` to approximate worker-local page decode/import overhead.
 
 ## Developer Guidelines
 

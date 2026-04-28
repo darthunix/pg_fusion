@@ -132,5 +132,7 @@ ORDER BY component, metric;
 
 `scan_postgres_read_ns` isolates PostgreSQL slot production time when detailed
 scan timing is enabled. `scan_arrow_encode_ns` isolates slot-to-page encoding.
-If the benchmark ratio is poor but those counters are small, inspect page
-handoff and worker-side operator metrics next.
+If the benchmark ratio is poor but those counters are small, inspect
+`scan_b2w_wait_ns`, `scan_batch_send_ns`, `scan_batch_delivery_ns`, and
+`scan_idle_sleep_ns` to separate page handoff, DataFusion channel backpressure,
+worker-local scan delivery, and idle polling.

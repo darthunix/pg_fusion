@@ -34,7 +34,9 @@ importance: 0.8
 - Runtime metrics are global shared-memory counters exposed by
   `pg_fusion_metrics()` and reset by `pg_fusion_metrics_reset()`. Page handoff
   latency is measured with page descriptor stamps, not by instrumenting ring
-  internals.
+  internals. Worker scan-thread metrics additionally split scan page handoff
+  into idle sleep time, page read/import time, `tx.send(Ok(batch))` time, and
+  frame-read-to-DataFusion-batch-delivery time.
 - `pg_fusion.scan_timing_detail` enables per-row backend scan callback timing
   so `scan_page_fill_ns` can be split into PostgreSQL read time and
   slot-to-Arrow serialization time. It is diagnostic-only and defaults off.

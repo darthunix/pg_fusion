@@ -6,7 +6,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use pool::PageDescriptor;
 
 const METRICS_MAGIC: u64 = 0x5047_4655_4D45_5431;
-const METRICS_VERSION: u32 = 1;
+const METRICS_VERSION: u32 = 2;
 const NO_STAMP: u64 = 0;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -98,6 +98,12 @@ pub enum MetricId {
     ScanB2wWaitTotal,
     ScanPageReadNs,
     ScanPagesReadTotal,
+    ScanBatchSendNs,
+    ScanBatchSendTotal,
+    ScanBatchDeliveryNs,
+    ScanBatchDeliveryTotal,
+    ScanIdleSleepNs,
+    ScanIdleSleepTotal,
     WorkerTotalNs,
     WorkerPhysicalPlanNs,
     WorkerPhysicalPlanTotal,
@@ -261,6 +267,48 @@ pub const METRIC_DESCRIPTORS: [MetricDescriptor; METRIC_COUNT] = [
         unit: MetricUnit::Count,
     },
     MetricDescriptor {
+        id: MetricId::ScanBatchSendNs,
+        component: "scan",
+        metric: "scan_batch_send_ns",
+        kind: MetricKind::Timer,
+        unit: MetricUnit::Nanoseconds,
+    },
+    MetricDescriptor {
+        id: MetricId::ScanBatchSendTotal,
+        component: "scan",
+        metric: "scan_batch_send_total",
+        kind: MetricKind::Counter,
+        unit: MetricUnit::Count,
+    },
+    MetricDescriptor {
+        id: MetricId::ScanBatchDeliveryNs,
+        component: "scan",
+        metric: "scan_batch_delivery_ns",
+        kind: MetricKind::Timer,
+        unit: MetricUnit::Nanoseconds,
+    },
+    MetricDescriptor {
+        id: MetricId::ScanBatchDeliveryTotal,
+        component: "scan",
+        metric: "scan_batch_delivery_total",
+        kind: MetricKind::Counter,
+        unit: MetricUnit::Count,
+    },
+    MetricDescriptor {
+        id: MetricId::ScanIdleSleepNs,
+        component: "scan",
+        metric: "scan_idle_sleep_ns",
+        kind: MetricKind::Timer,
+        unit: MetricUnit::Nanoseconds,
+    },
+    MetricDescriptor {
+        id: MetricId::ScanIdleSleepTotal,
+        component: "scan",
+        metric: "scan_idle_sleep_total",
+        kind: MetricKind::Counter,
+        unit: MetricUnit::Count,
+    },
+    MetricDescriptor {
         id: MetricId::WorkerTotalNs,
         component: "worker",
         metric: "worker_total_ns",
@@ -345,7 +393,7 @@ pub struct PageObservation {
     pub payload_bytes: u64,
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Default)]
 pub struct RuntimeMetrics {
     header: Option<NonNull<MetricsHeader>>,
     values: Option<NonNull<AtomicU64>>,
@@ -355,17 +403,6 @@ pub struct RuntimeMetrics {
 
 unsafe impl Send for RuntimeMetrics {}
 unsafe impl Sync for RuntimeMetrics {}
-
-impl Default for RuntimeMetrics {
-    fn default() -> Self {
-        Self {
-            header: None,
-            values: None,
-            stamps: None,
-            page_count: 0,
-        }
-    }
-}
 
 impl fmt::Debug for RuntimeMetrics {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -597,6 +634,15 @@ impl RuntimeMetrics {
         direction: PageDirection,
         descriptor: PageDescriptor,
     ) -> Option<PageObservation> {
+        self.observe_page_at(direction, descriptor, monotonic_ns())
+    }
+
+    pub fn observe_page_at(
+        &self,
+        direction: PageDirection,
+        descriptor: PageDescriptor,
+        observed_ns: u64,
+    ) -> Option<PageObservation> {
         let stamp = self.stamp_ref(descriptor.page_id)?;
         let expected = pack_epoch_direction(self.reset_epoch(), direction);
         if stamp.epoch_direction.load(Ordering::Acquire) != expected {
@@ -613,7 +659,7 @@ impl RuntimeMetrics {
             return None;
         }
         Some(PageObservation {
-            wait_ns: monotonic_ns().saturating_sub(sent_ns),
+            wait_ns: observed_ns.saturating_sub(sent_ns),
             payload_bytes: stamp.payload_bytes.load(Ordering::Relaxed),
         })
     }
@@ -884,6 +930,19 @@ mod tests {
     }
 
     #[test]
+    fn metric_descriptors_have_unique_names() {
+        let mut names = std::collections::HashSet::new();
+        for descriptor in METRIC_DESCRIPTORS {
+            assert!(
+                names.insert(descriptor.metric),
+                "duplicate metric name {}",
+                descriptor.metric
+            );
+        }
+        assert_eq!(names.len(), METRIC_COUNT);
+    }
+
+    #[test]
     fn page_stamp_observes_matching_generation() {
         let cfg = RuntimeMetricsConfig::new(2).expect("config");
         let layout = RuntimeMetrics::layout(cfg).expect("layout");
@@ -897,8 +956,9 @@ mod tests {
         };
 
         metrics.stamp_page(PageDirection::BackendToWorker, descriptor, 128);
+        let observed_at = metrics.now_ns();
         let observed = metrics
-            .observe_page(PageDirection::BackendToWorker, descriptor)
+            .observe_page_at(PageDirection::BackendToWorker, descriptor, observed_at)
             .expect("matching stamp observed");
         assert_eq!(observed.payload_bytes, 128);
 
