@@ -1,54 +1,30 @@
-use crate::bitmap::{bitmap_get_raw, bitmap_set_raw};
 use crate::datum::{
     database_encoding, pg_oid_needs_detoast, read_bool, read_f32, read_f64, read_fixed_bytes,
     read_i16, read_i32, read_i64, read_name_bytes, read_packed_varlena, validate_pg_layout_type,
     with_detoasted_slot_datum,
 };
 use crate::{ConfigError, EncodeError};
-use arrow_layout::constants::{UUID_WIDTH_BYTES, VIEW_INLINE_LEN};
-use arrow_layout::raw::{BlockHeader, ColumnDesc};
-use arrow_layout::{BlockRef, ByteView, TypeTag};
+use arrow_layout::TypeTag;
 use pgrx_pg_sys as pg_sys;
-use std::mem::size_of;
+use row_encoder::{CellRef, PageRowEncoder, RowSource};
 use std::ptr;
 
-/// Result of trying to append a slot to the current block.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum AppendStatus {
-    /// The row was written successfully.
-    Appended,
-    /// The current row did not fit and must be retried on a fresh block.
-    Full,
-}
+pub use row_encoder::{AppendStatus, EncodedBatch};
 
-/// Metadata returned after finalizing an encoded block.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct EncodedBatch {
-    /// Number of rows successfully written into the block.
-    pub row_count: usize,
-    /// Number of payload bytes occupied by the finalized block.
-    pub payload_len: usize,
-}
-
-/// Direct writer from PostgreSQL `TupleTableSlot` rows into a
+/// Direct writer from PostgreSQL `TupleTableSlot` rows into an
 /// `arrow_layout` block.
 ///
-/// The encoder assumes the payload already contains a valid initialized block
-/// produced by `arrow_layout`. It validates that the block layout matches
-/// the supplied PostgreSQL `TupleDesc`, then appends rows in-place without
-/// building Rust-side column buffers.
+/// `PageBatchEncoder` is the PostgreSQL adapter over `row_encoder`: it
+/// validates the `TupleDesc`, deforms enough slot attributes, detoasts varlena
+/// values, and feeds typed cells into the PostgreSQL-free page writer.
 #[derive(Debug)]
 pub struct PageBatchEncoder<'payload> {
     tuple_desc: pg_sys::TupleDesc,
     attrs_ptr: *mut pg_sys::FormData_pg_attribute,
-    col_count: usize,
     needed_attrs: i32,
     projection_ptr: *const usize,
     projection_len: usize,
-    payload: &'payload mut [u8],
-    block_ptr: *mut u8,
-    descs_ptr: *mut ColumnDesc,
-    header: BlockHeader,
+    inner: PageRowEncoder<'payload>,
     accepted_slot_desc: Option<pg_sys::TupleDesc>,
 }
 
@@ -96,8 +72,8 @@ impl<'payload> PageBatchEncoder<'payload> {
             return Err(ConfigError::NullTupleDesc);
         }
 
-        let block = BlockRef::open(&*payload)?;
-        let layout_cols = block.column_count();
+        let inner = PageRowEncoder::new(payload)?;
+        let layout_cols = inner.column_count();
         let tuple_desc_cols = unsafe { (*tuple_desc).natts as usize };
         if let Some(source_columns) = source_columns {
             if layout_cols != source_columns.len() {
@@ -114,9 +90,6 @@ impl<'payload> PageBatchEncoder<'payload> {
         }
 
         let attrs_ptr = unsafe { (*tuple_desc).attrs.as_mut_ptr() };
-        let block_ptr = payload.as_mut_ptr();
-        let descs_ptr = unsafe { block_ptr.add(size_of::<BlockHeader>()).cast::<ColumnDesc>() };
-        let header = unsafe { ptr::read_unaligned(block_ptr.cast::<BlockHeader>()) };
         let mut needs_utf8 = false;
         let mut max_needed_attr = 0usize;
         for index in 0..layout_cols {
@@ -141,8 +114,7 @@ impl<'payload> PageBatchEncoder<'payload> {
                 };
             }
 
-            let desc = unsafe { ptr::read_unaligned(descs_ptr.add(index)) };
-            let type_tag = desc.type_tag()?;
+            let type_tag = inner.column_type_tag(index)?;
             validate_pg_layout_type(index, attr.atttypid, type_tag)?;
             if type_tag == TypeTag::Utf8View {
                 needs_utf8 = true;
@@ -160,15 +132,11 @@ impl<'payload> PageBatchEncoder<'payload> {
         Ok(Self {
             tuple_desc,
             attrs_ptr,
-            col_count: layout_cols,
             needed_attrs: i32::try_from(max_needed_attr)
                 .map_err(|_| arrow_layout::LayoutError::SizeOverflow)?,
             projection_ptr: source_columns.map_or(ptr::null(), |columns| columns.as_ptr()),
             projection_len: source_columns.map_or(0, <[usize]>::len),
-            payload,
-            block_ptr,
-            descs_ptr,
-            header,
+            inner,
             accepted_slot_desc: None,
         })
     }
@@ -176,11 +144,12 @@ impl<'payload> PageBatchEncoder<'payload> {
     /// Appends one row from a PostgreSQL `TupleTableSlot`.
     ///
     /// The slot may be undeformed or partially deformed; the encoder will ask
-    /// PostgreSQL to deform enough attributes for the target layout when needed.
+    /// PostgreSQL to deform enough attributes for the target layout when
+    /// needed.
     ///
     /// Returns [`AppendStatus::Full`] when the row does not fit into the
-    /// current block. In that case the caller should finalize the current block,
-    /// allocate a fresh one, and retry the same slot there.
+    /// current block. In that case the caller should finalize the current
+    /// block, allocate a fresh one, and retry the same slot there.
     pub fn append_slot(
         &mut self,
         slot: *mut pg_sys::TupleTableSlot,
@@ -201,11 +170,6 @@ impl<'payload> PageBatchEncoder<'payload> {
         }
         self.validate_slot_tuple_desc(actual_tuple_desc)?;
 
-        let row_idx = self.header.row_count;
-        if row_idx >= self.header.max_rows {
-            return Ok(AppendStatus::Full);
-        }
-
         let needed_attrs = usize::try_from(self.needed_attrs)
             .map_err(|_| arrow_layout::LayoutError::SizeOverflow)?;
         let valid = unsafe { (*slot).tts_nvalid as usize };
@@ -221,104 +185,14 @@ impl<'payload> PageBatchEncoder<'payload> {
             return Err(EncodeError::InvalidSlotStorage);
         }
 
-        if let Some(status) = self.try_append_single_fixed_width_slot(row_idx, values, isnulls)? {
-            return Ok(status);
-        }
-
-        let tail_before = self.header.tail_cursor;
-        let mut processed_cols = 0usize;
-        for col_idx in 0..self.col_count {
-            let source_idx = self.source_index(col_idx);
-            let desc = self.desc(col_idx);
-            let attr = unsafe { &*self.attrs_ptr.add(source_idx) };
-            let is_null = unsafe { *isnulls.add(source_idx) };
-            let datum = unsafe { *values.add(source_idx) };
-            let result = if is_null
-                || attr.atttypid == pg_sys::NAMEOID
-                || !pg_oid_needs_detoast(attr.atttypid)
-            {
-                self.write_column_value(col_idx, row_idx, attr, desc, datum, is_null)
-            } else {
-                with_detoasted_slot_datum(datum, col_idx, |detoasted| {
-                    self.write_column_value(col_idx, row_idx, attr, desc, detoasted, false)
-                })
-            };
-
-            match result {
-                Ok(CellWrite::Written) => {
-                    processed_cols += 1;
-                }
-                Ok(CellWrite::Full) => {
-                    self.rollback_row(row_idx, processed_cols, tail_before)?;
-                    return Ok(AppendStatus::Full);
-                }
-                Err(error) => {
-                    self.rollback_row(row_idx, processed_cols, tail_before)?;
-                    return Err(error);
-                }
-            }
-        }
-
-        self.header.row_count = row_idx + 1;
-        Ok(AppendStatus::Appended)
-    }
-
-    fn try_append_single_fixed_width_slot(
-        &mut self,
-        row_idx: u32,
-        values: *mut pg_sys::Datum,
-        isnulls: *mut bool,
-    ) -> Result<Option<AppendStatus>, EncodeError> {
-        if self.col_count != 1 {
-            return Ok(None);
-        }
-
-        let source_idx = self.source_index(0);
-        let desc = self.desc(0);
-        let attr = unsafe { &*self.attrs_ptr.add(source_idx) };
-        let is_null = unsafe { *isnulls.add(source_idx) };
-        if is_null {
-            self.write_null(0, row_idx, desc)?;
-            self.header.row_count = row_idx + 1;
-            return Ok(Some(AppendStatus::Appended));
-        }
-
-        let datum = unsafe { *values.add(source_idx) };
-        match desc.type_tag {
-            raw if raw == TypeTag::Boolean.to_raw() => {
-                let value = unsafe { read_bool(datum, attr.attbyval) };
-                self.write_bool(row_idx, desc, value);
-            }
-            raw if raw == TypeTag::Int16.to_raw() => {
-                let value = unsafe { read_i16(datum, attr.attbyval) };
-                self.write_validity(row_idx, desc, true);
-                self.write_fixed_bytes(row_idx, desc, &value.to_ne_bytes())?;
-            }
-            raw if raw == TypeTag::Int32.to_raw() => {
-                let value = unsafe { read_i32(datum, attr.attbyval) };
-                self.write_validity(row_idx, desc, true);
-                self.write_fixed_bytes(row_idx, desc, &value.to_ne_bytes())?;
-            }
-            raw if raw == TypeTag::Int64.to_raw() => {
-                let value = unsafe { read_i64(datum, attr.attbyval) };
-                self.write_validity(row_idx, desc, true);
-                self.write_fixed_bytes(row_idx, desc, &value.to_ne_bytes())?;
-            }
-            raw if raw == TypeTag::Float32.to_raw() => {
-                let bits = unsafe { read_f32(datum, attr.attbyval) }.to_bits();
-                self.write_validity(row_idx, desc, true);
-                self.write_fixed_bytes(row_idx, desc, &bits.to_ne_bytes())?;
-            }
-            raw if raw == TypeTag::Float64.to_raw() => {
-                let bits = unsafe { read_f64(datum, attr.attbyval) }.to_bits();
-                self.write_validity(row_idx, desc, true);
-                self.write_fixed_bytes(row_idx, desc, &bits.to_ne_bytes())?;
-            }
-            _ => return Ok(None),
-        }
-
-        self.header.row_count = row_idx + 1;
-        Ok(Some(AppendStatus::Appended))
+        let mut source = PgSlotRow {
+            attrs_ptr: self.attrs_ptr,
+            projection_ptr: self.projection_ptr,
+            projection_len: self.projection_len,
+            values,
+            isnulls,
+        };
+        self.inner.append_row(&mut source)
     }
 
     fn source_index(&self, output_index: usize) -> usize {
@@ -341,12 +215,12 @@ impl<'payload> PageBatchEncoder<'payload> {
         }
 
         let actual_cols = unsafe { (*actual_tuple_desc).natts as usize };
-        if self.projection_len == 0 && actual_cols != self.col_count {
+        if self.projection_len == 0 && actual_cols != self.inner.column_count() {
             return Err(EncodeError::SlotTupleDescMismatch);
         }
 
         let actual_attrs_ptr = unsafe { (*actual_tuple_desc).attrs.as_mut_ptr() };
-        for index in 0..self.col_count {
+        for index in 0..self.inner.column_count() {
             let source_index = self.source_index(index);
             if source_index >= actual_cols {
                 return Err(EncodeError::SlotTupleDescMismatch);
@@ -367,313 +241,91 @@ impl<'payload> PageBatchEncoder<'payload> {
         Ok(())
     }
 
-    /// Finalizes the block and returns the written row count and payload length.
-    ///
-    /// This writes the encoder's local header state back into the payload and
-    /// reopens the block through `arrow_layout` to validate the final
-    /// structure.
-    pub fn finish(mut self) -> Result<EncodedBatch, EncodeError> {
-        self.write_header()?;
-        BlockRef::open(&*self.payload)?;
-        Ok(EncodedBatch {
-            row_count: usize::try_from(self.header.row_count)
-                .map_err(|_| arrow_layout::LayoutError::SizeOverflow)?,
-            payload_len: usize::try_from(self.header.block_size)
-                .map_err(|_| arrow_layout::LayoutError::SizeOverflow)?,
-        })
-    }
-
-    fn write_column_value(
-        &mut self,
-        index: usize,
-        row_idx: u32,
-        attr: &pg_sys::FormData_pg_attribute,
-        desc: ColumnDesc,
-        datum: pg_sys::Datum,
-        is_null: bool,
-    ) -> Result<CellWrite, EncodeError> {
-        if is_null {
-            if !desc.flags().is_nullable() {
-                return Err(EncodeError::NullInNonNullableColumn { index });
-            }
-            self.write_null(index, row_idx, desc)?;
-            return Ok(CellWrite::Written);
-        }
-
-        match desc.type_tag {
-            raw if raw == TypeTag::Boolean.to_raw() => {
-                let value = unsafe { read_bool(datum, attr.attbyval) };
-                self.write_bool(row_idx, desc, value);
-                Ok(CellWrite::Written)
-            }
-            raw if raw == TypeTag::Int16.to_raw() => {
-                let value = unsafe { read_i16(datum, attr.attbyval) };
-                self.write_fixed(row_idx, desc, &value.to_ne_bytes())
-            }
-            raw if raw == TypeTag::Int32.to_raw() => {
-                let value = unsafe { read_i32(datum, attr.attbyval) };
-                self.write_fixed(row_idx, desc, &value.to_ne_bytes())
-            }
-            raw if raw == TypeTag::Int64.to_raw() => {
-                let value = unsafe { read_i64(datum, attr.attbyval) };
-                self.write_fixed(row_idx, desc, &value.to_ne_bytes())
-            }
-            raw if raw == TypeTag::Float32.to_raw() => {
-                let bits = unsafe { read_f32(datum, attr.attbyval) }.to_bits();
-                self.write_fixed(row_idx, desc, &bits.to_ne_bytes())
-            }
-            raw if raw == TypeTag::Float64.to_raw() => {
-                let bits = unsafe { read_f64(datum, attr.attbyval) }.to_bits();
-                self.write_fixed(row_idx, desc, &bits.to_ne_bytes())
-            }
-            raw if raw == TypeTag::Uuid.to_raw() => {
-                let bytes = unsafe { read_fixed_bytes(datum, UUID_WIDTH_BYTES as usize, index)? };
-                self.write_fixed(row_idx, desc, bytes)
-            }
-            raw if raw == TypeTag::Utf8View.to_raw() => {
-                let bytes = if attr.atttypid == pg_sys::NAMEOID {
-                    unsafe { read_name_bytes(datum, index)? }
-                } else {
-                    unsafe { read_packed_varlena(datum, index)? }
-                };
-                self.write_view(index, row_idx, desc, bytes)
-            }
-            raw if raw == TypeTag::BinaryView.to_raw() => {
-                let bytes = unsafe { read_packed_varlena(datum, index)? };
-                self.write_view(index, row_idx, desc, bytes)
-            }
-            raw => Err(arrow_layout::LayoutError::InvalidTypeTag { raw }.into()),
-        }
-    }
-
-    fn write_fixed(
-        &mut self,
-        row_idx: u32,
-        desc: ColumnDesc,
-        bytes: &[u8],
-    ) -> Result<CellWrite, EncodeError> {
-        self.write_validity(row_idx, desc, true);
-        self.write_fixed_bytes(row_idx, desc, bytes)?;
-        Ok(CellWrite::Written)
-    }
-
-    fn write_view(
-        &mut self,
-        index: usize,
-        row_idx: u32,
-        desc: ColumnDesc,
-        bytes: &[u8],
-    ) -> Result<CellWrite, EncodeError> {
-        if bytes.len() > i32::MAX as usize {
-            return Err(EncodeError::RowValueTooLarge {
-                index,
-                len: bytes.len(),
-            });
-        }
-        if bytes.len() <= VIEW_INLINE_LEN {
-            self.write_validity(row_idx, desc, true);
-            self.write_view_slot(row_idx, desc, ByteView::new_inline(bytes)?)?;
-            return Ok(CellWrite::Written);
-        }
-
-        let len =
-            u32::try_from(bytes.len()).map_err(|_| arrow_layout::LayoutError::SizeOverflow)?;
-        let Some(start) = self.tail_alloc(len)? else {
-            return Ok(CellWrite::Full);
-        };
-        self.tail_bytes_mut(start, len).copy_from_slice(bytes);
-        self.write_validity(row_idx, desc, true);
-        self.write_view_slot(
-            row_idx,
-            desc,
-            ByteView::new_outline(bytes, start - self.header.pool_base)?,
-        )?;
-        Ok(CellWrite::Written)
-    }
-
-    fn rollback_row(
-        &mut self,
-        row_idx: u32,
-        processed_cols: usize,
-        tail_before: u32,
-    ) -> Result<(), EncodeError> {
-        self.header.tail_cursor = tail_before;
-        for index in 0..processed_cols {
-            let desc = self.desc(index);
-            if desc.flags().is_nullable() && !self.validity(row_idx, desc) {
-                self.decrement_null_count(index, desc)?;
-            }
-        }
-        Ok(())
-    }
-
-    fn write_null(
-        &mut self,
-        index: usize,
-        row_idx: u32,
-        desc: ColumnDesc,
-    ) -> Result<(), EncodeError> {
-        self.write_validity(row_idx, desc, false);
-        match desc.type_tag {
-            raw if raw == TypeTag::Boolean.to_raw() => self.write_bool_value(row_idx, desc, false),
-            raw if raw == TypeTag::Int16.to_raw() => self.zero_value_slot(row_idx, desc, 2),
-            raw if raw == TypeTag::Int32.to_raw() || raw == TypeTag::Float32.to_raw() => {
-                self.zero_value_slot(row_idx, desc, 4)
-            }
-            raw if raw == TypeTag::Int64.to_raw() || raw == TypeTag::Float64.to_raw() => {
-                self.zero_value_slot(row_idx, desc, 8)
-            }
-            raw if raw == TypeTag::Uuid.to_raw()
-                || raw == TypeTag::Utf8View.to_raw()
-                || raw == TypeTag::BinaryView.to_raw() =>
-            {
-                self.zero_value_slot(row_idx, desc, 16)
-            }
-            raw => return Err(arrow_layout::LayoutError::InvalidTypeTag { raw }.into()),
-        }
-        self.increment_null_count(index, desc)?;
-        Ok(())
-    }
-
-    fn desc(&self, index: usize) -> ColumnDesc {
-        unsafe { ptr::read_unaligned(self.descs_ptr.add(index)) }
-    }
-
-    fn write_desc(&mut self, index: usize, desc: ColumnDesc) {
-        unsafe { ptr::write_unaligned(self.descs_ptr.add(index), desc) };
-    }
-
-    fn write_header(&mut self) -> Result<(), EncodeError> {
-        unsafe { ptr::write_unaligned(self.block_ptr.cast::<BlockHeader>(), self.header) };
-        Ok(())
-    }
-
-    fn increment_null_count(
-        &mut self,
-        index: usize,
-        mut desc: ColumnDesc,
-    ) -> Result<(), EncodeError> {
-        desc.null_count = desc
-            .null_count
-            .checked_add(1)
-            .ok_or(arrow_layout::LayoutError::SizeOverflow)?;
-        self.write_desc(index, desc);
-        Ok(())
-    }
-
-    fn decrement_null_count(
-        &mut self,
-        index: usize,
-        mut desc: ColumnDesc,
-    ) -> Result<(), EncodeError> {
-        desc.null_count = desc
-            .null_count
-            .checked_sub(1)
-            .ok_or(arrow_layout::LayoutError::SizeOverflow)?;
-        self.write_desc(index, desc);
-        Ok(())
-    }
-
-    fn tail_alloc(&mut self, len: u32) -> Result<Option<u32>, EncodeError> {
-        if len == 0 {
-            return Ok(Some(self.header.tail_cursor));
-        }
-        let next = self
-            .header
-            .tail_cursor
-            .checked_sub(len)
-            .ok_or(arrow_layout::LayoutError::SizeOverflow)?;
-        if next < self.header.pool_base {
-            return Ok(None);
-        }
-        self.header.tail_cursor = next;
-        Ok(Some(next))
-    }
-
-    fn tail_bytes_mut(&mut self, start: u32, len: u32) -> &mut [u8] {
-        let start = start as usize;
-        let end = start + len as usize;
-        &mut self.payload[start..end]
-    }
-
-    fn write_validity(&mut self, row_idx: u32, desc: ColumnDesc, valid: bool) {
-        unsafe {
-            bitmap_set_raw(
-                self.block_ptr.add(desc.validity_off as usize),
-                row_idx,
-                valid,
-            )
-        };
-    }
-
-    fn validity(&self, row_idx: u32, desc: ColumnDesc) -> bool {
-        unsafe {
-            bitmap_get_raw(
-                self.block_ptr.add(desc.validity_off as usize).cast_const(),
-                row_idx,
-            )
-        }
-    }
-
-    fn write_bool(&mut self, row_idx: u32, desc: ColumnDesc, value: bool) {
-        self.write_validity(row_idx, desc, true);
-        self.write_bool_value(row_idx, desc, value);
-    }
-
-    fn write_bool_value(&mut self, row_idx: u32, desc: ColumnDesc, value: bool) {
-        unsafe { bitmap_set_raw(self.block_ptr.add(desc.values_off as usize), row_idx, value) };
-    }
-
-    fn write_fixed_bytes(
-        &mut self,
-        row_idx: u32,
-        desc: ColumnDesc,
-        bytes: &[u8],
-    ) -> Result<(), EncodeError> {
-        let width = match desc.type_tag {
-            raw if raw == TypeTag::Int16.to_raw() => 2usize,
-            raw if raw == TypeTag::Int32.to_raw() || raw == TypeTag::Float32.to_raw() => 4usize,
-            raw if raw == TypeTag::Int64.to_raw() || raw == TypeTag::Float64.to_raw() => 8usize,
-            raw if raw == TypeTag::Uuid.to_raw() => 16usize,
-            raw => return Err(arrow_layout::LayoutError::InvalidTypeTag { raw }.into()),
-        };
-        if bytes.len() != width {
-            return Err(arrow_layout::LayoutError::InvalidHeaderBounds.into());
-        }
-        let start = desc.values_off as usize + (row_idx as usize * width);
-        unsafe {
-            ptr::copy_nonoverlapping(bytes.as_ptr(), self.block_ptr.add(start), width);
-        }
-        Ok(())
-    }
-
-    fn zero_value_slot(&mut self, row_idx: u32, desc: ColumnDesc, width: usize) {
-        let start = desc.values_off as usize + (row_idx as usize * width);
-        unsafe {
-            ptr::write_bytes(self.block_ptr.add(start), 0, width);
-        }
-    }
-
-    fn write_view_slot(
-        &mut self,
-        row_idx: u32,
-        desc: ColumnDesc,
-        view: ByteView,
-    ) -> Result<(), EncodeError> {
-        let start = desc.values_off as usize + (row_idx as usize * size_of::<ByteView>());
-        unsafe {
-            ptr::write_unaligned(self.block_ptr.add(start).cast::<ByteView>(), view);
-        }
-        Ok(())
+    /// Finalizes the block and returns the written row count and payload
+    /// length.
+    pub fn finish(self) -> Result<EncodedBatch, EncodeError> {
+        self.inner.finish().map_err(Into::into)
     }
 
     #[cfg(test)]
     pub(crate) fn tail_cursor(&self) -> u32 {
-        self.header.tail_cursor
+        self.inner.tail_cursor_for_tests()
     }
 }
 
-enum CellWrite {
-    Written,
-    Full,
+struct PgSlotRow {
+    attrs_ptr: *mut pg_sys::FormData_pg_attribute,
+    projection_ptr: *const usize,
+    projection_len: usize,
+    values: *mut pg_sys::Datum,
+    isnulls: *mut bool,
+}
+
+impl PgSlotRow {
+    fn source_index(&self, output_index: usize) -> usize {
+        if self.projection_len == 0 {
+            output_index
+        } else {
+            debug_assert!(output_index < self.projection_len);
+            unsafe { *self.projection_ptr.add(output_index) }
+        }
+    }
+}
+
+impl RowSource for PgSlotRow {
+    type Error = EncodeError;
+
+    fn with_cell<R>(
+        &mut self,
+        index: usize,
+        f: impl FnOnce(CellRef<'_>) -> Result<R, Self::Error>,
+    ) -> Result<R, Self::Error> {
+        let source_idx = self.source_index(index);
+        let attr = unsafe { &*self.attrs_ptr.add(source_idx) };
+        let is_null = unsafe { *self.isnulls.add(source_idx) };
+        if is_null {
+            return f(CellRef::Null);
+        }
+
+        let datum = unsafe { *self.values.add(source_idx) };
+        match attr.atttypid {
+            oid if oid == pg_sys::BOOLOID => {
+                f(CellRef::Boolean(unsafe { read_bool(datum, attr.attbyval) }))
+            }
+            oid if oid == pg_sys::INT2OID => {
+                f(CellRef::Int16(unsafe { read_i16(datum, attr.attbyval) }))
+            }
+            oid if oid == pg_sys::INT4OID => {
+                f(CellRef::Int32(unsafe { read_i32(datum, attr.attbyval) }))
+            }
+            oid if oid == pg_sys::INT8OID => {
+                f(CellRef::Int64(unsafe { read_i64(datum, attr.attbyval) }))
+            }
+            oid if oid == pg_sys::FLOAT4OID => {
+                f(CellRef::Float32(unsafe { read_f32(datum, attr.attbyval) }))
+            }
+            oid if oid == pg_sys::FLOAT8OID => {
+                f(CellRef::Float64(unsafe { read_f64(datum, attr.attbyval) }))
+            }
+            oid if oid == pg_sys::UUIDOID => {
+                let bytes = unsafe { read_fixed_bytes(datum, 16, index)? };
+                f(CellRef::Uuid(bytes))
+            }
+            oid if oid == pg_sys::NAMEOID => {
+                let bytes = unsafe { read_name_bytes(datum, index)? };
+                f(CellRef::Utf8(bytes))
+            }
+            oid if pg_oid_needs_detoast(oid) => {
+                with_detoasted_slot_datum(datum, index, |detoasted| {
+                    let bytes = unsafe { read_packed_varlena(detoasted, index)? };
+                    if oid == pg_sys::BYTEAOID {
+                        f(CellRef::Binary(bytes))
+                    } else {
+                        f(CellRef::Utf8(bytes))
+                    }
+                })
+            }
+            _ => Err(EncodeError::UnsupportedRowAccess { index }),
+        }
+    }
 }

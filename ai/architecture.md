@@ -28,8 +28,10 @@ page-backed Arrow batches.
   transfer, and issued-frame flow.
 - `runtime_metrics`: shared-memory runtime counters and page-slot handoff
   stamps exposed through SQL.
-- `page/arrow_layout`, `page/import`, `pg/slot_encoder`, `pg/slot_import`:
-  page-backed Arrow layout, PostgreSQL slot encoding, and result projection.
+- `page/arrow_layout`, `page/row_encoder`, `page/import`,
+  `pg/slot_encoder`, `pg/slot_import`: page-backed Arrow layout,
+  PostgreSQL-free row-to-page encoding, PostgreSQL slot adaptation, and result
+  projection.
 - `pg/df_catalog`, `pg/plan_builder`, `pg/scan_node`, `pg/scan_sql`,
   `pg/slot_scan`: backend-side DataFusion planning and trusted PostgreSQL scan
   SQL execution.

@@ -26,7 +26,6 @@
 //! `arrow_layout` contract. They are not intended to be a portable wire or
 //! storage format.
 
-mod bitmap;
 mod datum;
 mod encoder;
 mod error;

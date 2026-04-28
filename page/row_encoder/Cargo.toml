@@ -1,0 +1,22 @@
+[package]
+name = "row_encoder"
+version = "25.0.0"
+edition = "2021"
+description = "PostgreSQL-free row writer for arrow_layout blocks"
+readme = "README.md"
+
+[lib]
+crate-type = ["lib"]
+doctest = false
+
+[dependencies]
+arrow_layout = { path = "../arrow_layout", version = "25.0.0" }
+thiserror = "2.0"
+
+[dev-dependencies]
+criterion = "0.5"
+csv = "1.3"
+
+[[bench]]
+name = "q05_encode"
+harness = false

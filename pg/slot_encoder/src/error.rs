@@ -1,5 +1,6 @@
 use arrow_layout::{LayoutError, TypeTag};
 use pgrx_pg_sys as pg_sys;
+use row_encoder::RowEncodeError;
 use thiserror::Error;
 
 #[derive(Debug, Error)]
@@ -85,6 +86,24 @@ pub enum EncodeError {
     UnsupportedRowAccess { index: usize },
     #[error("layout write failed: {0}")]
     Layout(#[from] LayoutError),
+}
+
+impl From<RowEncodeError> for EncodeError {
+    fn from(error: RowEncodeError) -> Self {
+        match error {
+            RowEncodeError::RowValueTooLarge { index, len } => {
+                Self::RowValueTooLarge { index, len }
+            }
+            RowEncodeError::NullInNonNullableColumn { index } => {
+                Self::NullInNonNullableColumn { index }
+            }
+            RowEncodeError::Layout(error) => Self::Layout(error),
+            RowEncodeError::TypeMismatch { index, .. }
+            | RowEncodeError::InvalidUuidWidth { index, .. } => {
+                Self::UnsupportedRowAccess { index }
+            }
+        }
+    }
 }
 
 pub(crate) fn oid_u32(oid: pg_sys::Oid) -> u32 {

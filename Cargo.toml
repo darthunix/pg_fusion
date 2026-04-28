@@ -8,6 +8,7 @@ members = [
   "page/pool",
   "page/transfer",
   "page/arrow_layout",
+  "page/row_encoder",
   "page/batch_encoder",
   "page/import",
   "page/issuance",

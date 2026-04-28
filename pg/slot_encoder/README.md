@@ -1,12 +1,13 @@
 # slot_encoder
 
-`slot_encoder` writes PostgreSQL `TupleTableSlot` rows directly into an initialized
-`arrow_layout` block.
+`slot_encoder` adapts PostgreSQL `TupleTableSlot` rows into typed cells and
+writes them into an initialized `arrow_layout` block through `row_encoder`.
 
 It is intentionally narrow:
 
 - producer-side only
-- direct page writes into a caller-provided mutable block
+- direct page writes into a caller-provided mutable block through
+  `page/row_encoder`
 - slot-only API over PostgreSQL `TupleTableSlot`
 - no dependency on `import`, `transfer`, `storage`, or DataFusion
 
@@ -17,9 +18,11 @@ The main API shape is:
 - append rows from `TupleTableSlot`
 - finalize the block and return `row_count` plus the written payload length
 
-The encoder does not maintain Rust heap-backed column state. Fixed-size values,
-validity bits, `ByteView` slots, and long view payloads are written directly into
-the target page as rows are appended.
+The encoder does not maintain Rust heap-backed column state. PostgreSQL-specific
+work is limited to slot deformation, `TupleDesc` validation, projection mapping,
+and varlena detoasting. Fixed-size values, validity bits, `ByteView` slots, and
+long view payloads are written directly into the target page by `row_encoder` as
+rows are appended.
 
 The output format is the same same-host shared-memory `arrow_layout` contract:
 
@@ -97,3 +100,12 @@ caller creates a fresh block whenever `AppendStatus::Full` is returned.
 - `Utf8View` columns require a UTF-8 PostgreSQL server encoding.
 - `AppendStatus::Full` means the current row did not fit and must be retried on a
   fresh block.
+
+## PostgreSQL-free encoding benchmark
+
+For a Criterion benchmark of the shared hot page-writing core, use:
+
+```bash
+PG_FUSION_TPCH_DIR=benches/tpch/data/sf_0_01 \
+  cargo bench -p row_encoder --bench q05_encode
+```
