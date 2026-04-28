@@ -1423,6 +1423,7 @@ impl ScanWorkerLauncher for DynamicScanWorkerLauncher {
                 scan_id: input.scan_id,
                 producer_id,
                 producer_count: total_producers,
+                scan_timing_detail: input.scan_timing_detail,
             }) {
                 Ok(job_id) => job_id,
                 Err(ScanWorkerJobError::NoFreeJobSlots) => {

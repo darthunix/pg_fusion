@@ -3,7 +3,7 @@ id: comp-host-runtime-0001
 type: fact
 scope: host_runtime
 tags: ["pgrx", "datafusion", "shared-memory", "runtime_protocol", "slot_scan"]
-updated_at: "2026-04-27"
+updated_at: "2026-04-28"
 importance: 0.8
 ---
 
@@ -46,7 +46,10 @@ importance: 0.8
 - `pg_fusion.scan_timing_detail` enables diagnostic backend scan timing.
   It splits `scan_page_fill_ns` into PostgreSQL read, slot-to-Arrow
   serialization, slot drain wrapper, snapshot wrapper, overflow-copy, retry,
-  prepare, and finish buckets. It is diagnostic-only and defaults off.
+  prepare, finish, and residual page-fill bookkeeping buckets. It is
+  diagnostic-only and defaults off. The query-time flag is copied into dynamic
+  scan worker jobs so leader and worker scan producers contribute comparable
+  detailed timing.
 - `EXPLAIN` stays backend-local: `backend_service` lowers the planned query to
   a DataFusion physical plan, renders PostgreSQL scan leaves with present
   soft-limit/fetch-hint metadata, and prints the nested multiline `slot_scan`

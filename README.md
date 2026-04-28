@@ -329,6 +329,11 @@ WHERE metric IN (
   'scan_overflow_copy_ns',
   'scan_page_retry_ns',
   'scan_page_retry_total',
+  'scan_fill_pre_drain_ns',
+  'scan_fill_post_drain_ns',
+  'scan_fill_overflow_encode_ns',
+  'scan_fill_emit_ns',
+  'scan_fill_unclassified_ns',
   'scan_postgres_read_ns',
   'scan_arrow_encode_ns',
   'scan_fetch_calls_total',
@@ -367,6 +372,10 @@ WHERE metric LIKE 'scan_%'
 ORDER BY metric;
 ```
 
+The query-time `scan_timing_detail` setting is also propagated to dynamic scan
+workers, so parallel scan producers contribute to the same detailed scan
+metrics.
+
 Interpretation:
 
 - `scan_postgres_read_ns >> scan_arrow_encode_ns` points at PostgreSQL
@@ -375,8 +384,12 @@ Interpretation:
   deform/detoast/Arrow serialization time.
 - `scan_slot_drain_ns - scan_postgres_read_ns - scan_arrow_encode_ns`
   approximates PostgreSQL direct receiver/SPI wrapper overhead.
-- `scan_page_fill_ns` minus snapshot, prepare, drain, finish, overflow-copy,
-  and retry timers is the remaining page-fill bookkeeping time.
+- `scan_fill_pre_drain_ns`, `scan_fill_post_drain_ns`,
+  `scan_fill_overflow_encode_ns`, `scan_fill_emit_ns`, and
+  `scan_fill_unclassified_ns` split the page-fill bookkeeping time left after
+  snapshot, prepare, drain, finish, and retry timers.
+- `scan_fill_unclassified_ns` should stay small; if it dominates, add a finer
+  timer around the remaining source-page code path.
 - `scan_eof_pages_total = 1` with one returned row means the scan emitted a
   partial page only after PostgreSQL reached EOF.
 - `scan_b2w_wait_ns` is backend stamp to worker scan-thread frame read.

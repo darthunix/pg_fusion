@@ -208,6 +208,7 @@ pub struct ScanWorkerLaunchInput<'a> {
     pub scan_id: u64,
     pub spec: &'a PgScanSpec,
     pub leader_peer: BackendLeaseSlot,
+    pub scan_timing_detail: bool,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -627,6 +628,7 @@ impl BackendService {
                         scan_id,
                         spec: spec.as_ref(),
                         leader_peer: scan_peer,
+                        scan_timing_detail: config.scan_timing_detail,
                     })?;
                     leader_ctid_range = output.leader_ctid_range.take();
                     producers.append(&mut output.workers);

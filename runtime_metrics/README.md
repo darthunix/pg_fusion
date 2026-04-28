@@ -119,7 +119,9 @@ ORDER BY metric;
 ```
 
 Detailed timing measures the row callback on every returned slot. Keep it off
-for normal runs; the measurement itself adds overhead to fast scans.
+for normal runs; the measurement itself adds overhead to fast scans. When
+dynamic scan workers are used, the query-time flag is propagated to each scan
+producer so scan detail metrics cover the leader and worker producers.
 
 Interpretation:
 
@@ -127,6 +129,11 @@ Interpretation:
   pg_fusion row callback.
 - `scan_arrow_encode_ns` is callback time: slot deform/detoast plus Arrow page
   writes.
+- `scan_fill_pre_drain_ns`, `scan_fill_post_drain_ns`,
+  `scan_fill_overflow_encode_ns`, and `scan_fill_emit_ns` split Rust-side
+  page-fill bookkeeping around the PostgreSQL drain and page emission paths.
+- `scan_fill_unclassified_ns` is the remaining successful-page fill time after
+  all published page-fill buckets are subtracted.
 - `scan_postgres_read_ns >> scan_arrow_encode_ns` points at PostgreSQL scan
   cost; the opposite points at serialization cost.
 
@@ -148,6 +155,11 @@ Interpretation:
 | `scan_overflow_copy_ns` | Detailed-only time spent copying an overflowing PostgreSQL slot into the pending overflow tuple when a variable-width row does not fit the current Arrow page. |
 | `scan_page_retry_ns` | Detailed-only time spent in page-fill attempts that did not emit a page and instead forced an estimator retry/backoff. |
 | `scan_page_retry_total` | Number of page-fill retry/backoff attempts included in `scan_page_retry_ns`. |
+| `scan_fill_pre_drain_ns` | Detailed-only Rust-side bookkeeping before a PostgreSQL drain call, such as row budget selection and callback setup, for emitted scan pages. |
+| `scan_fill_post_drain_ns` | Detailed-only Rust-side bookkeeping after a PostgreSQL drain call returns, before page finalization or retry handling, for emitted scan pages. |
+| `scan_fill_overflow_encode_ns` | Detailed-only time spent encoding a pending overflow row into a later emitted page, outside the normal drain callback path. |
+| `scan_fill_emit_ns` | Detailed-only time spent updating scan page counters and constructing the emitted page status after page finalization. |
+| `scan_fill_unclassified_ns` | Detailed-only remainder of successful scan page fill time after the published page-fill buckets are subtracted. This is a control metric and should stay small. |
 | `scan_fetch_calls_total` | Number of PostgreSQL cursor drain calls issued by the backend scan page source. |
 | `scan_rows_encoded_total` | Number of PostgreSQL rows encoded into emitted backend-to-worker scan pages. |
 | `scan_postgres_read_ns` | Detailed-only time spent in `PortalRunFetch` outside the pg_fusion row callback. This approximates PostgreSQL executor/heap/filter time. |
@@ -189,29 +201,39 @@ pages are reaching the worker only after PostgreSQL exhausts the cursor. For a
 highly selective query this can explain high latency even when only one row is
 returned.
 
-When `scan_timing_detail` is enabled, use these derived values to explain
-`scan_page_fill_ns`:
+When `scan_timing_detail` is enabled, use these derived values to explain the
+non-PostgreSQL parts of `scan_page_fill_ns`:
 
 ```sql
+WITH m AS (
+  SELECT metric, max(value) AS value
+  FROM pg_fusion_metrics()
+  GROUP BY metric
+)
 SELECT
-  max(value) FILTER (WHERE metric = 'scan_slot_drain_ns')
-    - max(value) FILTER (WHERE metric = 'scan_postgres_read_ns')
-    - max(value) FILTER (WHERE metric = 'scan_arrow_encode_ns')
+  coalesce(max(value) FILTER (WHERE metric = 'scan_slot_drain_ns'), 0)
+    - coalesce(max(value) FILTER (WHERE metric = 'scan_postgres_read_ns'), 0)
+    - coalesce(max(value) FILTER (WHERE metric = 'scan_arrow_encode_ns'), 0)
     AS scan_drain_wrapper_ns,
-  max(value) FILTER (WHERE metric = 'scan_page_fill_ns')
-    - max(value) FILTER (WHERE metric = 'scan_page_snapshot_ns')
-    - max(value) FILTER (WHERE metric = 'scan_page_prepare_ns')
-    - max(value) FILTER (WHERE metric = 'scan_slot_drain_ns')
-    - max(value) FILTER (WHERE metric = 'scan_page_finish_ns')
-    - max(value) FILTER (WHERE metric = 'scan_overflow_copy_ns')
-    - max(value) FILTER (WHERE metric = 'scan_page_retry_ns')
-    AS scan_fill_residual_ns
-FROM pg_fusion_metrics();
+  coalesce(max(value) FILTER (WHERE metric = 'scan_fill_pre_drain_ns'), 0)
+    AS scan_fill_pre_drain_ns,
+  coalesce(max(value) FILTER (WHERE metric = 'scan_fill_post_drain_ns'), 0)
+    AS scan_fill_post_drain_ns,
+  coalesce(max(value) FILTER (WHERE metric = 'scan_fill_overflow_encode_ns'), 0)
+    AS scan_fill_overflow_encode_ns,
+  coalesce(max(value) FILTER (WHERE metric = 'scan_fill_emit_ns'), 0)
+    AS scan_fill_emit_ns,
+  coalesce(max(value) FILTER (WHERE metric = 'scan_fill_unclassified_ns'), 0)
+    AS scan_fill_unclassified_ns
+FROM m;
 ```
 
 `scan_drain_wrapper_ns` points at `PortalRunFetch` receiver/SPI wrapper
-overhead outside PostgreSQL executor work and Arrow encoding. A large
-`scan_fill_residual_ns` means page-fill bookkeeping still needs finer metrics.
+overhead outside PostgreSQL executor work and Arrow encoding. The `scan_fill_*`
+metrics split the old residual page-fill bookkeeping bucket; a large
+`scan_fill_unclassified_ns` means the fill path still needs finer metrics.
+`scan_overflow_copy_ns` is nested inside the drain callback path, so inspect it
+separately instead of subtracting it again from the residual.
 
 If `scan_b2w_wait_ns` or `result_w2b_wait_ns` dominates, the page has already
 been produced and the delay is in data-plane handoff or receiver scheduling.

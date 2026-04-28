@@ -382,10 +382,13 @@ pub(crate) fn heap_parallel_scan_smoke() {
     tx.batch_execute(
         "\
         SET LOCAL statement_timeout = '20s';
-        SET LOCAL max_parallel_workers_per_gather = 2
+        SET LOCAL max_parallel_workers_per_gather = 2;
+        SET LOCAL pg_fusion.scan_timing_detail = on
         ",
     )
     .expect("enable dynamic scan workers");
+    simple_query_first_column_tx(&mut tx, "SELECT pg_fusion_metrics_reset()")
+        .expect("reset metrics before parallel scan");
     let sum: i64 = simple_query_first_column_tx(
         &mut tx,
         &format!("SELECT sum(id)::bigint FROM {table_name} WHERE id BETWEEN 100 AND 20000"),
@@ -394,6 +397,34 @@ pub(crate) fn heap_parallel_scan_smoke() {
     .parse()
     .expect("parallel heap scan sum must be an integer");
     assert_eq!(sum, 20000 * 20001 / 2 - 99 * 100 / 2);
+
+    let summary = simple_query_first_column_tx(
+        &mut tx,
+        "\
+        SELECT concat(
+            coalesce(max(value) FILTER (WHERE metric = 'scan_page_fill_ns'), 0), ',',
+            coalesce(max(value) FILTER (WHERE metric = 'scan_slot_drain_ns'), 0), ',',
+            coalesce(max(value) FILTER (WHERE metric = 'scan_postgres_read_ns'), 0), ',',
+            coalesce(max(value) FILTER (WHERE metric = 'scan_arrow_encode_ns'), 0), ',',
+            coalesce(max(value) FILTER (WHERE metric = 'scan_pages_sent_total'), 0)
+        )
+        FROM pg_fusion_metrics()
+        ",
+    )
+    .expect("parallel scan metrics summary must return one row");
+    let parts = summary
+        .split(',')
+        .map(|part| part.parse::<i64>().expect("metric value must be integer"))
+        .collect::<Vec<_>>();
+    assert_eq!(parts.len(), 5);
+    assert!(
+        parts[0] > 0 && parts[1] > 0 && parts[2] + parts[3] > 0 && parts[4] > 0,
+        "parallel detailed scan metrics must be positive: {summary}"
+    );
+    assert!(
+        parts[1] * 4 > parts[0] * 3,
+        "detailed scan drain timing should cover all dynamic scan producers: {summary}"
+    );
     tx.commit()
         .expect("commit parallel scan smoke transaction before cleanup");
     client
@@ -592,6 +623,11 @@ pub(crate) fn metrics_smoke() {
             coalesce(max(value) FILTER (WHERE metric = 'scan_overflow_copy_ns'), 0), ',',
             coalesce(max(value) FILTER (WHERE metric = 'scan_page_retry_ns'), 0), ',',
             coalesce(max(value) FILTER (WHERE metric = 'scan_page_retry_total'), 0), ',',
+            coalesce(max(value) FILTER (WHERE metric = 'scan_fill_pre_drain_ns'), 0), ',',
+            coalesce(max(value) FILTER (WHERE metric = 'scan_fill_post_drain_ns'), 0), ',',
+            coalesce(max(value) FILTER (WHERE metric = 'scan_fill_overflow_encode_ns'), 0), ',',
+            coalesce(max(value) FILTER (WHERE metric = 'scan_fill_emit_ns'), 0), ',',
+            coalesce(max(value) FILTER (WHERE metric = 'scan_fill_unclassified_ns'), 0), ',',
             coalesce(max(value) FILTER (WHERE metric = 'scan_batch_send_total'), 0), ',',
             coalesce(max(value) FILTER (WHERE metric = 'scan_batch_delivery_total'), 0), ',',
             coalesce(max(value) FILTER (WHERE metric = 'scan_idle_sleep_total'), 0), ',',
@@ -615,7 +651,7 @@ pub(crate) fn metrics_smoke() {
         .split(',')
         .map(|part| part.parse::<i64>().expect("metric value must be integer"))
         .collect::<Vec<_>>();
-    assert_eq!(parts.len(), 18);
+    assert_eq!(parts.len(), 23);
     assert!(
         parts[0] > 0,
         "scan_pages_sent_total must be positive: {summary}"
@@ -660,27 +696,47 @@ pub(crate) fn metrics_smoke() {
         parts[10], 0,
         "scan_page_retry_total must stay zero without detailed timing: {summary}"
     );
-    assert!(
-        parts[11] > 0,
-        "scan_batch_send_total must be positive: {summary}"
-    );
-    assert!(
-        parts[12] > 0,
-        "scan_batch_delivery_total must be positive: {summary}"
+    assert_eq!(
+        parts[11], 0,
+        "scan_fill_pre_drain_ns must stay zero without detailed timing: {summary}"
     );
     assert_eq!(
-        parts[14], 6,
-        "all worker scan-thread metric rows must be present: {summary}"
+        parts[12], 0,
+        "scan_fill_post_drain_ns must stay zero without detailed timing: {summary}"
     );
-    assert!(
-        parts[15] > 0,
-        "result_pages_read_total must be positive: {summary}"
+    assert_eq!(
+        parts[13], 0,
+        "scan_fill_overflow_encode_ns must stay zero without detailed timing: {summary}"
+    );
+    assert_eq!(
+        parts[14], 0,
+        "scan_fill_emit_ns must stay zero without detailed timing: {summary}"
+    );
+    assert_eq!(
+        parts[15], 0,
+        "scan_fill_unclassified_ns must stay zero without detailed timing: {summary}"
     );
     assert!(
         parts[16] > 0,
+        "scan_batch_send_total must be positive: {summary}"
+    );
+    assert!(
+        parts[17] > 0,
+        "scan_batch_delivery_total must be positive: {summary}"
+    );
+    assert_eq!(
+        parts[19], 6,
+        "all worker scan-thread metric rows must be present: {summary}"
+    );
+    assert!(
+        parts[20] > 0,
+        "result_pages_read_total must be positive: {summary}"
+    );
+    assert!(
+        parts[21] > 0,
         "backend_rows_returned_total must be positive: {summary}"
     );
-    assert_eq!(parts[17], before_epoch);
+    assert_eq!(parts[22], before_epoch);
 
     let detail_epoch: i64 =
         simple_query_first_column_tx(&mut tx, "SELECT pg_fusion_metrics_reset()")
@@ -711,6 +767,18 @@ pub(crate) fn metrics_smoke() {
             coalesce(max(value) FILTER (WHERE metric = 'scan_overflow_copy_ns'), 0), ',',
             coalesce(max(value) FILTER (WHERE metric = 'scan_page_retry_ns'), 0), ',',
             coalesce(max(value) FILTER (WHERE metric = 'scan_page_retry_total'), 0), ',',
+            coalesce(max(value) FILTER (WHERE metric = 'scan_fill_pre_drain_ns'), 0), ',',
+            coalesce(max(value) FILTER (WHERE metric = 'scan_fill_post_drain_ns'), 0), ',',
+            coalesce(max(value) FILTER (WHERE metric = 'scan_fill_overflow_encode_ns'), 0), ',',
+            coalesce(max(value) FILTER (WHERE metric = 'scan_fill_emit_ns'), 0), ',',
+            coalesce(max(value) FILTER (WHERE metric = 'scan_fill_unclassified_ns'), 0), ',',
+            count(*) FILTER (WHERE metric IN (
+                'scan_fill_pre_drain_ns',
+                'scan_fill_post_drain_ns',
+                'scan_fill_overflow_encode_ns',
+                'scan_fill_emit_ns',
+                'scan_fill_unclassified_ns'
+            )), ',',
             coalesce(max(reset_epoch), 0)
         )
         FROM pg_fusion_metrics()
@@ -721,7 +789,7 @@ pub(crate) fn metrics_smoke() {
         .split(',')
         .map(|part| part.parse::<i64>().expect("metric value must be integer"))
         .collect::<Vec<_>>();
-    assert_eq!(detailed_parts.len(), 10);
+    assert_eq!(detailed_parts.len(), 16);
     assert!(
         detailed_parts[0] > 0,
         "scan_fetch_calls_total must be positive with detailed timing: {detailed}"
@@ -738,7 +806,11 @@ pub(crate) fn metrics_smoke() {
         detailed_parts[4] > 0,
         "scan_slot_drain_ns must be positive with detailed timing: {detailed}"
     );
-    assert_eq!(detailed_parts[9], detail_epoch);
+    assert_eq!(
+        detailed_parts[14], 5,
+        "all scan fill residual metric rows must be present: {detailed}"
+    );
+    assert_eq!(detailed_parts[15], detail_epoch);
 
     let after_epoch: i64 =
         simple_query_first_column_tx(&mut tx, "SELECT pg_fusion_metrics_reset()")

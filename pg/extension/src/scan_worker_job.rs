@@ -22,6 +22,7 @@ const STATE_RUNNING: u32 = 4;
 const STATE_DONE: u32 = 5;
 const STATE_FAILED: u32 = 6;
 const STATE_FAILING: u32 = 7;
+const CONFIG_SCAN_TIMING_DETAIL: u32 = 1 << 0;
 
 #[repr(C, align(8))]
 pub(crate) struct ScanWorkerJobRegistry {
@@ -42,6 +43,7 @@ struct ScanWorkerJob {
     peer_generation: AtomicU64,
     peer_lease_epoch: AtomicU64,
     payload_len: AtomicU32,
+    config_flags: AtomicU32,
     error_len: AtomicU32,
     payload: [u8; SCAN_WORKER_PAYLOAD_CAPACITY],
     error: [u8; SCAN_WORKER_ERROR_CAPACITY],
@@ -63,6 +65,7 @@ pub(crate) struct ScanWorkerJobSpec<'a> {
     pub(crate) scan_id: u64,
     pub(crate) producer_id: u16,
     pub(crate) producer_count: u16,
+    pub(crate) scan_timing_detail: bool,
 }
 
 #[derive(Debug)]
@@ -74,6 +77,7 @@ pub(crate) struct ScanWorkerJobSnapshot {
     pub(crate) scan_id: u64,
     pub(crate) producer_id: u16,
     pub(crate) producer_count: u16,
+    pub(crate) scan_timing_detail: bool,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -149,6 +153,8 @@ impl ScanWorkerJobRegistryHandle {
             job.peer_slot_id.store(u32::MAX, Ordering::Relaxed);
             job.peer_generation.store(0, Ordering::Relaxed);
             job.peer_lease_epoch.store(0, Ordering::Relaxed);
+            job.config_flags
+                .store(config_flags(&spec), Ordering::Relaxed);
             job.error_len.store(0, Ordering::Relaxed);
             unsafe {
                 let dst = job.payload.as_ptr() as *mut u8;
@@ -188,6 +194,9 @@ impl ScanWorkerJobRegistryHandle {
             scan_id: job.scan_id.load(Ordering::Relaxed),
             producer_id: job.producer_id.load(Ordering::Relaxed) as u16,
             producer_count: job.producer_count.load(Ordering::Relaxed) as u16,
+            scan_timing_detail: job.config_flags.load(Ordering::Relaxed)
+                & CONFIG_SCAN_TIMING_DETAIL
+                != 0,
         })
     }
 
@@ -312,6 +321,14 @@ fn try_reserve_job(job: &ScanWorkerJob) -> bool {
         }
     }
     false
+}
+
+fn config_flags(spec: &ScanWorkerJobSpec<'_>) -> u32 {
+    if spec.scan_timing_detail {
+        CONFIG_SCAN_TIMING_DETAIL
+    } else {
+        0
+    }
 }
 
 fn transition_job_state(
@@ -639,6 +656,14 @@ mod tests {
             scan_id: 4,
             producer_id: 1,
             producer_count: 2,
+            scan_timing_detail: false,
+        }
+    }
+
+    fn spec_with_scan_timing_detail(payload: &[u8]) -> ScanWorkerJobSpec<'_> {
+        ScanWorkerJobSpec {
+            scan_timing_detail: true,
+            ..spec(payload)
         }
     }
 
@@ -664,6 +689,28 @@ mod tests {
         assert_eq!(snapshot.descriptor.sql, "select 2");
         assert_eq!(snapshot.descriptor.fields[0].name, "id");
         assert_eq!(snapshot.descriptor.planner_fetch_hint, Some(128));
+        assert!(!snapshot.scan_timing_detail);
+    }
+
+    #[test]
+    fn scan_timing_detail_is_snapshotted_and_overwritten_on_reuse() {
+        let registry = TestRegistry::new();
+        let jobs = registry.handle();
+        let first_payload = encoded_descriptor("select 1");
+        let second_payload = encoded_descriptor("select 2");
+
+        let first = jobs
+            .allocate(spec_with_scan_timing_detail(&first_payload))
+            .expect("first job");
+        let snapshot = jobs.snapshot(first).expect("first snapshot");
+        assert!(snapshot.scan_timing_detail);
+
+        jobs.mark_failed(first, "launch failed")
+            .expect("mark failed");
+        let second = jobs.allocate(spec(&second_payload)).expect("second job");
+        assert_eq!(second, first);
+        let snapshot = jobs.snapshot(second).expect("second snapshot");
+        assert!(!snapshot.scan_timing_detail);
     }
 
     #[test]
