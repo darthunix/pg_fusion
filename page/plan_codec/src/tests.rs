@@ -20,7 +20,7 @@ use datafusion_expr::{lit, Expr, Operator};
 use datafusion_proto::protobuf::logical_plan_node::LogicalPlanType;
 use df_catalog::{CatalogResolver, ResolveError, ResolvedTable};
 use plan_builder::{BuiltPlan, PlanBuildInput, PlanBuilder, PlanBuilderConfig};
-use scan_node::{PgScanId, PgScanNode, PgScanSpec};
+use scan_node::{PgCteRefNode, PgScanId, PgScanNode, PgScanSpec};
 use scan_sql::{compile_scan, CompileScanInput, LimitLowering, PgRelation};
 
 const TEST_IDENTIFIER_MAX_BYTES: usize = 63;
@@ -188,6 +188,20 @@ fn collect_pg_scans(plan: &LogicalPlan) -> Vec<Arc<PgScanSpec>> {
     scans
 }
 
+fn count_cte_refs(plan: &LogicalPlan) -> usize {
+    let mut count = 0;
+    plan.apply(|node| {
+        if let LogicalPlan::Extension(extension) = node {
+            if extension.node.as_any().is::<PgCteRefNode>() {
+                count += 1;
+            }
+        }
+        Ok(TreeNodeRecursion::Continue)
+    })
+    .expect("walk plan");
+    count
+}
+
 fn assert_scan_specs_eq(expected: &PgScanSpec, actual: &PgScanSpec) {
     assert_eq!(expected.scan_id, actual.scan_id);
     assert_eq!(expected.table_oid, actual.table_oid);
@@ -324,6 +338,25 @@ fn roundtrips_rewritten_in_subquery_with_multiple_pg_scans() {
         .display_indent()
         .to_string()
         .contains("LeftSemi Join"));
+}
+
+#[test]
+fn roundtrips_materialized_multi_use_cte() {
+    let built = build_sql(
+        "WITH u AS (SELECT id, score FROM users) \
+         SELECT a.id FROM u a JOIN u b ON a.id = b.id",
+    );
+    let decoded = roundtrip(&built.logical_plan);
+
+    assert_eq!(
+        built.logical_plan.display_indent().to_string(),
+        decoded.display_indent().to_string()
+    );
+    assert_eq!(count_cte_refs(&decoded), 2);
+    let scans = collect_pg_scans(&decoded);
+    assert_eq!(scans.len(), 2);
+    assert_eq!(scans[0].scan_id, scans[1].scan_id);
+    assert_eq!(scans[0].scan_id.get(), 1);
 }
 
 #[test]

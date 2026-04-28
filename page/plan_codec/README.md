@@ -10,6 +10,8 @@ The crate is intentionally narrow:
   expressions stay delegated to `datafusion-proto`
 - `scan_node::PgScanNode` carries only `scan_id` inside the protobuf logical
   plan; the full `PgScanSpec` table lives alongside it in the outer envelope
+- `scan_node::PgCteRefNode` carries its query-local CTE id, output schema, and
+  per-reference projection/fetch metadata; its child plan is the CTE producer
 - the payload carries `scan_id`, but never carries snapshot identity
 - callers use streaming sessions and provide page-sized chunks directly;
   `plan_codec` does not require a single staged `Vec<u8>` for the full plan

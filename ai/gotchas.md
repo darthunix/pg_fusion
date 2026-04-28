@@ -39,6 +39,11 @@ importance: 0.7
   optimization. Subqueries that decorrelate into ordinary relational operators
   can lower PostgreSQL leaf scans; subquery nodes that survive optimization
   remain unsupported.
+- DataFusion clones ordinary CTE plans at each reference. `plan_builder`
+  rewrites non-recursive multi-use CTEs before SQL planning so references become
+  `PgCteRefNode` reads over one materialized producer. Keep this path for
+  floating aggregates such as TPC-H q15; exact equality against a separately
+  recomputed aggregate can otherwise fail by a few floating-point bits.
 - PostgreSQL text-like columns (`text`, `varchar`, `bpchar`, `name`) are
   exposed to DataFusion as `Utf8View`, not `Utf8`. This keeps the logical scan
   schema aligned with page-backed shared-memory batches and avoids copying

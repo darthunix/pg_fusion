@@ -10,6 +10,8 @@ The crate is intentionally narrow:
 - it provides a DataFusion `UserDefinedLogicalNodeCore` implementation
 - it provides an `ExtensionPlanner` hook that delegates physical execution to a
   caller-provided factory
+- it defines `PgCteRefNode` / `CteScanExec` for query-local multi-use CTE
+  materialization
 - it provides `PageMaterializeExec` and a physical-plan rewrite that inserts
   copies only before DataFusion operators that can retain page-backed batches
 
@@ -69,3 +71,9 @@ streaming operators zero-copy and inserts `PageMaterializeExec` at retaining
 boundaries such as `SortExec`, window operators, and join build sides. Runtime
 planning and backend EXPLAIN both use this rewrite so the rendered plan matches
 the worker plan.
+
+`CteScanExec` materializes its child into owned Arrow batches on the first read
+and replays those batches for later reads with the same query-local CTE id. This
+is intentionally an owned-copy boundary: CTE results can be retained and reused
+after the original page-backed scan batches have released their shared-memory
+pages.

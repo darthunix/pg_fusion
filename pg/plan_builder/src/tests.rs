@@ -122,6 +122,20 @@ fn count_pg_scan_nodes(plan: &LogicalPlan) -> usize {
     count
 }
 
+fn count_cte_ref_nodes(plan: &LogicalPlan) -> usize {
+    let mut count = 0;
+    plan.apply(|node| {
+        if let LogicalPlan::Extension(extension) = node {
+            if extension.node.as_any().is::<PgCteRefNode>() {
+                count += 1;
+            }
+        }
+        Ok(TreeNodeRecursion::Continue)
+    })
+    .unwrap();
+    count
+}
+
 #[test]
 fn builds_simple_query_with_one_pg_scan_node() {
     let built = build_sql("SELECT id, name FROM users WHERE id > 10");
@@ -379,6 +393,30 @@ fn rewrites_scalar_subquery_after_optimization() {
     let rendered = built.logical_plan.display_indent().to_string();
     assert!(rendered.contains("Inner Join"), "{rendered}");
     assert!(rendered.contains("Aggregate"), "{rendered}");
+}
+
+#[test]
+fn materializes_multi_use_cte_once() {
+    let built = build_sql(
+        "WITH u AS (SELECT id, score FROM users) \
+         SELECT a.id FROM u a JOIN u b ON a.id = b.id",
+    );
+
+    assert_eq!(built.scans.len(), 1);
+    assert_eq!(built.scans[0].scan_id.get(), 1);
+    assert_eq!(count_cte_ref_nodes(&built.logical_plan), 2);
+    assert!(!contains_table_scan(&built.logical_plan));
+    let rendered = built.logical_plan.display_indent().to_string();
+    assert!(rendered.contains("PgCteRef"), "{rendered}");
+}
+
+#[test]
+fn leaves_single_use_cte_inline() {
+    let built = build_sql("WITH u AS (SELECT id FROM users) SELECT id FROM u");
+
+    assert_eq!(built.scans.len(), 1);
+    assert_eq!(count_cte_ref_nodes(&built.logical_plan), 0);
+    assert!(!contains_table_scan(&built.logical_plan));
 }
 
 #[test]

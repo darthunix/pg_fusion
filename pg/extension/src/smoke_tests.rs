@@ -286,6 +286,82 @@ pub(crate) fn heap_join_two_tables_smoke() {
     assert_eq!(score, 20);
 }
 
+pub(crate) fn heap_multi_use_cte_smoke() {
+    let mut client = smoke_client();
+    let mut tx = smoke_transaction(&mut client);
+    batch_execute_pg_fusion_disabled(
+        &mut tx,
+        "\
+        CREATE TEMP TABLE pgf_cte_lineitem (
+            l_suppkey bigint NOT NULL,
+            l_extendedprice double precision NOT NULL,
+            l_discount double precision NOT NULL,
+            l_shipdate text NOT NULL
+        );
+        CREATE TEMP TABLE pgf_cte_supplier (
+            s_suppkey bigint NOT NULL,
+            s_name text NOT NULL
+        );
+        INSERT INTO pgf_cte_supplier VALUES
+            (1, 'supplier#1'),
+            (2, 'supplier#2');
+        INSERT INTO pgf_cte_lineitem VALUES
+            (1, 100.0, 0.10, '1996-01-10'),
+            (1, 200.0, 0.00, '1996-02-10'),
+            (2, 500.0, 0.10, '1996-01-20'),
+            (2, 100.0, 0.00, '1996-03-20'),
+            (2, 1000.0, 0.00, '1996-06-01')
+        ",
+    );
+
+    let supplier = simple_query_first_column_tx(
+        &mut tx,
+        "\
+        WITH revenue AS (
+            SELECT
+                l_suppkey AS supplier_no,
+                sum(l_extendedprice * (1.0 - l_discount)) AS total_revenue
+            FROM pgf_cte_lineitem
+            WHERE l_shipdate >= '1996-01-01'
+              AND l_shipdate < '1996-04-01'
+            GROUP BY l_suppkey
+        )
+        SELECT s.s_name
+        FROM pgf_cte_supplier s
+        JOIN revenue ON s.s_suppkey = revenue.supplier_no
+        WHERE revenue.total_revenue = (SELECT max(total_revenue) FROM revenue)
+        ORDER BY s.s_suppkey
+        ",
+    )
+    .expect("multi-use CTE query must return one row");
+    assert_eq!(supplier, "supplier#2");
+
+    let explain = simple_query_first_column_rows_tx(
+        &mut tx,
+        "\
+        EXPLAIN
+        WITH revenue AS (
+            SELECT
+                l_suppkey AS supplier_no,
+                sum(l_extendedprice * (1.0 - l_discount)) AS total_revenue
+            FROM pgf_cte_lineitem
+            WHERE l_shipdate >= '1996-01-01'
+              AND l_shipdate < '1996-04-01'
+            GROUP BY l_suppkey
+        )
+        SELECT s.s_name
+        FROM pgf_cte_supplier s
+        JOIN revenue ON s.s_suppkey = revenue.supplier_no
+        WHERE revenue.total_revenue = (SELECT max(total_revenue) FROM revenue)
+        ",
+    )
+    .join("\n");
+    assert!(
+        explain.contains("CteScanExec: revenue"),
+        "EXPLAIN should expose materialized multi-use CTE reads: {explain}"
+    );
+}
+
 pub(crate) fn heap_parallel_scan_smoke() {
     let mut client = smoke_client();
     ensure_shared_preload(&mut client);

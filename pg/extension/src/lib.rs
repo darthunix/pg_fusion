@@ -82,6 +82,11 @@ mod tests {
     }
 
     #[pg_test]
+    fn pg_fusion_heap_multi_use_cte_smoke() {
+        super::smoke_tests::heap_multi_use_cte_smoke();
+    }
+
+    #[pg_test]
     fn pg_fusion_heap_parallel_scan_smoke() {
         super::smoke_tests::heap_parallel_scan_smoke();
     }

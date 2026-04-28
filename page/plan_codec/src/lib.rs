@@ -43,7 +43,7 @@ use rmp::decode::{
 use rmp::encode::{
     write_array_len, write_bin_len, write_bool, write_str, write_u32, write_u64, write_u8,
 };
-use scan_node::{PgScanFetchHints, PgScanId, PgScanNode, PgScanSpec};
+use scan_node::{PgCteId, PgCteRefNode, PgScanFetchHints, PgScanId, PgScanNode, PgScanSpec};
 use scan_sql::{CompiledFilter, CompiledScan, PgRelation};
 use smallvec::SmallVec;
 use thiserror::Error;
@@ -63,6 +63,8 @@ const PG_SCAN_PUSHED_FILTER_LEN: u32 = 2;
 
 const PG_SCAN_ID_PAYLOAD_VERSION: u8 = 1;
 const PG_SCAN_ID_PAYLOAD_LEN: usize = 1 + std::mem::size_of::<u64>();
+const PG_CTE_REF_PAYLOAD_VERSION: u8 = 2;
+const PG_CTE_REF_PAYLOAD_LEN: u32 = 6;
 
 const BUF_SCRATCH_LEN: usize = 64;
 
@@ -910,11 +912,7 @@ fn collect_pg_scan_specs_inner(
     if let LogicalPlan::Extension(extension) = plan {
         if let Some(pg_scan) = extension.node.as_any().downcast_ref::<PgScanNode>() {
             let spec = pg_scan.spec();
-            if specs.insert(spec.scan_id, spec.clone()).is_some() {
-                return Err(EncodeError::DuplicateScanId {
-                    scan_id: spec.scan_id.get(),
-                });
-            }
+            specs.entry(spec.scan_id).or_insert_with(|| spec.clone());
         }
     }
 
@@ -950,11 +948,7 @@ fn collect_used_scan_ids(
     if let LogicalPlan::Extension(extension) = plan {
         if let Some(pg_scan) = extension.node.as_any().downcast_ref::<PgScanNode>() {
             let scan_id = pg_scan.spec().scan_id;
-            if !used.insert(scan_id) {
-                return Err(DecodeError::DuplicateScanId {
-                    scan_id: scan_id.get(),
-                });
-            }
+            used.insert(scan_id);
         }
     }
 
@@ -1056,15 +1050,20 @@ impl LogicalExtensionCodec for PgScanEncodeExtensionCodec {
     }
 
     fn try_encode(&self, node: &Extension, buf: &mut Vec<u8>) -> DataFusionResult<()> {
-        let Some(pg_scan) = node.node.as_any().downcast_ref::<PgScanNode>() else {
-            return Err(DataFusionError::Plan(format!(
-                "unsupported logical extension node for plan codec: {}",
-                node.node.name()
-            )));
-        };
+        if let Some(pg_scan) = node.node.as_any().downcast_ref::<PgScanNode>() {
+            encode_scan_id_payload(pg_scan.spec().scan_id, buf);
+            return Ok(());
+        }
 
-        encode_scan_id_payload(pg_scan.spec().scan_id, buf);
-        Ok(())
+        if let Some(cte_ref) = node.node.as_any().downcast_ref::<PgCteRefNode>() {
+            encode_cte_ref_payload(cte_ref, buf)?;
+            return Ok(());
+        }
+
+        Err(DataFusionError::Plan(format!(
+            "unsupported logical extension node for plan codec: {}",
+            node.node.name()
+        )))
     }
 
     fn try_decode_table_provider(
@@ -1139,25 +1138,37 @@ impl LogicalExtensionCodec for PgScanDecodeExtensionCodec {
         inputs: &[LogicalPlan],
         _ctx: &SessionContext,
     ) -> DataFusionResult<Extension> {
-        if !inputs.is_empty() {
-            return Err(DataFusionError::Plan(
-                "PgScanNode decode received unexpected logical inputs".into(),
-            ));
+        if buf.len() == PG_SCAN_ID_PAYLOAD_LEN
+            && buf.first().copied() == Some(PG_SCAN_ID_PAYLOAD_VERSION)
+        {
+            if !inputs.is_empty() {
+                return Err(DataFusionError::Plan(
+                    "PgScanNode decode received unexpected logical inputs".into(),
+                ));
+            }
+            let scan_id = decode_scan_id_payload(buf).map_err(|error| {
+                DataFusionError::Plan(format!("failed to decode PgScanNode reference: {error}"))
+            })?;
+            let spec = self.specs.get(&scan_id).ok_or_else(|| {
+                DataFusionError::Plan(format!(
+                    "PgScanNode reference points at missing PgScanSpec: scan_id={}",
+                    scan_id.get()
+                ))
+            })?;
+
+            return Ok(Extension {
+                node: Arc::new(PgScanNode::new(Arc::clone(spec))),
+            });
         }
 
-        let scan_id = decode_scan_id_payload(buf).map_err(|error| {
-            DataFusionError::Plan(format!("failed to decode PgScanNode reference: {error}"))
-        })?;
-        let spec = self.specs.get(&scan_id).ok_or_else(|| {
-            DataFusionError::Plan(format!(
-                "PgScanNode reference points at missing PgScanSpec: scan_id={}",
-                scan_id.get()
-            ))
-        })?;
-
-        Ok(Extension {
-            node: Arc::new(PgScanNode::new(Arc::clone(spec))),
-        })
+        {
+            let cte = decode_cte_ref_payload(buf, inputs).map_err(|error| {
+                DataFusionError::Plan(format!("failed to decode PgCteRefNode reference: {error}"))
+            })?;
+            return Ok(Extension {
+                node: Arc::new(cte),
+            });
+        }
     }
 
     fn try_encode(&self, _node: &Extension, _buf: &mut Vec<u8>) -> DataFusionResult<()> {
@@ -1245,6 +1256,64 @@ fn decode_scan_id_payload(buf: &[u8]) -> Result<PgScanId, DecodeError> {
     let mut scan_id_bytes = [0u8; std::mem::size_of::<u64>()];
     scan_id_bytes.copy_from_slice(&buf[1..]);
     Ok(PgScanId::new(u64::from_be_bytes(scan_id_bytes)))
+}
+
+fn encode_cte_ref_payload(cte_ref: &PgCteRefNode, buf: &mut Vec<u8>) -> DataFusionResult<()> {
+    buf.clear();
+    encode_cte_ref_payload_inner(buf, cte_ref).map_err(|error| {
+        DataFusionError::Plan(format!("failed to encode PgCteRefNode payload: {error}"))
+    })
+}
+
+fn encode_cte_ref_payload_inner<S>(sink: &mut S, cte_ref: &PgCteRefNode) -> Result<(), EncodeError>
+where
+    S: BufMut,
+{
+    write_array_len_to(sink, PG_CTE_REF_PAYLOAD_LEN)?;
+    write_u8_to(sink, PG_CTE_REF_PAYLOAD_VERSION)?;
+    write_u64_to(sink, cte_ref.cte_id().get())?;
+    write_string_to(sink, cte_ref.name())?;
+    write_optional_usize_vec_to(sink, cte_ref.projection())?;
+    write_optional_usize_to(sink, cte_ref.fetch())?;
+    encode_df_schema_into(sink, cte_ref.schema())?;
+    Ok(())
+}
+
+fn decode_cte_ref_payload(buf: &[u8], inputs: &[LogicalPlan]) -> Result<PgCteRefNode, DecodeError> {
+    let [input] = inputs else {
+        return Err(DecodeError::InvalidScanPayload(format!(
+            "PgCteRefNode expected one input, got {}",
+            inputs.len()
+        )));
+    };
+
+    let mut source = buf;
+    expect_array_len_from(&mut source, PG_CTE_REF_PAYLOAD_LEN, "PgCteRefNode")?;
+    let version = read_u8_from(&mut source)?;
+    if version != PG_CTE_REF_PAYLOAD_VERSION {
+        return Err(DecodeError::InvalidScanPayload(format!(
+            "unsupported PgCteRefNode payload version: {version}"
+        )));
+    }
+    let cte_id = PgCteId::new(read_u64_from(&mut source)?);
+    let name = read_string_from(&mut source, "materialized CTE name")?;
+    let projection = read_optional_usize_vec_from(&mut source)?;
+    let fetch = read_optional_usize_from(&mut source)?;
+    let schema = decode_df_schema_from(&mut source)?;
+    if source.has_remaining() {
+        return Err(DecodeError::TrailingBytes {
+            remaining: source.remaining(),
+        });
+    }
+
+    Ok(PgCteRefNode::new(
+        cte_id,
+        name,
+        input.clone(),
+        schema,
+        projection,
+        fetch,
+    ))
 }
 
 #[cfg(test)]
@@ -1660,6 +1729,31 @@ where
         })?);
     }
     Ok(values)
+}
+
+fn write_optional_usize_vec_to<S>(sink: &mut S, values: Option<&[usize]>) -> Result<(), EncodeError>
+where
+    S: BufMut,
+{
+    match values {
+        Some(values) => {
+            write_bool_to(sink, true)?;
+            write_usize_vec_to(sink, values)?;
+        }
+        None => write_bool_to(sink, false)?,
+    }
+    Ok(())
+}
+
+fn read_optional_usize_vec_from<S>(source: &mut S) -> Result<Option<Vec<usize>>, DecodeError>
+where
+    S: Buf,
+{
+    if read_bool_from(source)? {
+        read_usize_vec_from(source).map(Some)
+    } else {
+        Ok(None)
+    }
 }
 
 fn write_protobuf_bin_to<M, S>(sink: &mut S, message: &M) -> Result<(), EncodeError>

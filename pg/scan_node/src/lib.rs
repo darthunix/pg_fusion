@@ -17,6 +17,7 @@
 //! node. Plan-building code must keep required residual predicates above the
 //! custom scan node.
 
+mod cte;
 mod page_materialize;
 
 use std::cmp::Ordering;
@@ -36,6 +37,7 @@ use datafusion_expr::logical_plan::{
 use datafusion_expr::Expr;
 use scan_sql::{CompiledScan, PgRelation};
 
+pub use cte::{MaterializedCteExec, PgCteId, PgCteRefNode};
 pub use page_materialize::{
     insert_page_materializers, materialize_record_batch, PageMaterializeExec,
 };
@@ -289,12 +291,16 @@ pub trait PgScanExecFactory: Debug + Send + Sync {
 #[derive(Debug, Clone)]
 pub struct PgScanExtensionPlanner {
     factory: Arc<dyn PgScanExecFactory>,
+    cte_registry: cte::CteMaterializationRegistry,
 }
 
 impl PgScanExtensionPlanner {
     /// Create a planner hook backed by a runtime-specific factory.
     pub fn new(factory: Arc<dyn PgScanExecFactory>) -> Self {
-        Self { factory }
+        Self {
+            factory,
+            cte_registry: cte::CteMaterializationRegistry::default(),
+        }
     }
 }
 
@@ -308,17 +314,46 @@ impl ExtensionPlanner for PgScanExtensionPlanner {
         physical_inputs: &[Arc<dyn ExecutionPlan>],
         _session_state: &SessionState,
     ) -> Result<Option<Arc<dyn ExecutionPlan>>> {
-        let Some(pg_scan) = node.as_any().downcast_ref::<PgScanNode>() else {
-            return Ok(None);
-        };
+        if let Some(pg_scan) = node.as_any().downcast_ref::<PgScanNode>() {
+            if !logical_inputs.is_empty() || !physical_inputs.is_empty() {
+                return Err(DataFusionError::Plan(
+                    "PgScanNode physical planning received unexpected inputs".into(),
+                ));
+            }
 
-        if !logical_inputs.is_empty() || !physical_inputs.is_empty() {
-            return Err(DataFusionError::Plan(
-                "PgScanNode physical planning received unexpected inputs".into(),
-            ));
+            return self.factory.create(pg_scan.spec()).map(Some);
         }
 
-        self.factory.create(pg_scan.spec()).map(Some)
+        if let Some(cte_ref) = node.as_any().downcast_ref::<PgCteRefNode>() {
+            let [logical_input] = logical_inputs else {
+                return Err(DataFusionError::Plan(
+                    "PgCteRefNode physical planning expected one logical input".into(),
+                ));
+            };
+            let [physical_input] = physical_inputs else {
+                return Err(DataFusionError::Plan(
+                    "PgCteRefNode physical planning expected one physical input".into(),
+                ));
+            };
+            if logical_input.schema().as_ref() != cte_ref.input().schema().as_ref() {
+                return Err(DataFusionError::Plan(
+                    "PgCteRefNode physical planning received a mismatched logical input".into(),
+                ));
+            }
+
+            let state = self.cte_registry.state_for(cte_ref.cte_id());
+            return Ok(Some(Arc::new(MaterializedCteExec::new(
+                cte_ref.cte_id(),
+                cte_ref.name().to_owned(),
+                Arc::clone(physical_input),
+                cte_ref.schema().inner().clone(),
+                cte_ref.projection().map(|projection| projection.to_vec()),
+                cte_ref.fetch(),
+                state,
+            ))));
+        }
+
+        Ok(None)
     }
 }
 

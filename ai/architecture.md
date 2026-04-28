@@ -37,9 +37,12 @@ page-backed Arrow batches.
 ## Data Path
 
 1. Backend planning resolves PostgreSQL catalog metadata and lowers scan leaves
-   to `PgScanNode`/`scan_sql` descriptors. PostgreSQL text-like columns are
-   represented as Arrow `Utf8View` in the DataFusion logical schema so scan
-   pages can stay zero-copy for string payloads.
+   to `PgScanNode`/`scan_sql` descriptors. Non-recursive CTEs referenced more
+   than once are planned as `PgCteRefNode` reads over a single lowered CTE
+   producer so worker execution materializes the CTE once and reuses the owned
+   batches. PostgreSQL text-like columns are represented as Arrow `Utf8View` in
+   the DataFusion logical schema so scan pages can stay zero-copy for string
+   payloads.
 2. Worker DataFusion execution opens scans through the runtime protocol.
 3. Backend executes trusted scan SQL through `slot_scan`, drains PostgreSQL
    executor slots with a custom `DestReceiver` and explicit fetch row budgets,
@@ -61,7 +64,9 @@ operators that can retain input batches beyond immediate streaming, such as
 sort/window operators and join build sides. The wrapper copies Arrow arrays into
 ordinary allocations at that boundary so shared-memory pages and permits can be
 released while preserving zero-copy for simple scans, filters, projections,
-limits, and plain aggregates.
+limits, and plain aggregates. Multi-use CTE materialization is another owned
+boundary: `CteScanExec` deep-copies the producer output once before replaying it
+to multiple consumers.
 
 Runtime metrics live in a separate shared-memory region. The runtime does not
 wrap control rings for v1 metrics; scan/result page senders stamp page

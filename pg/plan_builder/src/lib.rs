@@ -16,7 +16,8 @@
 //! nodes that survive optimization are rejected before `PgScanNode` lowering.
 
 use std::any::Any;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
+use std::ops::ControlFlow;
 use std::sync::{Arc, Mutex};
 
 use arrow_schema::SchemaRef;
@@ -34,12 +35,15 @@ use datafusion_expr::{
 };
 use datafusion_sql::parser::{DFParser, Statement as DFStatement};
 use datafusion_sql::planner::SqlToRel;
-use datafusion_sql::sqlparser::ast::Statement as SqlStatement;
+use datafusion_sql::sqlparser::ast::{
+    Cte, CteAsMaterialized, Ident, ObjectName, Query, Statement as SqlStatement, Visit, Visitor,
+    With,
+};
 use datafusion_sql::sqlparser::parser::ParserError;
 use df_catalog::{CatalogResolver, PgrxCatalogResolver, ResolveError, ResolvedTable};
 use once_cell::sync::Lazy;
 use pgrx::pg_sys;
-use scan_node::{PgScanId, PgScanNode, PgScanSpec};
+use scan_node::{PgCteId, PgCteRefNode, PgScanId, PgScanNode, PgScanSpec};
 use scan_sql::{compile_scan, CompileError, CompileScanInput, LimitLowering};
 use thiserror::Error;
 
@@ -153,15 +157,16 @@ where
 {
     /// Build an optimized logical plan and lower PostgreSQL table scans.
     pub fn build(&self, input: PlanBuildInput<'_>) -> Result<BuiltPlan, PlanBuildError> {
-        let statement = parse_one_query(input.sql)?;
+        let mut statement = parse_one_query(input.sql)?;
         let context = PgPlanningContext::new(&self.resolver, self.config);
+        let mut lowerer = ScanLowerer::new(self.config);
+        prepare_materialized_ctes(&mut statement, &context, &input.params, &mut lowerer)?;
         let planner = SqlToRel::new(&context);
         let plan = planner.statement_to_plan(statement)?;
         let plan = plan.with_param_values(input.params)?;
         let optimized = optimize_logical_plan(plan, self.config.target_partitions)?;
         validate_supported_plan_shape(&optimized)?;
 
-        let mut lowerer = ScanLowerer::new(self.config);
         let logical_plan = lowerer.lower(optimized)?;
         Ok(BuiltPlan {
             logical_plan,
@@ -273,6 +278,193 @@ fn recover_subquery_validation_error(
     }
 }
 
+fn prepare_materialized_ctes<R>(
+    statement: &mut DFStatement,
+    context: &PgPlanningContext<'_, R>,
+    params: &[ScalarValue],
+    lowerer: &mut ScanLowerer,
+) -> Result<(), PlanBuildError>
+where
+    R: CatalogResolver + Send + Sync,
+{
+    let DFStatement::Statement(statement_inner) = statement else {
+        return Ok(());
+    };
+    let SqlStatement::Query(query) = statement_inner.as_mut() else {
+        return Ok(());
+    };
+
+    let Some(with_ref) = query.with.as_ref() else {
+        return Ok(());
+    };
+    if with_ref.recursive {
+        return Err(PlanBuildError::UnsupportedStatement(
+            "recursive CTEs are not supported by pg_fusion".into(),
+        ));
+    }
+
+    let ref_counts = count_top_level_cte_references(query);
+    let mut prefix_ctes = Vec::new();
+    let mut next_cte_id = 1_u64;
+    let with_template = With {
+        with_token: with_ref.with_token.clone(),
+        recursive: false,
+        cte_tables: Vec::new(),
+    };
+    let Some(with_mut) = query.with.as_mut() else {
+        return Ok(());
+    };
+
+    for cte in &mut with_mut.cte_tables {
+        let cte_name = normalize_ident(cte.alias.name.clone());
+        let ref_count = ref_counts.get(&cte_name).copied().unwrap_or(0);
+        let should_materialize = match cte.materialized {
+            Some(CteAsMaterialized::Materialized) => true,
+            Some(CteAsMaterialized::NotMaterialized) => false,
+            None => ref_count > 1,
+        };
+
+        let original_cte = cte.clone();
+        if should_materialize {
+            let cte_id = PgCteId::new(next_cte_id);
+            next_cte_id = next_cte_id.checked_add(1).ok_or_else(|| {
+                PlanBuildError::Plan("materialized CTE id counter overflowed".into())
+            })?;
+            let definition_statement =
+                cte_definition_statement(&with_template, &prefix_ctes, original_cte)?;
+            let definition =
+                build_materialized_cte_definition(definition_statement, context, params, lowerer)?;
+            let synthetic_table = synthetic_cte_table_name(cte_id);
+            context.register_cte_source(
+                TableReference::bare(synthetic_table.clone()),
+                PgPlanningCteSource::new(cte_id, cte_name, definition),
+            )?;
+            cte.query = synthetic_cte_query(&synthetic_table)?;
+        }
+
+        prefix_ctes.push(cte.clone());
+    }
+
+    Ok(())
+}
+
+fn count_top_level_cte_references(query: &Query) -> HashMap<String, usize> {
+    let Some(with) = query.with.as_ref() else {
+        return HashMap::new();
+    };
+    let names = with
+        .cte_tables
+        .iter()
+        .map(|cte| normalize_ident(cte.alias.name.clone()))
+        .collect::<HashSet<_>>();
+    if names.is_empty() {
+        return HashMap::new();
+    }
+
+    let mut body_query = query.clone();
+    body_query.with = None;
+    let mut visitor = CteReferenceCounter {
+        names: &names,
+        counts: HashMap::new(),
+    };
+    let _ = body_query.visit(&mut visitor);
+    visitor.counts
+}
+
+struct CteReferenceCounter<'a> {
+    names: &'a HashSet<String>,
+    counts: HashMap<String, usize>,
+}
+
+impl Visitor for CteReferenceCounter<'_> {
+    type Break = ();
+
+    fn pre_visit_relation(&mut self, relation: &ObjectName) -> ControlFlow<Self::Break> {
+        if relation.0.len() == 1 {
+            let name = normalize_ident(relation.0[0].clone());
+            if self.names.contains(&name) {
+                *self.counts.entry(name).or_default() += 1;
+            }
+        }
+        ControlFlow::Continue(())
+    }
+}
+
+fn cte_definition_statement(
+    with_template: &With,
+    prefix_ctes: &[Cte],
+    cte: Cte,
+) -> Result<DFStatement, PlanBuildError> {
+    let mut statement = parse_select_star_statement(&cte.alias.name)?;
+    let DFStatement::Statement(statement_inner) = &mut statement else {
+        return Err(PlanBuildError::Plan(
+            "synthetic CTE definition statement was not a SQL statement".into(),
+        ));
+    };
+    let SqlStatement::Query(query) = statement_inner.as_mut() else {
+        return Err(PlanBuildError::Plan(
+            "synthetic CTE definition statement was not a query".into(),
+        ));
+    };
+
+    let mut cte_tables = prefix_ctes.to_vec();
+    cte_tables.push(cte);
+    query.with = Some(With {
+        with_token: with_template.with_token.clone(),
+        recursive: false,
+        cte_tables,
+    });
+    Ok(statement)
+}
+
+fn parse_select_star_statement(cte_name: &Ident) -> Result<DFStatement, PlanBuildError> {
+    parse_one_query(&format!("SELECT * FROM {cte_name}"))
+}
+
+fn synthetic_cte_query(synthetic_table: &str) -> Result<Box<Query>, PlanBuildError> {
+    let mut statement = parse_one_query(&format!("SELECT * FROM {synthetic_table}"))?;
+    let DFStatement::Statement(statement_inner) = &mut statement else {
+        return Err(PlanBuildError::Plan(
+            "synthetic CTE statement was not a SQL statement".into(),
+        ));
+    };
+    let SqlStatement::Query(query) = statement_inner.as_mut() else {
+        return Err(PlanBuildError::Plan(
+            "synthetic CTE statement was not a query".into(),
+        ));
+    };
+    Ok(query.clone())
+}
+
+fn synthetic_cte_table_name(cte_id: PgCteId) -> String {
+    format!("__pg_fusion_cte_{}", cte_id.get())
+}
+
+fn build_materialized_cte_definition<R>(
+    statement: DFStatement,
+    context: &PgPlanningContext<'_, R>,
+    params: &[ScalarValue],
+    lowerer: &mut ScanLowerer,
+) -> Result<LogicalPlan, PlanBuildError>
+where
+    R: CatalogResolver + Send + Sync,
+{
+    let planner = SqlToRel::new(context);
+    let plan = planner.statement_to_plan(statement)?;
+    let plan = plan.with_param_values(params.to_vec())?;
+    let optimized = optimize_logical_plan(plan, context.config.target_partitions)?;
+    validate_supported_plan_shape(&optimized)?;
+    lowerer.lower(optimized)
+}
+
+fn normalize_ident(ident: Ident) -> String {
+    if ident.quote_style.is_some() {
+        ident.value
+    } else {
+        ident.value.to_ascii_lowercase()
+    }
+}
+
 #[derive(Debug)]
 struct PgPlanningContext<'a, R> {
     resolver: &'a R,
@@ -280,6 +472,7 @@ struct PgPlanningContext<'a, R> {
     options: ConfigOptions,
     builtins: Arc<Builtins>,
     tables: Mutex<HashMap<TableReference, Arc<PgPlanningTableSource>>>,
+    cte_sources: Mutex<HashMap<TableReference, Arc<PgPlanningCteSource>>>,
 }
 
 impl<'a, R> PgPlanningContext<'a, R> {
@@ -292,7 +485,20 @@ impl<'a, R> PgPlanningContext<'a, R> {
             options,
             builtins: Arc::clone(&BUILTINS),
             tables: Mutex::new(HashMap::new()),
+            cte_sources: Mutex::new(HashMap::new()),
         }
+    }
+
+    fn register_cte_source(
+        &self,
+        table: TableReference,
+        source: PgPlanningCteSource,
+    ) -> DataFusionResult<()> {
+        let mut cte_sources = self.cte_sources.lock().map_err(|error| {
+            DataFusionError::Plan(format!("CTE source cache lock poisoned: {error}"))
+        })?;
+        cte_sources.insert(table, Arc::new(source));
+        Ok(())
     }
 }
 
@@ -302,6 +508,18 @@ where
 {
     fn get_table_source(&self, table: TableReference) -> DataFusionResult<Arc<dyn TableSource>> {
         validate_table_reference_identifiers(&table, self.config.identifier_max_bytes)?;
+
+        if let Some(source) = self
+            .cte_sources
+            .lock()
+            .map_err(|error| {
+                DataFusionError::Plan(format!("CTE source cache lock poisoned: {error}"))
+            })?
+            .get(&table)
+            .cloned()
+        {
+            return Ok(source);
+        }
 
         let mut tables = self.tables.lock().map_err(|error| {
             DataFusionError::Plan(format!("catalog cache lock poisoned: {error}"))
@@ -413,6 +631,46 @@ impl TableSource for PgPlanningTableSource {
 }
 
 #[derive(Debug)]
+struct PgPlanningCteSource {
+    cte_id: PgCteId,
+    name: String,
+    definition: LogicalPlan,
+    schema: SchemaRef,
+}
+
+impl PgPlanningCteSource {
+    fn new(cte_id: PgCteId, name: String, definition: LogicalPlan) -> Self {
+        let schema = definition.schema().inner().clone();
+        Self {
+            cte_id,
+            name,
+            definition,
+            schema,
+        }
+    }
+}
+
+impl TableSource for PgPlanningCteSource {
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+
+    fn schema(&self) -> SchemaRef {
+        Arc::clone(&self.schema)
+    }
+
+    fn supports_filters_pushdown(
+        &self,
+        filters: &[&Expr],
+    ) -> DataFusionResult<Vec<TableProviderFilterPushDown>> {
+        Ok(vec![
+            TableProviderFilterPushDown::Unsupported;
+            filters.len()
+        ])
+    }
+}
+
+#[derive(Debug)]
 struct Builtins {
     agg_udf: HashMap<String, Arc<AggregateUDF>>,
     scalar_udf: HashMap<String, Arc<ScalarUDF>>,
@@ -501,6 +759,21 @@ impl ScanLowerer {
     }
 
     fn lower_table_scan(&mut self, table_scan: TableScan) -> DataFusionResult<LogicalPlan> {
+        let cte_source = table_scan
+            .source
+            .as_any()
+            .downcast_ref::<PgPlanningCteSource>()
+            .map(|source| {
+                (
+                    source.cte_id,
+                    source.name.clone(),
+                    source.definition.clone(),
+                )
+            });
+        if let Some((cte_id, name, definition)) = cte_source {
+            return self.lower_cte_scan(table_scan, cte_id, name, definition);
+        }
+
         let source = table_scan
             .source
             .as_any()
@@ -558,6 +831,31 @@ impl ScanLowerer {
         }
 
         Ok(plan)
+    }
+
+    fn lower_cte_scan(
+        &mut self,
+        table_scan: TableScan,
+        cte_id: PgCteId,
+        name: String,
+        definition: LogicalPlan,
+    ) -> DataFusionResult<LogicalPlan> {
+        if !table_scan.filters.is_empty() {
+            return Err(DataFusionError::Plan(format!(
+                "materialized CTE {} unexpectedly received pushed filters",
+                name
+            )));
+        }
+
+        Ok(PgCteRefNode::new(
+            cte_id,
+            name,
+            definition,
+            table_scan.projected_schema,
+            table_scan.projection,
+            table_scan.fetch,
+        )
+        .into_logical_plan())
     }
 
     fn allocate_scan_id(&mut self) -> DataFusionResult<PgScanId> {

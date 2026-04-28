@@ -9,6 +9,9 @@ The crate is intentionally a planning bridge:
 - relation metadata comes from `df_catalog`
 - pushdown SQL is compiled by `scan_sql`
 - PostgreSQL scan leaves are represented by `scan_node::PgScanSpec`
+- non-recursive CTEs referenced more than once are lowered through
+  `scan_node::PgCteRefNode` so the worker can materialize them once and reuse
+  the same batches
 - snapshot ownership, plan serialization, backend scan serving, and page
   transport are left to later layers
 - subquery expressions are accepted when DataFusion optimization rewrites them
@@ -39,6 +42,13 @@ Residual `EXISTS (...)`, `IN (SELECT ...)`, scalar subqueries,
 `LogicalPlan::Subquery`, or correlated `OuterReferenceColumn` nodes are still
 rejected before lowering so the later `plan_codec` contract only needs to
 round-trip ordinary relational operators plus PostgreSQL leaf scans.
+
+DataFusion normally clones CTE plans at every reference. Before calling
+`SqlToRel`, `plan_builder` rewrites multi-use CTE definitions to synthetic
+planning table sources and plans the original CTE body separately. During scan
+lowering, each synthetic source becomes a `PgCteRefNode` with the lowered CTE
+definition as its child. This preserves PostgreSQL-style "compute once, read
+many" behavior for floating aggregates and other non-bit-stable computations.
 
 ## Example
 
