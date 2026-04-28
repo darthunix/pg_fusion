@@ -7,7 +7,9 @@ mod source;
 
 use arrow_layout::{ColumnSpec, TypeTag};
 use arrow_schema::{DataType, Field, Schema, SchemaRef};
-use control_transport::{BackendLeaseSlot, BackendSlotLease, CommitOutcome, TransportRegion};
+use control_transport::{
+    BackendLeaseSlot, BackendSlotLease, BackendTxError, CommitOutcome, TransportRegion, TxError,
+};
 use datafusion_common::ScalarValue;
 use datafusion_expr::logical_plan::LogicalPlan;
 use fsm::backend_execution_flow::StateMachine as BackendExecutionMachine;
@@ -368,6 +370,7 @@ pub struct ActiveScanDriver {
     key: ExecutionKey,
     scan_id: u64,
     state: ActiveScanDriverState,
+    pending_step: Option<ScanStreamStep>,
     // This handle drives process-local PostgreSQL backend state stored in
     // `ACTIVE_EXECUTION`. Keep it on the creating backend thread so `step()`
     // and `Drop` cannot accidentally consult another thread's empty TLS slot.
@@ -436,6 +439,10 @@ impl ActiveScanDriver {
     }
 
     pub fn step(&mut self) -> Result<ScanStreamStep, BackendServiceError> {
+        if let Some(step) = self.pending_step.take() {
+            return Ok(step);
+        }
+
         match self.state {
             ActiveScanDriverState::Streaming => {
                 let step = step_scan_with_driver(self.key, self.scan_id)?;
@@ -463,6 +470,69 @@ impl ActiveScanDriver {
             }
             ActiveScanDriverState::Released => Err(BackendServiceError::ProtocolViolation(
                 "scan driver has already been released".into(),
+            )),
+        }
+    }
+
+    pub fn defer_outbound_step(&mut self, step: ScanStreamStep) -> Result<(), BackendServiceError> {
+        if self.state != ActiveScanDriverState::Streaming {
+            return Err(BackendServiceError::ProtocolViolation(
+                "scan driver cannot defer an outbound page after the stream has terminated".into(),
+            ));
+        }
+        if self.pending_step.is_some() {
+            return Err(BackendServiceError::ProtocolViolation(
+                "scan driver already has a deferred outbound page".into(),
+            ));
+        }
+
+        match &step {
+            ScanStreamStep::OutboundPage { flow, .. }
+                if flow.session_epoch == self.key.session_epoch && flow.scan_id == self.scan_id =>
+            {
+                self.pending_step = Some(step);
+                Ok(())
+            }
+            ScanStreamStep::OutboundPage { flow, .. } => {
+                Err(BackendServiceError::ProtocolViolation(format!(
+                    "scan driver cannot defer outbound page for flow {:?}; expected session_epoch={} scan_id={}",
+                    flow, self.key.session_epoch, self.scan_id
+                )))
+            }
+            _ => Err(BackendServiceError::ProtocolViolation(
+                "scan driver can defer only outbound scan pages".into(),
+            )),
+        }
+    }
+
+    pub fn defer_terminal_step(&mut self, step: ScanStreamStep) -> Result<(), BackendServiceError> {
+        if self.pending_step.is_some() {
+            return Err(BackendServiceError::ProtocolViolation(
+                "scan driver already has a deferred scan step".into(),
+            ));
+        }
+
+        match &step {
+            ScanStreamStep::Finished { flow }
+                if flow.session_epoch == self.key.session_epoch && flow.scan_id == self.scan_id =>
+            {
+                self.pending_step = Some(step);
+                Ok(())
+            }
+            ScanStreamStep::Failed { flow, .. }
+                if flow.session_epoch == self.key.session_epoch && flow.scan_id == self.scan_id =>
+            {
+                self.pending_step = Some(step);
+                Ok(())
+            }
+            ScanStreamStep::Finished { flow } | ScanStreamStep::Failed { flow, .. } => {
+                Err(BackendServiceError::ProtocolViolation(format!(
+                    "scan driver cannot defer terminal step for flow {:?}; expected session_epoch={} scan_id={}",
+                    flow, self.key.session_epoch, self.scan_id
+                )))
+            }
+            _ => Err(BackendServiceError::ProtocolViolation(
+                "scan driver can defer only terminal scan steps".into(),
             )),
         }
     }
@@ -925,6 +995,7 @@ impl BackendService {
                 key: execution.key,
                 scan_id: input.scan_id,
                 state: ActiveScanDriverState::Streaming,
+                pending_step: None,
                 _thread_bound: PhantomData,
             }))
         })
@@ -1888,25 +1959,31 @@ fn drive_standalone_producer(
     mut producer: BackendProducerRole<source::SlotScanPageSource>,
     metrics: RuntimeMetrics,
 ) -> Result<(), BackendServiceError> {
+    let mut pending_outbound = None;
     loop {
+        if let Some(outbound) = pending_outbound.take() {
+            match try_send_standalone_scan_page(&mut scan_lease, metrics, outbound)? {
+                Some(outbound) => {
+                    pending_outbound = Some(outbound);
+                    wait_latch(Some(Duration::from_millis(1)));
+                }
+                None => {}
+            }
+            continue;
+        }
+
         match producer.step()? {
             BackendProducerStep::OutboundPage {
                 outbound,
                 flow: _,
                 producer_id: _,
             } => {
-                let descriptor = outbound.descriptor();
-                let payload_len = outbound.payload_len();
-                let frame = encode_issued_frame(outbound.frame()).map_err(|err| {
-                    BackendServiceError::ProtocolViolation(format!(
-                        "failed to encode standalone scan page frame: {err}"
-                    ))
-                })?;
-                let _ = scan_lease.to_worker_tx().send_frame(&frame)?;
-                metrics.stamp_page(PageDirection::BackendToWorker, descriptor, payload_len);
-                metrics.increment(MetricId::ScanPagesSentTotal);
-                metrics.add(MetricId::ScanBytesSentTotal, payload_len as u64);
-                outbound.mark_sent();
+                if let Some(outbound) =
+                    try_send_standalone_scan_page(&mut scan_lease, metrics, outbound)?
+                {
+                    pending_outbound = Some(outbound);
+                    wait_latch(Some(Duration::from_millis(1)));
+                }
             }
             BackendProducerStep::Blocked { .. } => {
                 wait_latch(Some(Duration::from_millis(1)));
@@ -1946,6 +2023,31 @@ fn drive_standalone_producer(
     }
 }
 
+fn try_send_standalone_scan_page(
+    scan_lease: &mut BackendSlotLease,
+    metrics: RuntimeMetrics,
+    outbound: issuance::IssuedOutboundPage,
+) -> Result<Option<issuance::IssuedOutboundPage>, BackendServiceError> {
+    let descriptor = outbound.descriptor();
+    let payload_len = outbound.payload_len();
+    let frame = encode_issued_frame(outbound.frame()).map_err(|err| {
+        BackendServiceError::ProtocolViolation(format!(
+            "failed to encode standalone scan page frame: {err}"
+        ))
+    })?;
+    match scan_lease.to_worker_tx().send_frame(&frame) {
+        Ok(_) => {
+            metrics.stamp_page(PageDirection::BackendToWorker, descriptor, payload_len);
+            metrics.increment(MetricId::ScanPagesSentTotal);
+            metrics.add(MetricId::ScanBytesSentTotal, payload_len as u64);
+            outbound.mark_sent();
+            Ok(None)
+        }
+        Err(BackendTxError::Ring(TxError::Full { .. })) => Ok(Some(outbound)),
+        Err(err) => Err(err.into()),
+    }
+}
+
 fn send_standalone_scan_terminal(
     scan_lease: &mut BackendSlotLease,
     message: BackendScanToWorker<'_>,
@@ -1956,7 +2058,15 @@ fn send_standalone_scan_terminal(
             "failed to encode standalone scan terminal: {err}"
         ))
     })?;
-    let _ = scan_lease.to_worker_tx().send_frame(&encoded[..written])?;
+    loop {
+        match scan_lease.to_worker_tx().send_frame(&encoded[..written]) {
+            Ok(_) => break,
+            Err(BackendTxError::Ring(TxError::Full { .. })) => {
+                wait_latch(Some(Duration::from_millis(1)));
+            }
+            Err(err) => return Err(err.into()),
+        }
+    }
     wait_for_standalone_worker_detach(scan_lease)?;
     Ok(())
 }

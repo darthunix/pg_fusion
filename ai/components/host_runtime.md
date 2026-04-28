@@ -13,6 +13,10 @@ importance: 0.8
 - Backend control uses `runtime_protocol` messages over `control_transport`.
 - Backend scan production uses PostgreSQL `slot_scan` plus `slot_encoder` to
   stream Arrow layout pages to the worker.
+- Backend-to-worker scan control ring `Full` is scan-stream backpressure. The
+  host keeps unsent scan pages and terminal scan frames pending and retries the
+  same frame later; `IssuedOutboundPage::mark_sent()` only follows successful
+  carrier delivery.
 - PostgreSQL `max_parallel_workers_per_gather` controls the query-wide dynamic
   background-worker scan producer budget for eligible heap scans. Each scan
   always has a leader backend producer; positive budget is shared across scans,

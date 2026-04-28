@@ -12,7 +12,9 @@ use backend_service::{
     ScanWorkerLaunchOutput, ScanWorkerLauncher, ScanWorkerProducer, ScanWorkerQueryInput,
     StartExecutionInput,
 };
-use control_transport::{BackendLeaseSlot, BackendSlotLease, WorkerTransport};
+use control_transport::{
+    BackendLeaseSlot, BackendSlotLease, BackendTxError, TxError, WorkerTransport,
+};
 use issuance::{
     decode_issued_frame, encode_issued_frame, IssuancePool, IssuedOwnedFrame, IssuedTx,
 };
@@ -980,7 +982,11 @@ fn drive_active_scans(
             }
         };
         match step {
-            ScanStreamStep::OutboundPage { outbound, .. } => {
+            ScanStreamStep::OutboundPage {
+                flow,
+                producer_id,
+                outbound,
+            } => {
                 host_diag(DiagnosticLogLevel::Trace, || {
                     format!(
                         "pg_fusion active scan scan_id={} produced one outbound page peer={} state_before_reinsert={}",
@@ -996,7 +1002,23 @@ fn drive_active_scans(
                         "failed to encode scan page header: {err}"
                     ))
                 })?;
-                let _ = BackendService::send_scan_peer_bytes(peer, &frame)?;
+                if !try_send_scan_peer_bytes(peer, &frame)? {
+                    host_diag(DiagnosticLogLevel::Trace, || {
+                        format!(
+                            "pg_fusion active scan scan_id={} scan control ring is full; deferring outbound page peer={} state_before_reinsert={}",
+                            scan_id,
+                            peer_snapshot(peer),
+                            host_state_snapshot(state)
+                        )
+                    });
+                    driver.defer_outbound_step(ScanStreamStep::OutboundPage {
+                        flow,
+                        producer_id,
+                        outbound,
+                    })?;
+                    state.active_drivers.insert(scan_id, driver);
+                    continue;
+                }
                 state
                     .metrics
                     .stamp_page(PageDirection::BackendToWorker, descriptor, payload_len);
@@ -1044,14 +1066,26 @@ fn drive_active_scans(
                         host_state_snapshot(state)
                     )
                 });
-                send_scan_terminal(
+                if !try_send_scan_terminal(
                     peer,
                     BackendScanToWorker::ScanFinished {
                         session_epoch: flow.session_epoch,
                         scan_id: flow.scan_id,
                         producer_id: 0,
                     },
-                )?;
+                )? {
+                    host_diag(DiagnosticLogLevel::Trace, || {
+                        format!(
+                            "pg_fusion active scan scan_id={} scan terminal ring is full; deferring finished terminal peer={} state_before_reinsert={}",
+                            scan_id,
+                            peer_snapshot(peer),
+                            host_state_snapshot(state)
+                        )
+                    });
+                    driver.defer_terminal_step(ScanStreamStep::Finished { flow })?;
+                    state.active_drivers.insert(scan_id, driver);
+                    continue;
+                }
                 progressed = true;
             }
             ScanStreamStep::Failed {
@@ -1069,7 +1103,7 @@ fn drive_active_scans(
                     )
                 });
                 let message = truncate_scan_failure_message(&message);
-                send_scan_terminal(
+                if !try_send_scan_terminal(
                     peer,
                     BackendScanToWorker::ScanFailed {
                         session_epoch: flow.session_epoch,
@@ -1077,7 +1111,24 @@ fn drive_active_scans(
                         producer_id,
                         message: &message,
                     },
-                )?;
+                )? {
+                    host_diag(DiagnosticLogLevel::Trace, || {
+                        format!(
+                            "pg_fusion active scan scan_id={} scan terminal ring is full; deferring failure terminal peer={} state_before_reinsert={}",
+                            scan_id,
+                            peer_snapshot(peer),
+                            host_state_snapshot(state)
+                        )
+                    });
+                    driver.defer_terminal_step(ScanStreamStep::Failed {
+                        flow,
+                        producer_id,
+                        message,
+                    })?;
+                    state.active_drivers.clear();
+                    state.active_drivers.insert(scan_id, driver);
+                    continue;
+                }
                 state.active_drivers.clear();
                 host_diag(DiagnosticLogLevel::Basic, || {
                     format!(
@@ -1094,6 +1145,19 @@ fn drive_active_scans(
         progressed |= flush_pending_complete(state, scan_slot, result_slot)?;
     }
     Ok(progressed)
+}
+
+fn try_send_scan_peer_bytes(
+    peer: BackendLeaseSlot,
+    frame: &[u8],
+) -> Result<bool, BackendServiceError> {
+    match BackendService::send_scan_peer_bytes(peer, frame) {
+        Ok(_) => Ok(true),
+        Err(BackendServiceError::ScanControlTx(BackendTxError::Ring(TxError::Full { .. }))) => {
+            Ok(false)
+        }
+        Err(err) => Err(err),
+    }
 }
 
 fn result_ingress_complete(state: &HostScanState) -> bool {
@@ -1209,15 +1273,14 @@ fn flush_pending_complete(
     Ok(true)
 }
 
-fn send_scan_terminal(
+fn try_send_scan_terminal(
     peer: BackendLeaseSlot,
     message: BackendScanToWorker<'_>,
-) -> Result<(), BackendServiceError> {
+) -> Result<bool, BackendServiceError> {
     let mut buf = vec![0_u8; encoded_len_backend_scan_to_worker(message)];
     let written = encode_backend_scan_to_worker_into(message, &mut buf)
         .map_err(|err| BackendServiceError::ProtocolViolation(err.to_string()))?;
-    let _ = BackendService::send_scan_peer_bytes(peer, &buf[..written])?;
-    Ok(())
+    try_send_scan_peer_bytes(peer, &buf[..written])
 }
 
 fn publish_plan_to_worker(lease: &mut BackendSlotLease) -> Result<(), BackendServiceError> {

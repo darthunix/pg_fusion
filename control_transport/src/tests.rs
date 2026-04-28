@@ -1667,6 +1667,40 @@ fn framed_ring_empty_nonzero_offset_resends_max_frame_capacity_10() {
 }
 
 #[test]
+fn framed_ring_full_send_is_non_mutating_and_retries_after_drain() {
+    let ring = TestFramedRing::new(10);
+    let mut tx = ring.ring();
+    let mut rx = ring.ring();
+    let mut buf = [0u8; 8];
+
+    assert_commit_published(
+        tx.send_frame(&ring.ready, &ring.peer_pid, b"abcde")
+            .expect("send fills ring"),
+    );
+    let err = tx
+        .send_frame(&ring.ready, &ring.peer_pid, b"x")
+        .expect_err("send while full must fail");
+    assert!(matches!(
+        err,
+        TxError::Full {
+            required: 5,
+            available: 0
+        }
+    ));
+
+    recv_exact(rx.recv_frame_into(&ring.ready, &mut buf), &buf, b"abcde");
+    assert_commit_published(
+        tx.send_frame(&ring.ready, &ring.peer_pid, b"x")
+            .expect("retry after drain"),
+    );
+    recv_exact(rx.recv_frame_into(&ring.ready, &mut buf), &buf, b"x");
+    assert_eq!(
+        rx.recv_frame_into(&ring.ready, &mut buf).expect("empty"),
+        None
+    );
+}
+
+#[test]
 fn framed_ring_empty_nonzero_offset_resends_max_frame_capacity_9() {
     let ring = TestFramedRing::new(9);
     let mut tx = ring.ring();

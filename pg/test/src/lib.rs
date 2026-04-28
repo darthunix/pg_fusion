@@ -67,6 +67,16 @@ mod tests {
     }
 
     #[pg_test]
+    fn backend_service_replays_deferred_outbound_page() {
+        super::backend_service::backend_service_deferred_outbound_page_is_replayed_before_scan_progress();
+    }
+
+    #[pg_test]
+    fn backend_service_replays_deferred_terminal_step() {
+        super::backend_service::backend_service_deferred_terminal_step_is_replayed();
+    }
+
+    #[pg_test]
     fn backend_service_driver_fail_execution_from_control_yield() {
         super::backend_service::backend_service_driver_fail_execution_from_control_yield();
     }

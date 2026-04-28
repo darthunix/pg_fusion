@@ -707,6 +707,184 @@ pub fn backend_service_yields_for_control_on_permit_backpressure() {
     execution_guard.disarm();
 }
 
+pub fn backend_service_deferred_outbound_page_is_replayed_before_scan_progress() {
+    reset_backend_service_table();
+    Spi::run("SET LOCAL max_parallel_workers_per_gather = 0").unwrap();
+
+    let query = test_query();
+    let scan_transport = IssuedTransportHarness::new();
+    let scan_slots = ControlTransportHarness::new(8);
+    let mut config = BackendServiceConfig::default();
+    config.scan_fetch_batch_rows = 2;
+    let _snapshot = unsafe { LatestSnapshotGuard::acquire() };
+    let begin = begin_and_finalize_execution(TEST_SLOT_ID, &query, &config, scan_slots.region());
+    let mut execution_guard = ActiveExecutionGuard::new(begin.key);
+
+    let built = PlanBuilder::new()
+        .build(PlanBuildInput {
+            sql: &query,
+            params: Vec::<ScalarValue>::new(),
+        })
+        .expect("build scan metadata");
+    assert_eq!(built.scans.len(), 1, "expected exactly one leaf scan");
+    let spec = &built.scans[0];
+    let scan_peer = peer_from_scan_channels(&begin, spec.scan_id.get());
+
+    let scan_rx = scan_transport.rx();
+    let mut driver = open_scan_with_runtime_protocol(
+        scan_peer,
+        begin.key.session_epoch,
+        spec.scan_id.get(),
+        &config,
+        scan_transport.tx(),
+    );
+
+    let (
+        first_flow,
+        first_producer_id,
+        first_transfer_id,
+        first_permit_id,
+        first_descriptor,
+        first_payload_len,
+    ) = match driver.step().expect("first scan step") {
+        ScanStreamStep::OutboundPage {
+            flow,
+            producer_id,
+            outbound,
+        } => {
+            let transfer_id = outbound.transfer_id();
+            let permit_id = outbound.permit_id();
+            let descriptor = outbound.descriptor();
+            let payload_len = outbound.payload_len();
+            driver
+                .defer_outbound_step(ScanStreamStep::OutboundPage {
+                    flow,
+                    producer_id,
+                    outbound,
+                })
+                .expect("defer outbound page");
+            (
+                flow,
+                producer_id,
+                transfer_id,
+                permit_id,
+                descriptor,
+                payload_len,
+            )
+        }
+        other => panic!("expected first outbound page, got {other:?}"),
+    };
+
+    match driver.step().expect("replay deferred scan step") {
+        ScanStreamStep::OutboundPage {
+            flow,
+            producer_id,
+            outbound,
+        } => {
+            assert_eq!(flow, first_flow);
+            assert_eq!(producer_id, first_producer_id);
+            assert_eq!(outbound.transfer_id(), first_transfer_id);
+            assert_eq!(outbound.permit_id(), first_permit_id);
+            assert_eq!(outbound.descriptor(), first_descriptor);
+            assert_eq!(outbound.payload_len(), first_payload_len);
+
+            let frame = outbound.frame();
+            outbound.mark_sent();
+            match scan_rx.accept(&frame).expect("accept replayed scan frame") {
+                IssueEvent::Page(page) => drop(page),
+                IssueEvent::Closed => panic!("scan transport should not emit close frame"),
+            }
+        }
+        other => panic!("expected replayed outbound page, got {other:?}"),
+    }
+
+    loop {
+        if step_scan_and_drain_page(&mut driver, &scan_rx) {
+            break;
+        }
+    }
+
+    scan_transport.assert_drained();
+    assert!(
+        driver
+            .complete_execution()
+            .expect("complete execution after deferred page"),
+        "fresh complete message must be accepted"
+    );
+    execution_guard.disarm();
+}
+
+pub fn backend_service_deferred_terminal_step_is_replayed() {
+    reset_backend_service_table();
+    Spi::run("SET LOCAL max_parallel_workers_per_gather = 0").unwrap();
+
+    let query = test_query();
+    let scan_transport = IssuedTransportHarness::new();
+    let scan_slots = ControlTransportHarness::new(8);
+    let config = BackendServiceConfig::default();
+    let _snapshot = unsafe { LatestSnapshotGuard::acquire() };
+    let begin = begin_and_finalize_execution(TEST_SLOT_ID, &query, &config, scan_slots.region());
+    let mut execution_guard = ActiveExecutionGuard::new(begin.key);
+
+    let built = PlanBuilder::new()
+        .build(PlanBuildInput {
+            sql: &query,
+            params: Vec::<ScalarValue>::new(),
+        })
+        .expect("build scan metadata");
+    assert_eq!(built.scans.len(), 1, "expected exactly one leaf scan");
+    let spec = &built.scans[0];
+    let scan_peer = peer_from_scan_channels(&begin, spec.scan_id.get());
+
+    let scan_rx = scan_transport.rx();
+    let mut driver = open_scan_with_runtime_protocol(
+        scan_peer,
+        begin.key.session_epoch,
+        spec.scan_id.get(),
+        &config,
+        scan_transport.tx(),
+    );
+
+    let terminal_flow = loop {
+        match driver.step().expect("step scan until terminal") {
+            ScanStreamStep::OutboundPage { outbound, .. } => {
+                let frame = outbound.frame();
+                outbound.mark_sent();
+                match scan_rx.accept(&frame).expect("accept scan frame") {
+                    IssueEvent::Page(page) => drop(page),
+                    IssueEvent::Closed => panic!("scan transport should not emit close frame"),
+                }
+            }
+            ScanStreamStep::YieldForControl { reason } => {
+                panic!("unexpected scan yield during terminal replay test: {reason:?}")
+            }
+            ScanStreamStep::Finished { flow } => break flow,
+            ScanStreamStep::Failed { message, .. } => {
+                panic!("unexpected scan failure: {message}")
+            }
+        }
+    };
+
+    driver
+        .defer_terminal_step(ScanStreamStep::Finished {
+            flow: terminal_flow,
+        })
+        .expect("defer terminal step");
+
+    match driver.step().expect("replay deferred terminal") {
+        ScanStreamStep::Finished { flow } => assert_eq!(flow, terminal_flow),
+        other => panic!("expected replayed terminal, got {other:?}"),
+    }
+
+    assert!(
+        driver
+            .complete_execution()
+            .expect("complete execution after deferred terminal"),
+        "fresh complete message must be accepted"
+    );
+    execution_guard.disarm();
+}
+
 pub fn backend_service_driver_fail_execution_from_control_yield() {
     reset_backend_service_table();
     Spi::run("SET LOCAL max_parallel_workers_per_gather = 0").unwrap();
