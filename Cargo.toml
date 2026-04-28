@@ -18,6 +18,7 @@ members = [
   "pg/df_catalog",
   "pg/backend_service",
   "pg/plan_builder",
+  "pg/statistics",
   "pg/row_estimator_seed",
   "pg/scan_node",
   "pg/scan_sql",

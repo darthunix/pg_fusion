@@ -23,6 +23,8 @@ mod slot_deform_bench;
 mod slot_import;
 #[cfg(any(test, feature = "pg_test"))]
 mod slot_scan;
+#[cfg(any(test, feature = "pg_test"))]
+mod statistics;
 
 #[cfg(any(test, feature = "pg_test"))]
 #[pg_schema]
@@ -317,6 +319,31 @@ mod tests {
     #[pg_test]
     fn row_estimator_seed_reports_type_mismatch() {
         super::row_estimator_seed::row_estimator_seed_reports_type_mismatch();
+    }
+
+    #[pg_test]
+    fn pg_statistics_estimates_filtered_scan_rows() {
+        super::statistics::pg_statistics_estimates_filtered_scan_rows();
+    }
+
+    #[pg_test]
+    fn pg_statistics_reads_column_stats() {
+        super::statistics::pg_statistics_reads_column_stats();
+    }
+
+    #[pg_test]
+    fn pg_statistics_detects_unique_keys() {
+        super::statistics::pg_statistics_detects_unique_keys();
+    }
+
+    #[pg_test]
+    fn pg_statistics_skips_partial_unique_keys() {
+        super::statistics::pg_statistics_skips_partial_unique_keys();
+    }
+
+    #[pg_test]
+    fn pg_statistics_estimates_equi_join_selectivity() {
+        super::statistics::pg_statistics_estimates_equi_join_selectivity();
     }
 
     #[pg_test]

@@ -1,0 +1,18 @@
+[package]
+name = "pg_statistics"
+version = "25.0.0"
+edition = "2021"
+description = "PostgreSQL planner and catalog statistics bridge"
+readme = "README.md"
+
+[lib]
+crate-type = ["lib"]
+doctest = false
+
+[features]
+default = ["pg17"]
+pg17 = ["pgrx/pg17"]
+
+[dependencies]
+pgrx = { workspace = true }
+thiserror = "2.0"

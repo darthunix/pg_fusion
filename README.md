@@ -27,6 +27,8 @@ projected back into PostgreSQL tuple slots.
   zero-copy Arrow page layout, PostgreSQL slot encoding, and result projection.
 - `pg/plan_builder/`, `pg/df_catalog/`, `pg/scan_node/`, `pg/scan_sql/`,
   `pg/slot_scan/` - backend-side SQL planning and PostgreSQL scan execution.
+- `pg/statistics/` - PostgreSQL planner/catalog statistics bridge for future
+  costed join-order planning.
 - `join_order/` - standalone compact join-order optimizer core for future
   DataFusion logical-plan reordering.
 - `pg/test/` - pgrx integration tests for the active runtime path and
@@ -44,6 +46,7 @@ cargo test --workspace \
   --exclude backend_service \
   --exclude df_catalog \
   --exclude pg_fusion \
+  --exclude pg_statistics \
   --exclude pg_test \
   --exclude plan_builder \
   --exclude row_estimator_seed \
@@ -55,6 +58,8 @@ cargo test --workspace \
 PostgreSQL-bound crates are intentionally excluded from standalone
 `cargo test`: they reference PostgreSQL backend symbols that only exist inside a
 PostgreSQL backend. Their regression coverage lives in the pgrx test crates.
+`pg_statistics` follows the same rule because it calls SPI and PostgreSQL
+syscache APIs directly.
 
 Build only the PostgreSQL extension crate:
 

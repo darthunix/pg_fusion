@@ -2,8 +2,8 @@
 id: arch-overview-0001
 type: fact
 scope: repo
-tags: ["architecture", "datafusion", "pgrx", "shared-memory", "ipc", "slot_scan"]
-updated_at: "2026-04-27"
+tags: ["architecture", "datafusion", "pgrx", "shared-memory", "ipc", "slot_scan", "statistics"]
+updated_at: "2026-04-28"
 importance: 0.8
 ---
 
@@ -33,6 +33,12 @@ page-backed Arrow batches.
 - `pg/df_catalog`, `pg/plan_builder`, `pg/scan_node`, `pg/scan_sql`,
   `pg/slot_scan`: backend-side DataFusion planning and trusted PostgreSQL scan
   SQL execution.
+- `pg/statistics`: PostgreSQL planner/catalog statistics bridge. It is
+  PostgreSQL-specific but independent of DataFusion and `join_order`; callers
+  can use it to turn scan SQL, `pg_class`, `pg_statistic`, and unique indexes
+  into compact relation/join estimates. It reports only relation-wide unique
+  keys; partial unique indexes are skipped until predicate implication is
+  modeled explicitly.
 - `join_order`: standalone compact join-order optimizer core. It has no
   DataFusion or PostgreSQL dependency; callers provide filtered relation
   statistics, join edges, and opaque predicate handles.

@@ -24,6 +24,7 @@ datafusion-expr = { workspace = true }
 df_catalog = { path = "../df_catalog", version = "25.0" }
 plan_codec = { path = "../../page/plan_codec", version = "25.0" }
 plan_builder = { path = "../plan_builder", version = "25.0" }
+pg_statistics = { path = "../statistics", version = "25.0" }
 scan_node = { path = "../scan_node", version = "25.0" }
 scan_flow = { path = "../../page/scan_flow", version = "25.0" }
 pool = { path = "../../page/pool", version = "25.0" }
