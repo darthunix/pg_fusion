@@ -62,6 +62,8 @@ impl SlotScanPageSource {
         payload: &mut [u8],
     ) -> Result<SourcePageStatus, BackendServiceError> {
         loop {
+            let metrics = self.metrics;
+            let retry_start = self.scan_timing_detail.then(|| metrics.now_ns());
             let session = self.session.as_mut().ok_or_else(|| {
                 BackendServiceError::PageSource("slot scan page source is not open".into())
             })?;
@@ -110,6 +112,7 @@ impl SlotScanPageSource {
                         rows_written += 1;
                     }
                     AppendStatus::Full => {
+                        record_page_retry(metrics, retry_start);
                         self.estimator
                             .observe_empty_full_page(estimate.rows_per_page)?;
                         continue;
@@ -155,7 +158,11 @@ impl SlotScanPageSource {
                                     "slot encoder filled before exhausting row budget: budget={row_budget}, rows_written={rows_written}, max_rows={max_rows}"
                                 )));
                         }
+                        let overflow_copy_start = self.scan_timing_detail.then(|| metrics.now_ns());
                         self.pending_overflow = unsafe { pg_sys::ExecCopySlotHeapTuple(slot) };
+                        if let Some(start) = overflow_copy_start {
+                            metrics.add_elapsed(MetricId::ScanOverflowCopyNs, start);
+                        }
                         if self.pending_overflow.is_null() {
                             return Err(BackendServiceError::PageSource(
                                 "ExecCopySlotHeapTuple returned null".into(),
@@ -164,7 +171,8 @@ impl SlotScanPageSource {
                         Ok::<SlotSinkAction, BackendServiceError>(SlotSinkAction::Continue)
                     }
                 };
-                let drain = unsafe {
+                let drain_start = self.scan_timing_detail.then(|| metrics.now_ns());
+                let drain_result = unsafe {
                     if self.scan_timing_detail {
                         session.drain_slots_without_unwind_guard_profiled::<BackendServiceError>(
                             row_budget,
@@ -176,8 +184,12 @@ impl SlotScanPageSource {
                             &mut append_slot,
                         )
                     }
-                }?;
+                };
                 drop(append_slot);
+                if let Some(start) = drain_start {
+                    metrics.add_elapsed(MetricId::ScanSlotDrainNs, start);
+                }
+                let drain = drain_result?;
                 self.metrics.increment(MetricId::ScanFetchCallsTotal);
                 if self.scan_timing_detail {
                     self.metrics
@@ -206,6 +218,7 @@ impl SlotScanPageSource {
                         });
                     }
 
+                    record_page_retry(metrics, retry_start);
                     self.estimator
                         .observe_empty_full_page(estimate.rows_per_page)?;
                     break;
@@ -245,6 +258,13 @@ impl SlotScanPageSource {
                 }
             }
         }
+    }
+}
+
+fn record_page_retry(metrics: RuntimeMetrics, retry_start: Option<u64>) {
+    if let Some(start) = retry_start {
+        metrics.add_elapsed(MetricId::ScanPageRetryNs, start);
+        metrics.increment(MetricId::ScanPageRetryTotal);
     }
 }
 
@@ -289,12 +309,26 @@ impl BackendPageSource for SlotScanPageSource {
         }
         let block = &mut payload[..block_size];
 
-        let fill_start = self.metrics.now_ns();
-        let result =
-            with_registered_snapshot(self.snapshot, || self.fill_next_page_with_snapshot(block));
+        let metrics = self.metrics;
+        let fill_start = metrics.now_ns();
+        let mut inner_fill_ns = 0_u64;
+        let result = with_registered_snapshot(self.snapshot, || {
+            let inner_start = self.scan_timing_detail.then(|| metrics.now_ns());
+            let result = self.fill_next_page_with_snapshot(block);
+            if let Some(start) = inner_start {
+                inner_fill_ns = metrics.now_ns().saturating_sub(start);
+            }
+            result
+        });
         if matches!(result, Ok(SourcePageStatus::Page { .. })) {
-            self.metrics
-                .add_elapsed(MetricId::ScanPageFillNs, fill_start);
+            let fill_ns = metrics.now_ns().saturating_sub(fill_start);
+            metrics.add(MetricId::ScanPageFillNs, fill_ns);
+            if self.scan_timing_detail {
+                metrics.add(
+                    MetricId::ScanPageSnapshotNs,
+                    fill_ns.saturating_sub(inner_fill_ns),
+                );
+            }
         }
         result
     }

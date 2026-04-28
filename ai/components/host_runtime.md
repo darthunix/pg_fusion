@@ -43,9 +43,10 @@ importance: 0.8
   internals. Worker scan-thread metrics additionally split scan page handoff
   into idle sleep time, page read/import time, `tx.send(Ok(batch))` time, and
   frame-read-to-DataFusion-batch-delivery time.
-- `pg_fusion.scan_timing_detail` enables per-row backend scan callback timing
-  so `scan_page_fill_ns` can be split into PostgreSQL read time and
-  slot-to-Arrow serialization time. It is diagnostic-only and defaults off.
+- `pg_fusion.scan_timing_detail` enables diagnostic backend scan timing.
+  It splits `scan_page_fill_ns` into PostgreSQL read, slot-to-Arrow
+  serialization, slot drain wrapper, snapshot wrapper, overflow-copy, retry,
+  prepare, and finish buckets. It is diagnostic-only and defaults off.
 - `EXPLAIN` stays backend-local: `backend_service` lowers the planned query to
   a DataFusion physical plan, renders PostgreSQL scan leaves with present
   soft-limit/fetch-hint metadata, and prints the nested multiline `slot_scan`

@@ -143,6 +143,11 @@ Interpretation:
 | `scan_page_fill_ns` | Backend time spent filling successful scan pages from PostgreSQL scan output into Arrow page payloads. This includes cursor/slot draining, tuple encoding, page layout, and estimator work for emitted pages. |
 | `scan_page_prepare_ns` | Backend time spent estimating page shape, building the Arrow layout, initializing the block, and constructing the scan page encoder for emitted pages. |
 | `scan_page_finish_ns` | Backend time spent finalizing emitted scan pages and feeding their encoded size back into the row estimator. |
+| `scan_page_snapshot_ns` | Detailed-only overhead around the registered PostgreSQL snapshot wrapper for emitted scan pages. This is `scan_page_fill_ns` minus the inner page-fill body. |
+| `scan_slot_drain_ns` | Detailed-only wall-clock time around one PostgreSQL slot drain call. Compare with `scan_postgres_read_ns + scan_arrow_encode_ns` to estimate direct receiver/SPI wrapper overhead. |
+| `scan_overflow_copy_ns` | Detailed-only time spent copying an overflowing PostgreSQL slot into the pending overflow tuple when a variable-width row does not fit the current Arrow page. |
+| `scan_page_retry_ns` | Detailed-only time spent in page-fill attempts that did not emit a page and instead forced an estimator retry/backoff. |
+| `scan_page_retry_total` | Number of page-fill retry/backoff attempts included in `scan_page_retry_ns`. |
 | `scan_fetch_calls_total` | Number of PostgreSQL cursor drain calls issued by the backend scan page source. |
 | `scan_rows_encoded_total` | Number of PostgreSQL rows encoded into emitted backend-to-worker scan pages. |
 | `scan_postgres_read_ns` | Detailed-only time spent in `PortalRunFetch` outside the pg_fusion row callback. This approximates PostgreSQL executor/heap/filter time. |
@@ -183,6 +188,30 @@ If `scan_eof_pages_total` is positive and `scan_full_pages_total` is zero, scan
 pages are reaching the worker only after PostgreSQL exhausts the cursor. For a
 highly selective query this can explain high latency even when only one row is
 returned.
+
+When `scan_timing_detail` is enabled, use these derived values to explain
+`scan_page_fill_ns`:
+
+```sql
+SELECT
+  max(value) FILTER (WHERE metric = 'scan_slot_drain_ns')
+    - max(value) FILTER (WHERE metric = 'scan_postgres_read_ns')
+    - max(value) FILTER (WHERE metric = 'scan_arrow_encode_ns')
+    AS scan_drain_wrapper_ns,
+  max(value) FILTER (WHERE metric = 'scan_page_fill_ns')
+    - max(value) FILTER (WHERE metric = 'scan_page_snapshot_ns')
+    - max(value) FILTER (WHERE metric = 'scan_page_prepare_ns')
+    - max(value) FILTER (WHERE metric = 'scan_slot_drain_ns')
+    - max(value) FILTER (WHERE metric = 'scan_page_finish_ns')
+    - max(value) FILTER (WHERE metric = 'scan_overflow_copy_ns')
+    - max(value) FILTER (WHERE metric = 'scan_page_retry_ns')
+    AS scan_fill_residual_ns
+FROM pg_fusion_metrics();
+```
+
+`scan_drain_wrapper_ns` points at `PortalRunFetch` receiver/SPI wrapper
+overhead outside PostgreSQL executor work and Arrow encoding. A large
+`scan_fill_residual_ns` means page-fill bookkeeping still needs finer metrics.
 
 If `scan_b2w_wait_ns` or `result_w2b_wait_ns` dominates, the page has already
 been produced and the delay is in data-plane handoff or receiver scheduling.

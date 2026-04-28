@@ -6,7 +6,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use pool::PageDescriptor;
 
 const METRICS_MAGIC: u64 = 0x5047_4655_4D45_5431;
-const METRICS_VERSION: u32 = 2;
+const METRICS_VERSION: u32 = 3;
 const NO_STAMP: u64 = 0;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -86,6 +86,11 @@ pub enum MetricId {
     ScanPageFillNs,
     ScanPagePrepareNs,
     ScanPageFinishNs,
+    ScanPageSnapshotNs,
+    ScanSlotDrainNs,
+    ScanOverflowCopyNs,
+    ScanPageRetryNs,
+    ScanPageRetryTotal,
     ScanFetchCallsTotal,
     ScanRowsEncodedTotal,
     ScanPostgresReadNs,
@@ -181,6 +186,41 @@ pub const METRIC_DESCRIPTORS: [MetricDescriptor; METRIC_COUNT] = [
         metric: "scan_page_finish_ns",
         kind: MetricKind::Timer,
         unit: MetricUnit::Nanoseconds,
+    },
+    MetricDescriptor {
+        id: MetricId::ScanPageSnapshotNs,
+        component: "scan",
+        metric: "scan_page_snapshot_ns",
+        kind: MetricKind::Timer,
+        unit: MetricUnit::Nanoseconds,
+    },
+    MetricDescriptor {
+        id: MetricId::ScanSlotDrainNs,
+        component: "scan",
+        metric: "scan_slot_drain_ns",
+        kind: MetricKind::Timer,
+        unit: MetricUnit::Nanoseconds,
+    },
+    MetricDescriptor {
+        id: MetricId::ScanOverflowCopyNs,
+        component: "scan",
+        metric: "scan_overflow_copy_ns",
+        kind: MetricKind::Timer,
+        unit: MetricUnit::Nanoseconds,
+    },
+    MetricDescriptor {
+        id: MetricId::ScanPageRetryNs,
+        component: "scan",
+        metric: "scan_page_retry_ns",
+        kind: MetricKind::Timer,
+        unit: MetricUnit::Nanoseconds,
+    },
+    MetricDescriptor {
+        id: MetricId::ScanPageRetryTotal,
+        component: "scan",
+        metric: "scan_page_retry_total",
+        kind: MetricKind::Counter,
+        unit: MetricUnit::Count,
     },
     MetricDescriptor {
         id: MetricId::ScanFetchCallsTotal,

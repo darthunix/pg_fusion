@@ -587,6 +587,11 @@ pub(crate) fn metrics_smoke() {
             coalesce(max(value) FILTER (WHERE metric = 'scan_rows_encoded_total'), 0), ',',
             coalesce(max(value) FILTER (WHERE metric = 'scan_postgres_read_ns'), 0), ',',
             coalesce(max(value) FILTER (WHERE metric = 'scan_arrow_encode_ns'), 0), ',',
+            coalesce(max(value) FILTER (WHERE metric = 'scan_slot_drain_ns'), 0), ',',
+            coalesce(max(value) FILTER (WHERE metric = 'scan_page_snapshot_ns'), 0), ',',
+            coalesce(max(value) FILTER (WHERE metric = 'scan_overflow_copy_ns'), 0), ',',
+            coalesce(max(value) FILTER (WHERE metric = 'scan_page_retry_ns'), 0), ',',
+            coalesce(max(value) FILTER (WHERE metric = 'scan_page_retry_total'), 0), ',',
             coalesce(max(value) FILTER (WHERE metric = 'scan_batch_send_total'), 0), ',',
             coalesce(max(value) FILTER (WHERE metric = 'scan_batch_delivery_total'), 0), ',',
             coalesce(max(value) FILTER (WHERE metric = 'scan_idle_sleep_total'), 0), ',',
@@ -610,7 +615,7 @@ pub(crate) fn metrics_smoke() {
         .split(',')
         .map(|part| part.parse::<i64>().expect("metric value must be integer"))
         .collect::<Vec<_>>();
-    assert_eq!(parts.len(), 13);
+    assert_eq!(parts.len(), 18);
     assert!(
         parts[0] > 0,
         "scan_pages_sent_total must be positive: {summary}"
@@ -635,27 +640,47 @@ pub(crate) fn metrics_smoke() {
         parts[5], 0,
         "scan_arrow_encode_ns must stay zero without detailed timing: {summary}"
     );
-    assert!(
-        parts[6] > 0,
-        "scan_batch_send_total must be positive: {summary}"
-    );
-    assert!(
-        parts[7] > 0,
-        "scan_batch_delivery_total must be positive: {summary}"
+    assert_eq!(
+        parts[6], 0,
+        "scan_slot_drain_ns must stay zero without detailed timing: {summary}"
     );
     assert_eq!(
-        parts[9], 6,
-        "all worker scan-thread metric rows must be present: {summary}"
+        parts[7], 0,
+        "scan_page_snapshot_ns must stay zero without detailed timing: {summary}"
     );
-    assert!(
-        parts[10] > 0,
-        "result_pages_read_total must be positive: {summary}"
+    assert_eq!(
+        parts[8], 0,
+        "scan_overflow_copy_ns must stay zero without detailed timing: {summary}"
+    );
+    assert_eq!(
+        parts[9], 0,
+        "scan_page_retry_ns must stay zero without detailed timing: {summary}"
+    );
+    assert_eq!(
+        parts[10], 0,
+        "scan_page_retry_total must stay zero without detailed timing: {summary}"
     );
     assert!(
         parts[11] > 0,
+        "scan_batch_send_total must be positive: {summary}"
+    );
+    assert!(
+        parts[12] > 0,
+        "scan_batch_delivery_total must be positive: {summary}"
+    );
+    assert_eq!(
+        parts[14], 6,
+        "all worker scan-thread metric rows must be present: {summary}"
+    );
+    assert!(
+        parts[15] > 0,
+        "result_pages_read_total must be positive: {summary}"
+    );
+    assert!(
+        parts[16] > 0,
         "backend_rows_returned_total must be positive: {summary}"
     );
-    assert_eq!(parts[12], before_epoch);
+    assert_eq!(parts[17], before_epoch);
 
     let detail_epoch: i64 =
         simple_query_first_column_tx(&mut tx, "SELECT pg_fusion_metrics_reset()")
@@ -681,6 +706,11 @@ pub(crate) fn metrics_smoke() {
             coalesce(max(value) FILTER (WHERE metric = 'scan_rows_encoded_total'), 0), ',',
             coalesce(max(value) FILTER (WHERE metric = 'scan_postgres_read_ns'), 0), ',',
             coalesce(max(value) FILTER (WHERE metric = 'scan_arrow_encode_ns'), 0), ',',
+            coalesce(max(value) FILTER (WHERE metric = 'scan_slot_drain_ns'), 0), ',',
+            coalesce(max(value) FILTER (WHERE metric = 'scan_page_snapshot_ns'), 0), ',',
+            coalesce(max(value) FILTER (WHERE metric = 'scan_overflow_copy_ns'), 0), ',',
+            coalesce(max(value) FILTER (WHERE metric = 'scan_page_retry_ns'), 0), ',',
+            coalesce(max(value) FILTER (WHERE metric = 'scan_page_retry_total'), 0), ',',
             coalesce(max(reset_epoch), 0)
         )
         FROM pg_fusion_metrics()
@@ -691,7 +721,7 @@ pub(crate) fn metrics_smoke() {
         .split(',')
         .map(|part| part.parse::<i64>().expect("metric value must be integer"))
         .collect::<Vec<_>>();
-    assert_eq!(detailed_parts.len(), 5);
+    assert_eq!(detailed_parts.len(), 10);
     assert!(
         detailed_parts[0] > 0,
         "scan_fetch_calls_total must be positive with detailed timing: {detailed}"
@@ -704,7 +734,11 @@ pub(crate) fn metrics_smoke() {
         detailed_parts[2] + detailed_parts[3] > 0,
         "detailed scan timers must be positive with detailed timing: {detailed}"
     );
-    assert_eq!(detailed_parts[4], detail_epoch);
+    assert!(
+        detailed_parts[4] > 0,
+        "scan_slot_drain_ns must be positive with detailed timing: {detailed}"
+    );
+    assert_eq!(detailed_parts[9], detail_epoch);
 
     let after_epoch: i64 =
         simple_query_first_column_tx(&mut tx, "SELECT pg_fusion_metrics_reset()")

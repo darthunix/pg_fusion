@@ -324,6 +324,11 @@ WHERE metric IN (
   'scan_page_fill_ns',
   'scan_page_prepare_ns',
   'scan_page_finish_ns',
+  'scan_page_snapshot_ns',
+  'scan_slot_drain_ns',
+  'scan_overflow_copy_ns',
+  'scan_page_retry_ns',
+  'scan_page_retry_total',
   'scan_postgres_read_ns',
   'scan_arrow_encode_ns',
   'scan_fetch_calls_total',
@@ -368,6 +373,10 @@ Interpretation:
   executor/heap/filter time.
 - `scan_arrow_encode_ns >> scan_postgres_read_ns` points at slot
   deform/detoast/Arrow serialization time.
+- `scan_slot_drain_ns - scan_postgres_read_ns - scan_arrow_encode_ns`
+  approximates PostgreSQL direct receiver/SPI wrapper overhead.
+- `scan_page_fill_ns` minus snapshot, prepare, drain, finish, overflow-copy,
+  and retry timers is the remaining page-fill bookkeeping time.
 - `scan_eof_pages_total = 1` with one returned row means the scan emitted a
   partial page only after PostgreSQL reached EOF.
 - `scan_b2w_wait_ns` is backend stamp to worker scan-thread frame read.
