@@ -8,6 +8,7 @@ use std::alloc::{alloc_zeroed, dealloc, GlobalAlloc, Layout, System};
 use std::cell::Cell;
 use std::mem::MaybeUninit;
 use std::ptr::NonNull;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Mutex, MutexGuard};
 
 struct CountingAllocator;
@@ -183,6 +184,14 @@ impl OwnedSlot {
     fn as_mut_ptr(&mut self) -> *mut pg_sys::TupleTableSlot {
         &mut *self.slot
     }
+
+    fn set_nvalid(&mut self, nvalid: i16) {
+        self.slot.tts_nvalid = nvalid;
+    }
+
+    fn set_ops(&mut self, ops: &'static pg_sys::TupleTableSlotOps) {
+        self.slot.tts_ops = ops;
+    }
 }
 
 enum MockCell {
@@ -314,6 +323,36 @@ fn view_bytes(block: &BlockRef<'_>, col: usize, row: u32) -> Option<Vec<u8>> {
     let len = view.len().expect("len");
     let pool = block.shared_pool().expect("pool");
     Some(pool[offset..offset + len].to_vec())
+}
+
+static TEST_GETSOMEATTRS_CALLS: AtomicUsize = AtomicUsize::new(0);
+
+unsafe extern "C-unwind" fn test_getsomeattrs(
+    slot: *mut pg_sys::TupleTableSlot,
+    natts: std::ffi::c_int,
+) {
+    TEST_GETSOMEATTRS_CALLS.fetch_add(1, Ordering::Relaxed);
+    unsafe {
+        (*slot).tts_nvalid = natts as i16;
+    }
+}
+
+fn test_slot_ops() -> &'static pg_sys::TupleTableSlotOps {
+    Box::leak(Box::new(pg_sys::TupleTableSlotOps {
+        base_slot_size: std::mem::size_of::<pg_sys::TupleTableSlot>(),
+        init: None,
+        release: None,
+        clear: None,
+        getsomeattrs: Some(test_getsomeattrs),
+        getsysattr: None,
+        is_current_xact_tuple: None,
+        materialize: None,
+        copyslot: None,
+        get_heap_tuple: None,
+        get_minimal_tuple: None,
+        copy_heap_tuple: None,
+        copy_minimal_tuple: None,
+    }))
 }
 
 #[test]
@@ -606,6 +645,126 @@ fn append_slot_projected_reads_source_columns() {
     let block = BlockRef::open(&payload).expect("block");
     assert_eq!(f64_at(&block, 0, 0), 7.5);
     assert_eq!(i32_at(&block, 1, 0), 42);
+}
+
+#[test]
+fn append_slot_projected_fixed_width_uses_fast_path() {
+    let specs = [
+        ColumnSpec::new(TypeTag::Int32, false),
+        ColumnSpec::new(TypeTag::Int32, false),
+    ];
+    let attrs = [
+        TestAttr {
+            oid: pg_sys::INT4OID,
+            attlen: 4,
+            attbyval: true,
+            attalign: b'i',
+        },
+        TestAttr {
+            oid: pg_sys::INT4OID,
+            attlen: 4,
+            attbyval: true,
+            attalign: b'i',
+        },
+        TestAttr {
+            oid: pg_sys::FLOAT8OID,
+            attlen: 8,
+            attbyval: true,
+            attalign: b'd',
+        },
+    ];
+    let tuple_desc = OwnedTupleDesc::new(&attrs);
+    let values = vec![
+        pg_sys::Datum::from(11i32),
+        pg_sys::Datum::from(22i32),
+        pg_sys::Datum::from(7.5f64.to_bits()),
+    ];
+    let isnull = vec![false, false, false];
+    let mut slot = OwnedSlot::new(tuple_desc.ptr, values, isnull);
+    let mut payload = init_payload(&specs, 2, 512);
+    let projection = [0usize, 1usize];
+    let mut encoder =
+        unsafe { PageBatchEncoder::new_projected(tuple_desc.ptr, &projection, &mut payload) }
+            .expect("encoder");
+    assert!(encoder.fixed_width_fast_path_for_tests());
+
+    let mut profile = EncodeProfile::default();
+    assert_eq!(
+        encoder
+            .append_slot_profiled(slot.as_mut_ptr(), &mut profile)
+            .expect("append slot"),
+        AppendStatus::Appended
+    );
+    assert_eq!(profile.cells_extracted_total, 2);
+    assert_eq!(profile.row_encode_outer_total, 1);
+    encoder.finish().expect("finish");
+
+    let block = BlockRef::open(&payload).expect("block");
+    assert_eq!(i32_at(&block, 0, 0), 11);
+    assert_eq!(i32_at(&block, 1, 0), 22);
+}
+
+#[test]
+fn append_slot_deforms_via_slot_ops_fast_path() {
+    TEST_GETSOMEATTRS_CALLS.store(0, Ordering::Relaxed);
+    let specs = [ColumnSpec::new(TypeTag::Int32, false)];
+    let attrs = [TestAttr {
+        oid: pg_sys::INT4OID,
+        attlen: 4,
+        attbyval: true,
+        attalign: b'i',
+    }];
+    let tuple_desc = OwnedTupleDesc::new(&attrs);
+    let values = vec![pg_sys::Datum::from(42i32)];
+    let isnull = vec![false];
+    let mut slot = OwnedSlot::new(tuple_desc.ptr, values, isnull);
+    slot.set_nvalid(0);
+    slot.set_ops(test_slot_ops());
+    let mut payload = init_payload(&specs, 2, 256);
+    let mut encoder =
+        unsafe { PageBatchEncoder::new(tuple_desc.ptr, &mut payload) }.expect("encoder");
+    assert!(encoder.fixed_width_fast_path_for_tests());
+
+    let mut profile = EncodeProfile::default();
+    assert_eq!(
+        encoder
+            .append_slot_profiled(slot.as_mut_ptr(), &mut profile)
+            .expect("append slot"),
+        AppendStatus::Appended
+    );
+    assert_eq!(TEST_GETSOMEATTRS_CALLS.load(Ordering::Relaxed), 1);
+    assert_eq!(profile.slot_deform_total, 1);
+    encoder.finish().expect("finish");
+
+    let block = BlockRef::open(&payload).expect("block");
+    assert_eq!(i32_at(&block, 0, 0), 42);
+}
+
+#[test]
+fn append_slot_reports_unavailable_slot_ops_for_undeformed_slot() {
+    let specs = [ColumnSpec::new(TypeTag::Int32, false)];
+    let attrs = [TestAttr {
+        oid: pg_sys::INT4OID,
+        attlen: 4,
+        attbyval: true,
+        attalign: b'i',
+    }];
+    let tuple_desc = OwnedTupleDesc::new(&attrs);
+    let values = vec![pg_sys::Datum::from(42i32)];
+    let isnull = vec![false];
+    let mut slot = OwnedSlot::new(tuple_desc.ptr, values, isnull);
+    slot.set_nvalid(0);
+    let mut payload = init_payload(&specs, 2, 256);
+    let mut encoder =
+        unsafe { PageBatchEncoder::new(tuple_desc.ptr, &mut payload) }.expect("encoder");
+
+    let error = encoder
+        .append_slot(slot.as_mut_ptr())
+        .expect_err("missing slot ops");
+    assert!(matches!(
+        error,
+        EncodeError::SlotAttrOpsUnavailable { attnum: 1 }
+    ));
 }
 
 #[test]

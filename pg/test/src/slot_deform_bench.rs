@@ -14,11 +14,14 @@ const DEFAULT_ROWS_PER_PAGE: usize = 64;
 const DEFAULT_PAYLOAD_CAPACITY_BYTES: usize = 8192 - 20;
 const FIXED_RELATION: &str = "pg_temp.slot_deform_fixed_src";
 const MIXED_RELATION: &str = "pg_temp.slot_deform_mixed_src";
+const PROJECTED_FIXED_RELATION: &str = "pg_temp.slot_deform_projected_fixed_src";
+const PROJECTED_FIXED_PROJECTION: &[usize] = &[0, 2, 3];
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum BenchmarkProfile {
     Fixed,
     Mixed,
+    ProjectedFixed,
 }
 
 impl BenchmarkProfile {
@@ -26,6 +29,7 @@ impl BenchmarkProfile {
         match raw.trim().to_ascii_lowercase().as_str() {
             "fixed" => Ok(Self::Fixed),
             "mixed" => Ok(Self::Mixed),
+            "projected_fixed" | "projected-fixed" => Ok(Self::ProjectedFixed),
             other => bail!("unknown benchmark profile: {other}"),
         }
     }
@@ -34,6 +38,7 @@ impl BenchmarkProfile {
         match self {
             Self::Fixed => "fixed",
             Self::Mixed => "mixed",
+            Self::ProjectedFixed => "projected_fixed",
         }
     }
 
@@ -41,6 +46,7 @@ impl BenchmarkProfile {
         match self {
             Self::Fixed => FIXED_RELATION,
             Self::Mixed => MIXED_RELATION,
+            Self::ProjectedFixed => PROJECTED_FIXED_RELATION,
         }
     }
 
@@ -62,7 +68,25 @@ impl BenchmarkProfile {
                 Field::new("t", DataType::Utf8View, true),
                 Field::new("bytes", DataType::BinaryView, true),
             ])),
+            Self::ProjectedFixed => Arc::new(Schema::new(vec![
+                Field::new("k", DataType::Int32, false),
+                Field::new("v", DataType::Int64, false),
+                Field::new("d", DataType::Float64, false),
+            ])),
         }
+    }
+
+    fn projection(self) -> Option<&'static [usize]> {
+        match self {
+            Self::ProjectedFixed => Some(PROJECTED_FIXED_PROJECTION),
+            Self::Fixed | Self::Mixed => None,
+        }
+    }
+
+    fn baseline_needed_attrs(self) -> Option<i32> {
+        self.projection()
+            .and_then(|projection| projection.iter().copied().max())
+            .map(|index| i32::try_from(index + 1).expect("projection attr index fits i32"))
     }
 }
 
@@ -288,6 +312,27 @@ fn setup_profile_table(profile: BenchmarkProfile, rows: usize) -> AnyResult<()> 
             ))
             .context("populate mixed temp table")?;
         }
+        BenchmarkProfile::ProjectedFixed => {
+            Spi::run(&format!(
+                "CREATE TEMP TABLE {relation} (
+                    k int4 NOT NULL,
+                    filler text NOT NULL,
+                    v int8 NOT NULL,
+                    d double precision NOT NULL
+                )"
+            ))
+            .context("create projected fixed temp table")?;
+            Spi::run(&format!(
+                "INSERT INTO {relation}
+                 SELECT
+                    g::int4,
+                    repeat(md5(g::text), 2),
+                    (g * 10)::int8,
+                    g::float8 / 10.0
+                 FROM generate_series(1, {rows}) AS g"
+            ))
+            .context("populate projected fixed temp table")?;
+        }
     }
     unsafe {
         pg_sys::CommandCounterIncrement();
@@ -299,6 +344,7 @@ fn run_baseline_bench(profile: BenchmarkProfile, iterations: usize) -> AnyResult
     let relation = profile.relation_name();
     let start = Instant::now();
     let mut rows_total = 0usize;
+    let needed_attrs = profile.baseline_needed_attrs();
 
     for _ in 0..iterations {
         let mut scan = RelationScan::open(relation)?;
@@ -306,7 +352,11 @@ fn run_baseline_bench(profile: BenchmarkProfile, iterations: usize) -> AnyResult
             .context("natts does not fit into usize")?;
         while scan.next_slot() {
             unsafe {
-                pg_sys::slot_getallattrs(scan.slot());
+                if let Some(needed_attrs) = needed_attrs {
+                    pg_sys::slot_getsomeattrs_int(scan.slot(), needed_attrs);
+                } else {
+                    pg_sys::slot_getallattrs(scan.slot());
+                }
                 let slot = &*scan.slot();
                 black_box(slot.tts_nvalid);
                 if natts > 0 {
@@ -322,6 +372,19 @@ fn run_baseline_bench(profile: BenchmarkProfile, iterations: usize) -> AnyResult
         rows_total,
         elapsed_ns: start.elapsed().as_nanos(),
     })
+}
+
+unsafe fn new_page_batch_encoder<'payload>(
+    profile: BenchmarkProfile,
+    tuple_desc: pg_sys::TupleDesc,
+    payload: &'payload mut [u8],
+) -> AnyResult<PageBatchEncoder<'payload>> {
+    if let Some(projection) = profile.projection() {
+        unsafe { PageBatchEncoder::new_projected(tuple_desc, projection, payload) }
+            .map_err(Into::into)
+    } else {
+        unsafe { PageBatchEncoder::new(tuple_desc, payload) }.map_err(Into::into)
+    }
 }
 
 fn baseline_metrics_json(
@@ -377,7 +440,8 @@ fn run_arrow_bench(
     for _ in 0..iterations {
         let mut scan = RelationScan::open(relation)?;
         init_block(&mut payload, &plan)?;
-        let mut encoder = unsafe { PageBatchEncoder::new(scan.tuple_desc(), &mut payload)? };
+        let mut encoder =
+            unsafe { new_page_batch_encoder(profile, scan.tuple_desc(), &mut payload)? };
 
         while scan.next_slot() {
             loop {
@@ -389,8 +453,9 @@ fn run_arrow_bench(
                     AppendStatus::Full => {
                         finish_page(encoder, &mut pages_total)?;
                         init_block(&mut payload, &plan)?;
-                        encoder =
-                            unsafe { PageBatchEncoder::new(scan.tuple_desc(), &mut payload)? };
+                        encoder = unsafe {
+                            new_page_batch_encoder(profile, scan.tuple_desc(), &mut payload)?
+                        };
                     }
                 }
             }
@@ -667,6 +732,21 @@ pub(crate) fn slot_deform_vs_page_encode_bench_mixed_smoke() {
         config,
     )
     .expect("mixed profile benchmark");
+    smoke_assertions(&metrics, rows, iterations);
+}
+
+pub(crate) fn slot_deform_vs_page_encode_bench_projected_fixed_smoke() {
+    let rows = 256usize;
+    let iterations = 1usize;
+    let config =
+        BenchConfig::new(DEFAULT_ROWS_PER_PAGE, DEFAULT_PAYLOAD_CAPACITY_BYTES).expect("config");
+    let metrics = run_slot_deform_vs_page_encode_bench_impl(
+        BenchmarkProfile::ProjectedFixed,
+        rows,
+        iterations,
+        config,
+    )
+    .expect("projected fixed profile benchmark");
     smoke_assertions(&metrics, rows, iterations);
 }
 

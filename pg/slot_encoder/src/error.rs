@@ -60,6 +60,8 @@ pub enum EncodeError {
     NullSlotTupleDesc,
     #[error("TupleTableSlot TupleDesc does not match the encoder TupleDesc")]
     SlotTupleDescMismatch,
+    #[error("TupleTableSlot attr access ops are unavailable for attnum {attnum}")]
+    SlotAttrOpsUnavailable { attnum: usize },
     #[error("TupleTableSlot attr access failed for attnum {attnum}")]
     SlotAttrAccess { attnum: usize },
     #[error("column {index} expected non-null Datum storage")]

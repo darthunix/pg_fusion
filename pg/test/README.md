@@ -31,6 +31,7 @@ Then run the benchmark:
 ```sql
 SELECT jsonb_pretty(tests.slot_deform_vs_page_encode_bench('fixed', 100000, 3));
 SELECT jsonb_pretty(tests.slot_deform_vs_page_encode_bench('mixed', 100000, 3));
+SELECT jsonb_pretty(tests.slot_deform_vs_page_encode_bench('projected_fixed', 100000, 3));
 SELECT jsonb_pretty(tests.slot_deform_vs_page_encode_bench('fixed', 100000, 3, 4096, 1048556));
 SELECT jsonb_pretty(tests.slot_deform_vs_page_encode_bench('mixed', 100000, 3, 8192, 1048556));
 ```
@@ -48,7 +49,7 @@ SELECT jsonb_pretty(tests.slot_deform_arrow_bench('mixed', 3, 8192, 1048556));
 
 The JSON result contains:
 
-- `profile`: `fixed` or `mixed`
+- `profile`: `fixed`, `mixed`, or `projected_fixed`
 - `rows`: source table row count per scan
 - `iterations`: number of full rescans
 - `rows_per_page`: current `slot_encoder` batch/page target
@@ -63,6 +64,8 @@ The JSON result contains:
 - The first run is usually slower because of warmup effects.
 - `fixed` isolates fixed-width deformation cost more clearly.
 - `mixed` includes `Utf8View` and `BinaryView`, so it exercises varlen packing too.
+- `projected_fixed` scans a wider table but encodes only non-null fixed-width
+  projected columns.
 - The fourth argument is the target row cap per page; the fifth is writable payload
   capacity, not the full shared-memory page size.
 - For larger shared-memory pages, raise both `rows_per_page` and

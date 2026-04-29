@@ -11,5 +11,8 @@ mod error;
 #[cfg(test)]
 mod tests;
 
-pub use encoder::{AppendStatus, CellRef, CellType, EncodedBatch, PageRowEncoder, RowSource};
+pub use encoder::{
+    AppendStatus, CellRef, CellType, EncodedBatch, FixedWidthCell, FixedWidthRowSource,
+    PageRowEncoder, RowSource,
+};
 pub use error::RowEncodeError;

@@ -63,6 +63,29 @@ impl CellRef<'_> {
     }
 }
 
+#[derive(Clone, Copy, Debug)]
+pub enum FixedWidthCell {
+    Boolean(bool),
+    Int16(i16),
+    Int32(i32),
+    Int64(i64),
+    Float32(f32),
+    Float64(f64),
+}
+
+impl FixedWidthCell {
+    fn cell_type(self) -> CellType {
+        match self {
+            Self::Boolean(_) => CellType::Boolean,
+            Self::Int16(_) => CellType::Int16,
+            Self::Int32(_) => CellType::Int32,
+            Self::Int64(_) => CellType::Int64,
+            Self::Float32(_) => CellType::Float32,
+            Self::Float64(_) => CellType::Float64,
+        }
+    }
+}
+
 pub trait RowSource {
     type Error: From<RowEncodeError>;
 
@@ -71,6 +94,16 @@ pub trait RowSource {
         index: usize,
         f: impl FnOnce(CellRef<'_>) -> Result<R, Self::Error>,
     ) -> Result<R, Self::Error>;
+}
+
+pub trait FixedWidthRowSource {
+    type Error: From<RowEncodeError>;
+
+    fn fixed_width_cell(
+        &mut self,
+        index: usize,
+        type_tag: TypeTag,
+    ) -> Result<FixedWidthCell, Self::Error>;
 }
 
 #[derive(Debug)]
@@ -112,6 +145,16 @@ impl<'payload> PageRowEncoder<'payload> {
         self.desc(index).type_tag()
     }
 
+    pub fn column_is_nullable(&self, index: usize) -> Result<bool, LayoutError> {
+        if index >= self.col_count {
+            return Err(LayoutError::ColumnIndexOutOfBounds {
+                index,
+                col_count: self.col_count,
+            });
+        }
+        Ok(self.desc(index).flags().is_nullable())
+    }
+
     pub fn append_row<S>(&mut self, source: &mut S) -> Result<AppendStatus, S::Error>
     where
         S: RowSource,
@@ -142,6 +185,30 @@ impl<'payload> PageRowEncoder<'payload> {
                     return Ok(AppendStatus::Full);
                 }
             }
+        }
+
+        self.header.row_count = row_idx + 1;
+        Ok(AppendStatus::Appended)
+    }
+
+    pub fn append_fixed_width_row<S>(&mut self, source: &mut S) -> Result<AppendStatus, S::Error>
+    where
+        S: FixedWidthRowSource,
+    {
+        let row_idx = self.header.row_count;
+        if row_idx >= self.header.max_rows {
+            return Ok(AppendStatus::Full);
+        }
+
+        for col_idx in 0..self.col_count {
+            let desc = self.desc(col_idx);
+            let type_tag = match TypeTag::from_raw(desc.type_tag) {
+                Ok(type_tag) => type_tag,
+                Err(error) => return Err(RowEncodeError::Layout(error).into()),
+            };
+            let cell = source.fixed_width_cell(col_idx, type_tag)?;
+            self.write_fixed_width_cell(col_idx, row_idx, desc, type_tag, cell)
+                .map_err(Into::into)?;
         }
 
         self.header.row_count = row_idx + 1;
@@ -280,6 +347,47 @@ impl<'payload> PageRowEncoder<'payload> {
             }
             (TypeTag::BinaryView, CellRef::Binary(bytes)) => {
                 self.write_view(index, row_idx, desc, bytes)
+            }
+            (expected, actual) => Err(RowEncodeError::TypeMismatch {
+                index,
+                expected,
+                actual: actual.cell_type(),
+            }),
+        }
+    }
+
+    fn write_fixed_width_cell(
+        &mut self,
+        index: usize,
+        row_idx: u32,
+        desc: ColumnDesc,
+        type_tag: TypeTag,
+        cell: FixedWidthCell,
+    ) -> Result<(), RowEncodeError> {
+        match (type_tag, cell) {
+            (TypeTag::Boolean, FixedWidthCell::Boolean(value)) => {
+                self.write_bool(row_idx, desc, value);
+                Ok(())
+            }
+            (TypeTag::Int16, FixedWidthCell::Int16(value)) => {
+                self.write_fixed(row_idx, desc, &value.to_ne_bytes())?;
+                Ok(())
+            }
+            (TypeTag::Int32, FixedWidthCell::Int32(value)) => {
+                self.write_fixed(row_idx, desc, &value.to_ne_bytes())?;
+                Ok(())
+            }
+            (TypeTag::Int64, FixedWidthCell::Int64(value)) => {
+                self.write_fixed(row_idx, desc, &value.to_ne_bytes())?;
+                Ok(())
+            }
+            (TypeTag::Float32, FixedWidthCell::Float32(value)) => {
+                self.write_fixed(row_idx, desc, &value.to_bits().to_ne_bytes())?;
+                Ok(())
+            }
+            (TypeTag::Float64, FixedWidthCell::Float64(value)) => {
+                self.write_fixed(row_idx, desc, &value.to_bits().to_ne_bytes())?;
+                Ok(())
             }
             (expected, actual) => Err(RowEncodeError::TypeMismatch {
                 index,

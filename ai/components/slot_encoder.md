@@ -3,7 +3,7 @@ id: comp-pg-slot-arrow-0001
 type: fact
 scope: slot_encoder
 tags: ["arrow", "layout", "postgres", "slot", "transfer"]
-updated_at: "2026-04-01"
+updated_at: "2026-04-29"
 importance: 0.72
 ---
 
@@ -34,8 +34,12 @@ importance: 0.72
   - executor slots may carry an equivalent but different `TupleDesc` pointer;
     the encoder validates structural compatibility once per page before using
     its planned output descriptor for type-specific writes
-  - it calls `slot_getsomeattrs_int` when the slot is not yet sufficiently
-    deformed
+  - it calls the slot-specific `tts_ops->getsomeattrs` function directly when
+    the slot is not yet sufficiently deformed, then preserves PostgreSQL's
+    missing-attribute fallback through `slot_getmissingattrs`
+  - projected non-null fixed-width `int2/int4/int8/float4/float8` batches use a
+    row encoder fast path that avoids per-cell closure dispatch and validity
+    writes
   - projected text-like and binary varlena values may be detoasted through
     `pg_detoast_datum_packed` before `row_encoder` sees borrowed bytes
   - detailed timing is not on the normal path; `append_slot_profiled` splits

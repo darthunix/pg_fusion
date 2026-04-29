@@ -178,7 +178,7 @@ Interpretation:
 | `scan_append_precheck_total` | Number of profiled slot append calls included in `scan_append_precheck_ns`. |
 | `scan_tupledesc_check_ns` | Detailed-only time spent validating the slot `TupleDesc` against the planned output descriptor. Cache hits are included and should be cheap. |
 | `scan_tupledesc_check_total` | Number of tuple descriptor checks included in `scan_tupledesc_check_ns`. |
-| `scan_slot_deform_ns` | Detailed-only time spent in PostgreSQL `slot_getsomeattrs_int()` while deforming slots before encoding. |
+| `scan_slot_deform_ns` | Detailed-only time spent in slot-specific `getsomeattrs` deformation before encoding, including rare PostgreSQL missing-attribute fallback work. |
 | `scan_slot_deform_total` | Number of slot deformation calls included in `scan_slot_deform_ns`. |
 | `scan_cell_extract_ns` | Detailed-only time spent mapping projected output columns to source attributes, reading `tts_values` / `tts_isnull`, dispatching PostgreSQL OIDs, and extracting fixed-width or varlena pointers. |
 | `scan_cells_extracted_total` | Number of output cells extracted from PostgreSQL slots, including cells from rows that later report `AppendStatus::Full`. |

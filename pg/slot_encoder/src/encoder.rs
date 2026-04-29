@@ -6,7 +6,7 @@ use crate::datum::{
 use crate::{ConfigError, EncodeError};
 use arrow_layout::TypeTag;
 use pgrx_pg_sys as pg_sys;
-use row_encoder::{CellRef, PageRowEncoder, RowSource};
+use row_encoder::{CellRef, FixedWidthCell, FixedWidthRowSource, PageRowEncoder, RowSource};
 use std::ptr;
 use std::time::Instant;
 
@@ -87,6 +87,7 @@ pub struct PageBatchEncoder<'payload> {
     projection_len: usize,
     inner: PageRowEncoder<'payload>,
     accepted_slot_desc: Option<pg_sys::TupleDesc>,
+    fixed_width_fast_path: bool,
 }
 
 impl<'payload> PageBatchEncoder<'payload> {
@@ -152,6 +153,7 @@ impl<'payload> PageBatchEncoder<'payload> {
 
         let attrs_ptr = unsafe { (*tuple_desc).attrs.as_mut_ptr() };
         let mut needs_utf8 = false;
+        let mut fixed_width_fast_path = layout_cols > 0;
         let mut max_needed_attr = 0usize;
         for index in 0..layout_cols {
             let source_index = source_columns.map_or(index, |columns| columns[index]);
@@ -180,6 +182,18 @@ impl<'payload> PageBatchEncoder<'payload> {
             if type_tag == TypeTag::Utf8View {
                 needs_utf8 = true;
             }
+            if inner.column_is_nullable(index)?
+                || !matches!(
+                    type_tag,
+                    TypeTag::Int16
+                        | TypeTag::Int32
+                        | TypeTag::Int64
+                        | TypeTag::Float32
+                        | TypeTag::Float64
+                )
+            {
+                fixed_width_fast_path = false;
+            }
             max_needed_attr = max_needed_attr.max(source_index + 1);
         }
 
@@ -199,6 +213,7 @@ impl<'payload> PageBatchEncoder<'payload> {
             projection_len: source_columns.map_or(0, <[usize]>::len),
             inner,
             accepted_slot_desc: None,
+            fixed_width_fast_path,
         })
     }
 
@@ -258,9 +273,7 @@ impl<'payload> PageBatchEncoder<'payload> {
         if valid < needed_attrs {
             record_append_precheck(&mut profile, precheck_start);
             let deform_start = profile.as_ref().map(|_| Instant::now());
-            unsafe {
-                pg_sys::slot_getsomeattrs_int(slot, self.needed_attrs);
-            }
+            unsafe { deform_slot_to(slot, self.needed_attrs)? };
             if let (Some(profile), Some(start)) = (profile.as_mut(), deform_start) {
                 profile.slot_deform_ns = profile.slot_deform_ns.saturating_add(elapsed_ns(start));
                 profile.slot_deform_total = profile.slot_deform_total.saturating_add(1);
@@ -289,13 +302,21 @@ impl<'payload> PageBatchEncoder<'payload> {
             isnulls,
             profile,
         };
-        let result = self.inner.append_row(&mut source);
+        let result = if self.fixed_width_fast_path {
+            self.inner.append_fixed_width_row(&mut source)
+        } else {
+            self.inner.append_row(&mut source)
+        };
         if let (Some(start), Some(profile)) = (row_encode_start, source.profile.as_mut()) {
             let row_encode_ns = elapsed_ns(start.start);
             let classified_ns = start.classified_delta(profile);
-            profile.row_encode_outer_ns = profile
-                .row_encode_outer_ns
-                .saturating_add(row_encode_ns.saturating_sub(classified_ns));
+            let unclassified_ns = row_encode_ns.saturating_sub(classified_ns);
+            if self.fixed_width_fast_path {
+                profile.page_write_ns = profile.page_write_ns.saturating_add(unclassified_ns);
+            } else {
+                profile.row_encode_outer_ns =
+                    profile.row_encode_outer_ns.saturating_add(unclassified_ns);
+            }
             profile.row_encode_outer_total = profile.row_encode_outer_total.saturating_add(1);
         }
         result
@@ -357,6 +378,11 @@ impl<'payload> PageBatchEncoder<'payload> {
     pub(crate) fn tail_cursor(&self) -> u32 {
         self.inner.tail_cursor_for_tests()
     }
+
+    #[cfg(test)]
+    pub(crate) fn fixed_width_fast_path_for_tests(&self) -> bool {
+        self.fixed_width_fast_path
+    }
 }
 
 fn record_append_precheck(profile: &mut Option<&mut EncodeProfile>, start: Option<Instant>) {
@@ -370,6 +396,47 @@ fn record_tupledesc_check(profile: &mut Option<&mut EncodeProfile>, start: Optio
         profile.tupledesc_check_ns = profile.tupledesc_check_ns.saturating_add(elapsed_ns(start));
         profile.tupledesc_check_total = profile.tupledesc_check_total.saturating_add(1);
     }
+}
+
+unsafe fn deform_slot_to(
+    slot: *mut pg_sys::TupleTableSlot,
+    needed_attrs: i32,
+) -> Result<(), EncodeError> {
+    if needed_attrs <= 0 {
+        return Ok(());
+    }
+
+    let ops = unsafe { (*slot).tts_ops };
+    if ops.is_null() {
+        return Err(EncodeError::SlotAttrOpsUnavailable {
+            attnum: needed_attrs as usize,
+        });
+    }
+    let Some(getsomeattrs) = (unsafe { (*ops).getsomeattrs }) else {
+        return Err(EncodeError::SlotAttrOpsUnavailable {
+            attnum: needed_attrs as usize,
+        });
+    };
+
+    unsafe {
+        getsomeattrs(slot, needed_attrs);
+    }
+
+    let valid = i32::from(unsafe { (*slot).tts_nvalid });
+    if valid < needed_attrs {
+        unsafe {
+            pg_sys::slot_getmissingattrs(slot, valid, needed_attrs);
+            (*slot).tts_nvalid = needed_attrs as i16;
+        }
+    }
+
+    if i32::from(unsafe { (*slot).tts_nvalid }) < needed_attrs {
+        return Err(EncodeError::SlotAttrAccess {
+            attnum: needed_attrs as usize,
+        });
+    }
+
+    Ok(())
 }
 
 struct PgSlotRow<'profile> {
@@ -429,6 +496,37 @@ impl PgSlotRow<'_> {
             profile.page_write_ns = profile.page_write_ns.saturating_add(elapsed_ns(start));
         }
         result
+    }
+}
+
+impl FixedWidthRowSource for PgSlotRow<'_> {
+    type Error = EncodeError;
+
+    fn fixed_width_cell(
+        &mut self,
+        index: usize,
+        type_tag: TypeTag,
+    ) -> Result<FixedWidthCell, Self::Error> {
+        let extract_start = self.profile_enabled().then(Instant::now);
+        let source_idx = self.source_index(index);
+        let attr = unsafe { &*self.attrs_ptr.add(source_idx) };
+        let is_null = unsafe { *self.isnulls.add(source_idx) };
+        if is_null {
+            self.record_cell_extracted(extract_start);
+            return Err(EncodeError::NullInNonNullableColumn { index });
+        }
+
+        let datum = unsafe { *self.values.add(source_idx) };
+        let cell = match type_tag {
+            TypeTag::Int16 => FixedWidthCell::Int16(unsafe { read_i16(datum, attr.attbyval) }),
+            TypeTag::Int32 => FixedWidthCell::Int32(unsafe { read_i32(datum, attr.attbyval) }),
+            TypeTag::Int64 => FixedWidthCell::Int64(unsafe { read_i64(datum, attr.attbyval) }),
+            TypeTag::Float32 => FixedWidthCell::Float32(unsafe { read_f32(datum, attr.attbyval) }),
+            TypeTag::Float64 => FixedWidthCell::Float64(unsafe { read_f64(datum, attr.attbyval) }),
+            _ => return Err(EncodeError::UnsupportedRowAccess { index }),
+        };
+        self.record_cell_extracted(extract_start);
+        Ok(cell)
     }
 }
 

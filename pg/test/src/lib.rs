@@ -455,6 +455,11 @@ mod tests {
     }
 
     #[pg_test]
+    fn slot_deform_vs_page_encode_bench_projected_fixed_smoke() {
+        super::slot_deform_bench::slot_deform_vs_page_encode_bench_projected_fixed_smoke();
+    }
+
+    #[pg_test]
     fn slot_deform_vs_page_encode_bench_large_page_smoke() {
         super::slot_deform_bench::slot_deform_vs_page_encode_bench_large_page_smoke();
     }
