@@ -172,12 +172,33 @@ impl<'a> RuntimeFilterSlot<'a> {
         }
     }
 
+    pub fn publish_build(&self, generation: u64) -> Result<RuntimeFilterProbe<'a>, LifecycleError> {
+        self.transition_build(generation, RuntimeFilterState::Ready)?;
+        Ok(RuntimeFilterProbe {
+            header: self.header,
+            bloom: self.bloom,
+            generation,
+        })
+    }
+
+    pub fn disable_build(&self, generation: u64) -> Result<(), LifecycleError> {
+        self.transition_build(generation, RuntimeFilterState::Disabled)
+    }
+
     pub fn probe(&self, generation: u64) -> RuntimeFilterProbe<'a> {
         RuntimeFilterProbe {
             header: self.header,
             bloom: self.bloom,
             generation,
         }
+    }
+
+    fn transition_build(
+        &self,
+        generation: u64,
+        next: RuntimeFilterState,
+    ) -> Result<(), LifecycleError> {
+        transition_build(self.header, generation, next)
     }
 
     /// Retire a published filter so the storage can be reused by a later
@@ -223,6 +244,11 @@ impl<'a> RuntimeFilterBuilder<'a> {
         self.generation
     }
 
+    pub fn detach(mut self) -> u64 {
+        self.active = false;
+        self.generation
+    }
+
     pub fn insert_u64(&self, value: u64) {
         self.bloom.insert_u64(value);
     }
@@ -248,22 +274,7 @@ impl<'a> RuntimeFilterBuilder<'a> {
     }
 
     fn transition(&self, next: RuntimeFilterState) -> Result<(), LifecycleError> {
-        let expected = LifecycleSnapshot {
-            generation: self.generation,
-            state: RuntimeFilterState::Building,
-        };
-        let expected_word = pack_lifecycle_word(self.generation, RuntimeFilterState::Building)
-            .expect("builder generation must pack");
-        let desired =
-            pack_lifecycle_word(self.generation, next).expect("builder generation must pack");
-        self.header
-            .lifecycle
-            .compare_exchange(expected_word, desired, Ordering::AcqRel, Ordering::Acquire)
-            .map(|_| ())
-            .map_err(|actual_word| LifecycleError::InvalidTransition {
-                expected,
-                actual: unpack_lifecycle_word(actual_word),
-            })
+        transition_build(self.header, self.generation, next)
     }
 }
 
@@ -303,6 +314,37 @@ impl<'a> RuntimeFilterProbe<'a> {
             ProbeDecision::DefinitelyAbsent
         }
     }
+
+    pub fn decision_for_null(&self) -> ProbeDecision {
+        let snapshot = self.header.load(Ordering::Acquire);
+        if snapshot.generation == self.generation && snapshot.state == RuntimeFilterState::Ready {
+            ProbeDecision::DefinitelyAbsent
+        } else {
+            ProbeDecision::PassUnfiltered
+        }
+    }
+}
+
+fn transition_build(
+    header: &RuntimeFilterHeader,
+    generation: u64,
+    next: RuntimeFilterState,
+) -> Result<(), LifecycleError> {
+    let expected = LifecycleSnapshot {
+        generation,
+        state: RuntimeFilterState::Building,
+    };
+    let expected_word = pack_lifecycle_word(generation, RuntimeFilterState::Building)
+        .expect("builder generation must pack");
+    let desired = pack_lifecycle_word(generation, next).expect("builder generation must pack");
+    header
+        .lifecycle
+        .compare_exchange(expected_word, desired, Ordering::AcqRel, Ordering::Acquire)
+        .map(|_| ())
+        .map_err(|actual_word| LifecycleError::InvalidTransition {
+            expected,
+            actual: unpack_lifecycle_word(actual_word),
+        })
 }
 
 pub fn pack_lifecycle_word(

@@ -47,8 +47,8 @@ use crate::scan_worker_job::{
     ScanWorkerJobSpec,
 };
 use crate::shmem::{
-    attach_control_region, attach_issuance_pool, attach_page_pool, attach_runtime_metrics,
-    attach_scan_region, attach_scan_worker_jobs,
+    attach_control_region, attach_issuance_pool, attach_page_pool, attach_runtime_filters,
+    attach_runtime_metrics, attach_scan_region, attach_scan_worker_jobs,
 };
 use crate::utility_hook::PlannerBypassGuard;
 
@@ -341,6 +341,7 @@ unsafe extern "C-unwind" fn begin_pg_fusion_scan(
     let backend_start = metrics.now_ns();
     let mut backend_config = config.backend_service_config();
     backend_config.metrics = metrics;
+    backend_config.runtime_filters = attach_runtime_filters();
     let control_region = attach_control_region();
     let scan_region = attach_scan_region();
     let scan_worker_jobs = attach_scan_worker_jobs();

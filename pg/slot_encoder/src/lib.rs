@@ -35,5 +35,8 @@ mod tests;
 
 #[cfg(test)]
 pub(crate) use datum::set_test_database_encoding;
-pub use encoder::{AppendStatus, EncodedBatch, PageBatchEncoder};
+pub use encoder::{
+    ensure_slot_deformed, read_int_key, AppendStatus, EncodedBatch, PageBatchEncoder,
+    SlotIntKeyType,
+};
 pub use error::{ConfigError, EncodeError};

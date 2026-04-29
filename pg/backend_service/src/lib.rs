@@ -22,6 +22,7 @@ use plan_builder::{PlanBuildInput, PlanBuilder};
 use plan_flow::{BackendPlanRole, BackendPlanStep, PlanOpen};
 use row_estimator::{EstimatorConfig, PageRowEstimator};
 use row_estimator_seed::{seed_estimator_config, ProjectedColumnRef};
+use runtime_filter::RuntimeFilterPool;
 use runtime_metrics::{MetricId, PageDirection, RuntimeMetrics};
 use runtime_protocol::{
     decode_worker_scan_to_backend, encode_backend_scan_to_worker_into, BackendExecutionToWorker,
@@ -88,6 +89,8 @@ pub struct BackendServiceConfig {
     pub diagnostics: DiagnosticsConfig,
     pub metrics: RuntimeMetrics,
     pub scan_timing_detail: bool,
+    pub runtime_filter_enabled: bool,
+    pub runtime_filters: RuntimeFilterPool,
 }
 
 impl Default for BackendServiceConfig {
@@ -105,6 +108,8 @@ impl Default for BackendServiceConfig {
             diagnostics: DiagnosticsConfig::default(),
             metrics: RuntimeMetrics::default(),
             scan_timing_detail: false,
+            runtime_filter_enabled: false,
+            runtime_filters: RuntimeFilterPool::default(),
         }
     }
 }
@@ -749,6 +754,7 @@ impl BackendService {
             let options = runtime_protocol::ExecutionOptionsWire {
                 scan_batch_channel_capacity: config.scan_batch_channel_capacity,
                 scan_idle_poll_interval_us: config.scan_idle_poll_interval_us,
+                runtime_filter_enabled: config.runtime_filter_enabled,
             };
 
             *slot.borrow_mut() = Some(ActiveExecution {
@@ -953,6 +959,10 @@ impl BackendService {
                 estimator,
                 execution.config.metrics,
                 execution.config.scan_timing_detail,
+                execution.config.runtime_filter_enabled,
+                execution.config.runtime_filters,
+                input.session_epoch,
+                input.scan_id,
             );
 
             let mut coordinator = BackendScanCoordinator::new();
@@ -1762,6 +1772,7 @@ fn run_standalone_scan_producer(
     )?;
 
     let source = match standalone_page_source(
+        input.session_epoch,
         input.scan_id,
         input.scan_tx.payload_capacity(),
         &input.config,
@@ -1796,6 +1807,7 @@ fn run_standalone_scan_producer(
 }
 
 fn standalone_page_source(
+    session_epoch: u64,
     scan_id: u64,
     payload_capacity: usize,
     config: &BackendServiceConfig,
@@ -1861,6 +1873,10 @@ fn standalone_page_source(
         estimator,
         config.metrics,
         config.scan_timing_detail,
+        config.runtime_filter_enabled,
+        config.runtime_filters,
+        session_epoch,
+        scan_id,
     ))
 }
 

@@ -13,6 +13,8 @@ use datafusion::physical_planner::{DefaultPhysicalPlanner, PhysicalPlanner};
 use datafusion_expr::logical_plan::LogicalPlan;
 use issuance::{decode_issued_frame, IssuedOwnedFrame, IssuedRx};
 use plan_flow::{FlowId as PlanFlowId, PlanOpen, WorkerPlanRole, WorkerStep as WorkerPlanStep};
+use runtime_filter::RuntimeFilterPool;
+use runtime_metrics::RuntimeMetrics;
 use runtime_protocol::{
     classify_session, decode_backend_execution_to_worker, decode_runtime_message_family,
     encode_worker_execution_to_backend_into, encoded_len_worker_execution_to_backend,
@@ -24,6 +26,7 @@ use scan_node::PgScanExtensionPlanner;
 use crate::error::WorkerRuntimeError;
 use crate::fsm::worker_execution_flow::StateMachine as WorkerExecutionMachine;
 use crate::fsm::{WorkerExecutionEvent, WorkerExecutionState};
+use crate::runtime_filter_plan::install_runtime_filters;
 use crate::scan_exec::{
     ScanBatchSource, ScanProducerPeer, WorkerPgScanExec, WorkerPgScanExecFactory, WorkerScanTuning,
 };
@@ -37,6 +40,10 @@ pub struct WorkerRuntimeConfig {
     pub scan_page_kind: transfer::MessageKind,
     /// Page flags expected for backend scan result pages.
     pub scan_page_flags: u16,
+    /// Shared runtime-filter pool available to worker-side physical planning.
+    pub runtime_filter_pool: RuntimeFilterPool,
+    /// Shared runtime metrics sink.
+    pub metrics: RuntimeMetrics,
 }
 
 impl Default for WorkerRuntimeConfig {
@@ -45,6 +52,8 @@ impl Default for WorkerRuntimeConfig {
             control_frame_capacity: 8192,
             scan_page_kind: import::ARROW_LAYOUT_BATCH_KIND,
             scan_page_flags: 0,
+            runtime_filter_pool: RuntimeFilterPool::default(),
+            metrics: RuntimeMetrics::default(),
         }
     }
 }
@@ -77,6 +86,7 @@ pub struct PendingPhysicalPlanning {
     scan_tuning: WorkerScanTuning,
     scan_source: Arc<dyn ScanBatchSource>,
     scan_peers: BTreeMap<u64, Vec<ScanProducerPeer>>,
+    runtime_filter_enabled: bool,
     logical_plan: LogicalPlan,
 }
 
@@ -133,6 +143,7 @@ pub struct WorkerRuntimeCore {
     latest_session: Option<RetainedSession>,
     active_plan_flow: Option<PlanFlowId>,
     active_scan_tuning: Option<WorkerScanTuning>,
+    active_runtime_filter_enabled: bool,
     scan_peers: BTreeMap<u64, Vec<ScanProducerPeer>>,
     plan_role: WorkerPlanRole,
     scan_source: Arc<dyn ScanBatchSource>,
@@ -164,6 +175,7 @@ impl WorkerRuntimeCore {
             latest_session: None,
             active_plan_flow: None,
             active_scan_tuning: None,
+            active_runtime_filter_enabled: false,
             scan_peers: BTreeMap::new(),
             plan_role: WorkerPlanRole::new(),
             scan_source,
@@ -410,6 +422,7 @@ impl WorkerRuntimeCore {
                 .expect("physical planning only starts with active execution options"),
             scan_source: Arc::clone(&self.scan_source),
             scan_peers: self.scan_peers.clone(),
+            runtime_filter_enabled: self.active_runtime_filter_enabled,
             logical_plan,
         }
     }
@@ -487,6 +500,7 @@ impl WorkerRuntimeCore {
         });
         self.active_plan_flow = Some(flow);
         self.active_scan_tuning = Some(scan_tuning);
+        self.active_runtime_filter_enabled = options.runtime_filter_enabled;
         self.scan_peers = scan_peers;
         self.physical_plan = None;
         Ok(WorkerRuntimeStep::PlanOpened {
@@ -598,6 +612,7 @@ impl WorkerRuntimeCore {
         self.active_session_epoch = None;
         self.active_plan_flow = None;
         self.active_scan_tuning = None;
+        self.active_runtime_filter_enabled = false;
         self.scan_peers.clear();
         self.plan_role.abort();
         self.physical_plan = None;
@@ -665,6 +680,17 @@ impl PendingPhysicalPlanning {
         let physical_plan = physical_planner
             .create_physical_plan(&self.logical_plan, &session_state)
             .await?;
+        let physical_plan =
+            if self.runtime_filter_enabled && self.config.runtime_filter_pool.is_attached() {
+                install_runtime_filters(
+                    physical_plan,
+                    self.flow.session_epoch,
+                    self.config.runtime_filter_pool,
+                    self.config.metrics,
+                )?
+            } else {
+                physical_plan
+            };
         Ok(scan_node::insert_page_materializers(
             physical_plan,
             &|plan| plan.as_any().is::<WorkerPgScanExec>(),
@@ -1158,6 +1184,7 @@ mod tests {
         let options = runtime_protocol::ExecutionOptionsWire {
             scan_batch_channel_capacity: 17,
             scan_idle_poll_interval_us: 250,
+            runtime_filter_enabled: false,
         };
         accept(
             &mut core,

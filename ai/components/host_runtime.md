@@ -3,7 +3,7 @@ id: comp-host-runtime-0001
 type: fact
 scope: host_runtime
 tags: ["pgrx", "datafusion", "shared-memory", "runtime_protocol", "slot_scan"]
-updated_at: "2026-04-28"
+updated_at: "2026-04-29"
 importance: 0.8
 ---
 
@@ -37,6 +37,16 @@ importance: 0.8
   captures `pg_fusion.scan_batch_channel_capacity` and
   `pg_fusion.scan_idle_poll_interval_us` at query start and passes them to the
   worker through `StartExecution`.
+- Runtime Bloom filters are controlled by `pg_fusion.runtime_filter_enable`
+  (default `off`) plus postmaster-sized pool settings
+  `pg_fusion.runtime_filter_count`, `pg_fusion.runtime_filter_bits`, and
+  `pg_fusion.runtime_filter_hashes`. Worker physical planning allocates filters
+  from a shared-memory pool and records `(session_epoch, scan_id,
+  output_column, key_type)` metadata there. Backend scan producers, including
+  dynamic standalone scan workers, attach probes by `(session_epoch, scan_id)`
+  at scan open and test integer keys before Arrow encoding. No control-ring
+  message is needed for readiness; probes read the shared lifecycle word and
+  pass rows unfiltered until the matching generation is `Ready`.
 - Results return as issued Arrow pages and are projected into PostgreSQL tuple
   slots through `pg/slot_import`.
 - The issuance permit pool is sized from `pg_fusion.page_count`; there is no
@@ -46,7 +56,10 @@ importance: 0.8
   latency is measured with page descriptor stamps, not by instrumenting ring
   internals. Worker scan-thread metrics additionally split scan page handoff
   into idle sleep time, page read/import time, `tx.send(Ok(batch))` time, and
-  frame-read-to-DataFusion-batch-delivery time.
+  frame-read-to-DataFusion-batch-delivery time. Runtime filter metrics count
+  allocations, ready publications, pool exhaustion, build rows, probed rows,
+  rejected rows, and probe rows that passed unfiltered because a filter was not
+  ready.
 - `pg_fusion.scan_timing_detail` enables diagnostic backend scan timing.
   It splits `scan_page_fill_ns` into coarse slot drain, snapshot wrapper,
   overflow-copy, retry, prepare, finish, and residual page-fill bookkeeping

@@ -1,3 +1,5 @@
+use std::alloc::{alloc_zeroed, dealloc, Layout};
+use std::ptr::NonNull;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use super::*;
@@ -9,6 +11,29 @@ fn bit_storage(words: usize) -> Vec<AtomicU64> {
 fn slot_fixture(params: BloomParams) -> (RuntimeFilterHeader, Vec<AtomicU64>, BloomParams) {
     let bits = bit_storage(params.word_count());
     (RuntimeFilterHeader::free(), bits, params)
+}
+
+struct PoolMemory {
+    ptr: NonNull<u8>,
+    layout: Layout,
+}
+
+impl Drop for PoolMemory {
+    fn drop(&mut self) {
+        unsafe { dealloc(self.ptr.as_ptr(), self.layout) };
+    }
+}
+
+fn pool_fixture(slot_count: u32) -> (RuntimeFilterPool, PoolMemory) {
+    let params = BloomParams::new(1024, 3, 17).unwrap();
+    let config = RuntimeFilterPoolConfig::new(slot_count, params);
+    let pool_layout = RuntimeFilterPool::layout(config).unwrap();
+    let layout = Layout::from_size_align(pool_layout.size, pool_layout.align).unwrap();
+    let ptr = NonNull::new(unsafe { alloc_zeroed(layout) }).expect("pool allocation");
+    let memory = PoolMemory { ptr, layout };
+    let pool = unsafe { RuntimeFilterPool::init_in_place(ptr.as_ptr(), pool_layout.size, config) }
+        .expect("pool init");
+    (pool, memory)
 }
 
 fn expect_builder_error(
@@ -415,4 +440,82 @@ fn raw_attach_accepts_valid_atomic_storage() {
 
     bloom.insert_u64(5);
     assert!(bloom.might_contain_u64(5));
+}
+
+#[test]
+fn pool_publishes_filter_and_probe_rejects_absent_keys() {
+    let (pool, _memory) = pool_fixture(1);
+    let target = RuntimeFilterTarget {
+        session_epoch: 11,
+        scan_id: 22,
+        output_column: 3,
+        key_type: RuntimeFilterKeyType::Int64,
+    };
+    let build = pool
+        .allocate_build(target)
+        .expect("allocate")
+        .expect("available slot");
+    build.insert_hash(hash_int_key(42)).unwrap();
+    build.publish_ready().unwrap();
+
+    let mut probes = Vec::new();
+    pool.lookup_probes(11, 22, &mut probes);
+    assert_eq!(probes.len(), 1);
+    assert_eq!(probes[0].output_column(), 3);
+    assert_eq!(probes[0].key_type(), RuntimeFilterKeyType::Int64);
+    assert_eq!(
+        probes[0].decision_for_hash(hash_int_key(42)),
+        ProbeDecision::MaybePresent
+    );
+    assert_eq!(
+        probes[0].decision_for_hash(hash_int_key(100_000)),
+        ProbeDecision::DefinitelyAbsent
+    );
+    assert_eq!(
+        probes[0].decision_for_null(),
+        ProbeDecision::DefinitelyAbsent
+    );
+}
+
+#[test]
+fn pool_does_not_reuse_storage_until_probes_are_dropped() {
+    let (pool, _memory) = pool_fixture(1);
+    let target = RuntimeFilterTarget {
+        session_epoch: 1,
+        scan_id: 2,
+        output_column: 0,
+        key_type: RuntimeFilterKeyType::Int32,
+    };
+    let build = pool
+        .allocate_build(target)
+        .expect("allocate")
+        .expect("available slot");
+    build.insert_hash(hash_int_key(7)).unwrap();
+    build.publish_ready().unwrap();
+
+    let mut probes = Vec::new();
+    pool.lookup_probes(1, 2, &mut probes);
+    assert_eq!(probes.len(), 1);
+    drop(build);
+
+    let next = pool
+        .allocate_build(RuntimeFilterTarget {
+            session_epoch: 3,
+            scan_id: 4,
+            output_column: 0,
+            key_type: RuntimeFilterKeyType::Int32,
+        })
+        .expect("allocate while old probe exists");
+    assert!(next.is_none());
+
+    drop(probes);
+    assert!(pool
+        .allocate_build(RuntimeFilterTarget {
+            session_epoch: 3,
+            scan_id: 4,
+            output_column: 0,
+            key_type: RuntimeFilterKeyType::Int32,
+        })
+        .expect("allocate after old probe exits")
+        .is_some());
 }

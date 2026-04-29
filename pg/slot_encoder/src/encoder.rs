@@ -11,6 +11,13 @@ use std::ptr;
 
 pub use row_encoder::{AppendStatus, EncodedBatch};
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SlotIntKeyType {
+    Int16,
+    Int32,
+    Int64,
+}
+
 /// Direct writer from PostgreSQL `TupleTableSlot` rows into an
 /// `arrow_layout` block.
 ///
@@ -183,7 +190,7 @@ impl<'payload> PageBatchEncoder<'payload> {
             .map_err(|_| arrow_layout::LayoutError::SizeOverflow)?;
         let valid = unsafe { (*slot).tts_nvalid as usize };
         if valid < needed_attrs {
-            unsafe { deform_slot_to(slot, self.needed_attrs)? };
+            unsafe { ensure_slot_deformed(slot, self.needed_attrs)? };
         }
 
         let values = unsafe { (*slot).tts_values };
@@ -204,6 +211,10 @@ impl<'payload> PageBatchEncoder<'payload> {
         } else {
             self.inner.append_row(&mut source)
         }
+    }
+
+    pub fn needed_attrs(&self) -> i32 {
+        self.needed_attrs
     }
 
     fn source_index(&self, output_index: usize) -> usize {
@@ -269,7 +280,7 @@ impl<'payload> PageBatchEncoder<'payload> {
     }
 }
 
-unsafe fn deform_slot_to(
+pub unsafe fn ensure_slot_deformed(
     slot: *mut pg_sys::TupleTableSlot,
     needed_attrs: i32,
 ) -> Result<(), EncodeError> {
@@ -308,6 +319,57 @@ unsafe fn deform_slot_to(
     }
 
     Ok(())
+}
+
+pub unsafe fn read_int_key(
+    slot: *mut pg_sys::TupleTableSlot,
+    source_index: usize,
+    key_type: SlotIntKeyType,
+) -> Result<Option<i64>, EncodeError> {
+    if slot.is_null() {
+        return Err(EncodeError::NullSlot);
+    }
+    let tuple_desc = unsafe { (*slot).tts_tupleDescriptor };
+    if tuple_desc.is_null() {
+        return Err(EncodeError::NullSlotTupleDesc);
+    }
+    let tuple_desc_cols = unsafe { (*tuple_desc).natts as usize };
+    if source_index >= tuple_desc_cols {
+        return Err(EncodeError::SlotAttrAccess {
+            attnum: source_index + 1,
+        });
+    }
+
+    let values = unsafe { (*slot).tts_values };
+    let isnulls = unsafe { (*slot).tts_isnull };
+    if values.is_null() || isnulls.is_null() {
+        return Err(EncodeError::InvalidSlotStorage);
+    }
+
+    if unsafe { *isnulls.add(source_index) } {
+        return Ok(None);
+    }
+
+    let attrs_ptr = unsafe { (*tuple_desc).attrs.as_mut_ptr() };
+    let attr = unsafe { &*attrs_ptr.add(source_index) };
+    let datum = unsafe { *values.add(source_index) };
+    let value = match key_type {
+        SlotIntKeyType::Int16 if attr.atttypid == pg_sys::INT2OID => unsafe {
+            read_i16(datum, attr.attbyval) as i64
+        },
+        SlotIntKeyType::Int32 if attr.atttypid == pg_sys::INT4OID => unsafe {
+            read_i32(datum, attr.attbyval) as i64
+        },
+        SlotIntKeyType::Int64 if attr.atttypid == pg_sys::INT8OID => unsafe {
+            read_i64(datum, attr.attbyval)
+        },
+        _ => {
+            return Err(EncodeError::UnsupportedRowAccess {
+                index: source_index,
+            })
+        }
+    };
+    Ok(Some(value))
 }
 
 struct PgSlotRow {

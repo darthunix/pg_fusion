@@ -75,6 +75,7 @@ impl TryFrom<u8> for ExecutionFailureCode {
 pub struct ExecutionOptionsWire {
     pub scan_batch_channel_capacity: u32,
     pub scan_idle_poll_interval_us: u32,
+    pub runtime_filter_enabled: bool,
 }
 
 impl Default for ExecutionOptionsWire {
@@ -82,6 +83,7 @@ impl Default for ExecutionOptionsWire {
         Self {
             scan_batch_channel_capacity: 8,
             scan_idle_poll_interval_us: 100,
+            runtime_filter_enabled: false,
         }
     }
 }

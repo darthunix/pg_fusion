@@ -3,9 +3,14 @@ use arrow_layout::{init_block, LayoutPlan};
 use arrow_schema::SchemaRef;
 use pgrx::pg_sys;
 use row_estimator::PageRowEstimator;
+use runtime_filter::{
+    hash_int_key, ProbeDecision, RuntimeFilterKeyType, RuntimeFilterPool, RuntimeFilterProbeHandle,
+};
 use runtime_metrics::{MetricId, RuntimeMetrics};
 use scan_flow::{BackendPageSource, FlowId, SourcePageStatus};
-use slot_encoder::{AppendStatus, PageBatchEncoder};
+use slot_encoder::{
+    ensure_slot_deformed, read_int_key, AppendStatus, PageBatchEncoder, SlotIntKeyType,
+};
 use slot_scan::{ExecutionSpiContext, PreparedScan, SlotSinkAction, StreamingScanSession};
 
 pub(crate) struct SlotScanPageSource {
@@ -20,6 +25,12 @@ pub(crate) struct SlotScanPageSource {
     estimator: PageRowEstimator,
     metrics: RuntimeMetrics,
     scan_timing_detail: bool,
+    runtime_filter_enabled: bool,
+    runtime_filters: RuntimeFilterPool,
+    session_epoch: u64,
+    scan_id: u64,
+    runtime_filter_probes: Vec<RuntimeFilterProbeHandle>,
+    runtime_filter_needed_attrs: i32,
     session: Option<StreamingScanSession>,
     overflow_slot: *mut pg_sys::TupleTableSlot,
     pending_overflow: pg_sys::HeapTuple,
@@ -77,6 +88,10 @@ impl SlotScanPageSource {
         estimator: PageRowEstimator,
         metrics: RuntimeMetrics,
         scan_timing_detail: bool,
+        runtime_filter_enabled: bool,
+        runtime_filters: RuntimeFilterPool,
+        session_epoch: u64,
+        scan_id: u64,
     ) -> Self {
         let single_row_drains = estimator.has_variable_width();
         Self {
@@ -91,10 +106,46 @@ impl SlotScanPageSource {
             estimator,
             metrics,
             scan_timing_detail,
+            runtime_filter_enabled,
+            runtime_filters,
+            session_epoch,
+            scan_id,
+            runtime_filter_probes: Vec::new(),
+            runtime_filter_needed_attrs: 0,
             session: None,
             overflow_slot: std::ptr::null_mut(),
             pending_overflow: std::ptr::null_mut(),
         }
+    }
+
+    fn attach_runtime_filter_probes(&mut self) -> Result<(), BackendServiceError> {
+        self.runtime_filter_probes.clear();
+        self.runtime_filter_needed_attrs = 0;
+        if !self.runtime_filter_enabled || !self.runtime_filters.is_attached() {
+            return Ok(());
+        }
+
+        self.runtime_filters.lookup_probes(
+            self.session_epoch,
+            self.scan_id,
+            &mut self.runtime_filter_probes,
+        );
+        let mut needed_attrs = 0_i32;
+        for probe in &self.runtime_filter_probes {
+            let output_column = probe.output_column() as usize;
+            let Some(source_column) = self.source_projection.get(output_column).copied() else {
+                return Err(BackendServiceError::ProtocolViolation(format!(
+                    "runtime filter target output column {output_column} is outside scan projection"
+                )));
+            };
+            needed_attrs = needed_attrs.max(i32::try_from(source_column + 1).map_err(|_| {
+                BackendServiceError::ProtocolViolation(format!(
+                    "runtime filter source column {source_column} does not fit into i32"
+                ))
+            })?);
+        }
+        self.runtime_filter_needed_attrs = needed_attrs;
+        Ok(())
     }
 
     fn fill_next_page_with_snapshot(
@@ -105,6 +156,9 @@ impl SlotScanPageSource {
         loop {
             let metrics = self.metrics;
             let retry_start = self.scan_timing_detail.then(|| metrics.now_ns());
+            let source_projection = &self.source_projection;
+            let runtime_filter_probes = &self.runtime_filter_probes;
+            let runtime_filter_needed_attrs = self.runtime_filter_needed_attrs;
             let session = self.session.as_mut().ok_or_else(|| {
                 BackendServiceError::PageSource("slot scan page source is not open".into())
             })?;
@@ -135,9 +189,11 @@ impl SlotScanPageSource {
                     payload,
                 )
             }?;
+            let needed_attrs = encoder.needed_attrs().max(runtime_filter_needed_attrs);
             let page_prepare_ns = self.metrics.now_ns().saturating_sub(prepare_start);
             let mut rows_written = 0usize;
             let mut pending_overflow_encode_ns = 0_u64;
+            let mut filter_stats = RuntimeFilterProbeStats::default();
 
             if !self.pending_overflow.is_null() {
                 let overflow_encode_start = self.scan_timing_detail.then(|| self.metrics.now_ns());
@@ -206,7 +262,18 @@ impl SlotScanPageSource {
                 }
                 let drain_start = self.scan_timing_detail.then(|| metrics.now_ns());
                 let drain_result = unsafe {
-                    let mut append_slot = |slot| {
+                    let mut append_slot = |slot: *mut pg_sys::TupleTableSlot| {
+                        if needed_attrs > 0 && i32::from((*slot).tts_nvalid) < needed_attrs {
+                            ensure_slot_deformed(slot, needed_attrs)?;
+                        }
+                        if runtime_filter_rejects_slot(
+                            slot,
+                            source_projection,
+                            runtime_filter_probes,
+                            &mut filter_stats,
+                        )? {
+                            return Ok(SlotSinkAction::Continue);
+                        }
                         let status = encoder.append_slot(slot)?;
                         handle_append_slot_status(
                             status,
@@ -233,6 +300,7 @@ impl SlotScanPageSource {
                 }
                 let post_drain_start = self.scan_timing_detail.then(|| metrics.now_ns());
                 let drain = drain_result?;
+                filter_stats.record(metrics);
                 self.metrics.increment(MetricId::ScanFetchCallsTotal);
                 let has_pending_overflow = !self.pending_overflow.is_null();
                 let drain_stopped = drain.stopped;
@@ -395,6 +463,81 @@ fn handle_append_slot_status(
     }
 }
 
+#[derive(Default)]
+struct RuntimeFilterProbeStats {
+    probe_rows: u64,
+    rejected_rows: u64,
+    pass_unfiltered: u64,
+}
+
+impl RuntimeFilterProbeStats {
+    fn record(&mut self, metrics: RuntimeMetrics) {
+        if self.probe_rows != 0 {
+            metrics.add(MetricId::RuntimeFilterProbeRowsTotal, self.probe_rows);
+            self.probe_rows = 0;
+        }
+        if self.rejected_rows != 0 {
+            metrics.add(
+                MetricId::RuntimeFilterProbeRowsRejectedTotal,
+                self.rejected_rows,
+            );
+            self.rejected_rows = 0;
+        }
+        if self.pass_unfiltered != 0 {
+            metrics.add(
+                MetricId::RuntimeFilterProbePassUnfilteredTotal,
+                self.pass_unfiltered,
+            );
+            self.pass_unfiltered = 0;
+        }
+    }
+}
+
+fn runtime_filter_rejects_slot(
+    slot: *mut pg_sys::TupleTableSlot,
+    source_projection: &[usize],
+    probes: &[RuntimeFilterProbeHandle],
+    stats: &mut RuntimeFilterProbeStats,
+) -> Result<bool, BackendServiceError> {
+    if probes.is_empty() {
+        return Ok(false);
+    }
+
+    stats.probe_rows = stats.probe_rows.saturating_add(1);
+    for probe in probes {
+        let output_column = probe.output_column() as usize;
+        let Some(source_column) = source_projection.get(output_column).copied() else {
+            return Err(BackendServiceError::ProtocolViolation(format!(
+                "runtime filter target output column {output_column} is outside scan projection"
+            )));
+        };
+        let decision =
+            match unsafe { read_int_key(slot, source_column, slot_key_type(probe.key_type())) }? {
+                Some(value) => probe.decision_for_hash(hash_int_key(value)),
+                None => probe.decision_for_null(),
+            };
+        match decision {
+            ProbeDecision::PassUnfiltered => {
+                stats.pass_unfiltered = stats.pass_unfiltered.saturating_add(1);
+            }
+            ProbeDecision::MaybePresent => {}
+            ProbeDecision::DefinitelyAbsent => {
+                stats.rejected_rows = stats.rejected_rows.saturating_add(1);
+                return Ok(true);
+            }
+        }
+    }
+    Ok(false)
+}
+
+fn slot_key_type(key_type: RuntimeFilterKeyType) -> SlotIntKeyType {
+    match key_type {
+        RuntimeFilterKeyType::Int16 => SlotIntKeyType::Int16,
+        RuntimeFilterKeyType::Int32 => SlotIntKeyType::Int32,
+        RuntimeFilterKeyType::Int64 => SlotIntKeyType::Int64,
+    }
+}
+
 impl BackendPageSource for SlotScanPageSource {
     type Error = BackendServiceError;
 
@@ -417,6 +560,7 @@ impl BackendPageSource for SlotScanPageSource {
         }
         self.overflow_slot = overflow_slot;
         self.session = Some(session);
+        self.attach_runtime_filter_probes()?;
         Ok(())
     }
 
@@ -469,6 +613,7 @@ impl BackendPageSource for SlotScanPageSource {
             self.overflow_slot = std::ptr::null_mut();
         }
         clear_pending_overflow(&mut self.pending_overflow);
+        self.runtime_filter_probes.clear();
         if let Some(session) = self.session.take() {
             with_registered_snapshot(self.snapshot, || {
                 session

@@ -29,9 +29,10 @@ The main contracts are:
   `OpenScan` with one leader plus 32 worker producers
 - `PlanFlowDescriptor` reconstructs a `plan_flow::PlanOpen` when paired with
   `session_epoch`
-- `ExecutionOptionsWire` carries query-scoped worker scan tuning captured by
-  the backend at `StartExecution`; it keeps session-level GUC values visible to
-  background workers without relying on their local GUC state
+- `ExecutionOptionsWire` carries query-scoped worker scan tuning and the
+  runtime-filter enable flag captured by the backend at `StartExecution`; it
+  keeps session-level GUC values visible to background workers without relying
+  on their local GUC state
 - `ScanChannelDescriptorWire` publishes one dedicated scan producer slot for one
   `(scan_id, producer_id)` up front in `StartExecution`
 - `scan_channels` are encoded in strictly increasing

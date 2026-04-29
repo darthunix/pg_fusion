@@ -1,6 +1,7 @@
 use backend_service::{BackendServiceConfig, DiagnosticLogLevel, DiagnosticsConfig};
 use control_transport::TransportRegionLayout;
 use pgrx::{GucContext, GucFlags, GucRegistry, GucSetting};
+use runtime_filter::{BloomParams, RuntimeFilterPoolConfig};
 use runtime_protocol::{
     MIN_SCAN_BACKEND_TO_WORKER_RING_CAPACITY, MIN_SCAN_WORKER_TO_BACKEND_RING_CAPACITY,
 };
@@ -37,6 +38,12 @@ pub(crate) static ESTIMATOR_INITIAL_TAIL_BYTES_PER_ROW: GucSetting<i32> =
     GucSetting::<i32>::new(64);
 pub(crate) static SCAN_TIMING_DETAIL: GucSetting<bool> = GucSetting::<bool>::new(false);
 pub(crate) static JOIN_REORDERING: GucSetting<bool> = GucSetting::<bool>::new(true);
+pub(crate) static RUNTIME_FILTER_ENABLE: GucSetting<bool> = GucSetting::<bool>::new(false);
+pub(crate) static RUNTIME_FILTER_COUNT: GucSetting<i32> = GucSetting::<i32>::new(64);
+pub(crate) static RUNTIME_FILTER_BITS: GucSetting<i32> = GucSetting::<i32>::new(1_048_576);
+pub(crate) static RUNTIME_FILTER_HASHES: GucSetting<i32> = GucSetting::<i32>::new(4);
+
+const RUNTIME_FILTER_SEED: u64 = 0x7067_6675_7369_6f6e;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct HostConfig {
@@ -59,6 +66,10 @@ pub struct HostConfig {
     pub estimator_initial_tail_bytes_per_row: u32,
     pub scan_timing_detail: bool,
     pub join_reordering: bool,
+    pub runtime_filter_enable: bool,
+    pub runtime_filter_count: u32,
+    pub runtime_filter_bits: usize,
+    pub runtime_filter_hashes: usize,
 }
 
 #[derive(Debug, Error, PartialEq, Eq)]
@@ -213,6 +224,32 @@ pub fn register_gucs() {
         GucContext::Userset,
         GucFlags::default(),
     );
+    GucRegistry::define_bool_guc(
+        c"pg_fusion.runtime_filter_enable",
+        c"Enable runtime Bloom filters",
+        c"Build worker-side runtime Bloom filters for eligible hash joins and apply them before backend scan encoding",
+        &RUNTIME_FILTER_ENABLE,
+        GucContext::Userset,
+        GucFlags::default(),
+    );
+    define_positive_int(
+        c"pg_fusion.runtime_filter_count",
+        c"Runtime filter slot count",
+        c"Number of shared-memory runtime filter slots",
+        &RUNTIME_FILTER_COUNT,
+    );
+    define_positive_int(
+        c"pg_fusion.runtime_filter_bits",
+        c"Runtime filter bit count",
+        c"Bloom bit count per runtime filter slot",
+        &RUNTIME_FILTER_BITS,
+    );
+    define_positive_int(
+        c"pg_fusion.runtime_filter_hashes",
+        c"Runtime filter hash count",
+        c"Number of Bloom hash probes per runtime filter slot",
+        &RUNTIME_FILTER_HASHES,
+    );
 }
 
 pub fn host_config() -> Result<HostConfig, HostConfigError> {
@@ -276,6 +313,19 @@ pub fn host_config() -> Result<HostConfig, HostConfigError> {
         )?,
         scan_timing_detail: SCAN_TIMING_DETAIL.get(),
         join_reordering: JOIN_REORDERING.get(),
+        runtime_filter_enable: RUNTIME_FILTER_ENABLE.get(),
+        runtime_filter_count: positive_u32(
+            "pg_fusion.runtime_filter_count",
+            RUNTIME_FILTER_COUNT.get(),
+        )?,
+        runtime_filter_bits: positive_usize(
+            "pg_fusion.runtime_filter_bits",
+            RUNTIME_FILTER_BITS.get(),
+        )?,
+        runtime_filter_hashes: positive_usize(
+            "pg_fusion.runtime_filter_hashes",
+            RUNTIME_FILTER_HASHES.get(),
+        )?,
     })
 }
 
@@ -310,7 +360,21 @@ impl HostConfig {
         config.diagnostics = DiagnosticsConfig::new(self.backend_log_level, self.log_path.clone());
         config.scan_timing_detail = self.scan_timing_detail;
         config.join_reordering_enabled = self.join_reordering;
+        config.runtime_filter_enabled = self.runtime_filter_enable;
         config
+    }
+
+    pub fn runtime_filter_pool_config(&self) -> RuntimeFilterPoolConfig {
+        RuntimeFilterPoolConfig::new(self.runtime_filter_count, self.runtime_filter_params())
+    }
+
+    fn runtime_filter_params(&self) -> BloomParams {
+        BloomParams::new(
+            self.runtime_filter_bits,
+            self.runtime_filter_hashes,
+            RUNTIME_FILTER_SEED,
+        )
+        .expect("validated runtime filter parameters")
     }
 
     pub fn plan_builder_config(&self) -> plan_builder::PlanBuilderConfig {
@@ -430,6 +494,10 @@ mod tests {
             estimator_initial_tail_bytes_per_row: 33,
             scan_timing_detail: true,
             join_reordering: false,
+            runtime_filter_enable: true,
+            runtime_filter_count: 16,
+            runtime_filter_bits: 4096,
+            runtime_filter_hashes: 3,
         };
 
         let backend = config.backend_service_config();
@@ -441,8 +509,15 @@ mod tests {
         assert_eq!(backend.estimator_default.initial_tail_bytes_per_row, 33);
         assert!(backend.scan_timing_detail);
         assert!(!backend.join_reordering_enabled);
+        assert!(backend.runtime_filter_enabled);
         assert_eq!(backend.diagnostics.level, DiagnosticLogLevel::Trace);
         assert_eq!(backend.diagnostics.log_path.as_ref(), "/tmp/pg_fusion.log");
         assert_eq!(worker.control_frame_capacity, 4096);
+        assert_eq!(config.runtime_filter_pool_config().slot_count(), 16);
+        assert_eq!(
+            config.runtime_filter_pool_config().params().bit_count(),
+            4096
+        );
+        assert_eq!(config.runtime_filter_pool_config().params().hash_count(), 3);
     }
 }

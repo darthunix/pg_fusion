@@ -179,6 +179,7 @@ fn encode_raw_backend_start_execution(
     write_u16_to(&mut buf, plan.page_flags).expect("page flags");
     write_u32_to(&mut buf, 8).expect("scan batch channel capacity");
     write_u32_to(&mut buf, 100).expect("scan idle poll interval");
+    write_u8_to(&mut buf, 0).expect("runtime filter enabled");
     buf.extend_from_slice(scan_channel_bytes);
     buf
 }
@@ -288,6 +289,7 @@ fn backend_start_execution_round_trips_with_scan_channels() {
     let options = ExecutionOptionsWire {
         scan_batch_channel_capacity: 16,
         scan_idle_poll_interval_us: 250,
+        runtime_filter_enabled: true,
     };
     let message = BackendExecutionToWorker::StartExecution {
         session_epoch: 9,

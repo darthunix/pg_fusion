@@ -6,7 +6,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use pool::PageDescriptor;
 
 const METRICS_MAGIC: u64 = 0x5047_4655_4D45_5431;
-const METRICS_VERSION: u32 = 8;
+const METRICS_VERSION: u32 = 9;
 const NO_STAMP: u64 = 0;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -122,9 +122,16 @@ pub enum MetricId {
     ResultW2bWaitTotal,
     ResultPageReadNs,
     ResultPagesReadTotal,
+    RuntimeFilterAllocatedTotal,
+    RuntimeFilterReadyTotal,
+    RuntimeFilterPoolExhaustedTotal,
+    RuntimeFilterBuildRowsTotal,
+    RuntimeFilterProbeRowsTotal,
+    RuntimeFilterProbeRowsRejectedTotal,
+    RuntimeFilterProbePassUnfilteredTotal,
 }
 
-pub const METRIC_COUNT: usize = MetricId::ResultPagesReadTotal as usize + 1;
+pub const METRIC_COUNT: usize = MetricId::RuntimeFilterProbePassUnfilteredTotal as usize + 1;
 
 pub const METRIC_DESCRIPTORS: [MetricDescriptor; METRIC_COUNT] = [
     MetricDescriptor {
@@ -439,6 +446,55 @@ pub const METRIC_DESCRIPTORS: [MetricDescriptor; METRIC_COUNT] = [
         id: MetricId::ResultPagesReadTotal,
         component: "result",
         metric: "result_pages_read_total",
+        kind: MetricKind::Counter,
+        unit: MetricUnit::Count,
+    },
+    MetricDescriptor {
+        id: MetricId::RuntimeFilterAllocatedTotal,
+        component: "runtime_filter",
+        metric: "runtime_filter_allocated_total",
+        kind: MetricKind::Counter,
+        unit: MetricUnit::Count,
+    },
+    MetricDescriptor {
+        id: MetricId::RuntimeFilterReadyTotal,
+        component: "runtime_filter",
+        metric: "runtime_filter_ready_total",
+        kind: MetricKind::Counter,
+        unit: MetricUnit::Count,
+    },
+    MetricDescriptor {
+        id: MetricId::RuntimeFilterPoolExhaustedTotal,
+        component: "runtime_filter",
+        metric: "runtime_filter_pool_exhausted_total",
+        kind: MetricKind::Counter,
+        unit: MetricUnit::Count,
+    },
+    MetricDescriptor {
+        id: MetricId::RuntimeFilterBuildRowsTotal,
+        component: "runtime_filter",
+        metric: "runtime_filter_build_rows_total",
+        kind: MetricKind::Counter,
+        unit: MetricUnit::Count,
+    },
+    MetricDescriptor {
+        id: MetricId::RuntimeFilterProbeRowsTotal,
+        component: "runtime_filter",
+        metric: "runtime_filter_probe_rows_total",
+        kind: MetricKind::Counter,
+        unit: MetricUnit::Count,
+    },
+    MetricDescriptor {
+        id: MetricId::RuntimeFilterProbeRowsRejectedTotal,
+        component: "runtime_filter",
+        metric: "runtime_filter_probe_rows_rejected_total",
+        kind: MetricKind::Counter,
+        unit: MetricUnit::Count,
+    },
+    MetricDescriptor {
+        id: MetricId::RuntimeFilterProbePassUnfilteredTotal,
+        component: "runtime_filter",
+        metric: "runtime_filter_probe_pass_unfiltered_total",
         kind: MetricKind::Counter,
         unit: MetricUnit::Count,
     },

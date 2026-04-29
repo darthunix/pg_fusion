@@ -22,6 +22,10 @@ independent ordered transfer stream that starts at `transfer_id = 1`.
 `OpenScanRequest.tuning` controls the bounded worker scan batch channel and the
 idle poll sleep used by the scan thread; production values come from
 `runtime_protocol::ExecutionOptionsWire` captured at `StartExecution`.
+The same options carry the runtime-filter enable flag. When it is set,
+physical planning can allocate shared runtime-filter slots for eligible integer
+inner hash joins and wrap the build side so backend scan producers can filter
+probe rows before Arrow encoding.
 Dedicated scan slots must provide at least:
 
 - `256` bytes raw backend-to-worker ring capacity

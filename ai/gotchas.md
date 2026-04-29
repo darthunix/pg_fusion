@@ -3,7 +3,7 @@ id: gotchas-0001
 type: gotcha
 scope: repo
 tags: ["shm", "pgrx", "slot_scan", "arrow", "testing"]
-updated_at: "2026-04-27"
+updated_at: "2026-04-29"
 importance: 0.7
 ---
 
@@ -37,6 +37,12 @@ importance: 0.7
 - Runtime metrics reset is intended for experiments before a query. It advances
   `reset_epoch` so old page stamps are ignored, but concurrent increments can
   still race with a manual reset.
+- Runtime filters must not reject until the shared lifecycle reports the exact
+  target generation as `Ready`; otherwise a probe can observe a partially built
+  Bloom filter and create false negatives. Reusing pool storage also requires
+  the owner and all probe handles to drop first. `TxError::Full` style control
+  messages are intentionally not part of readiness; backend probes poll shared
+  memory and pass rows unfiltered while the filter is not ready.
 - `pg_fusion.scan_timing_detail` uses coarse backend scan timers. It deliberately
   avoids per-row slot encode breakdown because clock reads distort the hot path;
   use flamegraphs for deformation and page-write detail.

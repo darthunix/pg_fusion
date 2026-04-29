@@ -129,6 +129,7 @@ pub fn decode_backend_execution_to_worker(
             let options = ExecutionOptionsWire {
                 scan_batch_channel_capacity: read_u32_from(&mut source)?,
                 scan_idle_poll_interval_us: read_u32_from(&mut source)?,
+                runtime_filter_enabled: read_u8_from(&mut source)? != 0,
             };
             let scans = decode_scan_channel_set_ref(original, &mut source)?;
             BackendExecutionToWorkerRef::StartExecution {
@@ -292,6 +293,7 @@ fn encode_backend_execution_to_worker_to<W: std::io::Write>(
             write_u16_to(sink, plan.page_flags)?;
             write_u32_to(sink, options.scan_batch_channel_capacity)?;
             write_u32_to(sink, options.scan_idle_poll_interval_us)?;
+            write_u8_to(sink, u8::from(options.runtime_filter_enabled))?;
             write_scan_channel_slice_to(sink, scans.channels())?;
         }
         BackendExecutionToWorker::CancelExecution { session_epoch } => {

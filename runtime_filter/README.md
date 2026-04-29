@@ -11,9 +11,14 @@ The crate is split into two layers:
   publish a generation as `Ready`, or disable the same generation via CAS.
   Probes reject rows only when their expected generation is currently `Ready`;
   all stale, free, building, or disabled states pass rows unfiltered.
+- `RuntimeFilterPool` adds fixed-slot shared-memory ownership metadata and
+  probe reference counts. It maps `(session_epoch, scan_id, output_column,
+  key_type)` to a lifecycle slot and delays storage reuse until the owner and
+  all probe handles are gone.
 
 This keeps the filter payload reusable while avoiding false negatives from
 clearing storage under old probes or letting stale builders overwrite newer
-generations. A ready generation can be retired for reuse only through
+generations. A ready generation can be retired directly only through
 `retire_ready_after_quiescence`, which is unsafe because the caller must prove
-that no old probe is still reading the bitset.
+that no old probe is still reading the bitset; production shared-memory reuse
+should go through `RuntimeFilterPool`.

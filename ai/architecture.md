@@ -25,12 +25,12 @@ page-backed Arrow batches.
 - `runtime_protocol/`: typed backend/worker control-plane messages.
 - `control_transport/`: shared-memory control rings and backend/worker leases.
 - `runtime_filter`: shared-memory friendly runtime filters. The Bloom bitset
-  layer is separate from the shared-memory lifecycle layer: builders acquire an
-  exclusive generation lease before clearing/inserting, publish `Ready` with a
-  CAS, and probes only reject rows for a matching ready generation. Stale or
-  in-progress generations pass rows unfiltered. Ready generations can be
-  retired for reuse only after external quiescence, preserving the
-  no-false-negative property.
+  layer is separate from the shared-memory pool/lifecycle layer: builders
+  acquire an exclusive generation before clearing/inserting, publish `Ready`
+  with a CAS, and probes only reject rows for a matching ready generation.
+  Stale or in-progress generations pass rows unfiltered. Pool slots use
+  reference counts so ready storage is reused only after the owner and all
+  probes have exited, preserving the no-false-negative property.
 - `page/pool`, `page/transfer`, `page/issuance`: fixed-page ownership,
   transfer, and issued-frame flow.
 - `runtime_metrics`: shared-memory runtime counters and page-slot handoff
@@ -67,19 +67,31 @@ page-backed Arrow batches.
    reuses the owned batches. PostgreSQL text-like columns are represented as
    Arrow `Utf8View` in the DataFusion logical schema so scan pages can stay
    zero-copy for string payloads.
-2. Worker DataFusion execution opens scans through the runtime protocol.
-3. Backend executes trusted scan SQL through `slot_scan`, drains PostgreSQL
+2. Worker physical planning can attach runtime Bloom filters to eligible
+   `HashJoinExec` nodes when `pg_fusion.runtime_filter_enable` is set. The v1
+   path is intentionally narrow: one `Inner` hash join equi-key, `Column =
+   Column`, single-partition build side, integer key type
+   (`int2`/`int4`/`int8`), and a `WorkerPgScanExec` on the probe side. The
+   worker registers the target by `(session_epoch,
+   scan_id, output_column)` in shared memory, fills the filter while consuming
+   the build side, and publishes it when that stream reaches EOF. If the pool
+   is full the join runs unchanged and increments a diagnostic counter.
+3. Worker DataFusion execution opens scans through the runtime protocol.
+4. Backend executes trusted scan SQL through `slot_scan`, drains PostgreSQL
    executor slots with a custom `DestReceiver` and explicit fetch row budgets,
-   encodes `TupleTableSlot` rows into initialized `arrow_layout` pages with
-   `slot_encoder`, and sends issued pages to the worker. Each scan always has a
+   optionally applies attached runtime filters before slot-to-Arrow encoding,
+   encodes surviving `TupleTableSlot` rows into initialized `arrow_layout`
+   pages with `slot_encoder`, and sends issued pages to the worker. The filter
+   key is deformed once and the same deformed slot is then reused by
+   `slot_encoder`. Each scan always has a
    leader backend producer. PostgreSQL `max_parallel_workers_per_gather` is a
    query-wide budget for additional dynamic background-worker producers across
    eligible heap scans, capped at `32` and bounded by `max_worker_processes`;
    each producer owns a dedicated scan control slot and writes its own Arrow
    pages into shared memory.
-4. Worker imports scan pages as Arrow `RecordBatch` values, runs DataFusion
+5. Worker imports scan pages as Arrow `RecordBatch` values, runs DataFusion
    operators, writes Arrow result pages, and sends issued frames back.
-5. Backend imports result pages with `slot_import` and projects rows into
+6. Backend imports result pages with `slot_import` and projects rows into
    PostgreSQL tuple slots.
 
 Page-backed scan batches stay zero-copy through streaming DataFusion operators.
@@ -100,7 +112,9 @@ backend-to-worker latency into idle sleeps, page import, and DataFusion scan
 channel send/delivery time. Detailed scan timing is opt-in through
 `pg_fusion.scan_timing_detail`; it splits backend scan page fill time with
 coarse page/fetch timers. Slot-to-Arrow serialization internals are left to
-external profilers.
+external profilers. Runtime filter counters track allocated/ready filters,
+pool exhaustion, build rows, probe rows, rejected rows, and rows that passed
+unfiltered because the filter was not ready for that probe.
 
 Dynamic scan workers use CTID block-range chunking as the first parallel scan
 strategy. The leader backend scans one heap block range, additional dynamic

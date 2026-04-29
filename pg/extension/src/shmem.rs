@@ -5,6 +5,7 @@ use issuance::{IssuanceConfig, IssuancePool};
 use pgrx::pg_sys::AsPgCStr;
 use pgrx::prelude::*;
 use pool::{PagePool, PagePoolConfig};
+use runtime_filter::RuntimeFilterPool;
 use runtime_metrics::{RuntimeMetrics, RuntimeMetricsConfig};
 
 use crate::guc::host_config;
@@ -15,6 +16,7 @@ const SCAN_REGION_NAME: &str = "pg_fusion:scan_transport";
 const PAGE_POOL_NAME: &str = "pg_fusion:page_pool";
 const ISSUANCE_POOL_NAME: &str = "pg_fusion:issuance_pool";
 const RUNTIME_METRICS_NAME: &str = "pg_fusion:runtime_metrics";
+const RUNTIME_FILTER_POOL_NAME: &str = "pg_fusion:runtime_filters";
 const SCAN_WORKER_JOBS_NAME: &str = "pg_fusion:scan_worker_jobs";
 
 static mut PREV_SHMEM_REQUEST_HOOK: pgrx::pg_sys::shmem_request_hook_type = None;
@@ -55,6 +57,8 @@ unsafe extern "C-unwind" fn pg_fusion_shmem_request_hook() {
         RuntimeMetricsConfig::new(config.page_count).expect("runtime metrics config"),
     )
     .expect("runtime metrics layout");
+    let runtime_filter_layout = RuntimeFilterPool::layout(config.runtime_filter_pool_config())
+        .expect("runtime filter pool layout");
     let scan_worker_jobs_layout = ScanWorkerJobRegistry::layout();
 
     let total = control_layout
@@ -63,6 +67,7 @@ unsafe extern "C-unwind" fn pg_fusion_shmem_request_hook() {
         .saturating_add(page_layout.size)
         .saturating_add(issuance_layout.size)
         .saturating_add(metrics_layout.size)
+        .saturating_add(runtime_filter_layout.size)
         .saturating_add(scan_worker_jobs_layout.size());
     pgrx::pg_sys::RequestAddinShmemSpace(total);
 }
@@ -86,6 +91,7 @@ pub(crate) unsafe extern "C-unwind" fn init_shmem() {
     init_page_pool(PAGE_POOL_NAME, config.page_size, config.page_count);
     init_issuance_pool(ISSUANCE_POOL_NAME, config.page_count);
     init_runtime_metrics(RUNTIME_METRICS_NAME, config.page_count);
+    init_runtime_filters(RUNTIME_FILTER_POOL_NAME);
     init_scan_worker_jobs(SCAN_WORKER_JOBS_NAME);
 }
 
@@ -131,6 +137,15 @@ pub(crate) fn attach_runtime_metrics() -> RuntimeMetrics {
     let layout = RuntimeMetrics::layout(cfg).expect("runtime metrics layout");
     let base = lookup_shmem(RUNTIME_METRICS_NAME, layout.size);
     unsafe { RuntimeMetrics::attach(base, layout.size) }.expect("attach runtime metrics")
+}
+
+pub(crate) fn attach_runtime_filters() -> RuntimeFilterPool {
+    let config = host_config().expect("host config");
+    let cfg = config.runtime_filter_pool_config();
+    let layout = RuntimeFilterPool::layout(cfg).expect("runtime filter pool layout");
+    let base = lookup_shmem(RUNTIME_FILTER_POOL_NAME, layout.size);
+    unsafe { RuntimeFilterPool::attach(base.as_ptr(), layout.size, cfg) }
+        .expect("attach runtime filter pool")
 }
 
 pub(crate) fn attach_scan_worker_jobs() -> ScanWorkerJobRegistryHandle {
@@ -218,6 +233,27 @@ fn init_runtime_metrics(name: &str, page_count: u32) {
         }
     };
     metrics.expect("runtime metrics");
+}
+
+fn init_runtime_filters(name: &str) {
+    let config = host_config().expect("host config");
+    let cfg = config.runtime_filter_pool_config();
+    let layout = RuntimeFilterPool::layout(cfg).expect("runtime filter pool layout");
+    let mut found = false;
+    let base = unsafe {
+        pgrx::pg_sys::ShmemInitStruct(name.as_pg_cstr(), layout.size, &mut found) as *mut u8
+    };
+    let base = NonNull::new(base).expect("runtime filter pool shmem");
+    let pool = unsafe {
+        if found {
+            RuntimeFilterPool::attach(base.as_ptr(), layout.size, cfg)
+                .map_err(|err| err.to_string())
+        } else {
+            RuntimeFilterPool::init_in_place(base.as_ptr(), layout.size, cfg)
+                .map_err(|err| err.to_string())
+        }
+    };
+    pool.expect("runtime filter pool");
 }
 
 fn init_scan_worker_jobs(name: &str) {

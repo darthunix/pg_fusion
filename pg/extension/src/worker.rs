@@ -24,8 +24,8 @@ use worker_runtime::{
 use crate::guc::host_config;
 use crate::logging::init_tracing_file_logger;
 use crate::shmem::{
-    attach_control_region, attach_issuance_pool, attach_page_pool, attach_runtime_metrics,
-    attach_scan_region, attach_scan_worker_jobs,
+    attach_control_region, attach_issuance_pool, attach_page_pool, attach_runtime_filters,
+    attach_runtime_metrics, attach_scan_region, attach_scan_worker_jobs,
 };
 
 const POLL_INTERVAL: Duration = Duration::from_millis(5);
@@ -82,6 +82,7 @@ fn run_scan_worker_main(job_id: usize) -> Result<(), String> {
     let page_pool = attach_page_pool();
     let issuance_pool = attach_issuance_pool();
     let metrics = attach_runtime_metrics();
+    let runtime_filters = attach_runtime_filters();
     let scan_lease = BackendSlotLease::acquire(&scan_region).map_err(|err| err.to_string())?;
     let peer = scan_lease.backend_lease_slot();
     jobs.publish_ready(job_id, peer)
@@ -90,6 +91,7 @@ fn run_scan_worker_main(job_id: usize) -> Result<(), String> {
 
     let mut backend_config = config.backend_service_config();
     backend_config.metrics = metrics;
+    backend_config.runtime_filters = runtime_filters;
     backend_config.scan_timing_detail = job.scan_timing_detail;
     let run_result = BackgroundWorker::transaction(|| {
         BackendService::run_standalone_scan_producer(StandaloneScanProducerInput {
@@ -138,8 +140,11 @@ fn run_worker_main() -> Result<(), WorkerRuntimeError> {
     let page_pool = attach_page_pool();
     let issuance_pool = attach_issuance_pool();
     let metrics = attach_runtime_metrics();
+    let runtime_filters = attach_runtime_filters();
 
-    let worker_config = config.worker_runtime_config();
+    let mut worker_config = config.worker_runtime_config();
+    worker_config.metrics = metrics;
+    worker_config.runtime_filter_pool = runtime_filters;
     let scan_transport = WorkerTransport::attach(&scan_region)?;
     let worker_pid = std::process::id() as i32;
     debug!(
