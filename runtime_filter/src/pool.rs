@@ -10,17 +10,22 @@ use crate::{
 };
 
 const POOL_MAGIC: u64 = 0x5047_4655_5246_5031;
+/// Shared-memory pool format version.
 pub const RUNTIME_FILTER_POOL_VERSION: u32 = 1;
 
 const SLOT_FREE: u32 = 0;
 const SLOT_ALLOCATED: u32 = 1;
 const SLOT_RETIRING: u32 = 2;
 
+/// Runtime-filter key types currently supported by pg_fusion scan probes.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[repr(u32)]
 pub enum RuntimeFilterKeyType {
+    /// Signed 16-bit integer key.
     Int16 = 1,
+    /// Signed 32-bit integer key.
     Int32 = 2,
+    /// Signed 64-bit integer key.
     Int64 = 3,
 }
 
@@ -35,14 +40,20 @@ impl RuntimeFilterKeyType {
     }
 }
 
+/// Logical target that connects a worker-built filter to backend scan probes.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct RuntimeFilterTarget {
+    /// Session epoch that scopes scan identifiers.
     pub session_epoch: u64,
+    /// Backend scan identifier.
     pub scan_id: u64,
+    /// Output column to inspect before tuple-to-Arrow encoding.
     pub output_column: u32,
+    /// Key type expected at `output_column`.
     pub key_type: RuntimeFilterKeyType,
 }
 
+/// Fixed shared-memory pool configuration.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct RuntimeFilterPoolConfig {
     slot_count: u32,
@@ -50,25 +61,32 @@ pub struct RuntimeFilterPoolConfig {
 }
 
 impl RuntimeFilterPoolConfig {
+    /// Create a pool configuration with `slot_count` independent filters.
     pub fn new(slot_count: u32, params: BloomParams) -> Self {
         Self { slot_count, params }
     }
 
+    /// Number of filter slots in the pool.
     pub fn slot_count(self) -> u32 {
         self.slot_count
     }
 
+    /// Bloom parameters used by every slot.
     pub fn params(self) -> BloomParams {
         self.params
     }
 }
 
+/// Size and alignment required by a [`RuntimeFilterPool`] region.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct RuntimeFilterPoolLayout {
+    /// Required byte length.
     pub size: usize,
+    /// Required base-pointer alignment.
     pub align: usize,
 }
 
+/// Failure to initialize or attach a runtime-filter pool.
 #[derive(Debug)]
 pub enum RuntimeFilterPoolAttachError {
     NullBase,
@@ -198,6 +216,11 @@ impl ComputedLayout {
     }
 }
 
+/// Fixed-slot shared-memory owner for runtime filters.
+///
+/// The pool manages slot metadata, target lookup, generation ownership, and
+/// probe reference counts. It is the production-safe way to reuse Bloom storage
+/// without clearing bits under old probes.
 #[derive(Clone, Copy, Debug)]
 pub struct RuntimeFilterPool {
     header: Option<NonNull<PoolHeader>>,
@@ -233,6 +256,7 @@ impl Default for RuntimeFilterPool {
 }
 
 impl RuntimeFilterPool {
+    /// Compute the required shared-memory layout for `config`.
     pub fn layout(
         config: RuntimeFilterPoolConfig,
     ) -> Result<RuntimeFilterPoolLayout, RuntimeFilterPoolAttachError> {
@@ -336,14 +360,21 @@ impl RuntimeFilterPool {
         })
     }
 
+    /// Return whether this handle is attached to a real shared-memory region.
     pub fn is_attached(self) -> bool {
         self.header.is_some()
     }
 
+    /// Return the pool configuration.
     pub fn config(self) -> RuntimeFilterPoolConfig {
         self.config
     }
 
+    /// Allocate a filter slot for a worker build.
+    ///
+    /// Returns `Ok(None)` when the pool is unavailable or exhausted. Callers
+    /// should treat that as a performance fallback and continue without a
+    /// runtime filter.
     pub fn allocate_build(
         self,
         target: RuntimeFilterTarget,
@@ -399,6 +430,10 @@ impl RuntimeFilterPool {
         Ok(None)
     }
 
+    /// Find probe handles matching `(session_epoch, scan_id)`.
+    ///
+    /// Matching handles are pushed into `probes` and hold pool references until
+    /// dropped.
     pub fn lookup_probes(
         self,
         session_epoch: u64,

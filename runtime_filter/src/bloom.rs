@@ -9,6 +9,10 @@ use crate::RuntimeFilterHeader;
 const HASH_GAMMA: u64 = 0x9E37_79B9_7F4A_7C15;
 const HASH_SALT: u64 = 0xD1B5_4A32_D192_ED03;
 
+/// Bloom filter sizing and hash seed.
+///
+/// The fields are intentionally private so every value attached to safe APIs
+/// satisfies the invariants required by [`AtomicBloomRef`].
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct BloomParams {
     bit_count: usize,
@@ -18,6 +22,10 @@ pub struct BloomParams {
 }
 
 impl BloomParams {
+    /// Create explicit Bloom parameters.
+    ///
+    /// `bit_count` is rounded up to an internal `u64` word count. `hash_count`
+    /// is the number of bit positions set or checked for each input hash.
     pub fn new(bit_count: usize, hash_count: usize, seed: u64) -> Result<Self, BloomParamError> {
         if bit_count == 0 {
             return Err(BloomParamError::ZeroBitCount);
@@ -39,6 +47,8 @@ impl BloomParams {
         })
     }
 
+    /// Estimate Bloom parameters for an expected cardinality and false-positive
+    /// rate.
     pub fn for_expected_items(
         expected_items: usize,
         false_positive_rate: f64,
@@ -68,23 +78,28 @@ impl BloomParams {
         Self::new(bit_count, hash_count, seed)
     }
 
+    /// Number of addressable Bloom bits.
     pub fn bit_count(self) -> usize {
         self.bit_count
     }
 
+    /// Number of [`AtomicU64`] words needed to store the bitset.
     pub fn word_count(self) -> usize {
         self.word_count
     }
 
+    /// Number of derived bit positions used per key.
     pub fn hash_count(self) -> usize {
         self.hash_count
     }
 
+    /// Seed mixed into every inserted or probed hash.
     pub fn seed(self) -> u64 {
         self.seed
     }
 }
 
+/// Invalid Bloom sizing input.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub enum BloomParamError {
     ZeroBitCount,
@@ -113,6 +128,7 @@ impl fmt::Display for BloomParamError {
 
 impl Error for BloomParamError {}
 
+/// Failure to attach a Bloom view to caller-owned storage.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum BloomAttachError {
     NullBits,
@@ -133,6 +149,12 @@ impl fmt::Display for BloomAttachError {
 
 impl Error for BloomAttachError {}
 
+/// Atomic Bloom filter over caller-owned [`AtomicU64`] storage.
+///
+/// This type does not own the memory and does not encode lifecycle state. It is
+/// safe to share between processes or threads as long as all participants agree
+/// on the same [`BloomParams`] and external lifecycle rules prevent clearing
+/// while old probes can still rely on the bits.
 #[derive(Clone, Copy, Debug)]
 pub struct AtomicBloomRef<'a> {
     bits: &'a [AtomicU64],
@@ -140,6 +162,7 @@ pub struct AtomicBloomRef<'a> {
 }
 
 impl<'a> AtomicBloomRef<'a> {
+    /// Attach to a slice of initialized atomic words.
     pub fn new(bits: &'a [AtomicU64], params: BloomParams) -> Result<Self, BloomAttachError> {
         if bits.len() < params.word_count {
             return Err(BloomAttachError::InsufficientWords {
@@ -170,24 +193,32 @@ impl<'a> AtomicBloomRef<'a> {
         Self::new(bits, params)
     }
 
+    /// Return the parameters used by this Bloom view.
     pub fn params(&self) -> BloomParams {
         self.params
     }
 
+    /// Clear all Bloom words.
+    ///
+    /// Callers must provide lifecycle synchronization. Clearing a ready filter
+    /// while an old probe can still read it can create false negatives.
     pub fn clear(&self) {
         for word in self.bits {
             word.store(0, Ordering::Relaxed);
         }
     }
 
+    /// Insert an integer value as an already-normalized key.
     pub fn insert_u64(&self, value: u64) {
         self.insert_hash(value);
     }
 
+    /// Check an integer value as an already-normalized key.
     pub fn might_contain_u64(&self, value: u64) -> bool {
         self.might_contain_hash(value)
     }
 
+    /// Insert an already-hashed key.
     pub fn insert_hash(&self, hash: u64) {
         for i in 0..self.params.hash_count {
             let (word_index, mask) = self.word_mask(hash, i);
@@ -195,6 +226,10 @@ impl<'a> AtomicBloomRef<'a> {
         }
     }
 
+    /// Return whether an already-hashed key may be present.
+    ///
+    /// `false` means definitely absent for the current Bloom contents. `true`
+    /// may be a true positive or a Bloom false positive.
     pub fn might_contain_hash(&self, hash: u64) -> bool {
         for i in 0..self.params.hash_count {
             let (word_index, mask) = self.word_mask(hash, i);
@@ -220,6 +255,7 @@ impl<'a> AtomicBloomRef<'a> {
     }
 }
 
+/// Layout for a standalone [`RuntimeFilterHeader`] plus Bloom bitset.
 #[derive(Clone, Copy, Debug)]
 pub struct RuntimeFilterLayout {
     pub layout: Layout,
@@ -227,6 +263,7 @@ pub struct RuntimeFilterLayout {
     pub word_count: usize,
 }
 
+/// Compute a C-compatible memory layout for a standalone runtime-filter slot.
 pub fn runtime_filter_layout(params: BloomParams) -> Result<RuntimeFilterLayout, LayoutError> {
     let header = Layout::new::<RuntimeFilterHeader>();
     let bits = Layout::array::<AtomicU64>(params.word_count)?;

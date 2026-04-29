@@ -8,12 +8,17 @@ const STATE_BITS: u64 = 2;
 const STATE_MASK: u64 = (1 << STATE_BITS) - 1;
 const MAX_GENERATION: u64 = u64::MAX >> STATE_BITS;
 
+/// Lifecycle state for one Bloom payload generation.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[repr(u8)]
 pub enum RuntimeFilterState {
+    /// No active owner; storage may be claimed by a new builder.
     Free = 0,
+    /// A builder is populating the Bloom payload; probes must pass rows.
     Building = 1,
+    /// The Bloom payload is complete and can reject absent probe keys.
     Ready = 2,
+    /// This generation has no usable filter; probes must pass rows.
     Disabled = 3,
 }
 
@@ -29,19 +34,27 @@ impl RuntimeFilterState {
     }
 }
 
+/// Atomic lifecycle word decoded into generation and state.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct LifecycleSnapshot {
+    /// Monotonically increasing slot generation.
     pub generation: u64,
+    /// Current state for `generation`.
     pub state: RuntimeFilterState,
 }
 
+/// Decision returned by a probe.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ProbeDecision {
+    /// Filtering is unavailable or unsafe; caller must keep the row.
     PassUnfiltered,
+    /// The key may be present. The caller must keep the row.
     MaybePresent,
+    /// The key is definitely absent from a ready filter. The caller may skip.
     DefinitelyAbsent,
 }
 
+/// Lifecycle transition error.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum LifecycleError {
     GenerationExhausted {
@@ -77,22 +90,26 @@ impl fmt::Display for LifecycleError {
 
 impl Error for LifecycleError {}
 
+/// Shared-memory header storing one packed runtime-filter lifecycle word.
 #[repr(C)]
 pub struct RuntimeFilterHeader {
     lifecycle: AtomicU64,
 }
 
 impl RuntimeFilterHeader {
+    /// Create a free lifecycle header.
     pub const fn free() -> Self {
         Self {
             lifecycle: AtomicU64::new(0),
         }
     }
 
+    /// Alias for [`RuntimeFilterHeader::free`].
     pub const fn empty() -> Self {
         Self::free()
     }
 
+    /// Load and decode the lifecycle word.
     pub fn load(&self, ordering: Ordering) -> LifecycleSnapshot {
         unpack_lifecycle_word(self.lifecycle.load(ordering))
     }
@@ -109,12 +126,18 @@ impl Default for RuntimeFilterHeader {
     }
 }
 
+/// A standalone runtime-filter slot over a lifecycle header and Bloom bits.
+///
+/// Prefer [`crate::RuntimeFilterPool`] for production shared-memory reuse. This
+/// lower-level type is useful for tests and for callers that can prove their
+/// own quiescence rules.
 pub struct RuntimeFilterSlot<'a> {
     header: &'a RuntimeFilterHeader,
     bloom: AtomicBloomRef<'a>,
 }
 
 impl<'a> RuntimeFilterSlot<'a> {
+    /// Attach a slot to caller-owned header and bit storage.
     pub fn new(
         header: &'a RuntimeFilterHeader,
         bits: &'a [AtomicU64],
@@ -127,10 +150,12 @@ impl<'a> RuntimeFilterSlot<'a> {
         Self { header, bloom }
     }
 
+    /// Return the current lifecycle snapshot.
     pub fn snapshot(&self) -> LifecycleSnapshot {
         self.header.load(Ordering::Acquire)
     }
 
+    /// Acquire an exclusive build lease and clear the Bloom payload.
     pub fn try_acquire_builder(&self) -> Result<RuntimeFilterBuilder<'a>, LifecycleError> {
         loop {
             let current_word = self.header.lifecycle.load(Ordering::Acquire);
@@ -172,6 +197,7 @@ impl<'a> RuntimeFilterSlot<'a> {
         }
     }
 
+    /// Publish a currently building generation as ready.
     pub fn publish_build(&self, generation: u64) -> Result<RuntimeFilterProbe<'a>, LifecycleError> {
         self.transition_build(generation, RuntimeFilterState::Ready)?;
         Ok(RuntimeFilterProbe {
@@ -181,10 +207,12 @@ impl<'a> RuntimeFilterSlot<'a> {
         })
     }
 
+    /// Disable a currently building generation.
     pub fn disable_build(&self, generation: u64) -> Result<(), LifecycleError> {
         self.transition_build(generation, RuntimeFilterState::Disabled)
     }
 
+    /// Create a probe handle for a generation.
     pub fn probe(&self, generation: u64) -> RuntimeFilterProbe<'a> {
         RuntimeFilterProbe {
             header: self.header,
@@ -232,6 +260,10 @@ impl<'a> RuntimeFilterSlot<'a> {
     }
 }
 
+/// Exclusive build lease for one runtime-filter generation.
+///
+/// Dropping an active builder disables its generation, which keeps probe-side
+/// behavior conservative if the build path exits early.
 pub struct RuntimeFilterBuilder<'a> {
     header: &'a RuntimeFilterHeader,
     bloom: AtomicBloomRef<'a>,
@@ -240,23 +272,31 @@ pub struct RuntimeFilterBuilder<'a> {
 }
 
 impl<'a> RuntimeFilterBuilder<'a> {
+    /// Generation owned by this builder.
     pub fn generation(&self) -> u64 {
         self.generation
     }
 
+    /// Detach lifecycle ownership without publishing or disabling.
+    ///
+    /// This is used by [`crate::RuntimeFilterPool`] after it has acquired the
+    /// build lease and wants the pool handle to own the eventual transition.
     pub fn detach(mut self) -> u64 {
         self.active = false;
         self.generation
     }
 
+    /// Insert an integer value as an already-normalized key.
     pub fn insert_u64(&self, value: u64) {
         self.bloom.insert_u64(value);
     }
 
+    /// Insert an already-hashed key.
     pub fn insert_hash(&self, hash: u64) {
         self.bloom.insert_hash(hash);
     }
 
+    /// Publish this builder's generation as ready and return a matching probe.
     pub fn publish_ready(mut self) -> Result<RuntimeFilterProbe<'a>, LifecycleError> {
         self.transition(RuntimeFilterState::Ready)?;
         self.active = false;
@@ -267,6 +307,7 @@ impl<'a> RuntimeFilterBuilder<'a> {
         })
     }
 
+    /// Disable this builder's generation.
     pub fn disable(mut self) -> Result<(), LifecycleError> {
         self.transition(RuntimeFilterState::Disabled)?;
         self.active = false;
@@ -286,6 +327,7 @@ impl Drop for RuntimeFilterBuilder<'_> {
     }
 }
 
+/// Probe handle for one runtime-filter generation.
 #[derive(Clone, Copy)]
 pub struct RuntimeFilterProbe<'a> {
     header: &'a RuntimeFilterHeader,
@@ -294,14 +336,17 @@ pub struct RuntimeFilterProbe<'a> {
 }
 
 impl<'a> RuntimeFilterProbe<'a> {
+    /// Generation expected by this probe.
     pub fn generation(&self) -> u64 {
         self.generation
     }
 
+    /// Probe an integer value as an already-normalized key.
     pub fn decision_for_u64(&self, value: u64) -> ProbeDecision {
         self.decision_for_hash(value)
     }
 
+    /// Probe an already-hashed key.
     pub fn decision_for_hash(&self, hash: u64) -> ProbeDecision {
         let snapshot = self.header.load(Ordering::Acquire);
         if snapshot.generation != self.generation || snapshot.state != RuntimeFilterState::Ready {
@@ -315,6 +360,10 @@ impl<'a> RuntimeFilterProbe<'a> {
         }
     }
 
+    /// Probe a null key.
+    ///
+    /// Nulls are never inserted into build-side runtime filters, so a matching
+    /// ready generation may reject them.
     pub fn decision_for_null(&self) -> ProbeDecision {
         let snapshot = self.header.load(Ordering::Acquire);
         if snapshot.generation == self.generation && snapshot.state == RuntimeFilterState::Ready {
@@ -347,6 +396,7 @@ fn transition_build(
         })
 }
 
+/// Pack a generation and state into the atomic lifecycle representation.
 pub fn pack_lifecycle_word(
     generation: u64,
     state: RuntimeFilterState,
@@ -357,6 +407,7 @@ pub fn pack_lifecycle_word(
     Ok((generation << STATE_BITS) | state as u64)
 }
 
+/// Decode an atomic lifecycle word.
 pub fn unpack_lifecycle_word(word: u64) -> LifecycleSnapshot {
     LifecycleSnapshot {
         generation: word >> STATE_BITS,
