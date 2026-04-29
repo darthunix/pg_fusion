@@ -87,11 +87,6 @@ caller creates a fresh block whenever `AppendStatus::Full` is returned.
   attributes.
 - `append_slot(slot)` accepts undeformed or partially deformed slots and asks
   PostgreSQL to deform enough attributes when needed.
-- `append_slot_profiled(slot, profile)` is the detailed-timing variant used by
-  `pg_fusion.scan_timing_detail`; it keeps the normal `append_slot` path free
-  from per-cell timers. The profile separates append prechecks, tuple
-  descriptor checks, slot deformation, cell extraction, detoasting, page
-  writes, and row-encoder outer bookkeeping.
 - `finish()` writes final header state back into the block and returns
   `EncodedBatch { row_count, payload_len }`.
 

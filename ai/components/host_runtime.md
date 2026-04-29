@@ -48,12 +48,12 @@ importance: 0.8
   into idle sleep time, page read/import time, `tx.send(Ok(batch))` time, and
   frame-read-to-DataFusion-batch-delivery time.
 - `pg_fusion.scan_timing_detail` enables diagnostic backend scan timing.
-  It splits `scan_page_fill_ns` into PostgreSQL read, slot-to-Arrow
-  serialization, slot drain wrapper, snapshot wrapper, overflow-copy, retry,
-  prepare, finish, and residual page-fill bookkeeping buckets. It is
-  diagnostic-only and defaults off. The query-time flag is copied into dynamic
-  scan worker jobs so leader and worker scan producers contribute comparable
-  detailed timing.
+  It splits `scan_page_fill_ns` into coarse slot drain, snapshot wrapper,
+  overflow-copy, retry, prepare, finish, and residual page-fill bookkeeping
+  buckets. It does not instrument slot-to-Arrow internals; use external
+  flamegraphs for deformation and page-write attribution. The query-time flag is
+  copied into dynamic scan worker jobs so leader and worker scan producers
+  contribute comparable diagnostics.
 - `EXPLAIN` stays backend-local: `backend_service` lowers the planned query to
   a DataFusion physical plan, renders PostgreSQL scan leaves with present
   soft-limit/fetch-hint metadata, and prints the nested multiline `slot_scan`

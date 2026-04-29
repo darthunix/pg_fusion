@@ -200,7 +200,7 @@ pub fn register_gucs() {
     GucRegistry::define_bool_guc(
         c"pg_fusion.scan_timing_detail",
         c"Enable detailed scan timing",
-        c"Measure per-row scan callback time to split PostgreSQL read time from Arrow serialization time",
+        c"Measure backend scan page and fetch timing",
         &SCAN_TIMING_DETAIL,
         GucContext::Userset,
         GucFlags::default(),

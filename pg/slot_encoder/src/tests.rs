@@ -1,7 +1,4 @@
-use super::{
-    set_test_database_encoding, AppendStatus, ConfigError, EncodeError, EncodeProfile,
-    PageBatchEncoder,
-};
+use super::{set_test_database_encoding, AppendStatus, ConfigError, EncodeError, PageBatchEncoder};
 use arrow_layout::{init_block, BlockRef, ColumnSpec, LayoutPlan, TypeTag};
 use pgrx_pg_sys as pg_sys;
 use std::alloc::{alloc_zeroed, dealloc, GlobalAlloc, Layout, System};
@@ -574,20 +571,10 @@ fn append_slot_reads_fixed_width_and_name_values() {
     let mut payload = init_payload(&specs, 2, 512);
     let mut encoder =
         unsafe { PageBatchEncoder::new(tuple_desc.ptr, &mut payload) }.expect("encoder");
-    let mut profile = EncodeProfile::default();
     assert_eq!(
-        encoder
-            .append_slot_profiled(slot.as_mut_ptr(), &mut profile)
-            .expect("append slot"),
+        encoder.append_slot(slot.as_mut_ptr()).expect("append slot"),
         AppendStatus::Appended
     );
-    assert_eq!(profile.cells_extracted_total, 3);
-    assert_eq!(profile.append_precheck_total, 1);
-    assert_eq!(profile.tupledesc_check_total, 1);
-    assert_eq!(profile.row_encode_outer_total, 1);
-    assert_eq!(profile.slot_deform_total, 0);
-    assert_eq!(profile.varlena_detoast_total, 0);
-    assert!(profile.classified_ns() >= profile.page_write_ns);
     encoder.finish().expect("finish");
 
     let block = BlockRef::open(&payload).expect("block");
@@ -688,15 +675,10 @@ fn append_slot_projected_fixed_width_uses_fast_path() {
             .expect("encoder");
     assert!(encoder.fixed_width_fast_path_for_tests());
 
-    let mut profile = EncodeProfile::default();
     assert_eq!(
-        encoder
-            .append_slot_profiled(slot.as_mut_ptr(), &mut profile)
-            .expect("append slot"),
+        encoder.append_slot(slot.as_mut_ptr()).expect("append slot"),
         AppendStatus::Appended
     );
-    assert_eq!(profile.cells_extracted_total, 2);
-    assert_eq!(profile.row_encode_outer_total, 1);
     encoder.finish().expect("finish");
 
     let block = BlockRef::open(&payload).expect("block");
@@ -725,15 +707,11 @@ fn append_slot_deforms_via_slot_ops_fast_path() {
         unsafe { PageBatchEncoder::new(tuple_desc.ptr, &mut payload) }.expect("encoder");
     assert!(encoder.fixed_width_fast_path_for_tests());
 
-    let mut profile = EncodeProfile::default();
     assert_eq!(
-        encoder
-            .append_slot_profiled(slot.as_mut_ptr(), &mut profile)
-            .expect("append slot"),
+        encoder.append_slot(slot.as_mut_ptr()).expect("append slot"),
         AppendStatus::Appended
     );
     assert_eq!(TEST_GETSOMEATTRS_CALLS.load(Ordering::Relaxed), 1);
-    assert_eq!(profile.slot_deform_total, 1);
     encoder.finish().expect("finish");
 
     let block = BlockRef::open(&payload).expect("block");
@@ -882,18 +860,10 @@ fn encodes_empty_short_varlena_values() {
             MockCell::Binary(short_varlena(b"")),
         ],
     );
-    let mut profile = EncodeProfile::default();
     assert_eq!(
-        encoder
-            .append_slot_profiled(slot.as_mut_ptr(), &mut profile)
-            .expect("append"),
+        encoder.append_slot(slot.as_mut_ptr()).expect("append"),
         AppendStatus::Appended
     );
-    assert_eq!(profile.cells_extracted_total, 2);
-    assert_eq!(profile.append_precheck_total, 1);
-    assert_eq!(profile.tupledesc_check_total, 1);
-    assert_eq!(profile.row_encode_outer_total, 1);
-    assert_eq!(profile.varlena_detoast_total, 2);
     encoder.finish().expect("finish");
 
     let block = BlockRef::open(&payload).expect("block");

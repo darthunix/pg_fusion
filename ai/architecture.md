@@ -91,8 +91,9 @@ descriptors, and receivers use those stamps to measure backend-to-worker and
 worker-to-backend page handoff latency. Worker scan threads also split
 backend-to-worker latency into idle sleeps, page import, and DataFusion scan
 channel send/delivery time. Detailed scan timing is opt-in through
-`pg_fusion.scan_timing_detail`; it splits backend scan page fill time into
-PostgreSQL read time and slot-to-Arrow serialization time.
+`pg_fusion.scan_timing_detail`; it splits backend scan page fill time with
+coarse page/fetch timers. Slot-to-Arrow serialization internals are left to
+external profilers.
 
 Dynamic scan workers use CTID block-range chunking as the first parallel scan
 strategy. The leader backend scans one heap block range, additional dynamic

@@ -68,5 +68,6 @@ The live fixture mirrors the columns encoded by the q05 PostgreSQL leaf scans:
 - `nation`: `n_nationkey`, `n_name`, `n_regionkey`
 - `region`: `r_regionkey` after `r_name = 'ASIA'`
 
-Use this benchmark as the first-pass CPU baseline for runtime
-`scan_arrow_encode_ns`.
+Use this benchmark as the first-pass CPU baseline for PostgreSQL-free Arrow
+page writing. PostgreSQL slot deformation and datum extraction still require
+PostgreSQL-side profiling.

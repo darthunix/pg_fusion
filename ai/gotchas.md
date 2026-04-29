@@ -37,8 +37,9 @@ importance: 0.7
 - Runtime metrics reset is intended for experiments before a query. It advances
   `reset_epoch` so old page stamps are ignored, but concurrent increments can
   still race with a manual reset.
-- `pg_fusion.scan_timing_detail` adds per-row timing inside the backend scan
-  receiver callback. Use it for diagnosis, not baseline latency measurements.
+- `pg_fusion.scan_timing_detail` uses coarse backend scan timers. It deliberately
+  avoids per-row slot encode breakdown because clock reads distort the hot path;
+  use flamegraphs for deformation and page-write detail.
 - `plan_builder` validates subquery shapes after DataFusion logical
   optimization. Subqueries that decorrelate into ordinary relational operators
   can lower PostgreSQL leaf scans; subquery nodes that survive optimization

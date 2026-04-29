@@ -334,24 +334,6 @@ WHERE metric IN (
   'scan_fill_overflow_encode_ns',
   'scan_fill_emit_ns',
   'scan_fill_unclassified_ns',
-  'scan_postgres_read_ns',
-  'scan_arrow_encode_ns',
-  'scan_append_precheck_ns',
-  'scan_append_precheck_total',
-  'scan_tupledesc_check_ns',
-  'scan_tupledesc_check_total',
-  'scan_slot_deform_ns',
-  'scan_slot_deform_total',
-  'scan_cell_extract_ns',
-  'scan_cells_extracted_total',
-  'scan_varlena_detoast_ns',
-  'scan_varlena_detoast_total',
-  'scan_page_write_ns',
-  'scan_row_encode_outer_ns',
-  'scan_row_encode_outer_total',
-  'scan_append_status_ns',
-  'scan_append_status_total',
-  'scan_encode_unclassified_ns',
   'scan_fetch_calls_total',
   'scan_rows_encoded_total',
   'scan_b2w_wait_ns',
@@ -372,8 +354,8 @@ pages, not PostgreSQL `TupleTableSlot`. Backend and worker timings may overlap,
 so `backend_total_ns + worker_total_ns` is not expected to equal
 `query_total_ns`.
 
-To split backend scan latency between PostgreSQL and serialization, reset the
-metrics, enable detailed timing, run the query, then read only scan metrics:
+To inspect backend scan latency, reset the metrics, enable detailed timing, run
+the query, then read only scan metrics:
 
 ```sql
 SELECT pg_fusion_metrics_reset();
@@ -390,22 +372,14 @@ ORDER BY metric;
 
 The query-time `scan_timing_detail` setting is also propagated to dynamic scan
 workers, so parallel scan producers contribute to the same detailed scan
-metrics.
+metrics. `scan_timing_detail` uses coarse page/fetch timers only. It does not
+instrument slot-to-Arrow internals; use a flamegraph or profiler for deformation
+and page-write attribution.
 
 Interpretation:
 
-- `scan_postgres_read_ns >> scan_arrow_encode_ns` points at PostgreSQL
-  executor/heap/filter time.
-- `scan_arrow_encode_ns >> scan_postgres_read_ns` points at slot
-  deform/detoast/Arrow serialization time.
-- `scan_append_precheck_ns`, `scan_tupledesc_check_ns`,
-  `scan_slot_deform_ns`, `scan_cell_extract_ns`,
-  `scan_varlena_detoast_ns`, `scan_page_write_ns`,
-  `scan_row_encode_outer_ns`, `scan_append_status_ns`, and
-  `scan_encode_unclassified_ns` split `scan_arrow_encode_ns`; compare
-  `scan_page_write_ns` with `cargo bench -p row_encoder --bench q05_encode`.
-- `scan_slot_drain_ns - scan_postgres_read_ns - scan_arrow_encode_ns`
-  approximates PostgreSQL direct receiver/SPI wrapper overhead.
+- `scan_slot_drain_ns` is coarse PostgreSQL portal-drain time for emitted scan
+  pages. It includes PostgreSQL executor work and receiver callback work.
 - `scan_fill_pre_drain_ns`, `scan_fill_post_drain_ns`,
   `scan_fill_overflow_encode_ns`, `scan_fill_emit_ns`, and
   `scan_fill_unclassified_ns` split the page-fill bookkeeping time left after

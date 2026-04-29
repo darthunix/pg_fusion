@@ -22,8 +22,6 @@ importance: 0.72
     PostgreSQL `TupleDesc`
   - `append_slot(slot)` deforms/detoasts PostgreSQL values, forwards typed
     cells to `row_encoder`, and returns `AppendStatus::{Appended, Full}`
-  - `append_slot_profiled(slot, profile)` is used only by detailed scan timing
-    to split deformation, extraction, detoast, and page-write costs
   - `finish()` writes final header state and returns `{ row_count, payload_len }`
 - Hot-path details:
   - `row_encoder` writes fixed-width values, validity bits, `ByteView` slots,
@@ -42,9 +40,6 @@ importance: 0.72
     writes
   - projected text-like and binary varlena values may be detoasted through
     `pg_detoast_datum_packed` before `row_encoder` sees borrowed bytes
-  - detailed timing is not on the normal path; `append_slot_profiled` splits
-    append setup, tuple descriptor checks, deformation, extraction, detoast,
-    page writes, and row-encoder outer bookkeeping
   - packed `varlena` parsing depends on PostgreSQL `varatt.h` header macros (`VARATT_IS_1B`, `VARATT_IS_1B_E`, `VARATT_IS_4B_C`, `VARSIZE_1B`, `VARSIZE_4B`)
   - when upgrading to a new PostgreSQL major, re-check those `varatt.h` macros against the Rust parser before trusting the existing bit layout assumptions
 - Supported v1 type surface:

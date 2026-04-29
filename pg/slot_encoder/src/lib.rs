@@ -35,5 +35,5 @@ mod tests;
 
 #[cfg(test)]
 pub(crate) use datum::set_test_database_encoding;
-pub use encoder::{AppendStatus, EncodeProfile, EncodedBatch, PageBatchEncoder};
+pub use encoder::{AppendStatus, EncodedBatch, PageBatchEncoder};
 pub use error::{ConfigError, EncodeError};
