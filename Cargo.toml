@@ -3,6 +3,7 @@ members = [
   "join_order",
   "lockfree",
   "control_transport",
+  "runtime_filter",
   "runtime_metrics",
   "runtime_protocol",
   "page/pool",

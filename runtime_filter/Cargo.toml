@@ -1,0 +1,20 @@
+[package]
+name = "runtime_filter"
+version = "25.0.0"
+edition = "2021"
+description = "Shared-memory runtime filters for pg_fusion"
+readme = "README.md"
+
+[lib]
+crate-type = ["lib"]
+doctest = false
+
+[dependencies]
+
+[dev-dependencies]
+criterion = "0.5"
+loom = "0.7"
+
+[[bench]]
+name = "atomic_bloom"
+harness = false

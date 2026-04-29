@@ -3,7 +3,7 @@ id: arch-overview-0001
 type: fact
 scope: repo
 tags: ["architecture", "datafusion", "pgrx", "shared-memory", "ipc", "slot_scan", "statistics"]
-updated_at: "2026-04-28"
+updated_at: "2026-04-29"
 importance: 0.8
 ---
 
@@ -24,6 +24,13 @@ page-backed Arrow batches.
   and result page production.
 - `runtime_protocol/`: typed backend/worker control-plane messages.
 - `control_transport/`: shared-memory control rings and backend/worker leases.
+- `runtime_filter`: shared-memory friendly runtime filters. The Bloom bitset
+  layer is separate from the shared-memory lifecycle layer: builders acquire an
+  exclusive generation lease before clearing/inserting, publish `Ready` with a
+  CAS, and probes only reject rows for a matching ready generation. Stale or
+  in-progress generations pass rows unfiltered. Ready generations can be
+  retired for reuse only after external quiescence, preserving the
+  no-false-negative property.
 - `page/pool`, `page/transfer`, `page/issuance`: fixed-page ownership,
   transfer, and issued-frame flow.
 - `runtime_metrics`: shared-memory runtime counters and page-slot handoff
