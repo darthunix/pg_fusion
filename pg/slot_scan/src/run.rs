@@ -9,6 +9,7 @@ use pgrx::PgTryBuilder;
 use std::cell::Cell;
 use std::ffi::c_void;
 use std::panic::{catch_unwind, AssertUnwindSafe};
+use std::ptr::NonNull;
 use std::rc::Rc;
 use std::time::Instant;
 
@@ -36,8 +37,8 @@ struct DirectSlotDestReceiver {
     state: *mut c_void,
 }
 
-struct DirectSlotReceiverState<'a, E> {
-    consume_slot: &'a mut dyn FnMut(*mut pg_sys::TupleTableSlot) -> Result<SlotSinkAction, E>,
+struct DirectSlotReceiverState<E, F> {
+    consume_slot: NonNull<F>,
     rows_consumed: usize,
     stopped: bool,
     error: Option<E>,
@@ -45,13 +46,13 @@ struct DirectSlotReceiverState<'a, E> {
     callback_ns: u64,
 }
 
-impl<'a, E> DirectSlotReceiverState<'a, E> {
-    fn new(
-        consume_slot: &'a mut dyn FnMut(*mut pg_sys::TupleTableSlot) -> Result<SlotSinkAction, E>,
-        profile_callbacks: bool,
-    ) -> Self {
+impl<E, F> DirectSlotReceiverState<E, F>
+where
+    F: FnMut(*mut pg_sys::TupleTableSlot) -> Result<SlotSinkAction, E>,
+{
+    fn new(consume_slot: &mut F, profile_callbacks: bool) -> Self {
         Self {
-            consume_slot,
+            consume_slot: NonNull::from(consume_slot),
             rows_consumed: 0,
             stopped: false,
             error: None,
@@ -68,48 +69,51 @@ enum DirectSlotReceiverMode {
 }
 
 impl DirectSlotDestReceiver {
-    fn new_guarded<E>(state: &mut DirectSlotReceiverState<'_, E>) -> Self
+    fn new_guarded<E, F>(state: &mut DirectSlotReceiverState<E, F>) -> Self
     where
         E: From<ScanError> + 'static,
+        F: FnMut(*mut pg_sys::TupleTableSlot) -> Result<SlotSinkAction, E>,
     {
         Self {
             dest: pg_sys::DestReceiver {
-                receiveSlot: Some(direct_receive_slot::<E>),
+                receiveSlot: Some(direct_receive_slot::<E, F>),
                 rStartup: Some(direct_receiver_startup),
                 rShutdown: Some(direct_receiver_shutdown),
                 rDestroy: Some(direct_receiver_destroy),
                 mydest: pg_sys::CommandDest::DestNone,
             },
-            state: state as *mut DirectSlotReceiverState<'_, E> as *mut c_void,
+            state: state as *mut DirectSlotReceiverState<E, F> as *mut c_void,
         }
     }
 
-    fn new_fast<E>(state: &mut DirectSlotReceiverState<'_, E>) -> Self
+    fn new_fast<E, F>(state: &mut DirectSlotReceiverState<E, F>) -> Self
     where
         E: From<ScanError> + 'static,
+        F: FnMut(*mut pg_sys::TupleTableSlot) -> Result<SlotSinkAction, E>,
     {
         Self {
             dest: pg_sys::DestReceiver {
-                receiveSlot: Some(direct_receive_slot_fast::<E>),
+                receiveSlot: Some(direct_receive_slot_fast::<E, F>),
                 rStartup: Some(direct_receiver_startup),
                 rShutdown: Some(direct_receiver_shutdown),
                 rDestroy: Some(direct_receiver_destroy),
                 mydest: pg_sys::CommandDest::DestNone,
             },
-            state: state as *mut DirectSlotReceiverState<'_, E> as *mut c_void,
+            state: state as *mut DirectSlotReceiverState<E, F> as *mut c_void,
         }
     }
 }
 
-unsafe extern "C-unwind" fn direct_receive_slot<E>(
+unsafe extern "C-unwind" fn direct_receive_slot<E, F>(
     slot: *mut pg_sys::TupleTableSlot,
     receiver: *mut pg_sys::DestReceiver,
 ) -> bool
 where
     E: From<ScanError> + 'static,
+    F: FnMut(*mut pg_sys::TupleTableSlot) -> Result<SlotSinkAction, E>,
 {
     let receiver = unsafe { &mut *(receiver.cast::<DirectSlotDestReceiver>()) };
-    let state = unsafe { &mut *(receiver.state.cast::<DirectSlotReceiverState<'static, E>>()) };
+    let state = unsafe { &mut *(receiver.state.cast::<DirectSlotReceiverState<E, F>>()) };
 
     if state.error.is_some() {
         return false;
@@ -125,15 +129,16 @@ where
     }
 }
 
-unsafe extern "C-unwind" fn direct_receive_slot_fast<E>(
+unsafe extern "C-unwind" fn direct_receive_slot_fast<E, F>(
     slot: *mut pg_sys::TupleTableSlot,
     receiver: *mut pg_sys::DestReceiver,
 ) -> bool
 where
     E: From<ScanError> + 'static,
+    F: FnMut(*mut pg_sys::TupleTableSlot) -> Result<SlotSinkAction, E>,
 {
     let receiver = unsafe { &mut *(receiver.cast::<DirectSlotDestReceiver>()) };
-    let state = unsafe { &mut *(receiver.state.cast::<DirectSlotReceiverState<'static, E>>()) };
+    let state = unsafe { &mut *(receiver.state.cast::<DirectSlotReceiverState<E, F>>()) };
 
     if state.error.is_some() {
         return false;
@@ -143,24 +148,33 @@ where
     handle_receive_slot_result(state, result)
 }
 
-fn receive_slot_callback<E>(
-    state: &mut DirectSlotReceiverState<'_, E>,
+#[inline(always)]
+fn receive_slot_callback<E, F>(
+    state: &mut DirectSlotReceiverState<E, F>,
     slot: *mut pg_sys::TupleTableSlot,
-) -> Result<SlotSinkAction, E> {
+) -> Result<SlotSinkAction, E>
+where
+    F: FnMut(*mut pg_sys::TupleTableSlot) -> Result<SlotSinkAction, E>,
+{
+    let consume_slot = unsafe { state.consume_slot.as_mut() };
     if !state.profile_callbacks {
-        return (state.consume_slot)(slot);
+        return consume_slot(slot);
     }
 
     let start = Instant::now();
-    let result = (state.consume_slot)(slot);
+    let result = consume_slot(slot);
     state.callback_ns = state.callback_ns.saturating_add(elapsed_ns(start));
     result
 }
 
-fn handle_receive_slot_result<E>(
-    state: &mut DirectSlotReceiverState<'_, E>,
+#[inline(always)]
+fn handle_receive_slot_result<E, F>(
+    state: &mut DirectSlotReceiverState<E, F>,
     result: Result<SlotSinkAction, E>,
-) -> bool {
+) -> bool
+where
+    F: FnMut(*mut pg_sys::TupleTableSlot) -> Result<SlotSinkAction, E>,
+{
     match result {
         Ok(SlotSinkAction::Continue) => {
             state.rows_consumed += 1;
@@ -422,15 +436,16 @@ impl StreamingScanSession {
         )
     }
 
-    fn drain_slots_inner<E>(
+    fn drain_slots_inner<E, F>(
         &mut self,
         row_budget: usize,
-        consume_slot: &mut dyn FnMut(*mut pg_sys::TupleTableSlot) -> Result<SlotSinkAction, E>,
+        consume_slot: &mut F,
         receiver_mode: DirectSlotReceiverMode,
         profile_callbacks: bool,
     ) -> Result<SlotDrainResult, E>
     where
         E: From<ScanError> + 'static,
+        F: FnMut(*mut pg_sys::TupleTableSlot) -> Result<SlotSinkAction, E>,
     {
         if self.closed {
             return Err(ScanError::CursorClosed.into());

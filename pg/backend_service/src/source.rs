@@ -262,7 +262,7 @@ impl SlotScanPageSource {
                 }
                 let drain_start = self.scan_timing_detail.then(|| metrics.now_ns());
                 let drain_result = unsafe {
-                    let mut append_slot = |slot: *mut pg_sys::TupleTableSlot| {
+                    let append_slot = |slot: *mut pg_sys::TupleTableSlot| {
                         if needed_attrs > 0 && i32::from((*slot).tts_nvalid) < needed_attrs {
                             ensure_slot_deformed(slot, needed_attrs)?;
                         }
@@ -288,7 +288,7 @@ impl SlotScanPageSource {
                     };
                     session.drain_slots_without_unwind_guard::<BackendServiceError>(
                         row_budget,
-                        &mut append_slot,
+                        append_slot,
                     )
                 };
                 let mut attempt_slot_drain_ns = 0_u64;

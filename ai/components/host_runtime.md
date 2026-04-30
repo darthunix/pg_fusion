@@ -67,6 +67,9 @@ importance: 0.8
   flamegraphs for deformation and page-write attribution. The query-time flag is
   copied into dynamic scan worker jobs so leader and worker scan producers
   contribute comparable diagnostics.
+- The fast backend scan receiver keeps the Rust row callback monomorphized
+  through `slot_scan`; the unavoidable indirect boundary is PostgreSQL's
+  `DestReceiver.receiveSlot` function pointer.
 - `EXPLAIN` stays backend-local: `backend_service` lowers the planned query to
   a DataFusion physical plan, renders PostgreSQL scan leaves with present
   soft-limit/fetch-hint metadata, and prints the nested multiline `slot_scan`
