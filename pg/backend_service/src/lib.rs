@@ -97,8 +97,8 @@ impl Default for BackendServiceConfig {
     fn default() -> Self {
         Self {
             scan_fetch_batch_rows: 1024,
-            scan_batch_channel_capacity: 8,
-            scan_idle_poll_interval_us: 100,
+            scan_batch_channel_capacity: 32,
+            scan_idle_poll_interval_us: 50,
             estimator_default: EstimatorConfig::default(),
             join_reordering_enabled: true,
             plan_page_kind: 0x504c,

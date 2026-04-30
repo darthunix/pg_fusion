@@ -33,7 +33,7 @@ importance: 0.8
   batches through `page/import`. Transport scan streams use a bounded
   DataFusion batch channel and short idle polling interval so scan threads can
   absorb minor downstream polling gaps without sleeping for millisecond-scale
-  page handoff latency. The defaults are `8` batches and `100us`; the backend
+  page handoff latency. The defaults are `32` batches and `50us`; the backend
   captures `pg_fusion.scan_batch_channel_capacity` and
   `pg_fusion.scan_idle_poll_interval_us` at query start and passes them to the
   worker through `StartExecution`.

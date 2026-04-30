@@ -33,8 +33,8 @@ pub struct WorkerScanTuning {
 impl Default for WorkerScanTuning {
     fn default() -> Self {
         Self {
-            batch_channel_capacity: 8,
-            idle_poll_interval: Duration::from_micros(100),
+            batch_channel_capacity: 32,
+            idle_poll_interval: Duration::from_micros(50),
         }
     }
 }

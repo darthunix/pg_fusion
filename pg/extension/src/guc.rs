@@ -32,8 +32,8 @@ pub(crate) static PAGE_SIZE: GucSetting<i32> = GucSetting::<i32>::new(64 * 1024)
 pub(crate) static PAGE_COUNT: GucSetting<i32> = GucSetting::<i32>::new(256);
 
 pub(crate) static SCAN_FETCH_BATCH_ROWS: GucSetting<i32> = GucSetting::<i32>::new(1024);
-pub(crate) static SCAN_BATCH_CHANNEL_CAPACITY: GucSetting<i32> = GucSetting::<i32>::new(8);
-pub(crate) static SCAN_IDLE_POLL_INTERVAL_US: GucSetting<i32> = GucSetting::<i32>::new(100);
+pub(crate) static SCAN_BATCH_CHANNEL_CAPACITY: GucSetting<i32> = GucSetting::<i32>::new(32);
+pub(crate) static SCAN_IDLE_POLL_INTERVAL_US: GucSetting<i32> = GucSetting::<i32>::new(50);
 pub(crate) static ESTIMATOR_INITIAL_TAIL_BYTES_PER_ROW: GucSetting<i32> =
     GucSetting::<i32>::new(64);
 pub(crate) static SCAN_TIMING_DETAIL: GucSetting<bool> = GucSetting::<bool>::new(false);
