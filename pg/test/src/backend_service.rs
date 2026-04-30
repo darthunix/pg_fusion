@@ -195,6 +195,8 @@ pub fn backend_service_render_explain_uses_physical_plan_and_pg_leaf() {
         params: Vec::new(),
         options: Default::default(),
         config: BackendServiceConfig::default(),
+        scan_worker_launcher: None,
+        actual_scan_parallelism: Default::default(),
     })
     .expect("render physical explain");
 
@@ -257,6 +259,8 @@ pub fn backend_service_render_explain_materializes_retaining_sort_input() {
         params: Vec::new(),
         options: Default::default(),
         config: BackendServiceConfig::default(),
+        scan_worker_launcher: None,
+        actual_scan_parallelism: Default::default(),
     })
     .expect("render physical explain");
 
@@ -290,6 +294,8 @@ pub fn backend_service_render_explain_keeps_aggregate_scan_zero_copy() {
         params: Vec::new(),
         options: Default::default(),
         config: BackendServiceConfig::default(),
+        scan_worker_launcher: None,
+        actual_scan_parallelism: Default::default(),
     })
     .expect("render physical explain");
 

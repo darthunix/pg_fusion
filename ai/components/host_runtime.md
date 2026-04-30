@@ -73,6 +73,8 @@ importance: 0.8
 - `EXPLAIN` stays backend-local: `backend_service` lowers the planned query to
   a DataFusion physical plan, renders PostgreSQL scan leaves with present
   soft-limit/fetch-hint metadata, and prints the nested multiline `slot_scan`
-  plan directly below the leaf.
+  plan directly below the leaf. Scan leaves also render pg_fusion's planned
+  dynamic scan producers and, for `EXPLAIN ANALYZE`, the producer set installed
+  during execution.
 - The retired raw heap page stack (`executor`, `scan`, `storage`, `protocol`,
   `common`) is no longer part of the workspace.

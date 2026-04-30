@@ -19,7 +19,10 @@ use plan_builder::{PlanBuildInput, PlanBuilder};
 use scan_node::{insert_page_materializers, PgScanExecFactory, PgScanExtensionPlanner, PgScanSpec};
 use slot_scan::{explain_scan, ScanExplainOptions, ScanOptions};
 
-use crate::{BackendServiceError, ExplainInput};
+use crate::{
+    BackendServiceError, ExplainInput, ExplainScanParallelism, ExplainScanParallelismStrategy,
+    ExplainScanProducerRole,
+};
 
 pub(crate) fn render_physical_explain(
     input: ExplainInput<'_>,
@@ -29,14 +32,26 @@ pub(crate) fn render_physical_explain(
         params,
         options,
         config,
+        mut scan_worker_launcher,
+        actual_scan_parallelism,
     } = input;
     let built = PlanBuilder::new()
         .with_config(config.plan_builder_config())
         .build(PlanBuildInput { sql, params })?;
 
+    let planned_scan_parallelism = if let Some(launcher) = scan_worker_launcher.as_deref_mut() {
+        launcher.explain_query(crate::ScanWorkerQueryInput {
+            scans: &built.scans,
+        })?
+    } else {
+        BTreeMap::new()
+    };
     let pg_leaf_explains = render_pg_leaf_explains(&built.scans, &config, options)?;
-    let pg_scan_planner =
-        PgScanExtensionPlanner::new(Arc::new(ExplainPgScanExecFactory { pg_leaf_explains }));
+    let pg_scan_planner = PgScanExtensionPlanner::new(Arc::new(ExplainPgScanExecFactory {
+        pg_leaf_explains,
+        planned_scan_parallelism,
+        actual_scan_parallelism,
+    }));
     let physical_planner =
         DefaultPhysicalPlanner::with_extension_planners(vec![Arc::new(pg_scan_planner)]);
     let session_state = build_explain_session_state();
@@ -93,6 +108,8 @@ fn build_explain_session_state() -> SessionState {
 #[derive(Debug)]
 struct ExplainPgScanExecFactory {
     pg_leaf_explains: BTreeMap<u64, Arc<str>>,
+    planned_scan_parallelism: BTreeMap<u64, ExplainScanParallelism>,
+    actual_scan_parallelism: BTreeMap<u64, ExplainScanParallelism>,
 }
 
 impl PgScanExecFactory for ExplainPgScanExecFactory {
@@ -107,7 +124,12 @@ impl PgScanExecFactory for ExplainPgScanExecFactory {
                     "missing PostgreSQL explain text for scan_id {scan_id}"
                 ))
             })?;
-        Ok(Arc::new(ExplainPgScanExec::new(spec, pg_explain)))
+        Ok(Arc::new(ExplainPgScanExec::new(
+            spec,
+            pg_explain,
+            self.planned_scan_parallelism.get(&scan_id).cloned(),
+            self.actual_scan_parallelism.get(&scan_id).cloned(),
+        )))
     }
 }
 
@@ -116,11 +138,18 @@ struct ExplainPgScanExec {
     spec: Arc<PgScanSpec>,
     output_schema: SchemaRef,
     pg_explain: Arc<str>,
+    planned_parallelism: Option<ExplainScanParallelism>,
+    actual_parallelism: Option<ExplainScanParallelism>,
     props: PlanProperties,
 }
 
 impl ExplainPgScanExec {
-    fn new(spec: Arc<PgScanSpec>, pg_explain: Arc<str>) -> Self {
+    fn new(
+        spec: Arc<PgScanSpec>,
+        pg_explain: Arc<str>,
+        planned_parallelism: Option<ExplainScanParallelism>,
+        actual_parallelism: Option<ExplainScanParallelism>,
+    ) -> Self {
         let output_schema = spec.arrow_schema();
         let props = PlanProperties::new(
             EquivalenceProperties::new(Arc::clone(&output_schema)),
@@ -132,6 +161,8 @@ impl ExplainPgScanExec {
             spec,
             output_schema,
             pg_explain,
+            planned_parallelism,
+            actual_parallelism,
             props,
         }
     }
@@ -248,6 +279,7 @@ fn render_physical_plan_node(
 
     if let Some(pg_scan) = plan.as_any().downcast_ref::<ExplainPgScanExec>() {
         let _ = writeln!(out, "{}{}", indent, pg_scan.display_line(verbose));
+        render_scan_parallelism(pg_scan, depth + 1, verbose, out);
         render_pg_scan_explain(pg_scan, depth + 1, out);
     } else {
         let _ = writeln!(out, "{}{}", indent, PlanLine { plan, format_type });
@@ -255,6 +287,89 @@ fn render_physical_plan_node(
 
     for child in plan.children() {
         render_physical_plan_node(child.as_ref(), verbose, depth + 1, out);
+    }
+}
+
+fn render_scan_parallelism(
+    pg_scan: &ExplainPgScanExec,
+    depth: usize,
+    verbose: bool,
+    out: &mut String,
+) {
+    let Some(planned) = pg_scan.planned_parallelism.as_ref() else {
+        return;
+    };
+
+    let body_indent = "  ".repeat(depth);
+    let mut line = format!(
+        "{body_indent}PgFusion Producers: planned={}",
+        producer_summary(planned)
+    );
+    if let Some(actual) = pg_scan.actual_parallelism.as_ref() {
+        line.push_str(&format!(", actual={}", producer_summary(actual)));
+    }
+    line.push_str(&format!(
+        ", strategy={}",
+        explain_strategy(planned.strategy)
+    ));
+    if let Some(block_count) = planned.block_count {
+        line.push_str(&format!(", blocks={block_count}"));
+    }
+    if let Some(reason) = planned.reason.as_deref() {
+        line.push_str(&format!(", reason={reason}"));
+    }
+    let _ = writeln!(out, "{line}");
+
+    if verbose {
+        for producer in &planned.producers {
+            let mut producer_line = format!(
+                "{body_indent}PgFusion Producer {}: {}",
+                producer.producer_id,
+                explain_role(producer.role)
+            );
+            if let Some(range) = producer.ctid_range {
+                producer_line.push_str(&format!(
+                    ", ctid_blocks=[{}, {})",
+                    range.start_block, range.end_block
+                ));
+            }
+            let _ = writeln!(out, "{producer_line}");
+        }
+    }
+}
+
+fn producer_summary(parallelism: &ExplainScanParallelism) -> String {
+    let leaders = parallelism
+        .producers
+        .iter()
+        .filter(|producer| producer.role == ExplainScanProducerRole::Leader)
+        .count();
+    let workers = parallelism
+        .producers
+        .iter()
+        .filter(|producer| producer.role == ExplainScanProducerRole::Worker)
+        .count();
+    match (leaders, workers) {
+        (1, 0) => "1 (leader-only)".to_string(),
+        (1, workers) => format!("{} (leader + {workers} workers)", workers + 1),
+        _ => format!(
+            "{} (leaders={leaders}, workers={workers})",
+            leaders + workers
+        ),
+    }
+}
+
+fn explain_strategy(strategy: ExplainScanParallelismStrategy) -> &'static str {
+    match strategy {
+        ExplainScanParallelismStrategy::LeaderOnly => "leader_only",
+        ExplainScanParallelismStrategy::CtidBlockRange => "ctid_range",
+    }
+}
+
+fn explain_role(role: ExplainScanProducerRole) -> &'static str {
+    match role {
+        ExplainScanProducerRole::Leader => "leader",
+        ExplainScanProducerRole::Worker => "worker",
     }
 }
 

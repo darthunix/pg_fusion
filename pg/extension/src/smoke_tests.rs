@@ -121,6 +121,13 @@ pub(crate) fn explain_smoke() {
         explain.contains("\"Plan\""),
         "unexpected EXPLAIN JSON: {explain}"
     );
+    let verbose_simple =
+        simple_query_first_column_rows_tx(&mut tx, "EXPLAIN (VERBOSE) SELECT 1::bigint AS one")
+            .join("\n");
+    assert!(
+        verbose_simple.contains("Custom Scan (PgFusionScan)"),
+        "verbose EXPLAIN should render pg_fusion custom scan: {verbose_simple}"
+    );
 
     reset_heap_fixture(&mut tx, "pg_fusion_explain_smoke");
     let text_explain = simple_query_first_column_rows_tx(
@@ -139,6 +146,16 @@ pub(crate) fn explain_smoke() {
     assert!(
         !text_explain.contains("PostgreSQL Plan:"),
         "text EXPLAIN should not render a redundant nested plan header: {text_explain}"
+    );
+    let verbose_heap_explain = simple_query_first_column_rows_tx(
+        &mut tx,
+        "EXPLAIN (VERBOSE) SELECT * FROM pg_fusion_explain_smoke WHERE id = 1",
+    )
+    .join("\n");
+    assert!(
+        verbose_heap_explain.contains("PostgreSQL Scan:")
+            && verbose_heap_explain.contains("PgFusion Producers:"),
+        "verbose heap EXPLAIN should render pg_fusion scan details: {verbose_heap_explain}"
     );
 }
 
@@ -387,6 +404,29 @@ pub(crate) fn heap_parallel_scan_smoke() {
         ",
     )
     .expect("enable dynamic scan workers");
+    let explain = simple_query_first_column_rows_tx(
+        &mut tx,
+        &format!("EXPLAIN SELECT sum(id)::bigint FROM {table_name} WHERE id BETWEEN 100 AND 20000"),
+    )
+    .join("\n");
+    assert!(
+        explain.contains("PgFusion Producers: planned=3 (leader + 2 workers)")
+            && explain.contains("strategy=ctid_range"),
+        "EXPLAIN should show planned dynamic scan producers: {explain}"
+    );
+    let analyze_explain = simple_query_first_column_rows_tx(
+        &mut tx,
+        &format!(
+            "EXPLAIN ANALYZE SELECT sum(id)::bigint FROM {table_name} WHERE id BETWEEN 100 AND 20000"
+        ),
+    )
+    .join("\n");
+    assert!(
+        analyze_explain.contains(
+            "PgFusion Producers: planned=3 (leader + 2 workers), actual=3 (leader + 2 workers)"
+        ),
+        "EXPLAIN ANALYZE should show actual dynamic scan producers: {analyze_explain}"
+    );
     simple_query_first_column_tx(&mut tx, "SELECT pg_fusion_metrics_reset()")
         .expect("reset metrics before parallel scan");
     let sum: i64 = simple_query_first_column_tx(
@@ -570,6 +610,16 @@ pub(crate) fn heap_leader_only_scan_smoke() {
         ",
     )
     .expect("disable dynamic scan workers through PostgreSQL parallel worker GUC");
+    let explain = simple_query_first_column_rows_tx(
+        &mut tx,
+        &format!("EXPLAIN SELECT sum(id)::bigint FROM {table_name} WHERE id BETWEEN 10 AND 1000"),
+    )
+    .join("\n");
+    assert!(
+        explain.contains("PgFusion Producers: planned=1 (leader-only)")
+            && explain.contains("reason=worker_budget_zero"),
+        "EXPLAIN should show leader-only scan producer reason: {explain}"
+    );
     let sum: i64 = simple_query_first_column_tx(
         &mut tx,
         &format!("SELECT sum(id)::bigint FROM {table_name} WHERE id BETWEEN 10 AND 1000"),

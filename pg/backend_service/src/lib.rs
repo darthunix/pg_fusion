@@ -204,6 +204,14 @@ pub trait ScanWorkerLauncher {
         &mut self,
         input: ScanWorkerLaunchInput<'_>,
     ) -> Result<ScanWorkerLaunchOutput, BackendServiceError>;
+
+    fn explain_query(
+        &mut self,
+        input: ScanWorkerQueryInput<'_>,
+    ) -> Result<BTreeMap<u64, ExplainScanParallelism>, BackendServiceError> {
+        let _ = input;
+        Ok(BTreeMap::new())
+    }
 }
 
 pub struct ScanWorkerQueryInput<'a> {
@@ -343,12 +351,15 @@ pub struct ExplainInput<'a> {
     pub params: Vec<ScalarValue>,
     pub options: ExplainRenderOptions,
     pub config: BackendServiceConfig,
+    pub scan_worker_launcher: Option<&'a mut dyn ScanWorkerLauncher>,
+    pub actual_scan_parallelism: BTreeMap<u64, ExplainScanParallelism>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct ExplainRenderOptions {
     pub verbose: bool,
     pub costs: bool,
+    pub analyze: bool,
 }
 
 impl Default for ExplainRenderOptions {
@@ -356,8 +367,36 @@ impl Default for ExplainRenderOptions {
         Self {
             verbose: false,
             costs: true,
+            analyze: false,
         }
     }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ExplainScanProducerRole {
+    Leader,
+    Worker,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ExplainScanProducer {
+    pub producer_id: u16,
+    pub role: ExplainScanProducerRole,
+    pub ctid_range: Option<CtidBlockRange>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ExplainScanParallelismStrategy {
+    LeaderOnly,
+    CtidBlockRange,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ExplainScanParallelism {
+    pub strategy: ExplainScanParallelismStrategy,
+    pub block_count: Option<u64>,
+    pub reason: Option<String>,
+    pub producers: Vec<ExplainScanProducer>,
 }
 
 #[derive(Default)]

@@ -128,7 +128,9 @@ start at `1`. Relations with dropped attributes or unsupported scan shapes stay
 on leader-only portal streaming. Dynamic scan worker jobs carry a resolved
 standalone scan descriptor for one PostgreSQL leaf scan rather than the original
 user SQL, so worker startup does not depend on backend-local `search_path` or
-repeat full DataFusion planning.
+repeat full DataFusion planning. `EXPLAIN` uses the same eligibility and budget
+logic to show planned producer counts for every PostgreSQL scan leaf; `EXPLAIN
+ANALYZE` also reports the producer channels installed for the real execution.
 
 ## Retired Legacy Stack
 

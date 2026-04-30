@@ -83,9 +83,9 @@ unsafe extern "C-unwind" fn build_planned_custom_scan(
         })
         .unwrap_or_else(|err| error!("pg_fusion planner build failed: {err}"));
 
-    let target_list = build_target_list(&built.logical_plan)
+    let target_lists = build_custom_scan_target_lists(&built.logical_plan)
         .unwrap_or_else(|err| error!("pg_fusion targetlist build failed: {err}"));
-    let custom_scan = pack_custom_scan(&sql, target_list);
+    let custom_scan = pack_custom_scan(&sql, target_lists);
 
     let stmt_ptr = palloc0(size_of::<PlannedStmt>()) as *mut PlannedStmt;
     let mut hasher = std::collections::hash_map::DefaultHasher::new();
@@ -140,7 +140,12 @@ unsafe fn select_sql_from_query(parse: *mut Query, query_string: *const c_char) 
     sql.to_owned()
 }
 
-unsafe fn pack_custom_scan(sql: &str, target_list: *mut List) -> *mut CustomScan {
+struct CustomScanTargetLists {
+    plan_target_list: *mut List,
+    scan_target_list: *mut List,
+}
+
+unsafe fn pack_custom_scan(sql: &str, target_lists: CustomScanTargetLists) -> *mut CustomScan {
     let sql_copy = palloc0(sql.len() + 1) as *mut u8;
     std::ptr::copy_nonoverlapping(sql.as_ptr(), sql_copy, sql.len());
     let query = ListCell {
@@ -150,8 +155,8 @@ unsafe fn pack_custom_scan(sql: &str, target_list: *mut List) -> *mut CustomScan
     let mut custom_scan = CustomScan::default();
     custom_scan.scan.plan.type_ = NodeTag::T_CustomScan;
     custom_scan.custom_private = list_make1_impl(NodeTag::T_List, query);
-    custom_scan.custom_scan_tlist = target_list;
-    custom_scan.scan.plan.targetlist = target_list;
+    custom_scan.custom_scan_tlist = target_lists.scan_target_list;
+    custom_scan.scan.plan.targetlist = target_lists.plan_target_list;
     custom_scan.methods = scan_methods();
 
     let ptr = palloc0(size_of::<CustomScan>()) as *mut CustomScan;
@@ -159,9 +164,12 @@ unsafe fn pack_custom_scan(sql: &str, target_list: *mut List) -> *mut CustomScan
     ptr
 }
 
-fn build_target_list(logical_plan: &LogicalPlan) -> Result<*mut List, String> {
+fn build_custom_scan_target_lists(
+    logical_plan: &LogicalPlan,
+) -> Result<CustomScanTargetLists, String> {
     let fields = logical_plan.schema().fields();
-    let mut target_list: *mut List = std::ptr::null_mut();
+    let mut plan_target_list: *mut List = std::ptr::null_mut();
+    let mut scan_target_list: *mut List = std::ptr::null_mut();
     for (index, field) in fields.iter().enumerate() {
         let oid = type_to_oid(field.data_type())
             .ok_or_else(|| format!("unsupported output type {}", field.data_type()))?;
@@ -172,28 +180,47 @@ fn build_target_list(logical_plan: &LogicalPlan) -> Result<*mut List, String> {
                 return Err(format!("type cache lookup failed for oid {}", oid.to_u32()));
             }
             let typtup = pgrx::pg_sys::GETSTRUCT(tuple) as pgrx::pg_sys::Form_pg_type;
-            let expr = pgrx::pg_sys::makeVar(
+            let attr_number = i16::try_from(index + 1)
+                .map_err(|_| "custom scan output has too many columns".to_string())?;
+            let typmod = (*typtup).typtypmod;
+            let collation = (*typtup).typcollation;
+            let plan_expr = pgrx::pg_sys::makeVar(
                 pgrx::pg_sys::INDEX_VAR,
-                i16::try_from(index + 1).expect("target position fits AttrNumber"),
+                attr_number,
                 oid,
-                (*typtup).typtypmod,
-                (*typtup).typcollation,
+                typmod,
+                collation,
                 0,
             );
+            let scan_expr = pgrx::pg_sys::makeNullConst(oid, typmod, collation);
             let name = field.name();
-            let col_name = palloc0(name.len() + 1) as *mut u8;
-            std::ptr::copy_nonoverlapping(name.as_ptr(), col_name, name.len());
-            let entry = pgrx::pg_sys::makeTargetEntry(
-                expr as *mut pgrx::pg_sys::Expr,
-                i16::try_from(index + 1).expect("target position fits AttrNumber") as _,
-                col_name as *mut i8,
+            let plan_entry = pgrx::pg_sys::makeTargetEntry(
+                plan_expr as *mut pgrx::pg_sys::Expr,
+                attr_number as _,
+                pstrdup(name),
                 false,
             );
-            target_list = list_append_unique_ptr(target_list, entry as *mut c_void);
+            let scan_entry = pgrx::pg_sys::makeTargetEntry(
+                scan_expr as *mut pgrx::pg_sys::Expr,
+                attr_number as _,
+                pstrdup(name),
+                false,
+            );
+            plan_target_list = list_append_unique_ptr(plan_target_list, plan_entry as *mut c_void);
+            scan_target_list = list_append_unique_ptr(scan_target_list, scan_entry as *mut c_void);
             pgrx::pg_sys::ReleaseSysCache(tuple);
         }
     }
-    Ok(target_list)
+    Ok(CustomScanTargetLists {
+        plan_target_list,
+        scan_target_list,
+    })
+}
+
+unsafe fn pstrdup(value: &str) -> *mut i8 {
+    let ptr = palloc0(value.len() + 1) as *mut u8;
+    std::ptr::copy_nonoverlapping(value.as_ptr(), ptr, value.len());
+    ptr.cast()
 }
 
 fn type_to_oid(data_type: &DataType) -> Option<Oid> {

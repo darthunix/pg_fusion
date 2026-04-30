@@ -8,9 +8,10 @@ use arrow_schema::{Field, Schema, SchemaRef};
 use backend_service::{
     build_standalone_scan_descriptor, ActiveScanDriver, BackendService, BackendServiceError,
     BeginExecutionOutput, CtidBlockRange, DiagnosticLogLevel, ExecutionKey, ExplainInput,
-    ExplainRenderOptions, OpenScanInput, ScanStreamStep, ScanWorkerLaunchInput,
-    ScanWorkerLaunchOutput, ScanWorkerLauncher, ScanWorkerProducer, ScanWorkerQueryInput,
-    StartExecutionInput,
+    ExplainRenderOptions, ExplainScanParallelism, ExplainScanParallelismStrategy,
+    ExplainScanProducer, ExplainScanProducerRole, OpenScanInput, ScanStreamStep,
+    ScanWorkerLaunchInput, ScanWorkerLaunchOutput, ScanWorkerLauncher, ScanWorkerProducer,
+    ScanWorkerQueryInput, StartExecutionInput,
 };
 use control_transport::{
     BackendLeaseSlot, BackendSlotLease, BackendTxError, TxError, WorkerTransport,
@@ -33,8 +34,10 @@ use runtime_protocol::{
     encode_backend_scan_to_worker_into, encode_worker_scan_to_backend_into,
     encoded_len_backend_execution_to_worker, encoded_len_backend_scan_to_worker,
     encoded_len_worker_scan_to_backend, BackendExecutionToWorker, BackendScanToWorker,
-    RuntimeMessageFamily, WorkerExecutionToBackend, WorkerScanToBackend, WorkerScanToBackendRef,
+    ProducerRole, RuntimeMessageFamily, ScanChannelDescriptorWire, WorkerExecutionToBackend,
+    WorkerScanToBackend, WorkerScanToBackendRef,
 };
+use scan_node::PgScanSpec;
 use transfer::PageTx;
 use worker_runtime::normalize_result_transport_schema;
 
@@ -87,6 +90,7 @@ struct HostScanState {
     control_lease: Option<BackendSlotLease>,
     execution_key: Option<ExecutionKey>,
     scan_peers: BTreeMap<u64, BackendLeaseSlot>,
+    scan_channels: Vec<ScanChannelDescriptorWire>,
     active_drivers: BTreeMap<u64, ActiveScanDriver>,
     pending_complete_session_epoch: Option<u64>,
     page_pool: Option<PagePool>,
@@ -178,6 +182,7 @@ unsafe extern "C-unwind" fn create_pg_fusion_scan_state(cscan: *mut CustomScan) 
         control_lease: None,
         execution_key: None,
         scan_peers: BTreeMap::new(),
+        scan_channels: Vec::new(),
         active_drivers: BTreeMap::new(),
         pending_complete_session_epoch: None,
         page_pool: None,
@@ -323,6 +328,7 @@ unsafe extern "C-unwind" fn begin_pg_fusion_scan(
         state.control_lease = None;
         state.execution_key = None;
         state.scan_peers.clear();
+        state.scan_channels.clear();
         state.active_drivers.clear();
         state.pending_complete_session_epoch = None;
         state.result_ingress = None;
@@ -425,6 +431,7 @@ unsafe extern "C-unwind" fn begin_pg_fusion_scan(
     state.page_pool = Some(page_pool);
     state.issuance_pool = Some(issuance_pool);
     state.scan_peers = scan_peers_from_begin(&begin);
+    state.scan_channels = begin.scan_channels.to_vec();
     state.pending_complete_session_epoch = None;
     state.primary_scratch = vec![
         0_u8;
@@ -655,13 +662,22 @@ unsafe extern "C-unwind" fn explain_pg_fusion_scan(
 ) {
     let state = host_state_ref(node);
     let config = host_config().unwrap_or_else(|err| error!("pg_fusion config error: {err}"));
+    let options = explain_render_options(es);
+    let actual_scan_parallelism = if options.analyze {
+        explain_actual_scan_parallelism(&state.scan_channels)
+    } else {
+        BTreeMap::new()
+    };
     let rendered = {
         let _planner_bypass = PlannerBypassGuard::enter();
+        let mut scan_worker_planner = ExplainScanWorkerPlanner;
         BackendService::render_explain(ExplainInput {
             sql: &state.sql,
             params: Vec::new(),
-            options: explain_render_options(es),
+            options,
             config: config.backend_service_config(),
+            scan_worker_launcher: Some(&mut scan_worker_planner),
+            actual_scan_parallelism,
         })
     }
     .unwrap_or_else(|err| error!("pg_fusion explain failed: {err}"));
@@ -675,6 +691,7 @@ unsafe fn explain_render_options(es: *mut pg_sys::ExplainState) -> ExplainRender
         ExplainRenderOptions {
             verbose: (*es).verbose,
             costs: (*es).costs,
+            analyze: (*es).analyze,
         }
     }
 }
@@ -1383,6 +1400,8 @@ struct DynamicScanWorkerLauncher {
     capacity_exhausted: bool,
 }
 
+struct ExplainScanWorkerPlanner;
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct ScanWorkerBudget {
     worker_count: u16,
@@ -1395,6 +1414,18 @@ struct ScanWorkerBudgetCandidate {
     block_count: u64,
     max_workers: u16,
     assigned_workers: u16,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum ScanWorkerEligibility {
+    Eligible {
+        block_count: u64,
+        max_workers: u16,
+    },
+    LeaderOnly {
+        block_count: Option<u64>,
+        reason: String,
+    },
 }
 
 impl ScanWorkerLauncher for DynamicScanWorkerLauncher {
@@ -1410,34 +1441,8 @@ impl ScanWorkerLauncher for DynamicScanWorkerLauncher {
             return Ok(());
         }
 
-        let mut candidates = Vec::new();
-        for spec in input.scans {
-            if spec.compiled_scan.uses_dummy_projection
-                || spec.compiled_scan.output_columns.is_empty()
-            {
-                continue;
-            }
-
-            let storage = relation_storage_info(spec.table_oid)?;
-            if !storage.is_cross_backend_visible
-                || !storage.has_no_dropped_attributes
-                || storage.block_count <= 1
-            {
-                continue;
-            }
-
-            candidates.push(ScanWorkerBudgetCandidate {
-                scan_id: spec.scan_id.get(),
-                block_count: storage.block_count,
-                max_workers: storage
-                    .block_count
-                    .saturating_sub(1)
-                    .min(u64::from(u16::MAX - 1)) as u16,
-                assigned_workers: 0,
-            });
-        }
-
-        self.budgets = assign_scan_worker_budgets(candidates, query_budget);
+        self.budgets =
+            assign_scan_worker_budgets(scan_worker_budget_candidates(input.scans)?, query_budget);
         Ok(())
     }
 
@@ -1537,6 +1542,29 @@ impl ScanWorkerLauncher for DynamicScanWorkerLauncher {
             workers,
         })
     }
+
+    fn explain_query(
+        &mut self,
+        input: ScanWorkerQueryInput<'_>,
+    ) -> Result<BTreeMap<u64, ExplainScanParallelism>, BackendServiceError> {
+        explain_scan_worker_parallelism(input.scans)
+    }
+}
+
+impl ScanWorkerLauncher for ExplainScanWorkerPlanner {
+    fn launch_scan_workers(
+        &mut self,
+        _input: ScanWorkerLaunchInput<'_>,
+    ) -> Result<ScanWorkerLaunchOutput, BackendServiceError> {
+        Ok(ScanWorkerLaunchOutput::default())
+    }
+
+    fn explain_query(
+        &mut self,
+        input: ScanWorkerQueryInput<'_>,
+    ) -> Result<BTreeMap<u64, ExplainScanParallelism>, BackendServiceError> {
+        explain_scan_worker_parallelism(input.scans)
+    }
 }
 
 impl DynamicScanWorkerLauncher {
@@ -1572,6 +1600,227 @@ fn postgres_max_parallel_workers_per_gather() -> u32 {
 
 fn postgres_max_worker_processes() -> u32 {
     unsafe { pg_sys::max_worker_processes.max(0) as u32 }
+}
+
+fn scan_worker_budget_candidates(
+    scans: &[Arc<PgScanSpec>],
+) -> Result<Vec<ScanWorkerBudgetCandidate>, BackendServiceError> {
+    let mut candidates = Vec::new();
+    for spec in scans {
+        if let ScanWorkerEligibility::Eligible {
+            block_count,
+            max_workers,
+        } = scan_worker_eligibility(spec)?
+        {
+            candidates.push(ScanWorkerBudgetCandidate {
+                scan_id: spec.scan_id.get(),
+                block_count,
+                max_workers,
+                assigned_workers: 0,
+            });
+        }
+    }
+    Ok(candidates)
+}
+
+fn scan_worker_eligibility(
+    spec: &PgScanSpec,
+) -> Result<ScanWorkerEligibility, BackendServiceError> {
+    let scan_id = spec.scan_id.get();
+    if spec.compiled_scan.uses_dummy_projection {
+        return Ok(ScanWorkerEligibility::LeaderOnly {
+            block_count: None,
+            reason: "dummy_projection".to_string(),
+        });
+    }
+    if spec.compiled_scan.output_columns.is_empty() {
+        return Ok(ScanWorkerEligibility::LeaderOnly {
+            block_count: None,
+            reason: "empty_output_projection".to_string(),
+        });
+    }
+
+    let storage = relation_storage_info(spec.table_oid)?;
+    if !storage.is_cross_backend_visible {
+        return Ok(ScanWorkerEligibility::LeaderOnly {
+            block_count: Some(storage.block_count),
+            reason: "relation_not_cross_backend_visible".to_string(),
+        });
+    }
+    if !storage.has_no_dropped_attributes {
+        return Ok(ScanWorkerEligibility::LeaderOnly {
+            block_count: Some(storage.block_count),
+            reason: "relation_has_dropped_attributes".to_string(),
+        });
+    }
+    if storage.block_count == 0 {
+        return Ok(ScanWorkerEligibility::LeaderOnly {
+            block_count: Some(0),
+            reason: "empty_relation".to_string(),
+        });
+    }
+    if storage.block_count == 1 {
+        return Ok(ScanWorkerEligibility::LeaderOnly {
+            block_count: Some(1),
+            reason: "single_block_relation".to_string(),
+        });
+    }
+
+    let max_workers = storage
+        .block_count
+        .saturating_sub(1)
+        .min(u64::from(u16::MAX - 1)) as u16;
+    if max_workers == 0 {
+        return Ok(ScanWorkerEligibility::LeaderOnly {
+            block_count: Some(storage.block_count),
+            reason: format!("scan_id_{scan_id}_has_no_worker_ranges"),
+        });
+    }
+    Ok(ScanWorkerEligibility::Eligible {
+        block_count: storage.block_count,
+        max_workers,
+    })
+}
+
+fn explain_scan_worker_parallelism(
+    scans: &[Arc<PgScanSpec>],
+) -> Result<BTreeMap<u64, ExplainScanParallelism>, BackendServiceError> {
+    let query_budget = postgres_dynamic_scan_worker_budget();
+    let mut eligibilities = BTreeMap::new();
+    let mut candidates = Vec::new();
+    for spec in scans {
+        let eligibility = scan_worker_eligibility(spec)?;
+        if let ScanWorkerEligibility::Eligible {
+            block_count,
+            max_workers,
+        } = eligibility
+        {
+            candidates.push(ScanWorkerBudgetCandidate {
+                scan_id: spec.scan_id.get(),
+                block_count,
+                max_workers,
+                assigned_workers: 0,
+            });
+        }
+        eligibilities.insert(spec.scan_id.get(), eligibility);
+    }
+
+    let budgets = if query_budget == 0 {
+        BTreeMap::new()
+    } else {
+        assign_scan_worker_budgets(candidates, query_budget)
+    };
+
+    let mut parallelism = BTreeMap::new();
+    for spec in scans {
+        let scan_id = spec.scan_id.get();
+        let Some(eligibility) = eligibilities.remove(&scan_id) else {
+            continue;
+        };
+        let explain = match eligibility {
+            ScanWorkerEligibility::LeaderOnly {
+                block_count,
+                reason,
+            } => explain_leader_only_scan(block_count, reason),
+            ScanWorkerEligibility::Eligible { block_count, .. } => {
+                if query_budget == 0 {
+                    explain_leader_only_scan(Some(block_count), "worker_budget_zero")
+                } else if let Some(budget) = budgets.get(&scan_id).copied() {
+                    explain_ctid_range_scan(budget.block_count, budget.worker_count)
+                } else {
+                    explain_leader_only_scan(Some(block_count), "worker_budget_not_assigned")
+                }
+            }
+        };
+        parallelism.insert(scan_id, explain);
+    }
+    Ok(parallelism)
+}
+
+fn explain_actual_scan_parallelism(
+    channels: &[ScanChannelDescriptorWire],
+) -> BTreeMap<u64, ExplainScanParallelism> {
+    let mut grouped: BTreeMap<u64, Vec<ExplainScanProducer>> = BTreeMap::new();
+    for channel in channels {
+        grouped
+            .entry(channel.scan_id)
+            .or_default()
+            .push(ExplainScanProducer {
+                producer_id: channel.producer_id,
+                role: match channel.role {
+                    ProducerRole::Leader => ExplainScanProducerRole::Leader,
+                    ProducerRole::Worker => ExplainScanProducerRole::Worker,
+                },
+                ctid_range: None,
+            });
+    }
+
+    grouped
+        .into_iter()
+        .map(|(scan_id, mut producers)| {
+            producers.sort_by_key(|producer| producer.producer_id);
+            let strategy = if producers
+                .iter()
+                .any(|producer| producer.role == ExplainScanProducerRole::Worker)
+            {
+                ExplainScanParallelismStrategy::CtidBlockRange
+            } else {
+                ExplainScanParallelismStrategy::LeaderOnly
+            };
+            (
+                scan_id,
+                ExplainScanParallelism {
+                    strategy,
+                    block_count: None,
+                    reason: None,
+                    producers,
+                },
+            )
+        })
+        .collect()
+}
+
+fn explain_leader_only_scan(
+    block_count: Option<u64>,
+    reason: impl Into<String>,
+) -> ExplainScanParallelism {
+    ExplainScanParallelism {
+        strategy: ExplainScanParallelismStrategy::LeaderOnly,
+        block_count,
+        reason: Some(reason.into()),
+        producers: vec![ExplainScanProducer {
+            producer_id: 0,
+            role: ExplainScanProducerRole::Leader,
+            ctid_range: None,
+        }],
+    }
+}
+
+fn explain_ctid_range_scan(block_count: u64, worker_count: u16) -> ExplainScanParallelism {
+    let total_producers = (u64::from(worker_count) + 1)
+        .min(block_count)
+        .min(u64::from(u16::MAX)) as u16;
+    let producers = (0..total_producers)
+        .map(|producer_id| ExplainScanProducer {
+            producer_id,
+            role: if producer_id == 0 {
+                ExplainScanProducerRole::Leader
+            } else {
+                ExplainScanProducerRole::Worker
+            },
+            ctid_range: Some(producer_block_range(
+                block_count,
+                total_producers,
+                producer_id,
+            )),
+        })
+        .collect();
+    ExplainScanParallelism {
+        strategy: ExplainScanParallelismStrategy::CtidBlockRange,
+        block_count: Some(block_count),
+        reason: None,
+        producers,
+    }
 }
 
 fn assign_scan_worker_budgets(

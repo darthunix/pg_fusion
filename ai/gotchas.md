@@ -15,6 +15,10 @@ importance: 0.7
   `shared_preload_libraries = 'pg_fusion'` in the test cluster.
 - `pg_fusion` queries in `pg/extension` smoke tests currently run through a
   normal PostgreSQL client connection, not SPI-owned execution contexts.
+- `CustomScan.custom_scan_tlist` must describe the scan tuple with terminal
+  expressions, not the same `INDEX_VAR` entries used by `plan.targetlist`.
+  Sharing the lists makes PostgreSQL `EXPLAIN VERBOSE` recursively deparse
+  custom scan output until it hits `max_stack_depth`.
 - `slot_scan` should execute trusted compiler-generated scan SQL. SQL safety and
   expression pushdown policy belong in `scan_sql`.
 - PostgreSQL-bound crates should not be included in standalone `cargo test` or

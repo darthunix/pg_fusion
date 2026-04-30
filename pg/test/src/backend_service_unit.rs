@@ -178,6 +178,8 @@ pub fn render_explain_is_rejected_while_execution_is_active() {
         params: Vec::new(),
         options: Default::default(),
         config: BackendServiceConfig::default(),
+        scan_worker_launcher: None,
+        actual_scan_parallelism: Default::default(),
     })
     .unwrap_err();
     assert!(matches!(err, BackendServiceError::ExecutionAlreadyActive));
