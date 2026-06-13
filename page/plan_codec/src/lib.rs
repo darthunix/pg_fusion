@@ -471,6 +471,8 @@ impl PlanDecodeSession {
             FunctionRegistry::register_udf(&mut ctx, df_functions::pg_numeric_round_scale_udf());
         let _ =
             FunctionRegistry::register_udf(&mut ctx, df_functions::pg_numeric_trunc_scale_udf());
+        let _ = FunctionRegistry::register_udf(&mut ctx, df_functions::pg_regex_match_udf());
+        let _ = FunctionRegistry::register_udf(&mut ctx, df_functions::pg_regex_not_match_udf());
         let _ = FunctionRegistry::register_udf(&mut ctx, df_functions::pg_varchar_typmod_udf());
         let _ = FunctionRegistry::register_udf(&mut ctx, df_functions::pg_bpchar_typmod_udf());
         let _ = FunctionRegistry::register_udf(&mut ctx, df_functions::pg_bpchar_cmp_key_udf());
@@ -1063,6 +1065,12 @@ fn decode_pg_scalar_udf(name: &str) -> Option<Arc<ScalarUDF>> {
     }
     if name.eq_ignore_ascii_case("pg_fusion_numeric_trunc_scale") {
         return Some(df_functions::pg_numeric_trunc_scale_udf());
+    }
+    if name.eq_ignore_ascii_case("pg_fusion_regex_match") {
+        return Some(df_functions::pg_regex_match_udf());
+    }
+    if name.eq_ignore_ascii_case("pg_fusion_regex_not_match") {
+        return Some(df_functions::pg_regex_not_match_udf());
     }
     if name.eq_ignore_ascii_case("pg_fusion_varchar_typmod") {
         return Some(df_functions::pg_varchar_typmod_udf());

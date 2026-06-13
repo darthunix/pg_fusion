@@ -307,6 +307,8 @@ fn optimize_logical_plan(
     let _ = state.register_udf(df_functions::pg_interval_out_udf());
     let _ = state.register_udf(df_functions::pg_numeric_round_scale_udf());
     let _ = state.register_udf(df_functions::pg_numeric_trunc_scale_udf());
+    let _ = state.register_udf(df_functions::pg_regex_match_udf());
+    let _ = state.register_udf(df_functions::pg_regex_not_match_udf());
     let _ = state.register_udf(df_functions::pg_varchar_typmod_udf());
     let _ = state.register_udf(df_functions::pg_bpchar_typmod_udf());
     let _ = state.register_udf(df_functions::pg_bpchar_cmp_key_udf());

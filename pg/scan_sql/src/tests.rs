@@ -713,6 +713,34 @@ fn renders_regex_filters() {
 }
 
 #[test]
+fn renders_pg_regex_internal_udfs_for_scan_filters() {
+    let schema = test_schema();
+    let match_filter = df_functions::pg_regex_match_udf()
+        .call(vec![Expr::Column(Column::from_name("name")), lit("^al.*")]);
+    let not_match_filter = df_functions::pg_regex_not_match_udf()
+        .call(vec![Expr::Column(Column::from_name("name")), lit("^bo.*")]);
+
+    let compiled = compile_scan(CompileScanInput {
+        relation: &test_relation(),
+        schema: &schema,
+        identifier_max_bytes: TEST_IDENTIFIER_MAX_BYTES,
+        projection: Some(&[1]),
+        filters: &[match_filter, not_match_filter],
+        requested_limit: None,
+        limit_lowering: LimitLowering::ExternalHint,
+    })
+    .unwrap();
+
+    assert!(compiled.all_filters_compiled);
+    assert_eq!(compiled.output_columns, vec![1]);
+    assert_eq!(compiled.residual_filters, Vec::<Expr>::new());
+    assert_eq!(
+        compiled.sql,
+        "SELECT \"name\" FROM \"public\".\"users\" WHERE (\"name\" ~ '^al.*') AND (\"name\" !~ '^bo.*')"
+    );
+}
+
+#[test]
 fn leaves_non_finite_float_literals_residual() {
     let schema = test_schema();
     let filter = Expr::Column(Column::from_name("score")).lt(lit(f64::INFINITY));

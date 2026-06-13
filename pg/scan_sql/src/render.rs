@@ -354,6 +354,8 @@ fn render_scalar_function(
         ("length", [value]) | ("char_length", [value]) => format!("char_length({value})"),
         ("pg_fusion_bpchar_cmp_key", [value]) => value.to_string(),
         ("pg_fusion_bpchar_length", [value]) => format!("length({value})"),
+        ("pg_fusion_regex_match", [value, pattern]) => format!("({value} ~ {pattern})"),
+        ("pg_fusion_regex_not_match", [value, pattern]) => format!("({value} !~ {pattern})"),
         ("strpos", [haystack, needle]) => format!("strpos({haystack}, {needle})"),
         ("contains", [haystack, needle]) => format!("(strpos({haystack}, {needle}) > 0)"),
         ("concat", args) if !args.is_empty() => format!("concat({})", args.join(", ")),

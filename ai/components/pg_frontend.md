@@ -142,10 +142,15 @@ operators over text-like operands and are treated as PostgreSQL-sensitive scan
 predicates: relation-local cases render back into PostgreSQL scan SQL, while
 residual join filters fail closed instead of relying on DataFusion LIKE
 semantics.
-`~`/`!~` regex operators are accepted over text-like operands with the same
-scan-only contract: relation-local predicates render into PostgreSQL scan SQL,
-while residual regex filters fail closed until pg_fusion has
-PostgreSQL-compatible DataFusion regex execution.
+`~`/`!~` regex operators are accepted over text-like operands. Relation-local
+predicates render into PostgreSQL scan SQL. Residual regex filters lower to
+internal `pg_fusion_regex_match`/`pg_fusion_regex_not_match` UDFs, which execute
+a deterministic Rust-regex subset configured for PostgreSQL's default
+non-newline-sensitive mode. They fail closed on PostgreSQL ARE constructs and
+quantifier forms that are not safely modeled in the worker, including
+backreferences, lookaround, word-boundary constraint escapes, POSIX bracket
+classes, collating elements, equivalence classes, adjacent quantifiers, and
+repetition bounds outside PostgreSQL's 0..255 range.
 `int2`/`int4`/`int8` `+`, `-`, and `*` lower to internal checked DataFusion
 UDFs instead of DataFusion binary arithmetic so PostgreSQL integer overflow
 raises `smallint`/`integer`/`bigint out of range` instead of wrapping.
@@ -184,8 +189,9 @@ only the preserved side; `FULL` neither). Filters that reach `scan_sql` must
 fully compile into PostgreSQL scan SQL; scan residuals are rejected before
 execution. Residual filters above joins may execute in DataFusion only when
 their typed expression is known not to depend on PostgreSQL-specific text-like
-semantics; `bpchar` equality/distinct and `length(bpchar)` use PG-aware UDFs,
-while `bpchar` ordering, text ordering, regex, unsupported collation residuals,
+semantics; `bpchar` equality/distinct, `length(bpchar)`, and restricted
+`~`/`!~` regex use PG-aware UDFs, while `bpchar` ordering, text ordering,
+unsupported collation residuals, regex patterns outside the supported subset,
 and uncovered text-sensitive function shapes fail closed.
 Target expressions compile in the DataFusion logical plan after PostgreSQL
 query-tree analysis has supplied function/operator OIDs and PostgreSQL type

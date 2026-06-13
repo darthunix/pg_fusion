@@ -3729,6 +3729,23 @@ FROM TEXT_TBL
 WHERE f1 !~ '^hi'
 ORDER BY f1;
 
+-- id: local_pg_regex_left_join_residual_filter
+-- origin: local pg_fusion regex residual UDF coverage
+-- compare: multiset
+SELECT l.i, r.t
+FROM j1_tbl l
+LEFT JOIN j1_tbl r ON l.i = r.i
+WHERE r.t ~ '^t';
+
+-- id: local_pg_regex_dot_matches_newline_residual_filter
+-- origin: local pg_fusion regex residual UDF PostgreSQL newline coverage
+-- compare: ordered
+SELECT l.i
+FROM j1_tbl l
+LEFT JOIN j1_tbl r ON l.i = r.i
+WHERE (CASE WHEN r.i = 2 THEN E'\n' ELSE r.t END) ~ '^.$'
+ORDER BY l.i;
+
 -- id: local_pg_tpch_q16_like_not_in_shape
 -- origin: local pg_fusion TPC-H q16-shaped LIKE/NOT IN coverage
 -- compare: ordered

@@ -148,6 +148,10 @@ pub(super) fn compile_binary_expr(
         ));
     }
 
+    if let Some(udf) = regex_match_udf(op) {
+        return Ok(udf.call(vec![left_expr, right_expr]));
+    }
+
     if let Some(policy) =
         numeric_decimal_arithmetic_policy(op, result_pg_type, left_source, right_source)?
     {
@@ -229,6 +233,14 @@ fn checked_integer_arithmetic_udf(
         QueryOperator::Plus => df_functions::pg_int_add_checked_udf(),
         QueryOperator::Minus => df_functions::pg_int_sub_checked_udf(),
         QueryOperator::Multiply => df_functions::pg_int_mul_checked_udf(),
+        _ => return None,
+    })
+}
+
+fn regex_match_udf(op: QueryOperator) -> Option<Arc<ScalarUDF>> {
+    Some(match op {
+        QueryOperator::RegexMatch => df_functions::pg_regex_match_udf(),
+        QueryOperator::RegexNotMatch => df_functions::pg_regex_not_match_udf(),
         _ => return None,
     })
 }

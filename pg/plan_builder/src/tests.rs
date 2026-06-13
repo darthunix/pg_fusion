@@ -161,11 +161,8 @@ fn frontend_logical_plan_builds_scans_before_optimizer_can_fold_pg_typed_literal
 
 #[test]
 fn regex_filters_compile_into_postgres_scan_sql() {
-    let regex_filter = Expr::BinaryExpr(BinaryExpr::new(
-        Box::new(Expr::Column(Column::from_name("name"))),
-        Operator::RegexMatch,
-        Box::new(lit("^a")),
-    ));
+    let regex_filter = df_functions::pg_regex_match_udf()
+        .call(vec![Expr::Column(Column::from_name("name")), lit("^a")]);
     let table_scan = TableScan::try_new(
         TableReference::bare("users"),
         user_table_source(),

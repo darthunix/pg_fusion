@@ -341,11 +341,13 @@ pub(super) fn binary_op_needs_pg_text_semantics(
 ) -> bool {
     let left_type = expr_pg_type(left);
     let right_type = expr_pg_type(right);
+    if matches!(op, QueryOperator::RegexMatch | QueryOperator::RegexNotMatch) {
+        return left_type.is_some_and(pg_text_type_has_unsupported_collation)
+            || right_type.is_some_and(pg_text_type_has_unsupported_collation);
+    }
     if matches!(
         op,
-        QueryOperator::RegexMatch
-            | QueryOperator::RegexNotMatch
-            | QueryOperator::StringConcat
+        QueryOperator::StringConcat
             | QueryOperator::LikeMatch
             | QueryOperator::NotLikeMatch
             | QueryOperator::ILikeMatch

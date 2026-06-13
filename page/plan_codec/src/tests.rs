@@ -10,12 +10,12 @@ use bytes::BytesMut;
 use datafusion::prelude::SessionContext;
 use datafusion_common::tree_node::{TreeNode, TreeNodeRecursion};
 use datafusion_common::{Column, DFSchema, NullEquality, TableReference};
-use datafusion_expr::expr::BinaryExpr;
+use datafusion_expr::expr::TryCast;
 use datafusion_expr::logical_plan::{
     build_join_schema, Aggregate, EmptyRelation, Extension as LogicalExtension, Filter, Join,
     JoinConstraint, JoinType, LogicalPlan, Projection, UserDefinedLogicalNodeCore,
 };
-use datafusion_expr::{lit, Expr, ExprFunctionExt, Operator};
+use datafusion_expr::{lit, Expr, ExprFunctionExt};
 use datafusion_proto::protobuf::logical_plan_node::LogicalPlanType;
 use scan_node::{PgCteId, PgCteRefNode, PgScanId, PgScanNode, PgScanSpec};
 use scan_sql::{compile_scan, CompileScanInput, LimitLowering, PgRelation};
@@ -368,17 +368,16 @@ fn residual_filter_plan() -> LogicalPlan {
         resolved.schema.as_ref(),
     )
     .expect("dfschema");
-    let regex_filter = Expr::BinaryExpr(BinaryExpr::new(
+    let unsupported_filter = Expr::IsNotNull(Box::new(Expr::TryCast(TryCast::new(
         Box::new(Expr::Column(Column::from_name("name"))),
-        Operator::RegexMatch,
-        Box::new(lit("^a")),
-    ));
+        DataType::Float64,
+    ))));
     let compiled = compile_scan(CompileScanInput {
         relation: &resolved.relation,
         schema: resolved.schema.as_ref(),
         identifier_max_bytes: TEST_IDENTIFIER_MAX_BYTES,
         projection: Some(&[0]),
-        filters: std::slice::from_ref(&regex_filter),
+        filters: std::slice::from_ref(&unsupported_filter),
         requested_limit: Some(10),
         limit_lowering: LimitLowering::ExternalHint,
     })

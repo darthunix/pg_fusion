@@ -278,6 +278,88 @@ mod tests {
     }
 
     #[test]
+    fn compile_query_lowers_regex_to_pg_udfs() {
+        let mut query = base_query();
+        query.from = FromItem::Empty;
+        query.targets = vec![
+            Target {
+                expr: QueryExpr::BinaryOp {
+                    op: QueryOperator::RegexMatch,
+                    left: Box::new(text_const("alpha")),
+                    right: Box::new(text_const("^al.*")),
+                    pg_type: bool_type(),
+                },
+                name: Some("matches".into()),
+                pg_type: bool_type(),
+                resno: 1,
+                ressortgroupref: 0,
+                resjunk: false,
+            },
+            Target {
+                expr: QueryExpr::BinaryOp {
+                    op: QueryOperator::RegexNotMatch,
+                    left: Box::new(text_const("beta")),
+                    right: Box::new(text_const("^al.*")),
+                    pg_type: bool_type(),
+                },
+                name: Some("not_matches".into()),
+                pg_type: bool_type(),
+                resno: 2,
+                ressortgroupref: 0,
+                resjunk: false,
+            },
+        ];
+
+        let output = compile_typed_query(
+            &query,
+            CompileConfig {
+                identifier_max_bytes: 63,
+            },
+        )
+        .expect("regex query should lower into a typed logical plan");
+
+        let rendered = output.logical_plan.display_indent().to_string();
+        assert!(
+            rendered.contains("pg_fusion_regex_match"),
+            "regex match must use PostgreSQL-compatible UDF: {rendered}"
+        );
+        assert!(
+            rendered.contains("pg_fusion_regex_not_match"),
+            "regex not-match must use PostgreSQL-compatible UDF: {rendered}"
+        );
+
+        let decoded = roundtrip_plan(output.logical_plan);
+        let decoded_rendered = decoded.display_indent().to_string();
+        assert!(
+            decoded_rendered.contains("pg_fusion_regex_match"),
+            "encoded regex plan must decode with match UDF: {decoded_rendered}"
+        );
+        assert!(
+            decoded_rendered.contains("pg_fusion_regex_not_match"),
+            "encoded regex plan must decode with not-match UDF: {decoded_rendered}"
+        );
+
+        let ctx = datafusion::prelude::SessionContext::new();
+        let batches = futures::executor::block_on(async {
+            let dataframe = ctx.execute_logical_plan(decoded).await?;
+            dataframe.collect().await
+        })
+        .expect("regex UDF plan should execute in DataFusion");
+        let matches = batches[0]
+            .column(0)
+            .as_any()
+            .downcast_ref::<datafusion::arrow::array::BooleanArray>()
+            .expect("regex match should produce BooleanArray");
+        assert!(matches.value(0));
+        let not_matches = batches[0]
+            .column(1)
+            .as_any()
+            .downcast_ref::<datafusion::arrow::array::BooleanArray>()
+            .expect("regex not-match should produce BooleanArray");
+        assert!(not_matches.value(0));
+    }
+
+    #[test]
     fn compile_query_lowers_text_typmod_casts_to_pg_udfs() {
         let mut query = base_query();
         query.from = FromItem::Empty;
@@ -1354,7 +1436,7 @@ mod tests {
     }
 
     #[test]
-    fn nullable_side_regex_residual_filter_fails_closed() {
+    fn nullable_side_regex_residual_filter_is_allowed() {
         let mut query = join_query(JoinKind::Left);
         query.selection = Some(binary_op_expr(
             QueryOperator::RegexMatch,
@@ -1362,8 +1444,34 @@ mod tests {
             text_const("^a"),
         ));
 
+        let pushdown = split_selection_for_scan_pushdown(&query)
+            .expect("nullable-side regex can run through pg_fusion UDF semantics");
+        assert!(pushdown.scan_filters.is_empty());
+        assert_eq!(
+            pushdown
+                .residual
+                .as_ref()
+                .and_then(single_predicate_rtindex),
+            Some(2)
+        );
+    }
+
+    #[test]
+    fn nullable_side_regex_residual_filter_with_unsupported_collation_fails_closed() {
+        let mut query = join_query(JoinKind::Left);
+        let collated_text = PgTypeRef {
+            oid: oid_u32(pgrx::pg_sys::TEXTOID),
+            typmod: -1,
+            collation: oid_u32(pgrx::pg_sys::C_COLLATION_OID),
+        };
+        query.selection = Some(binary_op_expr(
+            QueryOperator::RegexMatch,
+            var_attnum(2, 2, collated_text),
+            text_const("^a"),
+        ));
+
         let err = split_selection_for_scan_pushdown(&query)
-            .expect_err("nullable-side regex cannot run with DataFusion semantics");
+            .expect_err("collated residual regex cannot run with DataFusion semantics");
         assert!(
             err.to_string().contains("residual text-like WHERE"),
             "unexpected error: {err}"

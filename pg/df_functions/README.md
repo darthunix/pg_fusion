@@ -9,5 +9,6 @@ definitions.
 
 Current overrides include PostgreSQL-compatible `avg` aggregation semantics for
 the supported Arrow type surface, checked `int2`/`int4`/`int8` arithmetic for
-frontend-lowered `+`, `-`, and `*`, a `format(text, ...)` scalar function for
-ordinary non-`VARIADIC ARRAY` calls, and `quote_literal(text)`.
+frontend-lowered `+`, `-`, and `*`, restricted residual regex `~`/`!~`
+execution over a deterministic safe subset, a `format(text, ...)` scalar
+function for ordinary non-`VARIADIC ARRAY` calls, and `quote_literal(text)`.

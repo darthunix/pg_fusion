@@ -126,9 +126,9 @@ follows PostgreSQL semantics for the pushed portion, not DataFusion exactness.
   malformed metadata or unsupported OIDs leave the expression residual.
 - Zero-column projections are rendered with a synthetic dummy select item to
   preserve row cardinality for later integration.
-- Regex predicates are rendered as PostgreSQL regex operators (`~`, `!~`,
-  `~*`, `!~*`) so PostgreSQL owns regex semantics for relation-local scan
-  filters.
+- Regex predicates and internal pg_fusion regex UDFs are rendered as
+  PostgreSQL regex operators (`~`, `!~`, `~*`, `!~*`) so PostgreSQL owns regex
+  semantics for relation-local scan filters.
 - Timestamp literals with time zones, all temporal cast targets, non-finite
   float literals, and other ambiguous PostgreSQL mappings are intentionally
   left residual in v1.

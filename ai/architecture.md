@@ -73,6 +73,9 @@ page-backed Arrow batches.
   inverse transitions so bounded/sliding window frames can retract rows during
   DataFusion window execution. Its internal `pg_scalar_subquery_value` aggregate
   enforces PostgreSQL scalar-subquery cardinality after frontend lowering.
+  Internal regex match UDFs cover residual `~`/`!~` execution over a
+  deterministic PostgreSQL-oriented safe subset and fail closed for ARE
+  constructs that cannot be modeled without PostgreSQL's regex engine.
   `quote_literal(text)` shares the same text quoting helper as
   `format(... %L ...)`.
 - `pg/statistics`: PostgreSQL planner/catalog statistics bridge. It is
