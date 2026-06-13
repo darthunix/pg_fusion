@@ -666,30 +666,50 @@ fn accepts_exact_limit_column_names() {
 }
 
 #[test]
-fn leaves_regex_filters_residual() {
+fn renders_regex_filters() {
     let schema = test_schema();
-    let regex = Expr::BinaryExpr(BinaryExpr::new(
-        Box::new(Expr::Column(Column::from_name("name"))),
-        Operator::RegexMatch,
-        Box::new(lit("^al.*")),
-    ));
+    let filters = vec![
+        Expr::BinaryExpr(BinaryExpr::new(
+            Box::new(Expr::Column(Column::from_name("name"))),
+            Operator::RegexMatch,
+            Box::new(lit("^al.*")),
+        )),
+        Expr::BinaryExpr(BinaryExpr::new(
+            Box::new(Expr::Column(Column::from_name("name"))),
+            Operator::RegexNotMatch,
+            Box::new(lit("^bo.*")),
+        )),
+        Expr::BinaryExpr(BinaryExpr::new(
+            Box::new(Expr::Column(Column::from_name("name"))),
+            Operator::RegexIMatch,
+            Box::new(lit("^ca.*")),
+        )),
+        Expr::BinaryExpr(BinaryExpr::new(
+            Box::new(Expr::Column(Column::from_name("name"))),
+            Operator::RegexNotIMatch,
+            Box::new(lit("^da.*")),
+        )),
+    ];
 
     let compiled = compile_scan(CompileScanInput {
         relation: &test_relation(),
         schema: &schema,
         identifier_max_bytes: TEST_IDENTIFIER_MAX_BYTES,
         projection: Some(&[1]),
-        filters: std::slice::from_ref(&regex),
+        filters: &filters,
         requested_limit: None,
         limit_lowering: LimitLowering::ExternalHint,
     })
     .unwrap();
 
-    assert!(!compiled.all_filters_compiled);
+    assert!(compiled.all_filters_compiled);
     assert_eq!(compiled.output_columns, vec![1]);
     assert_eq!(compiled.residual_filter_columns, Vec::<usize>::new());
-    assert_eq!(compiled.residual_filters, vec![regex]);
-    assert_eq!(compiled.sql, "SELECT \"name\" FROM \"public\".\"users\"");
+    assert_eq!(compiled.residual_filters, Vec::<Expr>::new());
+    assert_eq!(
+        compiled.sql,
+        "SELECT \"name\" FROM \"public\".\"users\" WHERE (\"name\" ~ '^al.*') AND (\"name\" !~ '^bo.*') AND (\"name\" ~* '^ca.*') AND (\"name\" !~* '^da.*')"
+    );
 }
 
 #[test]

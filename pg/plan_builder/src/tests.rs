@@ -85,6 +85,13 @@ fn count_pg_scan_nodes(plan: &LogicalPlan) -> usize {
     count
 }
 
+fn unsupported_score_residual_filter() -> Expr {
+    Expr::IsNotNull(Box::new(Expr::TryCast(datafusion_expr::TryCast::new(
+        Box::new(Expr::Column(Column::from_name("score"))),
+        DataType::Float64,
+    ))))
+}
+
 #[test]
 fn preplanned_logical_plan_uses_shared_scan_building() {
     let filter = Expr::BinaryExpr(BinaryExpr::new(
@@ -150,6 +157,44 @@ fn frontend_logical_plan_builds_scans_before_optimizer_can_fold_pg_typed_literal
     );
     assert!(!contains_table_scan(&built.logical_plan));
     assert_eq!(count_pg_scan_nodes(&built.logical_plan), 1);
+}
+
+#[test]
+fn regex_filters_compile_into_postgres_scan_sql() {
+    let regex_filter = Expr::BinaryExpr(BinaryExpr::new(
+        Box::new(Expr::Column(Column::from_name("name"))),
+        Operator::RegexMatch,
+        Box::new(lit("^a")),
+    ));
+    let table_scan = TableScan::try_new(
+        TableReference::bare("users"),
+        user_table_source(),
+        Some(vec![1]),
+        vec![regex_filter],
+        Some(10),
+    )
+    .unwrap();
+    let mut scan_builder = PgScanBuilder::new(plan_builder_config(1));
+
+    let plan = scan_builder
+        .build_scans(LogicalPlan::TableScan(table_scan))
+        .expect("build regex scan");
+
+    assert_eq!(scan_builder.scans.len(), 1);
+    assert_eq!(
+        scan_builder.scans[0].compiled_scan.sql,
+        "SELECT \"name\" FROM \"public\".\"users\" WHERE (\"name\" ~ '^a')"
+    );
+    assert!(scan_builder.scans[0]
+        .compiled_scan
+        .residual_filters
+        .is_empty());
+    assert_eq!(
+        scan_builder.scans[0].fetch_hints.planner_fetch_hint,
+        Some(10)
+    );
+    assert_eq!(scan_builder.scans[0].fetch_hints.local_row_cap, Some(10));
+    assert!(!matches!(plan, LogicalPlan::Filter(_)));
 }
 
 #[test]
@@ -225,16 +270,11 @@ fn frontend_logical_plan_rewrites_grouping_function_before_runtime() {
 
 #[test]
 fn residual_filters_are_restored_and_extra_columns_projected_away() {
-    let regex_filter = Expr::BinaryExpr(BinaryExpr::new(
-        Box::new(Expr::Column(Column::from_name("name"))),
-        Operator::RegexMatch,
-        Box::new(lit("^a")),
-    ));
     let table_scan = TableScan::try_new(
         TableReference::bare("users"),
         user_table_source(),
         Some(vec![0]),
-        vec![regex_filter],
+        vec![unsupported_score_residual_filter()],
         None,
     )
     .unwrap();
@@ -247,11 +287,11 @@ fn residual_filters_are_restored_and_extra_columns_projected_away() {
     assert_eq!(scan_builder.scans.len(), 1);
     assert_eq!(
         scan_builder.scans[0].compiled_scan.output_columns,
-        vec![0, 1]
+        vec![0, 2]
     );
     assert_eq!(
         scan_builder.scans[0].compiled_scan.residual_filter_columns,
-        vec![1]
+        vec![2]
     );
     assert_eq!(plan.schema().fields().len(), 1);
     assert_eq!(plan.schema().field(0).name(), "id");
@@ -261,16 +301,11 @@ fn residual_filters_are_restored_and_extra_columns_projected_away() {
 
 #[test]
 fn residual_filters_disable_local_row_cap_but_keep_planner_hint() {
-    let regex_filter = Expr::BinaryExpr(BinaryExpr::new(
-        Box::new(Expr::Column(Column::from_name("name"))),
-        Operator::RegexMatch,
-        Box::new(lit("^a")),
-    ));
     let table_scan = TableScan::try_new(
         TableReference::bare("users"),
         user_table_source(),
         None,
-        vec![regex_filter],
+        vec![unsupported_score_residual_filter()],
         Some(10),
     )
     .unwrap();

@@ -3713,6 +3713,22 @@ FROM TEXT_TBL
 WHERE f1 NOT LIKE 'hi%'
 ORDER BY f1;
 
+-- id: local_pg_regex_match_scan_filter
+-- origin: local pg_fusion regex operator scan pushdown coverage
+-- compare: ordered
+SELECT f1
+FROM TEXT_TBL
+WHERE f1 ~ '^hi'
+ORDER BY f1;
+
+-- id: local_pg_regex_not_match_scan_filter
+-- origin: local pg_fusion regex operator scan pushdown coverage
+-- compare: ordered
+SELECT f1
+FROM TEXT_TBL
+WHERE f1 !~ '^hi'
+ORDER BY f1;
+
 -- id: local_pg_tpch_q16_like_not_in_shape
 -- origin: local pg_fusion TPC-H q16-shaped LIKE/NOT IN coverage
 -- compare: ordered

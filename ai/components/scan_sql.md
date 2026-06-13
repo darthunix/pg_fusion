@@ -37,9 +37,10 @@ importance: 0.66
 - Pushdown behavior:
   - top-level `AND` filters are split so supported conjuncts still push down when sibling conjuncts remain residual
   - when filters remain residual, any columns referenced by those residual filters are appended to SQL output so the caller can still evaluate them above the scan
-  - supported expression families include columns, common scalar literals, boolean/comparison/arithmetic operators, `LIKE` predicates, `BETWEEN`, `IN`, `CASE`, selected non-temporal casts, and a small scalar-function whitelist
+  - supported expression families include columns, common scalar literals, boolean/comparison/arithmetic operators, `LIKE` and regex predicates, `BETWEEN`, `IN`, `CASE`, selected non-temporal casts, and a small scalar-function whitelist
   - empty `IN` lists fold to constant `FALSE` / `TRUE` rather than emitting `IN ()`
-  - timestamp literals with time zones, temporal cast targets, regex operators, non-finite float literals, and other PostgreSQL-ambiguous mappings intentionally remain residual in v1
+  - timestamp literals with time zones, temporal cast targets, non-finite float literals, and other PostgreSQL-ambiguous mappings intentionally remain residual in v1
+  - regex predicates render to PostgreSQL regex operators (`~`, `!~`, `~*`, `!~*`) so PostgreSQL owns regex semantics when a predicate is relation-local and pushed into scan SQL
   - compiled SQL is expected to run with PostgreSQL semantics; the crate does not try to preserve exact DataFusion semantics across the engine boundary
   - current PostgreSQL-oriented behavior intentionally includes split top-level `AND`, empty `IN` folding, and `Int8 -> SMALLINT` cast rendering
   - requested limits are treated as fetch hints by default and should be lowered in the default `scan_sql -> slot_scan` path to both `slot_scan::ScanOptions.planner_fetch_hint` and `slot_scan::ScanOptions.local_row_cap`

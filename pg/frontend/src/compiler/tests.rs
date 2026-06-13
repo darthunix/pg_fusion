@@ -1354,6 +1354,23 @@ mod tests {
     }
 
     #[test]
+    fn nullable_side_regex_residual_filter_fails_closed() {
+        let mut query = join_query(JoinKind::Left);
+        query.selection = Some(binary_op_expr(
+            QueryOperator::RegexMatch,
+            var_attnum(2, 2, text_type()),
+            text_const("^a"),
+        ));
+
+        let err = split_selection_for_scan_pushdown(&query)
+            .expect_err("nullable-side regex cannot run with DataFusion semantics");
+        assert!(
+            err.to_string().contains("residual text-like WHERE"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
     fn nullable_side_bpchar_residual_equality_is_allowed() {
         let mut query = join_query(JoinKind::Left);
         let bpchar = PgTypeRef {

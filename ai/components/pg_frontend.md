@@ -142,6 +142,10 @@ operators over text-like operands and are treated as PostgreSQL-sensitive scan
 predicates: relation-local cases render back into PostgreSQL scan SQL, while
 residual join filters fail closed instead of relying on DataFusion LIKE
 semantics.
+`~`/`!~` regex operators are accepted over text-like operands with the same
+scan-only contract: relation-local predicates render into PostgreSQL scan SQL,
+while residual regex filters fail closed until pg_fusion has
+PostgreSQL-compatible DataFusion regex execution.
 `int2`/`int4`/`int8` `+`, `-`, and `*` lower to internal checked DataFusion
 UDFs instead of DataFusion binary arithmetic so PostgreSQL integer overflow
 raises `smallint`/`integer`/`bigint out of range` instead of wrapping.
