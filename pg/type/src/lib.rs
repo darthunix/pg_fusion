@@ -15,6 +15,9 @@ use std::collections::BTreeMap;
 use std::sync::Arc;
 use thiserror::Error;
 
+pub mod numeric;
+pub use numeric::{numeric_to_decimal128, NumericDecodeError};
+
 pub mod oid {
     pub const BOOLOID: u32 = 16;
     pub const BYTEAOID: u32 = 17;
