@@ -6,6 +6,7 @@ use issuance::{
     encode_issued_frame, IssuanceConfig, IssuancePool, IssueEvent, IssuedFrameDecoder,
     IssuedReceivedPage, IssuedRx, IssuedTx,
 };
+use pgrx::fcinfo::direct_function_call_as_datum;
 use pgrx::prelude::*;
 use pgrx::varlena::{text_to_rust_str_unchecked, varlena_to_byte_slice};
 use pgrx::PgMemoryContexts;
@@ -13,6 +14,7 @@ use pool::{PagePool, PagePoolConfig};
 use slot_encoder::{AppendStatus, PageBatchEncoder};
 use slot_import::{ArrowSlotProjector, ConfigError, ProjectError};
 use std::alloc::{alloc_zeroed, dealloc, Layout};
+use std::ffi::CStr;
 use std::ptr::NonNull;
 use std::slice;
 use std::sync::Arc;
@@ -22,6 +24,7 @@ const SLOT_IMPORT_TABLE: &str = "pg_temp.slot_import_fixture";
 const SLOT_IMPORT_NAME_TABLE: &str = "pg_temp.slot_import_name_fixture";
 const SLOT_IMPORT_VARCHAR_TABLE: &str = "pg_temp.slot_import_varchar_fixture";
 const SLOT_IMPORT_BPCHAR_TABLE: &str = "pg_temp.slot_import_bpchar_fixture";
+const SLOT_IMPORT_NUMERIC_TABLE: &str = "pg_temp.slot_import_numeric_fixture";
 const SLOT_IMPORT_PAGE_SIZE: usize = 8192;
 const SLOT_IMPORT_PAGE_COUNT: u32 = 4;
 
@@ -327,6 +330,17 @@ fn reset_slot_import_bpchar_table() {
     Spi::run("CREATE TEMP TABLE slot_import_bpchar_fixture (v char(5))").unwrap();
 }
 
+fn reset_slot_import_numeric_table() {
+    Spi::run("DROP TABLE IF EXISTS pg_temp.slot_import_numeric_fixture").unwrap();
+    Spi::run(
+        "CREATE TEMP TABLE slot_import_numeric_fixture (
+            fixed numeric(12,3),
+            bare numeric
+        )",
+    )
+    .unwrap();
+}
+
 unsafe fn relation_open_by_name(qualified: &str) -> pg_sys::Relation {
     let sql = format!("SELECT '{}'::regclass::oid", qualified);
     let relid: pg_sys::Oid = Spi::get_one(&sql).unwrap().unwrap();
@@ -483,6 +497,56 @@ fn send_manual_page(
     }
 }
 
+fn send_manual_decimal_page(
+    tx: &PageTx,
+    rx: &PageRx,
+    schema: &Schema,
+    payload_capacity: usize,
+    rows: &[(Option<i128>, Option<i128>)],
+) -> AnyResult<ReceivedPage> {
+    let plan = LayoutPlan::from_arrow_schema(
+        schema,
+        u32::try_from(rows.len())?,
+        u32::try_from(payload_capacity)?,
+    )?;
+    let mut writer = tx.begin(ARROW_LAYOUT_BATCH_KIND, 0)?;
+    {
+        let payload = writer.payload_mut();
+        init_block(payload, &plan)?;
+        let mut block = BlockMut::open(payload)?;
+        for (row_idx, (fixed, bare)) in rows.iter().enumerate() {
+            let row_idx = u32::try_from(row_idx)?;
+            if let Some(value) = fixed {
+                block.write_fixed(0, row_idx, &value.to_ne_bytes())?;
+            } else {
+                block.write_null(0, row_idx)?;
+            }
+            if let Some(value) = bare {
+                block.write_fixed(1, row_idx, &value.to_ne_bytes())?;
+            } else {
+                block.write_null(1, row_idx)?;
+            }
+            block.commit_current_row()?;
+        }
+        block.validate()?;
+    }
+    let payload_len = writer.payload_mut().len();
+    let outbound = writer.finish_with_payload_len(payload_len)?;
+    let frame = encode_frame(outbound.frame())?;
+    outbound.mark_sent();
+
+    let mut decoder = FrameDecoder::new();
+    let frame = decoder
+        .push(&frame)
+        .next()
+        .transpose()?
+        .ok_or_else(|| anyhow!("no frame decoded"))?;
+    match rx.accept(frame)? {
+        ReceiveEvent::Page(page) => Ok(page),
+        ReceiveEvent::Closed => bail!("unexpected close frame"),
+    }
+}
+
 fn send_issued_encoded_page(
     tx: &IssuedTx,
     rx: &IssuedRx,
@@ -568,6 +632,28 @@ unsafe fn decode_first_text_value(slot: *mut pg_sys::TupleTableSlot) -> Option<S
     } else {
         Some(text_to_rust_str_unchecked(values[0].cast_mut_ptr()).to_owned())
     }
+}
+
+unsafe fn decode_numeric_text_values(
+    slot: *mut pg_sys::TupleTableSlot,
+    column_count: usize,
+) -> Vec<Option<String>> {
+    let slot_ref = &*slot;
+    let values = slice::from_raw_parts(slot_ref.tts_values, slot_ref.tts_nvalid as usize);
+    let isnull = slice::from_raw_parts(slot_ref.tts_isnull, slot_ref.tts_nvalid as usize);
+    (0..column_count)
+        .map(|index| {
+            if isnull[index] {
+                None
+            } else {
+                let output =
+                    direct_function_call_as_datum(pg_sys::numeric_out, &[Some(values[index])])
+                        .expect("numeric_out should return cstring");
+                let ptr = output.cast_mut_ptr::<std::os::raw::c_char>();
+                Some(CStr::from_ptr(ptr).to_str().unwrap().to_owned())
+            }
+        })
+        .collect()
 }
 
 fn expected_decoded_rows() -> Vec<DecodedRow> {
@@ -748,6 +834,54 @@ pub fn slot_import_uuid_is_page_backed_but_text_and_bytea_are_copied() {
         .expect("advance")
         .is_some()
     {}
+    assert_eq!(harness.pool.snapshot().leased_pages, 0);
+}
+
+pub fn slot_import_projects_decimal128_numeric_values() {
+    reset_slot_import_numeric_table();
+    let relation = OpenRelation::open(SLOT_IMPORT_NUMERIC_TABLE);
+    let tupdesc = relation.tuple_desc();
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("fixed", DataType::Decimal128(12, 3), true),
+        Field::new("bare", DataType::Decimal128(38, 16), true),
+    ]));
+    let rows = [
+        (Some(12_340_i128), Some(12_300_000_000_000_000_i128)),
+        (Some(-125_i128), Some(10_000_000_000_000_000_i128)),
+        (None, None),
+    ];
+    let harness = init_import_harness().expect("harness");
+    let page = send_manual_decimal_page(
+        &harness.tx,
+        &harness.rx,
+        schema.as_ref(),
+        harness.payload_capacity,
+        &rows,
+    )
+    .expect("decimal page");
+
+    let per_tuple_memory = PgMemoryContexts::new("slot_import_numeric");
+    let mut projector =
+        unsafe { ArrowSlotProjector::new(schema, tupdesc, per_tuple_memory.value()) }
+            .expect("projector");
+    let mut cursor = projector.open_page(page).expect("cursor");
+    let mut output_slot = OwnedVirtualSlot::new(tupdesc).expect("output slot");
+
+    let mut decoded = Vec::new();
+    while let Some(slot) = unsafe { cursor.next_into_slot(output_slot.as_mut_ptr()) }.expect("row")
+    {
+        decoded.push(unsafe { decode_numeric_text_values(slot, 2) });
+        assert_eq!(harness.pool.snapshot().leased_pages, 1);
+    }
+
+    assert_eq!(
+        decoded,
+        vec![
+            vec![Some("12.340".to_owned()), Some("1.23".to_owned())],
+            vec![Some("-0.125".to_owned()), Some("1".to_owned())],
+            vec![None, None],
+        ]
+    );
     assert_eq!(harness.pool.snapshot().leased_pages, 0);
 }
 

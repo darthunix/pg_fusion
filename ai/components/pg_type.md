@@ -25,8 +25,19 @@ helpers instead of passing raw date integers through. PostgreSQL `DATE
 The crate intentionally does not read or write PostgreSQL `Datum` values.
 PostgreSQL-bound crates such as `slot_encoder`, `slot_import`, and
 `pg_frontend` adapters keep ownership of memory contexts, TOAST/detoast,
-varlena layout, fixed-size `NameData`, numeric/interval struct access, and
-tuple-slot projection.
+generic varlena pointer handling, fixed-size `NameData`, interval struct
+access, and tuple-slot projection.
+
+`pg/type::numeric` owns the PostgreSQL-runtime-free conversion between finite
+PostgreSQL `numeric` varlena layout and Arrow Decimal128. Backend scan encoding
+decodes detoasted PostgreSQL numeric bytes into Decimal128, and result slot
+projection encodes Decimal128 back into PostgreSQL numeric varlena bytes using
+stack-backed scratch buffers before the PostgreSQL-bound `slot_import` layer
+copies them into the per-tuple memory context. Decimal result projection must
+not round-trip through decimal strings or `numeric_in`; the remaining allocation
+on this path is the required PostgreSQL `palloc` for the result `Datum`. Numeric
+varlena length headers must use PostgreSQL's endian-specific 4-byte varlena
+packing; numeric payload fields remain native-endian PostgreSQL layout.
 
 `timestamp` and `timestamptz` currently share the same Arrow transport type
 (`Timestamp(Microsecond, None)`), so callers that render SQL or expose

@@ -8,14 +8,16 @@ use arrow_array::{
 use arrow_layout::TypeTag;
 use arrow_schema::{DataType, Field, SchemaRef, TimeUnit};
 use import::{ArrowPageDecoder, OwnedPage};
-use pg_type::{oid as pg_oid, pg_date_from_date32, type_tag_for_pg_type, PgTypeRef};
+use pg_type::{
+    decimal128_to_numeric_varlena, oid as pg_oid, pg_date_from_date32, type_tag_for_pg_type,
+    NumericVarlenaBuf, PgTypeRef,
+};
 use pgrx::fcinfo::direct_function_call_as_datum;
 use pgrx::pg_sys;
 use pgrx::pg_sys::panic::CaughtError;
 use pgrx::varlena::{rust_byte_slice_to_bytea, rust_str_to_text_p};
-use pgrx::{IntoDatum, PgMemoryContexts, PgTryBuilder};
+use pgrx::{PgMemoryContexts, PgTryBuilder};
 use std::convert::TryFrom;
-use std::ffi::CString;
 use std::panic::AssertUnwindSafe;
 use std::{ptr, slice};
 use transfer::ReceivedPage;
@@ -718,22 +720,15 @@ fn numeric_datum(
     scale: i8,
     trim_trailing_zeros: bool,
 ) -> Result<pg_sys::Datum, ProjectError> {
-    let rendered = format_decimal128(value, scale, trim_trailing_zeros);
-    let cstring = CString::new(rendered)
-        .map_err(|_| ProjectError::Postgres("numeric text contained NUL byte".to_owned()))?;
-    PgTryBuilder::new(AssertUnwindSafe(|| unsafe {
-        direct_function_call_as_datum(
-            pg_sys::numeric_in,
-            &[
-                cstring.as_c_str().into_datum(),
-                pg_sys::InvalidOid.into_datum(),
-                (-1_i32).into_datum(),
-            ],
-        )
-        .ok_or_else(|| ProjectError::Postgres("numeric_in returned null datum".to_owned()))
-    }))
-    .catch_others(|error| Err(project_error_from_caught_error(error)))
-    .execute()
+    let mut numeric_buf = NumericVarlenaBuf::new();
+    let varlena =
+        decimal128_to_numeric_varlena(value, scale, trim_trailing_zeros, &mut numeric_buf)
+            .map_err(|err| ProjectError::Postgres(err.to_string()))?;
+    let ptr = unsafe { pg_sys::palloc(varlena.len()) } as *mut u8;
+    unsafe {
+        ptr::copy_nonoverlapping(varlena.as_ptr(), ptr, varlena.len());
+    }
+    Ok(pg_sys::Datum::from(ptr))
 }
 
 fn interval_datum(
@@ -759,60 +754,6 @@ fn interval_datum(
         (*ptr).month = months;
     }
     Ok(pg_sys::Datum::from(ptr))
-}
-
-fn format_decimal128(value: i128, scale: i8, trim_trailing_zeros: bool) -> String {
-    let negative = value.is_negative();
-    let mut digits = value.unsigned_abs().to_string();
-    match scale.cmp(&0) {
-        std::cmp::Ordering::Equal => {}
-        std::cmp::Ordering::Less => {
-            let extra_zeros = usize::from(scale.unsigned_abs());
-            digits.extend(std::iter::repeat_n('0', extra_zeros));
-        }
-        std::cmp::Ordering::Greater => {
-            let scale = scale as usize;
-            if digits.len() <= scale {
-                let mut rendered = String::with_capacity(2 + scale + usize::from(negative));
-                if negative {
-                    rendered.push('-');
-                }
-                rendered.push_str("0.");
-                rendered.extend(std::iter::repeat_n('0', scale - digits.len()));
-                rendered.push_str(&digits);
-                if trim_trailing_zeros {
-                    trim_integer_decimal_fraction(&mut rendered);
-                }
-                return rendered;
-            }
-            let split = digits.len() - scale;
-            digits.insert(split, '.');
-            if trim_trailing_zeros {
-                trim_integer_decimal_fraction(&mut digits);
-            }
-        }
-    }
-
-    if negative {
-        let mut rendered = String::with_capacity(digits.len() + 1);
-        rendered.push('-');
-        rendered.push_str(&digits);
-        rendered
-    } else {
-        digits
-    }
-}
-
-fn trim_integer_decimal_fraction(value: &mut String) {
-    let Some(dot) = value.find('.') else {
-        return;
-    };
-    while value.ends_with('0') {
-        value.pop();
-    }
-    if value.len() == dot + 1 {
-        value.pop();
-    }
 }
 
 fn apply_text_typmod(
@@ -869,21 +810,6 @@ pub(crate) fn set_test_database_encoding(encoding: i32) -> i32 {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn format_decimal128_renders_scaled_values_for_numeric_in() {
-        assert_eq!(format_decimal128(123456789, 4, false), "12345.6789");
-        assert_eq!(format_decimal128(-50, 2, false), "-0.50");
-        assert_eq!(format_decimal128(42, 0, false), "42");
-        assert_eq!(format_decimal128(42, -2, false), "4200");
-    }
-
-    #[test]
-    fn format_decimal128_can_trim_bare_numeric_integer_fallback_scale() {
-        assert_eq!(format_decimal128(1230000, 6, true), "1.23");
-        assert_eq!(format_decimal128(1000000, 6, true), "1");
-        assert_eq!(format_decimal128(-500000, 6, true), "-0.5");
-    }
 
     #[test]
     fn numeric_projector_trims_only_for_bare_numeric_typmod() {

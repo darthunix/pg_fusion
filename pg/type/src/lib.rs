@@ -16,7 +16,10 @@ use std::sync::Arc;
 use thiserror::Error;
 
 pub mod numeric;
-pub use numeric::{numeric_to_decimal128, NumericDecodeError};
+pub use numeric::{
+    decimal128_to_numeric_varlena, numeric_to_decimal128, NumericDecodeError, NumericEncodeError,
+    NumericVarlenaBuf, NUMERIC_DECIMAL128_MAX_GROUPS, NUMERIC_DECIMAL128_MAX_VARLENA_BYTES,
+};
 
 pub mod oid {
     pub const BOOLOID: u32 = 16;

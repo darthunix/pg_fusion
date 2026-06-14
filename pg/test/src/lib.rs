@@ -568,6 +568,11 @@ mod tests {
     }
 
     #[pg_test]
+    fn slot_import_projects_decimal128_numeric_values() {
+        super::slot_import::slot_import_projects_decimal128_numeric_values();
+    }
+
+    #[pg_test]
     fn slot_import_rejects_schema_tupledesc_mismatch() {
         super::slot_import::slot_import_rejects_schema_tupledesc_mismatch();
     }
