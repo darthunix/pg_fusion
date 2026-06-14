@@ -53,6 +53,22 @@ pub enum ImportError {
         offset: u32,
         allocated_tail_start: u32,
     },
+    #[error("view at column {index}, row {row} has invalid length {len}")]
+    InvalidViewLength { index: usize, row: u32, len: u32 },
+    #[error("inline view at column {index}, row {row} with len {len} has non-zero padding")]
+    InvalidInlineViewPadding { index: usize, row: u32, len: u32 },
+    #[error("view at column {index}, row {row} has invalid buffer index {actual}; expected 0")]
+    InvalidViewBufferIndex { index: usize, row: u32, actual: u32 },
+    #[error("view at column {index}, row {row} offset {offset} with len {len} exceeds shared pool len {pool_len}")]
+    ViewOffsetOutOfBounds {
+        index: usize,
+        row: u32,
+        offset: u32,
+        len: u32,
+        pool_len: usize,
+    },
+    #[error("view at column {index}, row {row} prefix does not match shared pool bytes at offset {offset}")]
+    ViewPrefixMismatch { index: usize, row: u32, offset: u32 },
     #[error("payload range overflow: offset {offset}, len {len}")]
     PayloadRangeOverflow { offset: usize, len: usize },
     #[error("payload range offset {offset}, len {len} is out of bounds for payload of length {payload_len}")]

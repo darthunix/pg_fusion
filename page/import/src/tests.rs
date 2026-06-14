@@ -450,6 +450,74 @@ fn encode_layout_payload(batch: &RecordBatch, block_size: usize) -> Vec<u8> {
     payload
 }
 
+fn view_slot_range(payload: &[u8], col: usize, row: usize) -> std::ops::Range<usize> {
+    let block = BlockRef::open(payload).expect("block");
+    let layout = block.column_layout(col).expect("view layout");
+    let start =
+        usize::try_from(layout.values_off).expect("offset") + row * std::mem::size_of::<ByteView>();
+    start..start + std::mem::size_of::<ByteView>()
+}
+
+fn view_slot_raw(payload: &[u8], col: usize, row: usize) -> u128 {
+    let range = view_slot_range(payload, col, row);
+    u128::from_ne_bytes(payload[range].try_into().expect("view slot"))
+}
+
+fn write_view_slot_raw(payload: &mut [u8], col: usize, row: usize, raw: u128) {
+    let range = view_slot_range(payload, col, row);
+    payload[range].copy_from_slice(&raw.to_ne_bytes());
+}
+
+fn set_view_buffer_index(payload: &mut [u8], col: usize, row: usize, buffer_index: u32) {
+    let raw = view_slot_raw(payload, col, row);
+    let raw = (raw & !(u128::from(u32::MAX) << 64)) | (u128::from(buffer_index) << 64);
+    write_view_slot_raw(payload, col, row, raw);
+}
+
+fn set_view_offset(payload: &mut [u8], col: usize, row: usize, offset: u32) {
+    let raw = view_slot_raw(payload, col, row);
+    let raw = (raw & !(u128::from(u32::MAX) << 96)) | (u128::from(offset) << 96);
+    write_view_slot_raw(payload, col, row, raw);
+}
+
+fn set_view_prefix(payload: &mut [u8], col: usize, row: usize, prefix: u32) {
+    let raw = view_slot_raw(payload, col, row);
+    let raw = (raw & !(u128::from(u32::MAX) << 32)) | (u128::from(prefix) << 32);
+    write_view_slot_raw(payload, col, row, raw);
+}
+
+fn set_inline_view_padding(payload: &mut [u8], col: usize, row: usize) {
+    let raw = view_slot_raw(payload, col, row);
+    let len = raw as u32;
+    assert!(len < arrow_layout::constants::VIEW_INLINE_LEN as u32);
+    let raw = raw | (0xFFu128 << (32 + len * 8));
+    write_view_slot_raw(payload, col, row, raw);
+}
+
+fn write_long_view_raw(
+    payload: &mut [u8],
+    col: usize,
+    row: usize,
+    len: u32,
+    prefix: u32,
+    buffer_index: u32,
+    offset: u32,
+) {
+    assert!(len > arrow_layout::constants::VIEW_INLINE_LEN as u32);
+    let raw = u128::from(len)
+        | (u128::from(prefix) << 32)
+        | (u128::from(buffer_index) << 64)
+        | (u128::from(offset) << 96);
+    write_view_slot_raw(payload, col, row, raw);
+}
+
+fn shared_pool_capacity(payload: &[u8]) -> u32 {
+    BlockRef::open(payload)
+        .expect("block")
+        .shared_pool_capacity()
+        .expect("shared pool capacity")
+}
+
 #[test]
 fn imports_mixed_batch_zero_copy() {
     let batch = mixed_batch();
@@ -623,12 +691,7 @@ fn rejects_schema_type_mismatch() {
 fn rejects_invalid_view_buffer_index() {
     let batch = mixed_batch();
     let mut payload = encode_layout_payload(&batch, 4096);
-    let block = BlockRef::open(&payload).expect("block");
-    let layout = block.column_layout(10).expect("txt layout");
-    let row = 2usize;
-    let slot_off =
-        usize::try_from(layout.values_off).expect("offset") + row * std::mem::size_of::<ByteView>();
-    payload[slot_off + 4..slot_off + 8].copy_from_slice(&1i32.to_le_bytes());
+    set_view_buffer_index(&mut payload, 10, 2, 1);
 
     let (_region, pool) = init_pool(cfg(8192, 1));
     let page = send_page(pool, ARROW_LAYOUT_BATCH_KIND, 0, &payload);
@@ -636,7 +699,97 @@ fn rejects_invalid_view_buffer_index() {
     let err = decoder.import(page).expect_err("invalid view");
     assert!(matches!(
         err,
-        ImportError::Arrow(arrow_schema::ArrowError::InvalidArgumentError(_))
+        ImportError::InvalidViewBufferIndex {
+            index: 10,
+            row: 2,
+            actual: 1
+        }
+    ));
+    assert_eq!(pool.snapshot().leased_pages, 0);
+}
+
+#[test]
+fn rejects_invalid_inline_view_padding() {
+    let batch = mixed_batch();
+    let mut payload = encode_layout_payload(&batch, 4096);
+    set_inline_view_padding(&mut payload, 10, 0);
+
+    let (_region, pool) = init_pool(cfg(8192, 1));
+    let page = send_page(pool, ARROW_LAYOUT_BATCH_KIND, 0, &payload);
+    let decoder = ArrowPageDecoder::new(batch.schema()).expect("decoder");
+    let err = decoder.import(page).expect_err("invalid inline padding");
+    assert!(matches!(
+        err,
+        ImportError::InvalidInlineViewPadding {
+            index: 10,
+            row: 0,
+            len: 5
+        }
+    ));
+    assert_eq!(pool.snapshot().leased_pages, 0);
+}
+
+#[test]
+fn rejects_view_offset_out_of_bounds() {
+    let batch = mixed_batch();
+    let mut payload = encode_layout_payload(&batch, 4096);
+    let pool_capacity = shared_pool_capacity(&payload);
+    set_view_offset(&mut payload, 10, 2, pool_capacity - 1);
+
+    let (_region, pool) = init_pool(cfg(8192, 1));
+    let page = send_page(pool, ARROW_LAYOUT_BATCH_KIND, 0, &payload);
+    let decoder = ArrowPageDecoder::new(batch.schema()).expect("decoder");
+    let err = decoder.import(page).expect_err("view offset out of bounds");
+    assert!(matches!(
+        err,
+        ImportError::ViewOffsetOutOfBounds {
+            index: 10,
+            row: 2,
+            offset,
+            ..
+        } if offset == pool_capacity - 1
+    ));
+    assert_eq!(pool.snapshot().leased_pages, 0);
+}
+
+#[test]
+fn rejects_view_prefix_mismatch() {
+    let batch = mixed_batch();
+    let mut payload = encode_layout_payload(&batch, 4096);
+    set_view_prefix(&mut payload, 10, 2, 0);
+
+    let (_region, pool) = init_pool(cfg(8192, 1));
+    let page = send_page(pool, ARROW_LAYOUT_BATCH_KIND, 0, &payload);
+    let decoder = ArrowPageDecoder::new(batch.schema()).expect("decoder");
+    let err = decoder.import(page).expect_err("view prefix mismatch");
+    assert!(matches!(
+        err,
+        ImportError::ViewPrefixMismatch {
+            index: 10,
+            row: 2,
+            ..
+        }
+    ));
+    assert_eq!(pool.snapshot().leased_pages, 0);
+}
+
+#[test]
+fn rejects_invalid_null_row_view_slot() {
+    let batch = mixed_batch();
+    let mut payload = encode_layout_payload(&batch, 4096);
+    write_long_view_raw(&mut payload, 10, 1, 13, u32::from_le_bytes(*b"null"), 1, 0);
+
+    let (_region, pool) = init_pool(cfg(8192, 1));
+    let page = send_page(pool, ARROW_LAYOUT_BATCH_KIND, 0, &payload);
+    let decoder = ArrowPageDecoder::new(batch.schema()).expect("decoder");
+    let err = decoder.import(page).expect_err("invalid null row view");
+    assert!(matches!(
+        err,
+        ImportError::InvalidViewBufferIndex {
+            index: 10,
+            row: 1,
+            actual: 1
+        }
     ));
     assert_eq!(pool.snapshot().leased_pages, 0);
 }

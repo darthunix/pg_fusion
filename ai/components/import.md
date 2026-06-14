@@ -22,6 +22,9 @@ importance: 0.72
   - page payload is exactly one validated `arrow_layout` block
   - external Arrow schema must match the on-page layout exactly
   - string/binary columns must use `Utf8View` / `BinaryView`
+  - `Utf8View` / `BinaryView` import validates `ByteView` structure and tail
+    bounds but does not rescan UTF-8 bytes; UTF-8 validity is a producer
+    contract enforced before text-like PostgreSQL pages are encoded
   - finite PostgreSQL intervals use Arrow `Interval(MonthDayNano)` fixed-width
     slots; interval infinities are outside the page contract
 - Ownership model:

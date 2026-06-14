@@ -30,7 +30,9 @@ use arrow_array::{
 use arrow_buffer::alloc::Allocation;
 use arrow_buffer::{BooleanBuffer, Buffer, NullBuffer, ScalarBuffer};
 use arrow_layout::bitmap::bitmap_bytes;
-use arrow_layout::constants::UUID_WIDTH_BYTES;
+use arrow_layout::constants::{
+    SHARED_VIEW_BUFFER_INDEX, UUID_WIDTH_BYTES, VIEW_INLINE_LEN, VIEW_PREFIX_LEN,
+};
 use arrow_layout::{BlockRef, ColumnLayout, LayoutError, TypeTag};
 use arrow_schema::{DataType, SchemaRef};
 pub use error::{ConfigError, ImportError};
@@ -398,16 +400,19 @@ impl ArrowPageDecoder {
         shared_pool: SharedPoolImport,
         nulls: Option<NullBuffer>,
     ) -> Result<StringViewArray, ImportError> {
-        self.validate_view_tail(
-            owner,
+        let views = self.import_view_slots(owner, layout, row_count)?;
+        let shared_pool_buffer = owner.buffer_from_payload(shared_pool.offset, shared_pool.len)?;
+        Self::validate_view_slots(
             index,
-            layout,
-            row_count,
+            &views,
+            shared_pool_buffer.as_slice(),
             shared_pool.allocated_tail_start,
         )?;
-        let views = self.import_view_slots(owner, layout, row_count)?;
-        let shared_pool = owner.buffer_from_payload(shared_pool.offset, shared_pool.len)?;
-        Ok(StringViewArray::try_new(views, vec![shared_pool], nulls)?)
+        // SAFETY: `validate_view_slots` checks the ByteView structure Arrow needs
+        // for safe access. UTF-8 validity is a producer contract: PostgreSQL scan
+        // encoding allows Utf8View only under PG_UTF8, and Arrow/DataFusion result
+        // producers already hold valid string arrays.
+        Ok(unsafe { StringViewArray::new_unchecked(views, vec![shared_pool_buffer], nulls) })
     }
 
     fn import_binary_view(
@@ -419,16 +424,17 @@ impl ArrowPageDecoder {
         shared_pool: SharedPoolImport,
         nulls: Option<NullBuffer>,
     ) -> Result<BinaryViewArray, ImportError> {
-        self.validate_view_tail(
-            owner,
+        let views = self.import_view_slots(owner, layout, row_count)?;
+        let shared_pool_buffer = owner.buffer_from_payload(shared_pool.offset, shared_pool.len)?;
+        Self::validate_view_slots(
             index,
-            layout,
-            row_count,
+            &views,
+            shared_pool_buffer.as_slice(),
             shared_pool.allocated_tail_start,
         )?;
-        let views = self.import_view_slots(owner, layout, row_count)?;
-        let shared_pool = owner.buffer_from_payload(shared_pool.offset, shared_pool.len)?;
-        Ok(BinaryViewArray::try_new(views, vec![shared_pool], nulls)?)
+        // SAFETY: `validate_view_slots` checks the ByteView structure Arrow needs
+        // for safe access. BinaryView has no additional UTF-8 invariant.
+        Ok(unsafe { BinaryViewArray::new_unchecked(views, vec![shared_pool_buffer], nulls) })
     }
 
     fn import_view_slots(
@@ -451,34 +457,78 @@ impl ArrowPageDecoder {
         ))
     }
 
-    fn validate_view_tail(
-        &self,
-        owner: &Arc<PageAllocationOwner>,
+    fn validate_view_slots(
         index: usize,
-        layout: &ColumnLayout,
-        row_count: u32,
+        views: &[u128],
+        shared_pool: &[u8],
         allocated_tail_start: u32,
     ) -> Result<(), ImportError> {
-        owner.inspect(|payload| {
-            let block = BlockRef::open(payload)?;
-            for row in 0..row_count {
-                if layout.flags.is_nullable() && !block.validity(index, row)? {
-                    continue;
-                }
-                let view = block.view(index, row)?;
-                if let Some(offset) = view.offset()? {
-                    if offset < allocated_tail_start {
-                        return Err(ImportError::ViewOffsetBeforeAllocatedTail {
-                            index,
-                            row,
-                            offset,
-                            allocated_tail_start,
-                        });
+        for (row, view) in views.iter().copied().enumerate() {
+            let row = u32::try_from(row).map_err(|_| LayoutError::SizeOverflow)?;
+            let len = view as u32;
+            if len > i32::MAX as u32 {
+                return Err(ImportError::InvalidViewLength { index, row, len });
+            }
+
+            if (len as usize) <= VIEW_INLINE_LEN {
+                if (len as usize) < VIEW_INLINE_LEN {
+                    let padding_shift = 32 + len * 8;
+                    if (view >> padding_shift) != 0 {
+                        return Err(ImportError::InvalidInlineViewPadding { index, row, len });
                     }
                 }
+                continue;
             }
-            Ok(())
-        })
+
+            let actual_buffer_index = (view >> 64) as u32;
+            if actual_buffer_index != SHARED_VIEW_BUFFER_INDEX as u32 {
+                return Err(ImportError::InvalidViewBufferIndex {
+                    index,
+                    row,
+                    actual: actual_buffer_index,
+                });
+            }
+
+            let offset = (view >> 96) as u32;
+            if offset > i32::MAX as u32 {
+                return Err(ImportError::ViewOffsetOutOfBounds {
+                    index,
+                    row,
+                    offset,
+                    len,
+                    pool_len: shared_pool.len(),
+                });
+            }
+            if offset < allocated_tail_start {
+                return Err(ImportError::ViewOffsetBeforeAllocatedTail {
+                    index,
+                    row,
+                    offset,
+                    allocated_tail_start,
+                });
+            }
+
+            let start = usize::try_from(offset).map_err(|_| LayoutError::SizeOverflow)?;
+            let len_usize = usize::try_from(len).map_err(|_| LayoutError::SizeOverflow)?;
+            let end = start
+                .checked_add(len_usize)
+                .ok_or(LayoutError::SizeOverflow)?;
+            let Some(value) = shared_pool.get(start..end) else {
+                return Err(ImportError::ViewOffsetOutOfBounds {
+                    index,
+                    row,
+                    offset,
+                    len,
+                    pool_len: shared_pool.len(),
+                });
+            };
+
+            let prefix = ((view >> 32) as u32).to_le_bytes();
+            if !value.starts_with(&prefix[..VIEW_PREFIX_LEN]) {
+                return Err(ImportError::ViewPrefixMismatch { index, row, offset });
+            }
+        }
+        Ok(())
     }
 }
 
