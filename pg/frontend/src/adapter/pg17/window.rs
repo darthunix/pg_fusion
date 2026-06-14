@@ -143,7 +143,7 @@ pub(super) fn window_frame_offset_is_negative(constant: &Const) -> bool {
         Some(PgConstValue::Int64(value)) => *value < 0,
         Some(PgConstValue::Float32(value)) => value.is_sign_negative(),
         Some(PgConstValue::Float64(value)) => value.is_sign_negative(),
-        Some(PgConstValue::Numeric(value)) => value.starts_with('-'),
+        Some(PgConstValue::Numeric(value)) => value.value < 0,
         _ => false,
     }
 }

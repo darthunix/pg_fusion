@@ -34,8 +34,10 @@ decodes detoasted PostgreSQL numeric bytes into Decimal128, and result slot
 projection encodes Decimal128 back into PostgreSQL numeric varlena bytes using
 stack-backed scratch buffers before the PostgreSQL-bound `slot_import` layer
 copies them into the per-tuple memory context. Decimal result projection must
-not round-trip through decimal strings or `numeric_in`; the remaining allocation
-on this path is the required PostgreSQL `palloc` for the result `Datum`. Numeric
+not round-trip through decimal strings or `numeric_in`; frontend numeric
+constants also decode through the same varlena-to-Decimal128 helpers after the
+PostgreSQL-bound adapter detoasts the `Datum`. The remaining allocation on the
+result path is the required PostgreSQL `palloc` for the result `Datum`. Numeric
 varlena length headers must use PostgreSQL's endian-specific 4-byte varlena
 packing; numeric payload fields remain native-endian PostgreSQL layout.
 

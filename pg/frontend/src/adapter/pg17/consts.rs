@@ -44,11 +44,9 @@ pub(super) unsafe fn read_const(constant: &pg_sys::Const) -> Result<Const, PgFro
         oid if oid == pg_sys::FLOAT8OID => {
             PgConstValue::Float64(unsafe { f64::from_datum(constant.constvalue, false) }.unwrap())
         }
-        oid if oid == pg_sys::NUMERICOID => PgConstValue::Numeric(
-            unsafe { pgrx::AnyNumeric::from_datum(constant.constvalue, false) }
-                .unwrap()
-                .to_string(),
-        ),
+        oid if oid == pg_sys::NUMERICOID => unsafe {
+            read_numeric_const(constant.constvalue, pg_type)?
+        },
         oid if oid == pg_sys::TEXTOID || oid == pg_sys::VARCHAROID || oid == pg_sys::BPCHAROID => {
             PgConstValue::Text(
                 unsafe {
@@ -95,6 +93,61 @@ pub(super) unsafe fn read_const(constant: &pg_sys::Const) -> Result<Const, PgFro
         pg_type,
         value: Some(value),
     })
+}
+
+unsafe fn read_numeric_const(
+    datum: pg_sys::Datum,
+    pg_type: PgTypeRef,
+) -> Result<PgConstValue, PgFrontendError> {
+    let (precision, scale) = numeric_shape_from_typmod(pg_type.typmod).ok_or_else(|| {
+        PgFrontendError::unsupported(format!(
+            "unsupported numeric typmod {} in constant",
+            pg_type.typmod
+        ))
+    })?;
+    let original = datum.cast_mut_ptr::<pg_sys::varlena>();
+    if original.is_null() {
+        return Err(PgFrontendError::unsupported("null numeric datum pointer"));
+    }
+    let detoasted = unsafe { pg_sys::pg_detoast_datum(original) };
+    if detoasted.is_null() {
+        return Err(PgFrontendError::unsupported(
+            "null detoasted numeric datum pointer",
+        ));
+    }
+
+    let is_copy = !std::ptr::eq(detoasted, original);
+    let result = (|| {
+        let len = unsafe { pgrx::varlena::varsize_4b(detoasted) };
+        let bytes = unsafe { slice::from_raw_parts(detoasted.cast::<u8>(), len) };
+        let value = numeric_to_decimal128(bytes, scale, precision).map_err(numeric_const_error)?;
+        let display_scale = numeric_display_scale(bytes).map_err(numeric_const_error)?;
+        let display_scale = i8::try_from(display_scale).map_err(|_| {
+            PgFrontendError::unsupported(
+                "numeric constant display scale exceeds Decimal128 scale support",
+            )
+        })?;
+        Ok(PgConstValue::Numeric(PgNumericConst {
+            value,
+            scale,
+            display_scale,
+        }))
+    })();
+    if is_copy {
+        unsafe { pg_sys::pfree(detoasted.cast()) };
+    }
+    result
+}
+
+fn numeric_const_error(error: NumericDecodeError) -> PgFrontendError {
+    match error {
+        NumericDecodeError::Special => PgFrontendError::unsupported(
+            "pg_fusion Decimal128 numeric cannot represent PostgreSQL numeric NaN/Infinity values",
+        ),
+        NumericDecodeError::OutOfRange => {
+            PgFrontendError::unsupported("numeric constant is outside pg_fusion Decimal128 support")
+        }
+    }
 }
 
 pub(super) unsafe fn read_unknown_const(datum: pg_sys::Datum) -> Result<String, PgFrontendError> {

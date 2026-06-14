@@ -17,8 +17,9 @@ use thiserror::Error;
 
 pub mod numeric;
 pub use numeric::{
-    decimal128_to_numeric_varlena, numeric_to_decimal128, NumericDecodeError, NumericEncodeError,
-    NumericVarlenaBuf, NUMERIC_DECIMAL128_MAX_GROUPS, NUMERIC_DECIMAL128_MAX_VARLENA_BYTES,
+    decimal128_to_numeric_varlena, numeric_display_scale, numeric_to_decimal128,
+    NumericDecodeError, NumericEncodeError, NumericVarlenaBuf, NUMERIC_DECIMAL128_MAX_GROUPS,
+    NUMERIC_DECIMAL128_MAX_VARLENA_BYTES,
 };
 
 pub mod oid {
@@ -99,11 +100,18 @@ pub enum PgConstValue {
     Int64(i64),
     Float32(f32),
     Float64(f64),
-    Numeric(String),
+    Numeric(PgNumericConst),
     Text(String),
     Binary(Vec<u8>),
     Date32(i32),
     Time64Microsecond(i64),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PgNumericConst {
+    pub value: i128,
+    pub scale: i8,
+    pub display_scale: i8,
 }
 
 #[derive(Debug, Error, Clone, PartialEq, Eq)]
@@ -522,11 +530,15 @@ pub fn scalar_for_pg_const(
                     typmod: pg_type.typmod,
                 },
             )?;
-            Ok(ScalarValue::Decimal128(
-                Some(decimal128_for_numeric_text(value, precision, scale)?),
-                precision,
-                scale,
-            ))
+            if value.scale != scale
+                || value.display_scale > scale
+                || !decimal128_fits_precision(value.value, precision)
+            {
+                return Err(PgTypeError::UnsupportedConstValue {
+                    oid: oid::NUMERICOID,
+                });
+            }
+            Ok(ScalarValue::Decimal128(Some(value.value), precision, scale))
         }
         Some(PgConstValue::Text(value)) => Ok(ScalarValue::Utf8View(Some(value.clone()))),
         Some(PgConstValue::Binary(value)) => Ok(ScalarValue::BinaryView(Some(value.clone()))),
@@ -538,61 +550,8 @@ pub fn scalar_for_pg_const(
 }
 
 #[cfg(feature = "datafusion")]
-fn decimal128_for_numeric_text(value: &str, precision: u8, scale: i8) -> Result<i128, PgTypeError> {
-    let scale = usize::try_from(scale).map_err(|_| PgTypeError::UnsupportedConstValue {
-        oid: oid::NUMERICOID,
-    })?;
-    let value = value.trim();
-    if value.eq_ignore_ascii_case("nan")
-        || value.eq_ignore_ascii_case("infinity")
-        || value.eq_ignore_ascii_case("+infinity")
-        || value.eq_ignore_ascii_case("-infinity")
-    {
-        return Err(PgTypeError::UnsupportedConstValue {
-            oid: oid::NUMERICOID,
-        });
-    }
-
-    let (negative, unsigned) = match value.as_bytes().first().copied() {
-        Some(b'-') => (true, &value[1..]),
-        Some(b'+') => (false, &value[1..]),
-        _ => (false, value),
-    };
-    let (whole, fractional) = unsigned.split_once('.').unwrap_or((unsigned, ""));
-    if whole.is_empty() && fractional.is_empty()
-        || !whole.bytes().all(|byte| byte.is_ascii_digit())
-        || !fractional.bytes().all(|byte| byte.is_ascii_digit())
-        || fractional.len() > scale
-    {
-        return Err(PgTypeError::UnsupportedConstValue {
-            oid: oid::NUMERICOID,
-        });
-    }
-
-    let whole = whole.trim_start_matches('0');
-    let significant_whole = if whole.is_empty() { "" } else { whole };
-    let digit_count = significant_whole.len().saturating_add(scale);
-    if digit_count > usize::from(precision) {
-        return Err(PgTypeError::UnsupportedConstValue {
-            oid: oid::NUMERICOID,
-        });
-    }
-
-    let mut digits = String::with_capacity(significant_whole.len() + scale);
-    digits.push_str(significant_whole);
-    digits.push_str(fractional);
-    for _ in fractional.len()..scale {
-        digits.push('0');
-    }
-    if digits.is_empty() {
-        digits.push('0');
-    }
-    let scaled = digits
-        .parse::<i128>()
-        .map_err(|_| PgTypeError::UnsupportedConstValue {
-            oid: oid::NUMERICOID,
-        })?;
-    Ok(if negative { -scaled } else { scaled })
+fn decimal128_fits_precision(value: i128, precision: u8) -> bool {
+    value.unsigned_abs() < 10u128.pow(u32::from(precision))
 }
 
 #[cfg(feature = "datafusion")]
@@ -715,14 +674,22 @@ mod tests {
     #[test]
     fn maps_numeric_constants_to_decimal128() {
         let scalar = scalar_for_pg_const(
-            Some(&PgConstValue::Numeric("-12.5".into())),
+            Some(&PgConstValue::Numeric(PgNumericConst {
+                value: -1250,
+                scale: 2,
+                display_scale: 1,
+            })),
             PgTypeRef::new(oid::NUMERICOID, numeric_typmod(5, 2), 0),
         )
         .unwrap();
         assert_eq!(scalar, ScalarValue::Decimal128(Some(-1250), 5, 2));
 
         assert!(scalar_for_pg_const(
-            Some(&PgConstValue::Numeric("1.234".into())),
+            Some(&PgConstValue::Numeric(PgNumericConst {
+                value: 123,
+                scale: 2,
+                display_scale: 3,
+            })),
             PgTypeRef::new(oid::NUMERICOID, numeric_typmod(5, 2), 0),
         )
         .is_err());

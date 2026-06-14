@@ -2754,9 +2754,38 @@ mod tests {
     }
 
     fn numeric_const(value: &str) -> QueryExpr {
+        let trimmed = value.trim();
+        let (negative, unsigned) = match trimmed.as_bytes().first().copied() {
+            Some(b'-') => (true, &trimmed[1..]),
+            Some(b'+') => (false, &trimmed[1..]),
+            _ => (false, trimmed),
+        };
+        let (whole, fractional) = unsigned.split_once('.').unwrap_or((unsigned, ""));
+        let scale = pg_type::NUMERIC_FALLBACK_SCALE;
+        let display_scale = i8::try_from(fractional.len()).expect("test numeric display scale");
+        assert!(display_scale <= scale);
+
+        let mut digits = String::new();
+        digits.push_str(whole.trim_start_matches('0'));
+        digits.push_str(fractional);
+        for _ in fractional.len()..usize::try_from(scale).unwrap() {
+            digits.push('0');
+        }
+        if digits.is_empty() {
+            digits.push('0');
+        }
+        let mut unscaled = digits.parse::<i128>().expect("test numeric digits");
+        if negative {
+            unscaled = -unscaled;
+        }
+
         QueryExpr::Const(Const {
             pg_type: numeric_type(),
-            value: Some(PgConstValue::Numeric(value.into())),
+            value: Some(PgConstValue::Numeric(pg_type::PgNumericConst {
+                value: unscaled,
+                scale,
+                display_scale,
+            })),
         })
     }
 

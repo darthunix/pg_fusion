@@ -110,6 +110,29 @@ impl Default for NumericVarlenaBuf {
     }
 }
 
+fn numeric_header(varlena: &[u8]) -> Option<u16> {
+    let header_bytes = varlena.get(VARHDRSZ..VARHDRSZ + 2)?;
+    Some(u16::from_ne_bytes(header_bytes.try_into().unwrap()))
+}
+
+/// Reads the PostgreSQL display scale (`dscale`) from a finite `numeric`.
+///
+/// `varlena` must be the full detoasted numeric varlena including its 4-byte
+/// header. Special numeric values return [`NumericDecodeError::Special`].
+pub fn numeric_display_scale(varlena: &[u8]) -> Result<i32, NumericDecodeError> {
+    let Some(n_header) = numeric_header(varlena) else {
+        return Ok(0);
+    };
+    if (n_header & NUMERIC_SIGN_MASK) == NUMERIC_SPECIAL {
+        return Err(NumericDecodeError::Special);
+    }
+    if (n_header & NUMERIC_SHORT) != 0 {
+        Ok(i32::from((n_header & 0x1F80) >> NUMERIC_SHORT_DSCALE_SHIFT))
+    } else {
+        Ok(i32::from(n_header & NUMERIC_DSCALE_MASK))
+    }
+}
+
 /// Decodes a detoasted PostgreSQL `numeric` varlena into an Arrow `Decimal128`
 /// unscaled integer at `target_scale`.
 ///
@@ -120,17 +143,16 @@ impl Default for NumericVarlenaBuf {
 /// unscaled integer. Digits that fall entirely below the target scale must be
 /// zero (exact conversion); the magnitude must fit `max_precision` significant
 /// digits. Both conditions otherwise yield [`NumericDecodeError::OutOfRange`],
-/// matching the previous `numeric_out` text path.
+/// matching the previous decimal text path.
 pub fn numeric_to_decimal128(
     varlena: &[u8],
     target_scale: i8,
     max_precision: u8,
 ) -> Result<i128, NumericDecodeError> {
     // The numeric header word sits right after the 4-byte varlena header.
-    let Some(header_bytes) = varlena.get(VARHDRSZ..VARHDRSZ + 2) else {
+    let Some(n_header) = numeric_header(varlena) else {
         return Ok(0);
     };
-    let n_header = u16::from_ne_bytes(header_bytes.try_into().unwrap());
 
     if (n_header & NUMERIC_SIGN_MASK) == NUMERIC_SPECIAL {
         // NaN / +Inf / -Inf.
@@ -521,6 +543,12 @@ mod tests {
     #[cfg(target_endian = "big")]
     fn varlena_4b_len_word_uses_big_endian_packing() {
         assert_eq!(super::varlena_4b_len_word(42).unwrap(), 42);
+    }
+
+    #[test]
+    fn reads_numeric_display_scale() {
+        let buf = build_numeric_short(&[1200], 0, 4, false);
+        assert_eq!(super::numeric_display_scale(&buf).unwrap(), 4);
     }
 
     #[test]

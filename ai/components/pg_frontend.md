@@ -114,8 +114,9 @@ Finite `numeric` arithmetic that PostgreSQL analyzes as a `numeric` result is
 lowered with bounded Decimal128 operand/result scales before DataFusion sees the
 binary operator. Integer exact operands use scale 0, typmodded numeric operands
 use their typmod scale, bare numeric columns fall back to `Decimal128(38,16)`,
-and bare numeric literals use their literal fractional scale including trailing
-fractional zeros. `+`, `-`, and `%` use the maximum operand scale, while `*`
+and bare numeric literals use the PostgreSQL numeric varlena display scale
+recorded by the pg17 adapter, including trailing fractional zeros. `+`, `-`,
+and `%` use the maximum operand scale, while `*`
 uses the sum of operand scales. `/` uses the fallback result scale unless
 PostgreSQL supplied an explicit numeric typmod, and raises the left operand
 work scale before the binary operation so DataFusion computes the quotient at

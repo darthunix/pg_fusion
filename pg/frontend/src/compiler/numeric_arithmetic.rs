@@ -187,22 +187,9 @@ pub(super) fn numeric_literal_display_scale(constant: &Const) -> Option<i8> {
         pg_type::PgConstValue::Int16(_)
         | pg_type::PgConstValue::Int32(_)
         | pg_type::PgConstValue::Int64(_) => Some(0),
-        pg_type::PgConstValue::Numeric(value) => numeric_text_display_scale(value),
+        pg_type::PgConstValue::Numeric(value) => Some(value.display_scale),
         _ => None,
     }
-}
-
-fn numeric_text_display_scale(value: &str) -> Option<i8> {
-    let value = value.trim();
-    if is_nonfinite_numeric_text(value) {
-        return None;
-    }
-    let unsigned = match value.as_bytes().first().copied() {
-        Some(b'+') | Some(b'-') => &value[1..],
-        _ => value,
-    };
-    let (_, fractional) = unsigned.split_once('.').unwrap_or((unsigned, ""));
-    i8::try_from(fractional.len()).ok()
 }
 
 fn is_decimal_arithmetic_operand_oid(oid: u32) -> bool {
