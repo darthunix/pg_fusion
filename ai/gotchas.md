@@ -3,7 +3,7 @@ id: gotchas-0001
 type: gotcha
 scope: repo
 tags: ["shm", "pgrx", "slot_scan", "arrow", "testing"]
-updated_at: "2026-05-11"
+updated_at: "2026-06-14"
 importance: 0.7
 ---
 
@@ -66,6 +66,24 @@ importance: 0.7
   `FailExecution`, and only then should backend execution cleanup run; otherwise
   the user sees a generic missing-execution error instead of the original scan
   failure detail.
+- PostgreSQL interrupts raised through `check_for_interrupts!()` behave like
+  PostgreSQL `ERROR`, not ordinary Rust `Err` values. `CustomScan`
+  Begin/Exec wait points that can hold `ACTIVE_EXECUTION` must catch them with
+  pgrx `PgTryBuilder`, perform best-effort cleanup, and then raise a controlled
+  PostgreSQL error; otherwise a canceled query can leave the backend process
+  unable to start the next pg_fusion execution.
+- After backend cancel/error cleanup, worker-side access to that backend's
+  control slot may fail with `Released` or `StaleLeaseEpoch`. Treat that as a
+  local execution abort for the active peer, not as a fatal primary-worker
+  error; otherwise the worker exits, deactivates the control generation, and
+  later queries fail with `control worker generation is not active`. The worker
+  must probe its active backend peer even when `next_ready_backend_lease` has
+  not reported it; backend cleanup can release/finalize the slot without
+  leaving another frame to mark the peer ready.
+- Dynamic standalone scan workers must keep polling their scan control ring
+  after `OpenScan`. `CancelScan` is the worker-side signal that releases those
+  PostgreSQL backends and their relation locks when another producer fails or
+  the result stream is dropped.
 - `plan_builder` validates subquery shapes after DataFusion logical
   optimization. Subqueries that decorrelate into ordinary relational operators
   can lower PostgreSQL leaf scans; subquery nodes that survive optimization

@@ -395,6 +395,36 @@ impl WorkerRuntimeCore {
         })
     }
 
+    /// Cancel the active execution because its backend transport peer detached.
+    ///
+    /// This is a worker-local recovery path for backend cancel/error unwinding:
+    /// once the backend has released its control slot, the worker cannot send a
+    /// terminal frame back to that peer, but the primary worker generation must
+    /// remain online for later queries.
+    pub fn cancel_detached_backend_peer(
+        &mut self,
+        peer: BackendLeaseSlot,
+    ) -> Result<Option<WorkerRuntimeStep>, WorkerRuntimeError> {
+        if self.active_peer != Some(peer) {
+            return Ok(None);
+        }
+        let session_epoch = self
+            .active_session_epoch
+            .ok_or(WorkerRuntimeError::NoActiveExecution)?;
+        match self.state() {
+            WorkerExecutionState::ReceivingPlan
+            | WorkerExecutionState::Planning
+            | WorkerExecutionState::Running => {
+                self.consume_event(WorkerExecutionEvent::CancelExecution)?;
+                self.clear_active_execution_state();
+                Ok(Some(WorkerRuntimeStep::ExecutionCancelled {
+                    session_epoch,
+                }))
+            }
+            WorkerExecutionState::Terminal | WorkerExecutionState::Idle => Ok(None),
+        }
+    }
+
     /// Reset transient execution state after the FSM reaches `Terminal`.
     pub fn cleanup(&mut self) -> Result<(), WorkerRuntimeError> {
         self.consume_event(WorkerExecutionEvent::Cleanup)?;
@@ -1353,6 +1383,60 @@ mod tests {
         core.cleanup().unwrap();
         assert_eq!(core.state(), WorkerExecutionState::Idle);
         assert_eq!(core.session_epoch(), None);
+    }
+
+    #[test]
+    fn detached_active_backend_peer_cancels_and_cleanup_resets() {
+        let mut core = core();
+        accept(
+            &mut core,
+            BackendToWorker::StartExecution {
+                session_epoch: 10,
+                plan: plan_descriptor(20),
+                options: protocol::ExecutionOptionsWire::default(),
+                scans: ScanChannelSet::empty(),
+            },
+        )
+        .unwrap();
+
+        let step = core
+            .cancel_detached_backend_peer(peer_a())
+            .expect("detached active peer should cancel execution")
+            .expect("active peer should produce a terminal step");
+
+        assert!(matches!(
+            step,
+            WorkerRuntimeStep::ExecutionCancelled { session_epoch: 10 }
+        ));
+        assert_eq!(core.state(), WorkerExecutionState::Terminal);
+        assert_eq!(core.session_epoch(), None);
+
+        core.cleanup().unwrap();
+        assert_eq!(core.state(), WorkerExecutionState::Idle);
+    }
+
+    #[test]
+    fn detached_stale_backend_peer_is_ignored() {
+        let mut core = core();
+        accept(
+            &mut core,
+            BackendToWorker::StartExecution {
+                session_epoch: 10,
+                plan: plan_descriptor(20),
+                options: protocol::ExecutionOptionsWire::default(),
+                scans: ScanChannelSet::empty(),
+            },
+        )
+        .unwrap();
+
+        let step = core
+            .cancel_detached_backend_peer(peer_b())
+            .expect("stale detached peer should not fail worker runtime");
+
+        assert!(step.is_none());
+        assert_eq!(core.state(), WorkerExecutionState::ReceivingPlan);
+        assert_eq!(core.session_epoch(), Some(10));
+        assert_eq!(core.active_peer(), Some(peer_a()));
     }
 
     #[test]

@@ -21,6 +21,7 @@ use issuance::{
     decode_issued_frame, encode_issued_frame, IssuancePool, IssuedOwnedFrame, IssuedTx,
 };
 use pgrx::bgworkers::BackgroundWorkerBuilder;
+use pgrx::pg_sys::panic::CaughtError;
 use pgrx::pg_sys::{
     self, CustomExecMethods, CustomScan, CustomScanMethods, CustomScanState, ExecutorEnd_hook_type,
     List, MyLatch, Node, QueryDesc, WL_LATCH_SET, WL_POSTMASTER_DEATH, WL_TIMEOUT,
@@ -138,12 +139,7 @@ unsafe extern "C-unwind" fn pg_fusion_executor_end_hook(query_desc: *mut QueryDe
     } else {
         (*query_desc).planstate
     };
-    let custom_scan =
-        if !planstate.is_null() && (*planstate).type_ == pg_sys::NodeTag::T_CustomScanState {
-            planstate.cast::<CustomScanState>()
-        } else {
-            std::ptr::null_mut()
-        };
+    let custom_scan = find_pg_fusion_custom_scan_state(planstate);
 
     diag::update_executor_watch(query_desc, estate, custom_scan);
     diag::backend_diag(|| {
@@ -154,6 +150,7 @@ unsafe extern "C-unwind" fn pg_fusion_executor_end_hook(query_desc: *mut QueryDe
     });
     if !custom_scan.is_null() {
         diag::log_live_watch("pg_fusion ExecutorEnd hook entry live watch");
+        cleanup_active_host_scan_from_executor_end(custom_scan);
     }
 
     if let Some(prev) = PREV_EXECUTOR_END_HOOK {
@@ -172,6 +169,25 @@ unsafe extern "C-unwind" fn pg_fusion_executor_end_hook(query_desc: *mut QueryDe
         )
     });
     diag::clear_watch();
+}
+
+unsafe fn find_pg_fusion_custom_scan_state(
+    planstate: *mut pg_sys::PlanState,
+) -> *mut CustomScanState {
+    if planstate.is_null() {
+        return std::ptr::null_mut();
+    }
+    if (*planstate).type_ == pg_sys::NodeTag::T_CustomScanState {
+        let custom_scan = planstate.cast::<CustomScanState>();
+        if (*custom_scan).methods == exec_methods() {
+            return custom_scan;
+        }
+    }
+    let left = find_pg_fusion_custom_scan_state((*planstate).lefttree);
+    if !left.is_null() {
+        return left;
+    }
+    find_pg_fusion_custom_scan_state((*planstate).righttree)
 }
 
 #[pg_guard]
@@ -322,6 +338,14 @@ unsafe extern "C-unwind" fn begin_pg_fusion_scan(
     estate: *mut pg_sys::EState,
     eflags: i32,
 ) {
+    begin_pg_fusion_scan_impl(node, estate, eflags);
+}
+
+unsafe fn begin_pg_fusion_scan_impl(
+    node: *mut CustomScanState,
+    estate: *mut pg_sys::EState,
+    eflags: i32,
+) {
     let state = host_state_mut(node);
     if eflags & pg_sys::EXEC_FLAG_EXPLAIN_ONLY as i32 != 0 {
         validate_core_slots(node, estate, state);
@@ -390,6 +414,7 @@ unsafe extern "C-unwind" fn begin_pg_fusion_scan(
         })
     }
     .unwrap_or_else(|err| error!("pg_fusion begin execution failed: {err}"));
+    state.execution_key = Some(begin.key);
     host_diag(DiagnosticLogLevel::Basic, || {
         format!(
             "pg_fusion begin_execution returned key={:?} scan_channel_count={} primary_peer={} state={}",
@@ -472,6 +497,10 @@ unsafe extern "C-unwind" fn begin_pg_fusion_scan(
 unsafe extern "C-unwind" fn exec_pg_fusion_scan(
     node: *mut CustomScanState,
 ) -> *mut pg_sys::TupleTableSlot {
+    exec_pg_fusion_scan_impl(node)
+}
+
+unsafe fn exec_pg_fusion_scan_impl(node: *mut CustomScanState) -> *mut pg_sys::TupleTableSlot {
     let state = host_state_mut(node);
     state.metrics.increment(MetricId::BackendExecCallsTotal);
     let backend_start = state.metrics.now_ns();
@@ -619,7 +648,10 @@ unsafe extern "C-unwind" fn exec_pg_fusion_scan(
 
         if !progressed {
             let wait_start = state.metrics.now_ns();
-            wait_latch(Some(Duration::from_millis(1)));
+            if let Err(err) = wait_latch_checked(Some(Duration::from_millis(1))) {
+                cleanup_host_scan_state(node, state, "ExecCustomScan", false);
+                error!("{err}");
+            }
             state
                 .metrics
                 .add_elapsed(MetricId::BackendWaitLatchNs, wait_start);
@@ -639,19 +671,7 @@ unsafe extern "C-unwind" fn end_pg_fusion_scan(node: *mut CustomScanState) {
             host_state_snapshot(state)
         )
     });
-    if let Some(key) = state.execution_key.take() {
-        let _ = BackendService::accept_cancel_execution(key.slot_id, key.session_epoch);
-    }
-    record_query_total(state);
-    state.active_drivers.clear();
-    state.pending_complete_session_epoch = None;
-    let scan_slot = (*node).ss.ss_ScanTupleSlot;
-    if !scan_slot.is_null() {
-        pg_sys::ExecClearTuple(scan_slot);
-    }
-    state.result_ingress.take();
-    state.control_lease.take();
-    drop_owned_result_slot(node, state);
+    cleanup_host_scan_state(node, state, "EndCustomScan", true);
 
     let host_state = std::mem::replace(&mut state_from_node(node).state, std::ptr::null_mut());
     if !host_state.is_null() {
@@ -661,6 +681,73 @@ unsafe extern "C-unwind" fn end_pg_fusion_scan(node: *mut CustomScanState) {
     host_diag(DiagnosticLogLevel::Basic, || {
         "pg_fusion finished custom scan cleanup".to_string()
     });
+}
+
+unsafe fn cleanup_active_host_scan_from_executor_end(node: *mut CustomScanState) {
+    if node.is_null() {
+        return;
+    }
+    let scan_state = state_from_node(node);
+    if scan_state.state.is_null() {
+        return;
+    }
+    let state = &mut *scan_state.state;
+    if state.execution_key.is_none() {
+        return;
+    }
+    host_diag(DiagnosticLogLevel::Basic, || {
+        format!(
+            "pg_fusion ExecutorEnd cleaning up still-active custom scan: {}",
+            host_state_snapshot(state)
+        )
+    });
+    cleanup_host_scan_state(node, state, "ExecutorEnd", false);
+}
+
+unsafe fn cleanup_host_scan_state(
+    node: *mut CustomScanState,
+    state: &mut HostScanState,
+    phase: &'static str,
+    cleanup_executor_slots: bool,
+) {
+    if let Some(key) = state.execution_key.take() {
+        match BackendService::accept_cancel_execution(key.slot_id, key.session_epoch) {
+            Ok(handled) => {
+                host_diag(DiagnosticLogLevel::Basic, || {
+                    format!(
+                        "pg_fusion cleanup {phase} canceled backend execution slot_id={} session_epoch={} handled={}",
+                        key.slot_id, key.session_epoch, handled
+                    )
+                });
+            }
+            Err(err) => {
+                host_diag(DiagnosticLogLevel::Basic, || {
+                    format!(
+                        "pg_fusion cleanup {phase} ignored backend execution cancel error slot_id={} session_epoch={}: {err}",
+                        key.slot_id, key.session_epoch
+                    )
+                });
+            }
+        }
+    }
+
+    record_query_total(state);
+    state.active_drivers.clear();
+    state.pending_complete_session_epoch = None;
+    state.terminal_error = None;
+    if cleanup_executor_slots {
+        let scan_slot = (*node).ss.ss_ScanTupleSlot;
+        if !scan_slot.is_null() {
+            pg_sys::ExecClearTuple(scan_slot);
+        }
+    }
+    state.result_ingress.take();
+    state.control_lease.take();
+    state.page_pool = None;
+    state.issuance_pool = None;
+    if cleanup_executor_slots {
+        drop_owned_result_slot(node, state);
+    }
 }
 
 #[pg_guard]
@@ -1348,7 +1435,7 @@ fn publish_plan_to_worker(lease: &mut BackendSlotLease) -> Result<(), BackendSer
                 break;
             }
             plan_flow::BackendPlanStep::Blocked { .. } => {
-                wait_latch(Some(Duration::from_millis(1)))
+                wait_latch_checked(Some(Duration::from_millis(1)))?;
             }
             plan_flow::BackendPlanStep::LogicalError { message, .. } => {
                 return Err(BackendServiceError::ProtocolViolation(message));
@@ -2133,6 +2220,24 @@ unsafe fn host_state_mut<'a>(node: *mut CustomScanState) -> &'a mut HostScanStat
 
 unsafe fn host_state_ref<'a>(node: *mut CustomScanState) -> &'a HostScanState {
     &*state_from_node(node).state
+}
+
+fn wait_latch_checked(timeout: Option<Duration>) -> Result<(), BackendServiceError> {
+    PgTryBuilder::new(AssertUnwindSafe(|| {
+        wait_latch(timeout);
+        Ok(())
+    }))
+    .catch_others(|cause| Err(BackendServiceError::Postgres(caught_error_message(&cause))))
+    .execute()
+}
+
+fn caught_error_message(cause: &CaughtError) -> String {
+    match cause {
+        CaughtError::PostgresError(report) | CaughtError::ErrorReport(report) => {
+            report.message().to_string()
+        }
+        CaughtError::RustPanic { ereport, .. } => ereport.message().to_string(),
+    }
 }
 
 fn wait_latch(timeout: Option<Duration>) {

@@ -120,6 +120,18 @@ fn simple_query_first_column_client(client: &mut Client, sql: &str) -> Option<St
         })
 }
 
+fn simple_query_first_column_rows_client(client: &mut Client, sql: &str) -> Vec<String> {
+    client
+        .simple_query(sql)
+        .expect("simple query must succeed")
+        .into_iter()
+        .filter_map(|message| match message {
+            SimpleQueryMessage::Row(row) => row.get(0).map(str::to_owned),
+            _ => None,
+        })
+        .collect()
+}
+
 fn simple_query_first_column_tx(tx: &mut Transaction<'_>, sql: &str) -> Option<String> {
     tx.simple_query(sql)
         .expect("simple query must succeed")
@@ -1579,6 +1591,141 @@ pub(crate) fn heap_leader_only_scan_smoke() {
     client
         .batch_execute(&format!("DROP TABLE IF EXISTS {table_name}"))
         .expect("drop committed heap table for leader-only scan smoke");
+}
+
+pub(crate) fn statement_timeout_cleans_up_active_execution_smoke() {
+    let mut client = smoke_client();
+    ensure_shared_preload(&mut client);
+    let table_name = "public.pgf_cancel_cleanup_smoke";
+    client
+        .batch_execute(&format!(
+            "\
+            SELECT pg_advisory_lock({SMOKE_TEST_ADVISORY_LOCK});
+            SET pg_fusion.enable = off;
+            DROP TABLE IF EXISTS {table_name};
+            CREATE TABLE {table_name} AS
+            SELECT g::bigint AS id
+            FROM generate_series(1, 2000000) AS g;
+            ANALYZE {table_name};
+            SET pg_fusion.enable = on;
+            SET max_parallel_workers_per_gather = 0;
+            SET statement_timeout = '50ms';
+            "
+        ))
+        .expect("create committed cancel-cleanup fixture");
+
+    let err = client
+        .simple_query(&format!(
+            "\
+            SELECT sum(id)::bigint
+            FROM {table_name}
+            "
+        ))
+        .expect_err("large pg_fusion query should hit statement_timeout");
+    let message = err
+        .as_db_error()
+        .map(|db_error| db_error.message().to_string())
+        .unwrap_or_else(|| err.to_string());
+    assert!(
+        message.contains("statement timeout") || message.contains("canceling statement"),
+        "expected statement timeout/cancel error, got: {message}"
+    );
+
+    client
+        .batch_execute("RESET statement_timeout")
+        .expect("reset statement timeout after canceled query");
+    let sum: i64 = simple_query_first_column_client(
+        &mut client,
+        &format!("SELECT sum(id)::bigint FROM {table_name} WHERE id <= 10"),
+    )
+    .expect("same session should start a new pg_fusion execution after timeout")
+    .parse()
+    .expect("sum must be an integer");
+    assert_eq!(sum, 55);
+
+    client
+        .batch_execute(&format!(
+            "\
+            SET pg_fusion.enable = off;
+            DROP TABLE IF EXISTS {table_name};
+            SELECT pg_advisory_unlock({SMOKE_TEST_ADVISORY_LOCK});
+            "
+        ))
+        .expect("drop cancel-cleanup fixture");
+}
+
+pub(crate) fn parallel_statement_timeout_keeps_worker_generation_online_smoke() {
+    let mut client = smoke_client();
+    ensure_shared_preload(&mut client);
+    let table_name = "public.pgf_parallel_cancel_cleanup_smoke";
+    client
+        .batch_execute(&format!(
+            "\
+            SELECT pg_advisory_lock({SMOKE_TEST_ADVISORY_LOCK});
+            SET pg_fusion.enable = off;
+            DROP TABLE IF EXISTS {table_name};
+            CREATE TABLE {table_name} AS
+            SELECT g::bigint AS id, (g * 10)::bigint AS payload
+            FROM generate_series(1, 2000000) AS g;
+            ANALYZE {table_name};
+            SET pg_fusion.enable = on;
+            SET max_parallel_workers_per_gather = 2;
+            "
+        ))
+        .expect("create committed parallel cancel-cleanup fixture");
+
+    let explain = simple_query_first_column_rows_client(
+        &mut client,
+        &format!("EXPLAIN SELECT sum(id)::bigint FROM {table_name} WHERE id > 0"),
+    )
+    .join("\n");
+    assert!(
+        explain.contains("PgFusion Producers: planned=3 (leader + 2 workers)"),
+        "EXPLAIN should show dynamic scan producers before cancel regression: {explain}"
+    );
+
+    client
+        .batch_execute("SET statement_timeout = '50ms'")
+        .expect("set statement timeout for parallel cancel-cleanup query");
+    let err = client
+        .simple_query(&format!(
+            "\
+            SELECT sum(id)::bigint
+            FROM {table_name}
+            WHERE id > 0
+            "
+        ))
+        .expect_err("large parallel pg_fusion query should hit statement_timeout");
+    let message = err
+        .as_db_error()
+        .map(|db_error| db_error.message().to_string())
+        .unwrap_or_else(|| err.to_string());
+    assert!(
+        message.contains("statement timeout") || message.contains("canceling statement"),
+        "expected statement timeout/cancel error, got: {message}"
+    );
+
+    client
+        .batch_execute("RESET statement_timeout")
+        .expect("reset statement timeout after canceled parallel query");
+    let sum: i64 = simple_query_first_column_client(
+        &mut client,
+        &format!("SELECT sum(id)::bigint FROM {table_name} WHERE id <= 10"),
+    )
+    .expect("same session should start a new pg_fusion execution after parallel timeout")
+    .parse()
+    .expect("sum must be an integer");
+    assert_eq!(sum, 55);
+
+    client
+        .batch_execute(&format!(
+            "\
+            SET pg_fusion.enable = off;
+            DROP TABLE IF EXISTS {table_name};
+            SELECT pg_advisory_unlock({SMOKE_TEST_ADVISORY_LOCK});
+            "
+        ))
+        .expect("drop parallel cancel-cleanup fixture");
 }
 
 pub(crate) fn metrics_smoke() {

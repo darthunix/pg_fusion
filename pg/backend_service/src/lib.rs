@@ -2003,7 +2003,13 @@ fn run_standalone_scan_producer(
         );
         return Err(err);
     }
-    drive_standalone_producer(scan_lease, producer, input.config.metrics)
+    drive_standalone_producer(
+        scan_lease,
+        producer,
+        input.session_epoch,
+        input.scan_id,
+        input.config.metrics,
+    )
 }
 
 fn standalone_page_source(
@@ -2160,10 +2166,18 @@ fn wait_for_standalone_open_scan(
 fn drive_standalone_producer(
     mut scan_lease: BackendSlotLease,
     mut producer: BackendProducerRole<source::SlotScanPageSource>,
+    session_epoch: u64,
+    scan_id: u64,
     metrics: RuntimeMetrics,
 ) -> Result<(), BackendServiceError> {
     let mut pending_outbound = None;
+    let mut scratch = vec![0_u8; 1024];
     loop {
+        if poll_standalone_cancel_scan(&mut scan_lease, session_epoch, scan_id, &mut scratch)? {
+            let _ = producer.abort();
+            return Ok(());
+        }
+
         if let Some(outbound) = pending_outbound.take() {
             if let Some(outbound) =
                 try_send_standalone_scan_page(&mut scan_lease, metrics, outbound)?
@@ -2222,6 +2236,41 @@ fn drive_standalone_producer(
                 return Err(BackendServiceError::ProtocolViolation(message));
             }
         }
+    }
+}
+
+fn poll_standalone_cancel_scan(
+    scan_lease: &mut BackendSlotLease,
+    session_epoch: u64,
+    scan_id: u64,
+    scratch: &mut [u8],
+) -> Result<bool, BackendServiceError> {
+    let received = {
+        let mut rx = scan_lease.from_worker_rx();
+        rx.recv_frame_into(scratch)?
+    };
+    let Some(len) = received else {
+        return Ok(false);
+    };
+    match decode_worker_scan_to_backend(&scratch[..len]).map_err(|err| {
+        BackendServiceError::ProtocolViolation(format!(
+            "failed to decode standalone scan control: {err}"
+        ))
+    })? {
+        WorkerScanToBackendRef::CancelScan {
+            session_epoch: incoming_epoch,
+            scan_id: incoming_scan_id,
+        } => {
+            if incoming_epoch != session_epoch || incoming_scan_id != scan_id {
+                return Err(BackendServiceError::ProtocolViolation(format!(
+                    "standalone scan cancel targeted session_epoch={incoming_epoch}, scan_id={incoming_scan_id}; expected session_epoch={session_epoch}, scan_id={scan_id}"
+                )));
+            }
+            Ok(true)
+        }
+        WorkerScanToBackendRef::OpenScan { .. } => Err(BackendServiceError::ProtocolViolation(
+            "standalone scan received duplicate OpenScan after startup".into(),
+        )),
     }
 }
 

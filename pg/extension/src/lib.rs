@@ -190,6 +190,16 @@ mod tests {
     }
 
     #[pg_test]
+    fn pg_fusion_statement_timeout_cleans_up_active_execution_smoke() {
+        super::smoke_tests::statement_timeout_cleans_up_active_execution_smoke();
+    }
+
+    #[pg_test]
+    fn pg_fusion_parallel_statement_timeout_keeps_worker_generation_online_smoke() {
+        super::smoke_tests::parallel_statement_timeout_keeps_worker_generation_online_smoke();
+    }
+
+    #[pg_test]
     fn pg_fusion_result_ingress_roundtrip_smoke() {
         super::result_ingress_tests::result_ingress_roundtrip_smoke();
     }

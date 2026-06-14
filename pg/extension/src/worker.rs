@@ -220,8 +220,68 @@ fn run_worker_main() -> Result<(), WorkerRuntimeError> {
             debug!(component = "worker", "worker entering main poll loop");
 
             while BackgroundWorker::wait_latch(Some(POLL_INTERVAL)) {
+                if let Some(peer) = runtime.active_peer() {
+                    trace!(
+                        component = "worker",
+                        peer = ?peer,
+                        state = ?runtime.state(),
+                        "worker probing active backend peer"
+                    );
+                    let steps = recv_backend_peer_steps(
+                        &mut transport,
+                        &mut runtime,
+                        peer,
+                        page_pool,
+                        issuance_pool,
+                        &mut plan_rx,
+                    )?;
+                    handle_steps(
+                        &mut transport,
+                        &mut runtime,
+                        &df_runtime,
+                        &mut spill_runtime,
+                        &config,
+                        page_pool,
+                        issuance_pool,
+                        &mut plan_rx,
+                        metrics,
+                        steps,
+                    )?;
+                }
+
                 let mut ready_cursor = 0;
                 while let Some(peer) = transport.next_ready_backend_lease(&mut ready_cursor) {
+                    if let Some(active_peer) = runtime.active_peer() {
+                        if active_peer != peer {
+                            trace!(
+                                component = "worker",
+                                peer = ?active_peer,
+                                incoming_peer = ?peer,
+                                state = ?runtime.state(),
+                                "worker probing active backend peer before non-active peer"
+                            );
+                            let steps = recv_backend_peer_steps(
+                                &mut transport,
+                                &mut runtime,
+                                active_peer,
+                                page_pool,
+                                issuance_pool,
+                                &mut plan_rx,
+                            )?;
+                            handle_steps(
+                                &mut transport,
+                                &mut runtime,
+                                &df_runtime,
+                                &mut spill_runtime,
+                                &config,
+                                page_pool,
+                                issuance_pool,
+                                &mut plan_rx,
+                                metrics,
+                                steps,
+                            )?;
+                        }
+                    }
                     if tracing::enabled!(Level::TRACE) {
                         trace!(
                             component = "worker",
@@ -230,32 +290,14 @@ fn run_worker_main() -> Result<(), WorkerRuntimeError> {
                             "worker polling ready backend peer"
                         );
                     }
-                    let mut steps = VecDeque::new();
-                    transport.recv_peer_frames(peer, |bytes| {
-                        let decoded = WorkerRuntimeCore::decode_inbound(bytes)?;
-                        let step = match decoded {
-                            DecodedInbound::Control(message) => {
-                                runtime.accept_backend_control(peer, message)?
-                            }
-                            DecodedInbound::IssuedFrame(frame) => {
-                                let rx = plan_rx.as_ref().ok_or_else(|| {
-                                    WorkerRuntimeError::ProtocolViolation(
-                                        "received a plan frame before opening plan ingress".into(),
-                                    )
-                                })?;
-                                runtime.accept_issued_plan_frame(peer, rx, &frame)?
-                            }
-                        };
-                        if matches!(step, WorkerRuntimeStep::PlanOpened { .. }) {
-                            plan_rx = Some(IssuedRx::new(
-                                transfer::PageRx::new(page_pool),
-                                issuance_pool,
-                            ));
-                        }
-                        steps.push_back(step);
-                        Ok(())
-                    })?;
-
+                    let steps = recv_backend_peer_steps(
+                        &mut transport,
+                        &mut runtime,
+                        peer,
+                        page_pool,
+                        issuance_pool,
+                        &mut plan_rx,
+                    )?;
                     handle_steps(
                         &mut transport,
                         &mut runtime,
@@ -290,6 +332,57 @@ fn run_worker_main() -> Result<(), WorkerRuntimeError> {
     Ok(())
 }
 
+fn recv_backend_peer_steps(
+    transport: &mut TransportWorkerRuntime,
+    runtime: &mut WorkerRuntimeCore,
+    peer: BackendLeaseSlot,
+    page_pool: PagePool,
+    issuance_pool: IssuancePool,
+    plan_rx: &mut Option<IssuedRx>,
+) -> Result<VecDeque<WorkerRuntimeStep>, WorkerRuntimeError> {
+    let mut steps = VecDeque::new();
+    let recv_result = transport.recv_peer_frames(peer, |bytes| {
+        let decoded = WorkerRuntimeCore::decode_inbound(bytes)?;
+        let step = match decoded {
+            DecodedInbound::Control(message) => runtime.accept_backend_control(peer, message)?,
+            DecodedInbound::IssuedFrame(frame) => {
+                let rx = plan_rx.as_ref().ok_or_else(|| {
+                    WorkerRuntimeError::ProtocolViolation(
+                        "received a plan frame before opening plan ingress".into(),
+                    )
+                })?;
+                runtime.accept_issued_plan_frame(peer, rx, &frame)?
+            }
+        };
+        if matches!(step, WorkerRuntimeStep::PlanOpened { .. }) {
+            *plan_rx = Some(IssuedRx::new(
+                transfer::PageRx::new(page_pool),
+                issuance_pool,
+            ));
+        }
+        steps.push_back(step);
+        Ok(())
+    });
+
+    match recv_result {
+        Ok(()) => Ok(steps),
+        Err(err) if is_detached_backend_peer_error(&err) => {
+            warn!(
+                component = "worker",
+                peer = ?peer,
+                error = %err,
+                "worker observed detached backend peer while receiving frames"
+            );
+            steps.clear();
+            if let Some(step) = runtime.cancel_detached_backend_peer(peer)? {
+                steps.push_back(step);
+            }
+            Ok(steps)
+        }
+        Err(err) => Err(err),
+    }
+}
+
 fn finish_with_deactivation(
     result: Result<(), WorkerRuntimeError>,
     deactivate: Result<u64, WorkerRuntimeError>,
@@ -309,6 +402,25 @@ fn finish_with_deactivation(
             Err(err)
         }
     }
+}
+
+fn is_detached_backend_peer_error(err: &WorkerRuntimeError) -> bool {
+    match err {
+        WorkerRuntimeError::SlotAccess(err) => is_detached_slot_access_error(err),
+        WorkerRuntimeError::WorkerTx(control_transport::WorkerTxError::Slot(err))
+        | WorkerRuntimeError::WorkerRx(control_transport::WorkerRxError::Slot(err)) => {
+            is_detached_slot_access_error(err)
+        }
+        _ => false,
+    }
+}
+
+fn is_detached_slot_access_error(err: &control_transport::SlotAccessError) -> bool {
+    matches!(
+        err,
+        control_transport::SlotAccessError::Released { .. }
+            | control_transport::SlotAccessError::StaleLeaseEpoch { .. }
+    )
 }
 
 fn worker_spill_cluster_id() -> String {
@@ -417,6 +529,42 @@ mod tests {
             err.to_string(),
             "runtime protocol violation: deactivation failed"
         );
+    }
+
+    #[test]
+    fn detached_backend_peer_error_classifies_released_and_stale_lease() {
+        let released = WorkerRuntimeError::WorkerTx(control_transport::WorkerTxError::Slot(
+            control_transport::SlotAccessError::Released {
+                slot_id: 7,
+                claimed_generation: 1,
+            },
+        ));
+        let stale_lease = WorkerRuntimeError::WorkerRx(control_transport::WorkerRxError::Slot(
+            control_transport::SlotAccessError::StaleLeaseEpoch {
+                slot_id: 7,
+                claimed_generation: 1,
+                claimed_lease_epoch: 2,
+                current_lease_epoch: 3,
+            },
+        ));
+
+        assert!(is_detached_backend_peer_error(&released));
+        assert!(is_detached_backend_peer_error(&stale_lease));
+    }
+
+    #[test]
+    fn detached_backend_peer_error_keeps_unrelated_errors_fatal() {
+        let worker_offline =
+            WorkerRuntimeError::SlotAccess(control_transport::SlotAccessError::WorkerOffline);
+        let ring_full = WorkerRuntimeError::WorkerTx(control_transport::WorkerTxError::Ring(
+            control_transport::TxError::Full {
+                required: 16,
+                available: 8,
+            },
+        ));
+
+        assert!(!is_detached_backend_peer_error(&worker_offline));
+        assert!(!is_detached_backend_peer_error(&ring_full));
     }
 
     #[test]
@@ -549,12 +697,24 @@ fn handle_steps(
                             peer = ?peer,
                             "worker finished execution successfully and is sending CompleteExecution"
                         );
-                        transport.send_peer_message(
+                        if let Err(err) = transport.send_peer_message(
                             peer,
                             WorkerExecutionToBackend::CompleteExecution {
                                 session_epoch: result.session_epoch,
                             },
-                        )?;
+                        ) {
+                            if is_detached_backend_peer_error(&err) {
+                                warn!(
+                                    component = "worker",
+                                    session_epoch = result.session_epoch,
+                                    peer = ?peer,
+                                    error = %err,
+                                    "worker could not send CompleteExecution because backend peer detached"
+                                );
+                            } else {
+                                return Err(err);
+                            }
+                        }
                         metrics.add_elapsed(MetricId::WorkerTotalNs, worker_start);
                         steps.push_back(runtime.mark_execution_complete()?);
                     }
@@ -570,14 +730,26 @@ fn handle_steps(
                             error = %err,
                             "worker execution failed locally; sending FailExecution"
                         );
-                        transport.send_peer_message(
+                        if let Err(send_err) = transport.send_peer_message(
                             peer,
                             WorkerExecutionToBackend::FailExecution {
                                 session_epoch: result.session_epoch,
                                 code: ExecutionFailureCode::Internal,
                                 detail,
                             },
-                        )?;
+                        ) {
+                            if is_detached_backend_peer_error(&send_err) {
+                                warn!(
+                                    component = "worker",
+                                    session_epoch = result.session_epoch,
+                                    peer = ?peer,
+                                    error = %send_err,
+                                    "worker could not send FailExecution because backend peer detached"
+                                );
+                            } else {
+                                return Err(send_err);
+                            }
+                        }
                         metrics.add_elapsed(MetricId::WorkerTotalNs, worker_start);
                         steps.push_back(
                             runtime.fail_execution_locally(ExecutionFailureCode::Internal, None)?,

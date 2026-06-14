@@ -216,6 +216,13 @@ enum ScanInbound<'a> {
     Issued(IssuedOwnedFrame),
 }
 
+enum ScanThreadPoll {
+    Abort,
+    Continue,
+    Stopped,
+    Terminal,
+}
+
 fn run_transport_scan_thread(
     region: TransportRegion,
     control_frame_capacity: usize,
@@ -308,96 +315,23 @@ fn run_transport_scan_thread_inner(
 
     let mut terminal = false;
     let loop_result: Result<(), WorkerRuntimeError> = loop {
-        if stop.load(Ordering::Acquire) {
-            debug!(
-                component = "worker_scan",
-                session_epoch = request.session_epoch,
-                scan_id = request.scan_id.get(),
-                producer_count = slots.len(),
-                "transport scan stream was dropped; terminating scan thread"
-            );
-            break Ok(());
-        }
-
-        let mut any_frame = false;
-        for producer in &mut slots {
-            let received = {
-                let mut rx = producer.slot.from_backend_rx()?;
-                rx.recv_frame_into(&mut scratch)?
-            };
-            let Some(len) = received else {
-                continue;
-            };
-            any_frame = true;
-            let frame_read_ns = metrics.now_ns();
-            let producer_id = producer.producer_id;
-
-            match decode_scan_inbound(&scratch[..len])? {
-                ScanInbound::Issued(frame) => {
-                    if let Some(descriptor) = issued_page_descriptor(&frame) {
-                        if let Some(observation) = metrics.observe_page_at(
-                            PageDirection::BackendToWorker,
-                            descriptor,
-                            frame_read_ns,
-                        ) {
-                            metrics.add(MetricId::ScanB2wWaitNs, observation.wait_ns);
-                            metrics.increment(MetricId::ScanB2wWaitTotal);
-                        }
-                    }
-                    let read_start = metrics.now_ns();
-                    let step = driver.accept_page_frame(producer_id, &producer.rx, &frame)?;
-                    metrics.add_elapsed(MetricId::ScanPageReadNs, read_start);
-                    metrics.increment(MetricId::ScanPagesReadTotal);
-                    if forward_driver_step(
-                        &mut driver,
-                        step,
-                        tx,
-                        stop,
-                        metrics,
-                        Some(frame_read_ns),
-                    )? {
-                        terminal = true;
-                        debug!(
-                            component = "worker_scan",
-                            session_epoch = request.session_epoch,
-                            scan_id = request.scan_id.get(),
-                            producer_id,
-                            peer = ?producer.peer,
-                            "transport scan thread reached terminal state from issued page path"
-                        );
-                        break;
-                    }
-                }
-                ScanInbound::Control(control) => {
-                    let step = control_to_driver_step(request, &mut driver, control)?;
-                    if forward_driver_step(&mut driver, step, tx, stop, metrics, None)? {
-                        terminal = true;
-                        debug!(
-                            component = "worker_scan",
-                            session_epoch = request.session_epoch,
-                            scan_id = request.scan_id.get(),
-                            producer_id,
-                            peer = ?producer.peer,
-                            "transport scan thread reached terminal state from control path"
-                        );
-                        break;
-                    }
-                }
+        match poll_transport_scan_thread(
+            request,
+            &mut slots,
+            &mut driver,
+            tx,
+            stop,
+            metrics,
+            &mut scratch,
+        ) {
+            Ok(ScanThreadPoll::Abort) => break Ok(()),
+            Ok(ScanThreadPoll::Continue) => continue,
+            Ok(ScanThreadPoll::Stopped) => break Ok(()),
+            Ok(ScanThreadPoll::Terminal) => {
+                terminal = true;
+                break Ok(());
             }
-        }
-        if terminal {
-            break Ok(());
-        }
-        if !any_frame {
-            let idle_start = metrics.now_ns();
-            thread::sleep(request.tuning.idle_poll_interval);
-            let idle_end = metrics.now_ns();
-            metrics.add(
-                MetricId::ScanIdleSleepNs,
-                idle_end.saturating_sub(idle_start),
-            );
-            metrics.increment(MetricId::ScanIdleSleepTotal);
-            continue;
+            Err(err) => break Err(err),
         }
     };
 
@@ -421,6 +355,185 @@ fn run_transport_scan_thread_inner(
     }
 
     loop_result
+}
+
+#[allow(clippy::too_many_arguments)]
+fn poll_transport_scan_thread(
+    request: &OpenScanRequest,
+    slots: &mut [OpenedProducerSlot<'_>],
+    driver: &mut ScanFlowDriver,
+    tx: &mut Sender<DFResult<RecordBatch>>,
+    stop: &AtomicBool,
+    metrics: RuntimeMetrics,
+    scratch: &mut [u8],
+) -> Result<ScanThreadPoll, WorkerRuntimeError> {
+    if stop.load(Ordering::Acquire) {
+        debug!(
+            component = "worker_scan",
+            session_epoch = request.session_epoch,
+            scan_id = request.scan_id.get(),
+            producer_count = slots.len(),
+            "transport scan stream was dropped; terminating scan thread"
+        );
+        return Ok(ScanThreadPoll::Stopped);
+    }
+
+    let mut any_frame = false;
+    for producer in slots {
+        let received = {
+            let mut rx = producer.slot.from_backend_rx()?;
+            rx.recv_frame_into(scratch)?
+        };
+        let Some(len) = received else {
+            continue;
+        };
+        any_frame = true;
+        let frame_read_ns = metrics.now_ns();
+        let producer_id = producer.producer_id;
+
+        match decode_scan_inbound(&scratch[..len])? {
+            ScanInbound::Issued(frame) => {
+                if let Some(descriptor) = issued_page_descriptor(&frame) {
+                    if let Some(observation) = metrics.observe_page_at(
+                        PageDirection::BackendToWorker,
+                        descriptor,
+                        frame_read_ns,
+                    ) {
+                        metrics.add(MetricId::ScanB2wWaitNs, observation.wait_ns);
+                        metrics.increment(MetricId::ScanB2wWaitTotal);
+                    }
+                }
+                let read_start = metrics.now_ns();
+                let step = driver.accept_page_frame(producer_id, &producer.rx, &frame)?;
+                metrics.add_elapsed(MetricId::ScanPageReadNs, read_start);
+                metrics.increment(MetricId::ScanPagesReadTotal);
+                match forward_driver_step(driver, step, tx, stop, metrics, Some(frame_read_ns))? {
+                    ScanThreadPoll::Continue => {}
+                    ScanThreadPoll::Abort => return Ok(ScanThreadPoll::Abort),
+                    ScanThreadPoll::Stopped => return Ok(ScanThreadPoll::Stopped),
+                    ScanThreadPoll::Terminal => {
+                        debug!(
+                            component = "worker_scan",
+                            session_epoch = request.session_epoch,
+                            scan_id = request.scan_id.get(),
+                            producer_id,
+                            peer = ?producer.peer,
+                            "transport scan thread reached terminal state from issued page path"
+                        );
+                        return Ok(ScanThreadPoll::Terminal);
+                    }
+                }
+            }
+            ScanInbound::Control(control) => {
+                let step = control_to_driver_step(request, driver, control)?;
+                match forward_driver_step(driver, step, tx, stop, metrics, None)? {
+                    ScanThreadPoll::Continue => {}
+                    ScanThreadPoll::Abort => return Ok(ScanThreadPoll::Abort),
+                    ScanThreadPoll::Stopped => return Ok(ScanThreadPoll::Stopped),
+                    ScanThreadPoll::Terminal => {
+                        debug!(
+                            component = "worker_scan",
+                            session_epoch = request.session_epoch,
+                            scan_id = request.scan_id.get(),
+                            producer_id,
+                            peer = ?producer.peer,
+                            "transport scan thread reached terminal state from control path"
+                        );
+                        return Ok(ScanThreadPoll::Terminal);
+                    }
+                }
+            }
+        }
+    }
+    if !any_frame {
+        let idle_start = metrics.now_ns();
+        thread::sleep(request.tuning.idle_poll_interval);
+        let idle_end = metrics.now_ns();
+        metrics.add(
+            MetricId::ScanIdleSleepNs,
+            idle_end.saturating_sub(idle_start),
+        );
+        metrics.increment(MetricId::ScanIdleSleepTotal);
+    }
+    Ok(ScanThreadPoll::Continue)
+}
+
+fn forward_driver_step(
+    driver: &mut ScanFlowDriver,
+    step: ScanFlowDriverStep,
+    tx: &mut Sender<DFResult<RecordBatch>>,
+    stop: &AtomicBool,
+    metrics: RuntimeMetrics,
+    batch_delivery_start_ns: Option<u64>,
+) -> Result<ScanThreadPoll, WorkerRuntimeError> {
+    match step {
+        ScanFlowDriverStep::Idle => Ok(ScanThreadPoll::Continue),
+        ScanFlowDriverStep::Batch { batch, .. } => {
+            let send_start = metrics.now_ns();
+            let send_result = futures::executor::block_on(tx.send(Ok(batch)));
+            let send_end = metrics.now_ns();
+            metrics.add(
+                MetricId::ScanBatchSendNs,
+                send_end.saturating_sub(send_start),
+            );
+            metrics.increment(MetricId::ScanBatchSendTotal);
+            if let Some(start_ns) = batch_delivery_start_ns {
+                metrics.add(
+                    MetricId::ScanBatchDeliveryNs,
+                    send_end.saturating_sub(start_ns),
+                );
+                metrics.increment(MetricId::ScanBatchDeliveryTotal);
+            }
+            if send_result.is_err() {
+                stop.store(true, Ordering::Release);
+            }
+            Ok(ScanThreadPoll::Continue)
+        }
+        ScanFlowDriverStep::LogicalEof { .. } => {
+            driver.close()?;
+            Ok(ScanThreadPoll::Terminal)
+        }
+        ScanFlowDriverStep::LogicalError { message, .. } => {
+            let _ = futures::executor::block_on(tx.send(Err(DataFusionError::Execution(message))));
+            driver.close()?;
+            Ok(ScanThreadPoll::Abort)
+        }
+    }
+}
+
+fn send_open_scan(
+    slot: &mut control_transport::WorkerSlot<'_>,
+    control: &OpenScanControl,
+    scratch: &mut [u8],
+) -> Result<(), WorkerRuntimeError> {
+    let written = control.encode_into(scratch)?;
+    let mut tx = slot.to_backend_tx()?;
+    let _ = tx.send_frame(&scratch[..written])?;
+    Ok(())
+}
+
+fn send_cancel_scan(
+    slot: &mut control_transport::WorkerSlot<'_>,
+    session_epoch: u64,
+    scan_id: u64,
+    scratch: &mut [u8],
+) -> Result<(), WorkerRuntimeError> {
+    let message = WorkerScanToBackend::CancelScan {
+        session_epoch,
+        scan_id,
+    };
+    let written = protocol::encoded_len_worker_scan_to_backend(message);
+    if written > scratch.len() {
+        return Err(WorkerRuntimeError::ControlFrameTooLarge);
+    }
+    let written = protocol::encode_worker_scan_to_backend_into(message, scratch)?;
+    let mut tx = slot.to_backend_tx()?;
+    let _ = tx.send_frame(&scratch[..written])?;
+    Ok(())
+}
+
+fn df_external(err: WorkerRuntimeError) -> DataFusionError {
+    DataFusionError::External(Box::new(err))
 }
 
 struct OpenedProducerSlot<'a> {
@@ -513,82 +626,4 @@ fn validate_scan_terminal(
         )));
     }
     Ok(())
-}
-
-fn forward_driver_step(
-    driver: &mut ScanFlowDriver,
-    step: ScanFlowDriverStep,
-    tx: &mut Sender<DFResult<RecordBatch>>,
-    stop: &AtomicBool,
-    metrics: RuntimeMetrics,
-    batch_delivery_start_ns: Option<u64>,
-) -> Result<bool, WorkerRuntimeError> {
-    match step {
-        ScanFlowDriverStep::Idle => Ok(false),
-        ScanFlowDriverStep::Batch { batch, .. } => {
-            let send_start = metrics.now_ns();
-            let send_result = futures::executor::block_on(tx.send(Ok(batch)));
-            let send_end = metrics.now_ns();
-            metrics.add(
-                MetricId::ScanBatchSendNs,
-                send_end.saturating_sub(send_start),
-            );
-            metrics.increment(MetricId::ScanBatchSendTotal);
-            if let Some(start_ns) = batch_delivery_start_ns {
-                metrics.add(
-                    MetricId::ScanBatchDeliveryNs,
-                    send_end.saturating_sub(start_ns),
-                );
-                metrics.increment(MetricId::ScanBatchDeliveryTotal);
-            }
-            if send_result.is_err() {
-                stop.store(true, Ordering::Release);
-            }
-            Ok(false)
-        }
-        ScanFlowDriverStep::LogicalEof { .. } => {
-            driver.close()?;
-            Ok(true)
-        }
-        ScanFlowDriverStep::LogicalError { message, .. } => {
-            let _ = futures::executor::block_on(tx.send(Err(DataFusionError::Execution(message))));
-            driver.close()?;
-            Ok(true)
-        }
-    }
-}
-
-fn send_open_scan(
-    slot: &mut control_transport::WorkerSlot<'_>,
-    control: &OpenScanControl,
-    scratch: &mut [u8],
-) -> Result<(), WorkerRuntimeError> {
-    let written = control.encode_into(scratch)?;
-    let mut tx = slot.to_backend_tx()?;
-    let _ = tx.send_frame(&scratch[..written])?;
-    Ok(())
-}
-
-fn send_cancel_scan(
-    slot: &mut control_transport::WorkerSlot<'_>,
-    session_epoch: u64,
-    scan_id: u64,
-    scratch: &mut [u8],
-) -> Result<(), WorkerRuntimeError> {
-    let message = WorkerScanToBackend::CancelScan {
-        session_epoch,
-        scan_id,
-    };
-    let written = protocol::encoded_len_worker_scan_to_backend(message);
-    if written > scratch.len() {
-        return Err(WorkerRuntimeError::ControlFrameTooLarge);
-    }
-    let written = protocol::encode_worker_scan_to_backend_into(message, scratch)?;
-    let mut tx = slot.to_backend_tx()?;
-    let _ = tx.send_frame(&scratch[..written])?;
-    Ok(())
-}
-
-fn df_external(err: WorkerRuntimeError) -> DataFusionError {
-    DataFusionError::External(Box::new(err))
 }
