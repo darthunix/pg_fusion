@@ -157,6 +157,11 @@ pub fn plan_codec_roundtrips_builtin_sql_forms() {
         normalize_plan_display_for_builtin_sql_forms(&built),
         normalize_plan_display_for_builtin_sql_forms(&decoded)
     );
-    assert_eq!(collect_pg_scans(&decoded).len(), 1);
-    assert!(decoded.display_indent().to_string().contains("Filter"));
+    let scans = collect_pg_scans(&decoded);
+    assert_eq!(scans.len(), 1);
+    assert_eq!(
+        scans[0].compiled_scan.sql,
+        "SELECT \"id\", \"payload\" FROM \"public\".\"plan_codec_functions\" WHERE (\"payload\" ~ '^a')"
+    );
+    assert_eq!(scans[0].compiled_scan.pushed_filters.len(), 1);
 }
