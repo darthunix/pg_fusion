@@ -60,6 +60,8 @@ unsafe extern "C-unwind" fn pg_fusion_shmem_request_hook() {
     let runtime_filter_layout = RuntimeFilterPool::layout(config.runtime_filter_pool_config())
         .expect("runtime filter pool layout");
     let scan_worker_jobs_layout = ScanWorkerJobRegistry::layout();
+    #[cfg(feature = "pg_test")]
+    crate::test_gate::request_shmem_space();
 
     let total = control_layout
         .size
@@ -93,6 +95,8 @@ pub(crate) unsafe extern "C-unwind" fn init_shmem() {
     init_runtime_metrics(RUNTIME_METRICS_NAME, config.page_count);
     init_runtime_filters(RUNTIME_FILTER_POOL_NAME);
     init_scan_worker_jobs(SCAN_WORKER_JOBS_NAME);
+    #[cfg(feature = "pg_test")]
+    crate::test_gate::init_shmem();
 }
 
 pub(crate) fn attach_control_region() -> TransportRegion {

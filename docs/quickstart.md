@@ -54,6 +54,7 @@ For a 16 GiB development machine, add:
 shared_preload_libraries = 'pg_fusion'
 
 pg_fusion.worker_threads = 0
+pg_fusion.max_fusion_tasks = 0
 pg_fusion.log_path = '/tmp/pg_fusion.log'
 pg_fusion.worker_log_filter = 'warn'
 pg_fusion.worker_memory_limit_mb = 2048

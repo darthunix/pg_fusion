@@ -93,9 +93,15 @@ importance: 0.7
   ...)` directly only drains partition `0` and breaks multi-partition roots
   such as `UNION`.
 - `pg_fusion.worker_threads` controls the worker's Tokio runtime thread count.
-  It does not make `WorkerPgScanExec` multi-partition and does not change the
-  current worker planning contract of `target_partitions = 1`; scan/physical
-  partitioning changes must be designed separately.
+  It does not make `WorkerPgScanExec` multi-partition, does not change the
+  current worker planning contract of `target_partitions = 1`, and is separate
+  from `pg_fusion.max_fusion_tasks`, which caps concurrent backend execution
+  tasks. Scan/physical partitioning changes must be designed separately.
+- Worker Tokio tasks must not call PostgreSQL APIs or write primary control
+  transport directly. They report planning, result-page, close-frame, and
+  terminal events back to the PostgreSQL background-worker scheduler thread,
+  then wake it through the local scheduler wake fd that is waited together with
+  the PG latch.
 - Worker DataFusion spill is OS-path spill owned by pg_fusion. It is enabled
   only when `pg_fusion.worker_memory_limit_mb > 0`, creates per-execution
   directories below a cluster-scoped worker spill root, and relies on worker

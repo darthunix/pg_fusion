@@ -108,6 +108,12 @@ the configured worker thread pool. The current worker planning contract still
 sets DataFusion `target_partitions` to `1`, so thread count and physical plan
 partition count are separate controls.
 
+The PostgreSQL background-worker thread remains the scheduler for primary
+control transport, result-frame delivery, and PostgreSQL latch/signal handling.
+Physical planning and execution run as per-backend Tokio tasks. The
+`pg_fusion.max_fusion_tasks` GUC caps how many backend executions can be active
+inside the worker; its default `0` uses the primary control slot count.
+
 PostgreSQL scan producers are not Tokio tasks. They remain PostgreSQL backend or
 background-worker execution paths because they call PostgreSQL APIs. Scan
 control slots coordinate those producer streams, but slots are fixed

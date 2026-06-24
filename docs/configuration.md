@@ -44,6 +44,7 @@ The worker is the DataFusion resource box. These settings are postmaster-level.
 | Setting | Default | Description |
 | --- | ---: | --- |
 | `pg_fusion.worker_threads` | `0` | DataFusion Tokio runtime thread count. `0` chooses automatically from available CPU parallelism. |
+| `pg_fusion.max_fusion_tasks` | `0` | Maximum concurrent backend execution tasks inside the worker. `0` uses `pg_fusion.control_slot_count`; explicit values are capped at the control slot count. |
 | `pg_fusion.worker_memory_limit_mb` | `0` | DataFusion worker memory limit. `0` uses the default unbounded runtime and disables worker spill. |
 | `pg_fusion.worker_spill_directory` | `''` | Base directory for worker-owned spill files. Empty uses OS temporary storage. |
 | `pg_fusion.worker_log_filter` | `warn` | Worker tracing filter. |
@@ -56,7 +57,12 @@ temporary files.
 `pg_fusion.worker_threads` controls the Tokio runtime threads inside the
 pg_fusion worker process. It does not control PostgreSQL dynamic scan workers,
 and it does not by itself change DataFusion physical plan partitioning. Set it
-to `1` to force the previous single-thread runtime shape.
+to `1` to run the multi-thread Tokio runtime with one worker thread.
+
+`pg_fusion.max_fusion_tasks` limits how many backend executions the worker can
+have active at once. The default `0` uses the primary control slot count, so one
+backend can normally own one worker task. Lower explicit values can be used to
+serialize or throttle worker execution without resizing shared memory.
 
 ## Size Shared Memory
 

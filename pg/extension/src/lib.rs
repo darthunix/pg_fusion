@@ -21,6 +21,8 @@ mod scan_worker_job;
 mod shmem;
 #[cfg(feature = "pg_test")]
 mod smoke_tests;
+#[cfg(feature = "pg_test")]
+mod test_gate;
 mod utility_hook;
 mod worker;
 
@@ -48,6 +50,29 @@ fn mark_guc_prefix_reserved(guc_prefix: &str) {
 #[pg_schema]
 mod tests {
     use pgrx::prelude::*;
+
+    #[pg_extern]
+    fn pg_fusion_test_execution_gate_reset() -> i32 {
+        super::test_gate::attach().reset();
+        0
+    }
+
+    #[pg_extern]
+    fn pg_fusion_test_execution_gate_release() -> i32 {
+        super::test_gate::attach().release();
+        0
+    }
+
+    #[pg_extern]
+    fn pg_fusion_test_execution_gate_disable() -> i32 {
+        super::test_gate::attach().disable();
+        0
+    }
+
+    #[pg_extern]
+    fn pg_fusion_test_execution_gate_entered() -> i32 {
+        super::test_gate::attach().entered()
+    }
 
     #[pg_test]
     fn pg_fusion_simple_select_smoke() {
@@ -187,6 +212,16 @@ mod tests {
     #[pg_test]
     fn pg_fusion_heap_leader_only_scan_smoke() {
         super::smoke_tests::heap_leader_only_scan_smoke();
+    }
+
+    #[pg_test]
+    fn pg_fusion_worker_concurrent_backend_tasks_smoke() {
+        super::smoke_tests::worker_executes_second_backend_while_first_task_waits_smoke();
+    }
+
+    #[pg_test]
+    fn pg_fusion_multi_page_result_transport_smoke() {
+        super::smoke_tests::multi_page_result_transport_smoke();
     }
 
     #[pg_test]

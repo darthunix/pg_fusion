@@ -46,11 +46,15 @@ fn wait_for_worker() {
 pub(crate) fn smoke_client() -> Client {
     wait_for_worker();
     let (port, dbname, user) = current_backend_connection();
+    connect_smoke_client(port, &dbname, &user)
+}
+
+fn connect_smoke_client(port: u16, dbname: &str, user: &str) -> Client {
     postgres::Config::new()
         .host("127.0.0.1")
         .port(port)
-        .user(&user)
-        .dbname(&dbname)
+        .user(user)
+        .dbname(dbname)
         .connect(postgres::NoTls)
         .expect("connect to pgrx test cluster")
 }
@@ -709,6 +713,68 @@ pub(crate) fn copy_select_smoke() {
         "COPY (SELECT ...) should return rows through pg_fusion custom scan"
     );
     assert_eq!(metrics_epoch, reset_epoch);
+}
+
+pub(crate) fn multi_page_result_transport_smoke() {
+    let mut client = smoke_client();
+    let mut tx = smoke_transaction(&mut client);
+    let table_name = "pg_temp.pgf_multi_page_result_transport_smoke";
+    const ROW_COUNT: usize = 4096;
+    const PAYLOAD_LEN: usize = 1024;
+
+    batch_execute_pg_fusion_disabled(
+        &mut tx,
+        &format!(
+            "\
+            CREATE TABLE {table_name} (id bigint NOT NULL, payload text NOT NULL);
+            INSERT INTO {table_name} (id, payload)
+            SELECT g::bigint, repeat('x', {PAYLOAD_LEN}) || g::text
+            FROM generate_series(1, {ROW_COUNT}) AS g
+            "
+        ),
+    );
+    simple_query_first_column_tx(&mut tx, "SELECT pg_fusion_metrics_reset()")
+        .expect("metrics reset before multi-page result smoke");
+
+    let rows = simple_query_first_column_rows_tx(
+        &mut tx,
+        &format!("SELECT payload FROM {table_name} ORDER BY id DESC"),
+    );
+    assert_eq!(rows.len(), ROW_COUNT);
+    assert!(
+        rows.first()
+            .is_some_and(|payload| payload.ends_with(&ROW_COUNT.to_string())),
+        "first sorted payload should come from highest id"
+    );
+    assert!(
+        rows.last().is_some_and(|payload| payload.ends_with('1')),
+        "last sorted payload should come from lowest id"
+    );
+
+    let summary = simple_query_first_column_tx(
+        &mut tx,
+        "\
+        SELECT concat(
+            coalesce(max(value) FILTER (WHERE metric = 'worker_result_pages_total'), 0), ',',
+            coalesce(max(value) FILTER (WHERE metric = 'result_pages_read_total'), 0)
+        )
+        FROM pg_fusion_metrics()
+        ",
+    )
+    .expect("multi-page result metric summary must return one row");
+    let parts = summary
+        .split(',')
+        .map(|part| part.parse::<i64>().expect("metric value must be integer"))
+        .collect::<Vec<_>>();
+    assert_eq!(parts.len(), 2);
+    assert!(
+        parts[0] > 1,
+        "worker_result_pages_total must prove multi-page result output: {summary}"
+    );
+    assert!(
+        parts[1] > 1,
+        "result_pages_read_total must prove backend consumed multiple result pages: {summary}"
+    );
 }
 
 pub(crate) fn copy_catalog_strict_smoke() {
@@ -1591,6 +1657,115 @@ pub(crate) fn heap_leader_only_scan_smoke() {
     client
         .batch_execute(&format!("DROP TABLE IF EXISTS {table_name}"))
         .expect("drop committed heap table for leader-only scan smoke");
+}
+
+pub(crate) fn worker_executes_second_backend_while_first_task_waits_smoke() {
+    let mut admin = smoke_client();
+    ensure_shared_preload(&mut admin);
+    let (port, dbname, user) = current_backend_connection();
+    let table_name = "public.pgf_worker_concurrent_tasks_smoke";
+    admin
+        .batch_execute(&format!(
+            "\
+            SELECT pg_advisory_lock({SMOKE_TEST_ADVISORY_LOCK});
+            SET pg_fusion.enable = off;
+            DROP TABLE IF EXISTS {table_name};
+            CREATE TABLE {table_name} AS
+            SELECT g::bigint AS id
+            FROM generate_series(1, 16) AS g;
+            ANALYZE {table_name};
+            SELECT tests.pg_fusion_test_execution_gate_reset();
+            "
+        ))
+        .expect("create committed worker concurrency fixture and enable test gate");
+
+    let first_table = table_name.to_owned();
+    let first_dbname = dbname.clone();
+    let first_user = user.clone();
+    let first_query = thread::spawn(move || -> Result<String, String> {
+        let mut client = connect_smoke_client(port, &first_dbname, &first_user);
+        ensure_shared_preload(&mut client);
+        client
+            .batch_execute(
+                "\
+                SET pg_fusion.enable = on;
+                SET max_parallel_workers_per_gather = 0;
+                SET statement_timeout = '10s';
+                ",
+            )
+            .map_err(|err| err.to_string())?;
+        simple_query_first_column_client(
+            &mut client,
+            &format!("SELECT sum(id)::bigint FROM {first_table}"),
+        )
+        .ok_or_else(|| "first backend query returned no rows".to_owned())
+    });
+
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        let entered: i32 = simple_query_first_column_client(
+            &mut admin,
+            "SELECT tests.pg_fusion_test_execution_gate_entered()",
+        )
+        .expect("test gate entered counter must return one row")
+        .parse()
+        .expect("test gate entered counter must be an integer");
+        if entered >= 1 {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "first backend did not enter the worker execution test gate"
+        );
+        thread::sleep(Duration::from_millis(10));
+    }
+
+    let mut second = connect_smoke_client(port, &dbname, &user);
+    ensure_shared_preload(&mut second);
+    second
+        .batch_execute(
+            "\
+            SET pg_fusion.enable = on;
+            SET max_parallel_workers_per_gather = 0;
+            SET statement_timeout = '2s';
+            ",
+        )
+        .expect("configure second backend worker concurrency session");
+    let second_value: i64 = simple_query_first_column_client(
+        &mut second,
+        &format!("SELECT sum(id)::bigint FROM {table_name} WHERE id <= 2"),
+    )
+    .expect("second backend should finish while first backend waits in worker task")
+    .parse()
+    .expect("second backend result must be an integer");
+    assert_eq!(second_value, 3);
+
+    admin
+        .batch_execute(
+            "\
+            SET pg_fusion.enable = off;
+            SELECT tests.pg_fusion_test_execution_gate_release();
+            ",
+        )
+        .expect("release worker execution test gate");
+    let first_value: i64 = first_query
+        .join()
+        .expect("first backend query thread must not panic")
+        .expect("first backend query must finish after gate release")
+        .parse()
+        .expect("first backend result must be an integer");
+    assert_eq!(first_value, 136);
+
+    admin
+        .batch_execute(&format!(
+            "\
+            SET pg_fusion.enable = off;
+            SELECT tests.pg_fusion_test_execution_gate_disable();
+            DROP TABLE IF EXISTS {table_name};
+            SELECT pg_advisory_unlock({SMOKE_TEST_ADVISORY_LOCK});
+            "
+        ))
+        .expect("drop worker concurrency fixture and disable test gate");
 }
 
 pub(crate) fn statement_timeout_cleans_up_active_execution_smoke() {
