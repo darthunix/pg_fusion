@@ -139,6 +139,8 @@ The pg_fusion worker is one PostgreSQL background worker process that owns a
 DataFusion runtime. Tokio drives DataFusion's async execution and internal
 tasks inside that process. `pg_fusion.worker_threads` controls the Tokio
 runtime threads for this worker, not PostgreSQL scan-producer processes.
+`pg_fusion.max_fusion_tasks` caps concurrent backend execution tasks in that
+runtime and defaults to the primary control slot count.
 
 PostgreSQL scan producers remain PostgreSQL backend or background-worker
 threads/processes. They do not call PostgreSQL APIs from Tokio tasks.

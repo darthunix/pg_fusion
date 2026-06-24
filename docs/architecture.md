@@ -95,10 +95,12 @@ The intended operational model is a resource box.
 
 This is different from putting a separate DataFusion runtime in each backend.
 Many backends can feed work into the same cooperative DataFusion/Tokio runtime,
-and the worker can reuse its configured threads across submitted executions. At
-the same time, memory, spill, and shared-memory capacity are easier to reason
-about because they are configured as one worker plus one preallocated transport
-area.
+and the worker can reuse its configured threads across submitted executions.
+The worker's PostgreSQL background-worker thread still owns primary transport
+and PG latch/signal integration; physical planning and execution run as
+per-backend Tokio tasks capped by `pg_fusion.max_fusion_tasks`. At the same
+time, memory, spill, and shared-memory capacity are easier to reason about
+because they are configured as one worker plus one preallocated transport area.
 
 The page pool bounds scan memory behavior. If scan pages or scan channels are
 exhausted, execution applies backpressure instead of allocating an unbounded

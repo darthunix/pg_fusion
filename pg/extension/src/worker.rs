@@ -1,5 +1,9 @@
-use std::collections::VecDeque;
+use std::collections::{HashMap, VecDeque};
 use std::ffi::CStr;
+use std::io::{self, Read, Write};
+use std::os::fd::{AsRawFd, RawFd};
+use std::os::raw::c_long;
+use std::os::unix::net::UnixStream;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
@@ -8,8 +12,8 @@ use ::metrics::{MetricId, PageDirection, RuntimeMetrics};
 use ::worker::{
     record_datafusion_spill_leaks, record_datafusion_spill_metrics, DecodedInbound,
     ExecutionSpillDir, ResultPageEmitter, ResultPageProducerConfig, ResultPageStep,
-    ScanIngressProvider, TransportScanBatchSource, TransportWorkerRuntime, WorkerRuntimeCore,
-    WorkerRuntimeError, WorkerRuntimeStep, WorkerSpillRuntime,
+    ScanIngressProvider, TransportScanBatchSource, TransportWorkerRuntime, WorkerRuntimeConfig,
+    WorkerRuntimeCore, WorkerRuntimeError, WorkerRuntimeStep, WorkerSpillRuntime,
 };
 use backend_service::{BackendService, StandaloneScanProducerInput};
 use control_transport::WorkerTransport;
@@ -23,6 +27,8 @@ use protocol::{
     ExecutionFailureCode, WorkerExecutionToBackend, MAX_EXECUTION_FAILURE_DETAIL_LEN,
     RUNTIME_ENVELOPE_HEADER_LEN,
 };
+use tokio::sync::{mpsc, oneshot};
+use tokio::task::JoinHandle;
 use tracing::{debug, info, trace, warn, Level};
 use transfer::PageTx;
 
@@ -34,6 +40,181 @@ use crate::shmem::{
 };
 
 const POLL_INTERVAL: Duration = Duration::from_millis(5);
+
+type WorkerTaskSender = mpsc::Sender<WorkerTaskEvent>;
+type WorkerTaskReceiver = mpsc::Receiver<WorkerTaskEvent>;
+type WorkerTaskAck = oneshot::Sender<Result<(), WorkerRuntimeError>>;
+
+struct ActiveWorkerExecution {
+    runtime: WorkerRuntimeCore,
+    plan_rx: Option<IssuedRx>,
+    task: Option<JoinHandle<()>>,
+    worker_start_ns: Option<u64>,
+}
+
+impl ActiveWorkerExecution {
+    fn new(config: WorkerRuntimeConfig, scan_source: Arc<dyn ::worker::ScanBatchSource>) -> Self {
+        Self {
+            runtime: WorkerRuntimeCore::new(config, scan_source),
+            plan_rx: None,
+            task: None,
+            worker_start_ns: None,
+        }
+    }
+
+    fn abort_task(&mut self) {
+        if let Some(task) = self.task.take() {
+            task.abort();
+        }
+    }
+}
+
+enum WorkerTaskEvent {
+    PhysicalPlanningFinished {
+        peer: BackendLeaseSlot,
+        flow: plan_flow::FlowId,
+        result: Result<Arc<dyn ExecutionPlan>, WorkerRuntimeError>,
+    },
+    ResultPage {
+        peer: BackendLeaseSlot,
+        session_epoch: u64,
+        outbound: issuance::IssuedOutboundPage,
+        ack: WorkerTaskAck,
+    },
+    ResultClose {
+        peer: BackendLeaseSlot,
+        session_epoch: u64,
+        frame: issuance::IssuedOwnedFrame,
+        ack: WorkerTaskAck,
+    },
+    ExecutionFinished {
+        peer: BackendLeaseSlot,
+        session_epoch: u64,
+        result: Result<(), WorkerRuntimeError>,
+    },
+}
+
+struct ExecutionTaskInput {
+    task_tx: WorkerTaskNotifier,
+    page_pool: PagePool,
+    issuance_pool: IssuancePool,
+    metrics: RuntimeMetrics,
+    peer: BackendLeaseSlot,
+    session_epoch: u64,
+    plan: Arc<dyn ExecutionPlan>,
+    task_ctx: Arc<datafusion_execution::TaskContext>,
+    spill_dir: ExecutionSpillDir,
+    spill_dir_created: bool,
+    estimator_initial_tail_bytes_per_row: u32,
+    #[cfg(feature = "pg_test")]
+    test_execution_gate: crate::test_gate::TestExecutionGateHandle,
+}
+
+struct WorkerSchedulerWake {
+    reader: UnixStream,
+    sender: WorkerSchedulerWakeSender,
+}
+
+impl WorkerSchedulerWake {
+    fn new() -> Result<Self, WorkerRuntimeError> {
+        let (reader, writer) = UnixStream::pair().map_err(|err| {
+            WorkerRuntimeError::ProtocolViolation(format!(
+                "failed to create worker scheduler wake socket: {err}"
+            ))
+        })?;
+        reader.set_nonblocking(true).map_err(|err| {
+            WorkerRuntimeError::ProtocolViolation(format!(
+                "failed to configure worker scheduler wake reader: {err}"
+            ))
+        })?;
+        writer.set_nonblocking(true).map_err(|err| {
+            WorkerRuntimeError::ProtocolViolation(format!(
+                "failed to configure worker scheduler wake writer: {err}"
+            ))
+        })?;
+        Ok(Self {
+            reader,
+            sender: WorkerSchedulerWakeSender {
+                writer: Arc::new(writer),
+            },
+        })
+    }
+
+    fn sender(&self) -> WorkerSchedulerWakeSender {
+        self.sender.clone()
+    }
+
+    fn read_fd(&self) -> RawFd {
+        self.reader.as_raw_fd()
+    }
+
+    fn drain(&mut self) -> usize {
+        let mut buf = [0_u8; 64];
+        let mut drained = 0;
+        loop {
+            match self.reader.read(&mut buf) {
+                Ok(0) => return drained,
+                Ok(bytes) => drained += bytes,
+                Err(err) if err.kind() == io::ErrorKind::WouldBlock => return drained,
+                Err(err) if err.kind() == io::ErrorKind::Interrupted => {}
+                Err(err) => {
+                    warn!(
+                        component = "worker",
+                        error = %err,
+                        "failed to drain worker scheduler wake socket"
+                    );
+                    return drained;
+                }
+            }
+        }
+    }
+}
+
+#[derive(Clone)]
+struct WorkerSchedulerWakeSender {
+    writer: Arc<UnixStream>,
+}
+
+impl WorkerSchedulerWakeSender {
+    fn wake(&self) -> io::Result<()> {
+        let mut writer = self.writer.as_ref();
+        loop {
+            match writer.write(&[1]) {
+                Ok(_) => return Ok(()),
+                Err(err) if err.kind() == io::ErrorKind::WouldBlock => return Ok(()),
+                Err(err) if err.kind() == io::ErrorKind::Interrupted => {}
+                Err(err) => return Err(err),
+            }
+        }
+    }
+}
+
+#[derive(Clone)]
+struct WorkerTaskNotifier {
+    tx: WorkerTaskSender,
+    wake: WorkerSchedulerWakeSender,
+}
+
+impl WorkerTaskNotifier {
+    fn new(tx: WorkerTaskSender, wake: WorkerSchedulerWakeSender) -> Self {
+        Self { tx, wake }
+    }
+
+    async fn send(
+        &self,
+        event: WorkerTaskEvent,
+    ) -> Result<(), mpsc::error::SendError<WorkerTaskEvent>> {
+        self.tx.send(event).await?;
+        if let Err(err) = self.wake.wake() {
+            warn!(
+                component = "worker",
+                error = %err,
+                "failed to wake worker scheduler after task event"
+            );
+        }
+        Ok(())
+    }
+}
 
 pub(crate) fn register_background_worker() {
     BackgroundWorkerBuilder::new("pg_fusion")
@@ -197,17 +378,23 @@ fn run_worker_main() -> Result<(), WorkerRuntimeError> {
                 );
             }
 
-            let scan_source = Arc::new(TransportScanBatchSource::new_with_metrics(
-                scan_region,
-                config.scan_backend_to_worker_capacity,
-                Arc::new(SharedScanIngress {
-                    page_pool,
-                    issuance_pool,
-                }),
-                metrics,
-            )?);
-            let mut runtime = WorkerRuntimeCore::new(worker_config, scan_source);
-            let mut plan_rx: Option<IssuedRx> = None;
+            let scan_source: Arc<dyn ::worker::ScanBatchSource> =
+                Arc::new(TransportScanBatchSource::new_with_metrics(
+                    scan_region,
+                    config.scan_backend_to_worker_capacity,
+                    Arc::new(SharedScanIngress {
+                        page_pool,
+                        issuance_pool,
+                    }),
+                    metrics,
+                )?);
+            let mut scheduler_wake = WorkerSchedulerWake::new()?;
+            let (task_event_tx, mut task_rx) =
+                mpsc::channel(config.max_fusion_tasks.saturating_mul(4).max(1));
+            let task_tx = WorkerTaskNotifier::new(task_event_tx, scheduler_wake.sender());
+            let mut executions: HashMap<BackendLeaseSlot, ActiveWorkerExecution> = HashMap::new();
+            #[cfg(feature = "pg_test")]
+            let test_execution_gate = crate::test_gate::attach();
             let df_runtime_plan = resolve_datafusion_runtime_plan(config.worker_threads);
             let df_runtime = build_datafusion_runtime(df_runtime_plan)?;
             info!(
@@ -219,100 +406,106 @@ fn run_worker_main() -> Result<(), WorkerRuntimeError> {
             );
             debug!(component = "worker", "worker entering main poll loop");
 
-            while BackgroundWorker::wait_latch(Some(POLL_INTERVAL)) {
-                if let Some(peer) = runtime.active_peer() {
+            while wait_worker_scheduler(&mut scheduler_wake, POLL_INTERVAL) {
+                drain_task_events(
+                    &mut executions,
+                    &mut transport,
+                    &df_runtime,
+                    &mut spill_runtime,
+                    &config,
+                    page_pool,
+                    issuance_pool,
+                    metrics,
+                    &mut task_rx,
+                    &task_tx,
+                    #[cfg(feature = "pg_test")]
+                    test_execution_gate,
+                )?;
+
+                let active_peers = executions.keys().copied().collect::<Vec<_>>();
+                for peer in active_peers {
                     trace!(
                         component = "worker",
                         peer = ?peer,
-                        state = ?runtime.state(),
                         "worker probing active backend peer"
                     );
-                    let steps = recv_backend_peer_steps(
+                    poll_execution_peer(
+                        &mut executions,
                         &mut transport,
-                        &mut runtime,
-                        peer,
-                        page_pool,
-                        issuance_pool,
-                        &mut plan_rx,
-                    )?;
-                    handle_steps(
-                        &mut transport,
-                        &mut runtime,
                         &df_runtime,
                         &mut spill_runtime,
                         &config,
+                        &worker_config,
+                        &scan_source,
+                        &task_tx,
+                        #[cfg(feature = "pg_test")]
+                        test_execution_gate,
+                        peer,
                         page_pool,
                         issuance_pool,
-                        &mut plan_rx,
                         metrics,
-                        steps,
                     )?;
                 }
 
                 let mut ready_cursor = 0;
                 while let Some(peer) = transport.next_ready_backend_lease(&mut ready_cursor) {
-                    if let Some(active_peer) = runtime.active_peer() {
-                        if active_peer != peer {
-                            trace!(
-                                component = "worker",
-                                peer = ?active_peer,
-                                incoming_peer = ?peer,
-                                state = ?runtime.state(),
-                                "worker probing active backend peer before non-active peer"
-                            );
-                            let steps = recv_backend_peer_steps(
-                                &mut transport,
-                                &mut runtime,
-                                active_peer,
-                                page_pool,
-                                issuance_pool,
-                                &mut plan_rx,
-                            )?;
-                            handle_steps(
-                                &mut transport,
-                                &mut runtime,
-                                &df_runtime,
-                                &mut spill_runtime,
-                                &config,
-                                page_pool,
-                                issuance_pool,
-                                &mut plan_rx,
-                                metrics,
-                                steps,
-                            )?;
-                        }
+                    if executions.contains_key(&peer) {
+                        continue;
+                    }
+                    if executions.len() >= config.max_fusion_tasks {
+                        trace!(
+                            component = "worker",
+                            peer = ?peer,
+                            active_executions = executions.len(),
+                            max_fusion_tasks = config.max_fusion_tasks,
+                            "worker deferring new backend peer because fusion task limit is reached"
+                        );
+                        continue;
                     }
                     if tracing::enabled!(Level::TRACE) {
                         trace!(
                             component = "worker",
                             peer = ?peer,
-                            state = ?runtime.state(),
                             "worker polling ready backend peer"
                         );
                     }
-                    let steps = recv_backend_peer_steps(
+                    poll_execution_peer(
+                        &mut executions,
                         &mut transport,
-                        &mut runtime,
-                        peer,
-                        page_pool,
-                        issuance_pool,
-                        &mut plan_rx,
-                    )?;
-                    handle_steps(
-                        &mut transport,
-                        &mut runtime,
                         &df_runtime,
                         &mut spill_runtime,
                         &config,
+                        &worker_config,
+                        &scan_source,
+                        &task_tx,
+                        #[cfg(feature = "pg_test")]
+                        test_execution_gate,
+                        peer,
                         page_pool,
                         issuance_pool,
-                        &mut plan_rx,
                         metrics,
-                        steps,
                     )?;
                 }
+
+                drain_task_events(
+                    &mut executions,
+                    &mut transport,
+                    &df_runtime,
+                    &mut spill_runtime,
+                    &config,
+                    page_pool,
+                    issuance_pool,
+                    metrics,
+                    &mut task_rx,
+                    &task_tx,
+                    #[cfg(feature = "pg_test")]
+                    test_execution_gate,
+                )?;
             }
 
+            for execution in executions.values_mut() {
+                execution.abort_task();
+            }
             Ok(())
         })();
 
@@ -330,6 +523,224 @@ fn run_worker_main() -> Result<(), WorkerRuntimeError> {
     )?;
     info!(component = "worker", "worker stopped cleanly");
     Ok(())
+}
+
+fn wait_worker_scheduler(wake: &mut WorkerSchedulerWake, timeout: Duration) -> bool {
+    let timeout_ms = timeout.as_millis().try_into().unwrap_or(c_long::MAX);
+    let wake_events = (pgrx::pg_sys::WL_LATCH_SET
+        | pgrx::pg_sys::WL_SOCKET_READABLE
+        | pgrx::pg_sys::WL_TIMEOUT
+        | pgrx::pg_sys::WL_POSTMASTER_DEATH) as i32;
+
+    let wakeup_flags = unsafe {
+        let flags = pgrx::pg_sys::WaitLatchOrSocket(
+            pgrx::pg_sys::MyLatch,
+            wake_events,
+            wake.read_fd() as pgrx::pg_sys::pgsocket,
+            timeout_ms,
+            pgrx::pg_sys::PG_WAIT_EXTENSION,
+        );
+        pgrx::pg_sys::ResetLatch(pgrx::pg_sys::MyLatch);
+        pgrx::pg_sys::check_for_interrupts!();
+        flags
+    };
+
+    if wakeup_flags & pgrx::pg_sys::WL_SOCKET_READABLE as i32 != 0 {
+        wake.drain();
+    }
+
+    let postmaster_died = wakeup_flags & pgrx::pg_sys::WL_POSTMASTER_DEATH as i32 != 0;
+    !BackgroundWorker::sigterm_received() && !postmaster_died
+}
+
+#[allow(clippy::too_many_arguments)]
+fn poll_execution_peer(
+    executions: &mut HashMap<BackendLeaseSlot, ActiveWorkerExecution>,
+    transport: &mut TransportWorkerRuntime,
+    df_runtime: &tokio::runtime::Runtime,
+    spill_runtime: &mut WorkerSpillRuntime,
+    config: &crate::HostConfig,
+    worker_config: &WorkerRuntimeConfig,
+    scan_source: &Arc<dyn ::worker::ScanBatchSource>,
+    task_tx: &WorkerTaskNotifier,
+    #[cfg(feature = "pg_test")] test_execution_gate: crate::test_gate::TestExecutionGateHandle,
+    peer: BackendLeaseSlot,
+    page_pool: PagePool,
+    issuance_pool: IssuancePool,
+    metrics: RuntimeMetrics,
+) -> Result<(), WorkerRuntimeError> {
+    let mut execution = executions.remove(&peer).unwrap_or_else(|| {
+        ActiveWorkerExecution::new(worker_config.clone(), Arc::clone(scan_source))
+    });
+    let steps = recv_backend_peer_steps(
+        transport,
+        &mut execution.runtime,
+        peer,
+        page_pool,
+        issuance_pool,
+        &mut execution.plan_rx,
+    )?;
+    handle_steps(
+        transport,
+        &mut execution,
+        df_runtime,
+        spill_runtime,
+        config,
+        page_pool,
+        issuance_pool,
+        metrics,
+        task_tx,
+        #[cfg(feature = "pg_test")]
+        test_execution_gate,
+        steps,
+    )?;
+    if execution.runtime.active_peer().is_some() {
+        executions.insert(peer, execution);
+    } else {
+        execution.abort_task();
+    }
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn drain_task_events(
+    executions: &mut HashMap<BackendLeaseSlot, ActiveWorkerExecution>,
+    transport: &mut TransportWorkerRuntime,
+    df_runtime: &tokio::runtime::Runtime,
+    spill_runtime: &mut WorkerSpillRuntime,
+    config: &crate::HostConfig,
+    page_pool: PagePool,
+    issuance_pool: IssuancePool,
+    metrics: RuntimeMetrics,
+    task_rx: &mut WorkerTaskReceiver,
+    task_tx: &WorkerTaskNotifier,
+    #[cfg(feature = "pg_test")] test_execution_gate: crate::test_gate::TestExecutionGateHandle,
+) -> Result<(), WorkerRuntimeError> {
+    while let Ok(event) = task_rx.try_recv() {
+        handle_task_event(
+            executions,
+            transport,
+            df_runtime,
+            spill_runtime,
+            config,
+            page_pool,
+            issuance_pool,
+            metrics,
+            task_tx,
+            #[cfg(feature = "pg_test")]
+            test_execution_gate,
+            event,
+        )?;
+    }
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn handle_task_event(
+    executions: &mut HashMap<BackendLeaseSlot, ActiveWorkerExecution>,
+    transport: &mut TransportWorkerRuntime,
+    df_runtime: &tokio::runtime::Runtime,
+    spill_runtime: &mut WorkerSpillRuntime,
+    config: &crate::HostConfig,
+    page_pool: PagePool,
+    issuance_pool: IssuancePool,
+    metrics: RuntimeMetrics,
+    task_tx: &WorkerTaskNotifier,
+    #[cfg(feature = "pg_test")] test_execution_gate: crate::test_gate::TestExecutionGateHandle,
+    event: WorkerTaskEvent,
+) -> Result<(), WorkerRuntimeError> {
+    match event {
+        WorkerTaskEvent::PhysicalPlanningFinished { peer, flow, result } => {
+            let Some(mut execution) = executions.remove(&peer) else {
+                return Ok(());
+            };
+            execution.task = None;
+            let step = execution
+                .runtime
+                .finish_physical_planning(peer, flow, result)?;
+            handle_steps(
+                transport,
+                &mut execution,
+                df_runtime,
+                spill_runtime,
+                config,
+                page_pool,
+                issuance_pool,
+                metrics,
+                task_tx,
+                #[cfg(feature = "pg_test")]
+                test_execution_gate,
+                VecDeque::from([step]),
+            )?;
+            if execution.runtime.active_peer().is_some() {
+                executions.insert(peer, execution);
+            } else {
+                execution.abort_task();
+            }
+        }
+        WorkerTaskEvent::ResultPage {
+            peer,
+            session_epoch,
+            outbound,
+            ack,
+        } => {
+            let result = if active_execution_session_matches(executions, peer, session_epoch) {
+                send_result_page_from_task(transport, metrics, peer, session_epoch, outbound)
+            } else {
+                Err(stale_execution_task_error(peer, session_epoch))
+            };
+            let _ = ack.send(result);
+        }
+        WorkerTaskEvent::ResultClose {
+            peer,
+            session_epoch,
+            frame,
+            ack,
+        } => {
+            let result = if active_execution_session_matches(executions, peer, session_epoch) {
+                send_result_close_from_task(transport, peer, session_epoch, frame)
+            } else {
+                Err(stale_execution_task_error(peer, session_epoch))
+            };
+            let _ = ack.send(result);
+        }
+        WorkerTaskEvent::ExecutionFinished {
+            peer,
+            session_epoch,
+            result,
+        } => {
+            let Some(mut execution) = executions.remove(&peer) else {
+                return Ok(());
+            };
+            execution.task = None;
+            finish_execution_task(
+                transport,
+                &mut execution,
+                config,
+                metrics,
+                peer,
+                session_epoch,
+                result,
+            )?;
+            if execution.runtime.active_peer().is_some() {
+                executions.insert(peer, execution);
+            } else {
+                execution.abort_task();
+            }
+        }
+    }
+    Ok(())
+}
+
+fn active_execution_session_matches(
+    executions: &HashMap<BackendLeaseSlot, ActiveWorkerExecution>,
+    peer: BackendLeaseSlot,
+    session_epoch: u64,
+) -> bool {
+    executions
+        .get(&peer)
+        .and_then(|execution| execution.runtime.session_epoch())
+        == Some(session_epoch)
 }
 
 fn recv_backend_peer_steps(
@@ -381,6 +792,175 @@ fn recv_backend_peer_steps(
         }
         Err(err) => Err(err),
     }
+}
+
+fn send_result_page_from_task(
+    transport: &mut TransportWorkerRuntime,
+    metrics: RuntimeMetrics,
+    peer: BackendLeaseSlot,
+    session_epoch: u64,
+    outbound: issuance::IssuedOutboundPage,
+) -> Result<(), WorkerRuntimeError> {
+    trace!(
+        component = "worker",
+        session_epoch,
+        peer = ?peer,
+        "worker produced one result page"
+    );
+    let descriptor = outbound.descriptor();
+    let payload_len = outbound.payload_len();
+    let frame = encode_issued_frame(outbound.frame()).map_err(|err| {
+        WorkerRuntimeError::ProtocolViolation(format!("failed to encode result page frame: {err}"))
+    })?;
+    transport.send_peer_bytes(peer, &frame)?;
+    metrics.stamp_page(PageDirection::WorkerToBackend, descriptor, payload_len);
+    metrics.increment(MetricId::WorkerResultPagesTotal);
+    metrics.add(MetricId::WorkerResultBytesSentTotal, payload_len as u64);
+    outbound.mark_sent();
+    Ok(())
+}
+
+fn send_result_close_from_task(
+    transport: &mut TransportWorkerRuntime,
+    peer: BackendLeaseSlot,
+    session_epoch: u64,
+    frame: issuance::IssuedOwnedFrame,
+) -> Result<(), WorkerRuntimeError> {
+    debug!(
+        component = "worker",
+        session_epoch,
+        peer = ?peer,
+        "worker produced terminal result close frame"
+    );
+    let frame = encode_issued_frame(frame).map_err(|err| {
+        WorkerRuntimeError::ProtocolViolation(format!("failed to encode result close frame: {err}"))
+    })?;
+    transport.send_peer_bytes(peer, &frame)?;
+    Ok(())
+}
+
+fn finish_execution_task(
+    transport: &mut TransportWorkerRuntime,
+    execution: &mut ActiveWorkerExecution,
+    config: &crate::HostConfig,
+    metrics: RuntimeMetrics,
+    peer: BackendLeaseSlot,
+    session_epoch: u64,
+    result: Result<(), WorkerRuntimeError>,
+) -> Result<(), WorkerRuntimeError> {
+    let worker_start = execution.worker_start_ns.take();
+    match result {
+        Ok(()) => {
+            info!(
+                component = "worker",
+                session_epoch,
+                peer = ?peer,
+                "worker finished execution successfully and is sending CompleteExecution"
+            );
+            if let Err(err) = transport.send_peer_message(
+                peer,
+                WorkerExecutionToBackend::CompleteExecution { session_epoch },
+            ) {
+                if is_detached_backend_peer_error(&err) {
+                    warn!(
+                        component = "worker",
+                        session_epoch,
+                        peer = ?peer,
+                        error = %err,
+                        "worker could not send CompleteExecution because backend peer detached"
+                    );
+                } else {
+                    return Err(err);
+                }
+            }
+            if let Some(worker_start) = worker_start {
+                metrics.add_elapsed(MetricId::WorkerTotalNs, worker_start);
+            }
+            let step = execution.runtime.mark_execution_complete()?;
+            handle_terminal_step(execution, step)?;
+        }
+        Err(err) => {
+            let detail =
+                worker_execution_failure_detail(&err, config.control_backend_to_worker_capacity);
+            warn!(
+                component = "worker",
+                session_epoch,
+                peer = ?peer,
+                error = %err,
+                "worker execution failed locally; sending FailExecution"
+            );
+            if let Err(send_err) = transport.send_peer_message(
+                peer,
+                WorkerExecutionToBackend::FailExecution {
+                    session_epoch,
+                    code: ExecutionFailureCode::Internal,
+                    detail,
+                },
+            ) {
+                if is_detached_backend_peer_error(&send_err) {
+                    warn!(
+                        component = "worker",
+                        session_epoch,
+                        peer = ?peer,
+                        error = %send_err,
+                        "worker could not send FailExecution because backend peer detached"
+                    );
+                } else {
+                    return Err(send_err);
+                }
+            }
+            if let Some(worker_start) = worker_start {
+                metrics.add_elapsed(MetricId::WorkerTotalNs, worker_start);
+            }
+            let step = execution
+                .runtime
+                .fail_execution_locally(ExecutionFailureCode::Internal, None)?;
+            handle_terminal_step(execution, step)?;
+        }
+    }
+    Ok(())
+}
+
+fn handle_terminal_step(
+    execution: &mut ActiveWorkerExecution,
+    step: WorkerRuntimeStep,
+) -> Result<(), WorkerRuntimeError> {
+    match step {
+        WorkerRuntimeStep::ExecutionCancelled { session_epoch } => {
+            info!(
+                component = "worker",
+                session_epoch, "worker observed execution cancel"
+            );
+            execution.plan_rx.take();
+        }
+        WorkerRuntimeStep::ExecutionFailed {
+            session_epoch,
+            code,
+            detail,
+        } => {
+            warn!(
+                component = "worker",
+                session_epoch,
+                code = ?code,
+                detail = ?detail,
+                "worker observed execution failure transition"
+            );
+            execution.plan_rx.take();
+        }
+        WorkerRuntimeStep::ExecutionCompleted { session_epoch } => {
+            info!(
+                component = "worker",
+                session_epoch, "worker observed execution complete transition"
+            );
+            execution.plan_rx.take();
+        }
+        _ => return Ok(()),
+    }
+
+    if execution.runtime.state() == ::worker::fsm::WorkerExecutionState::Terminal {
+        execution.runtime.cleanup()?;
+    }
+    Ok(())
 }
 
 fn finish_with_deactivation(
@@ -568,13 +1148,13 @@ mod tests {
     }
 
     #[test]
-    fn datafusion_runtime_plan_uses_explicit_current_thread() {
+    fn datafusion_runtime_plan_uses_explicit_single_worker_thread() {
         let plan = resolve_datafusion_runtime_plan_with(Some(1), || 8);
 
         assert_eq!(plan.requested_worker_threads, Some(1));
         assert_eq!(plan.worker_threads, 1);
-        assert_eq!(plan.mode, DataFusionRuntimeMode::CurrentThread);
-        assert_eq!(plan.mode.as_str(), "current-thread");
+        assert_eq!(plan.mode, DataFusionRuntimeMode::MultiThread);
+        assert_eq!(plan.mode.as_str(), "multi-thread");
     }
 
     #[test]
@@ -601,7 +1181,56 @@ mod tests {
         let plan = resolve_datafusion_runtime_plan_with(None, || 0);
 
         assert_eq!(plan.worker_threads, 1);
-        assert_eq!(plan.mode, DataFusionRuntimeMode::CurrentThread);
+        assert_eq!(plan.mode, DataFusionRuntimeMode::MultiThread);
+    }
+
+    #[test]
+    fn scheduler_wake_drains_nonblocking_notifications() {
+        let mut wake = WorkerSchedulerWake::new().expect("create scheduler wake");
+        let sender = wake.sender();
+
+        sender.wake().expect("wake scheduler");
+        sender.wake().expect("coalesce second scheduler wake");
+        assert!(wake.drain() >= 1);
+        assert_eq!(wake.drain(), 0);
+        sender.wake().expect("wake after drain");
+        assert_eq!(wake.drain(), 1);
+    }
+
+    #[test]
+    fn task_notifier_wakes_after_event_send() {
+        let mut wake = WorkerSchedulerWake::new().expect("create scheduler wake");
+        let (tx, mut rx) = mpsc::channel(1);
+        let notifier = WorkerTaskNotifier::new(tx, wake.sender());
+        let peer = BackendLeaseSlot::new(0, control_transport::BackendLeaseId::new(1, 1));
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .expect("create test runtime");
+
+        runtime.block_on(async {
+            notifier
+                .send(WorkerTaskEvent::ExecutionFinished {
+                    peer,
+                    session_epoch: 42,
+                    result: Ok(()),
+                })
+                .await
+                .expect("send task event");
+        });
+
+        assert_eq!(wake.drain(), 1);
+        match rx.try_recv().expect("receive task event") {
+            WorkerTaskEvent::ExecutionFinished {
+                peer: received_peer,
+                session_epoch,
+                result,
+            } => {
+                assert_eq!(received_peer, peer);
+                assert_eq!(session_epoch, 42);
+                assert!(result.is_ok());
+            }
+            _ => panic!("unexpected task event"),
+        }
     }
 
     fn protocol_error(message: &str) -> WorkerRuntimeError {
@@ -623,14 +1252,15 @@ mod tests {
 #[allow(clippy::too_many_arguments)]
 fn handle_steps(
     transport: &mut TransportWorkerRuntime,
-    runtime: &mut WorkerRuntimeCore,
+    execution: &mut ActiveWorkerExecution,
     df_runtime: &tokio::runtime::Runtime,
     spill_runtime: &mut WorkerSpillRuntime,
     config: &crate::HostConfig,
     page_pool: PagePool,
     issuance_pool: IssuancePool,
-    plan_rx: &mut Option<IssuedRx>,
     metrics: RuntimeMetrics,
+    task_tx: &WorkerTaskNotifier,
+    #[cfg(feature = "pg_test")] test_execution_gate: crate::test_gate::TestExecutionGateHandle,
     mut steps: VecDeque<WorkerRuntimeStep>,
 ) -> Result<(), WorkerRuntimeError> {
     while let Some(step) = steps.pop_front() {
@@ -657,14 +1287,20 @@ fn handle_steps(
                     flow = ?flow,
                     "worker starting physical planning"
                 );
-                let plan_start = metrics.now_ns();
-                let result = df_runtime.block_on(pending.plan());
-                metrics.add_elapsed(MetricId::WorkerPhysicalPlanNs, plan_start);
-                metrics.increment(MetricId::WorkerPhysicalPlanTotal);
-                steps.push_back(runtime.finish_physical_planning(peer, flow, result)?);
+                let task_tx = task_tx.clone();
+                execution.abort_task();
+                execution.task = Some(df_runtime.spawn(async move {
+                    let plan_start = metrics.now_ns();
+                    let result = pending.plan().await;
+                    metrics.add_elapsed(MetricId::WorkerPhysicalPlanNs, plan_start);
+                    metrics.increment(MetricId::WorkerPhysicalPlanTotal);
+                    let _ = task_tx
+                        .send(WorkerTaskEvent::PhysicalPlanningFinished { peer, flow, result })
+                        .await;
+                }));
             }
             WorkerRuntimeStep::PhysicalPlanReady(result) => {
-                let peer = runtime.active_peer().expect("peer");
+                let peer = execution.runtime.active_peer().expect("peer");
                 let worker_start = metrics.now_ns();
                 info!(
                     component = "worker",
@@ -672,139 +1308,89 @@ fn handle_steps(
                     peer = ?peer,
                     "worker received physical plan and is starting execution"
                 );
-                let execution_result: Result<(), WorkerRuntimeError> = runtime
+                let plan = execution
+                    .runtime
                     .take_physical_plan()
-                    .ok_or(WorkerRuntimeError::MissingPhysicalPlan)
-                    .and_then(|plan| {
-                        df_runtime.block_on(execute_physical_plan(
-                            transport,
-                            spill_runtime,
-                            config,
-                            page_pool,
-                            issuance_pool,
+                    .ok_or(WorkerRuntimeError::MissingPhysicalPlan)?;
+                let spill_dir = spill_runtime.execution_dir(peer, result.session_epoch)?;
+                execution.worker_start_ns = Some(worker_start);
+                let spill_dir_created = spill_dir.path().is_some();
+                if spill_dir_created {
+                    metrics.increment(MetricId::WorkerSpillDirsCreatedTotal);
+                }
+                let task_ctx = match spill_runtime.task_context(&spill_dir) {
+                    Ok(task_ctx) => task_ctx,
+                    Err(err) => {
+                        let cleanup_result = cleanup_execution_spill_dir(
+                            spill_dir,
+                            spill_dir_created,
                             metrics,
                             peer,
                             result.session_epoch,
-                            plan,
-                        ))
-                    });
+                        );
+                        if let Err(cleanup_err) = cleanup_result {
+                            warn!(
+                                component = "worker",
+                                session_epoch = result.session_epoch,
+                                peer = ?peer,
+                                error = %cleanup_err,
+                                "worker failed to clean execution spill directory after task context failure"
+                            );
+                        }
+                        finish_execution_task(
+                            transport,
+                            execution,
+                            config,
+                            metrics,
+                            peer,
+                            result.session_epoch,
+                            Err(err),
+                        )?;
+                        continue;
+                    }
+                };
 
-                match execution_result {
-                    Ok(()) => {
-                        info!(
-                            component = "worker",
-                            session_epoch = result.session_epoch,
-                            peer = ?peer,
-                            "worker finished execution successfully and is sending CompleteExecution"
-                        );
-                        if let Err(err) = transport.send_peer_message(
+                let task_input = ExecutionTaskInput {
+                    task_tx: task_tx.clone(),
+                    page_pool,
+                    issuance_pool,
+                    metrics,
+                    peer,
+                    session_epoch: result.session_epoch,
+                    plan,
+                    task_ctx,
+                    spill_dir,
+                    spill_dir_created,
+                    estimator_initial_tail_bytes_per_row: config
+                        .estimator_initial_tail_bytes_per_row,
+                    #[cfg(feature = "pg_test")]
+                    test_execution_gate,
+                };
+                execution.abort_task();
+                execution.task = Some(df_runtime.spawn(async move {
+                    let peer = task_input.peer;
+                    let session_epoch = task_input.session_epoch;
+                    let task_tx = task_input.task_tx.clone();
+                    let result = execute_physical_plan_task(task_input).await;
+                    let _ = task_tx
+                        .send(WorkerTaskEvent::ExecutionFinished {
                             peer,
-                            WorkerExecutionToBackend::CompleteExecution {
-                                session_epoch: result.session_epoch,
-                            },
-                        ) {
-                            if is_detached_backend_peer_error(&err) {
-                                warn!(
-                                    component = "worker",
-                                    session_epoch = result.session_epoch,
-                                    peer = ?peer,
-                                    error = %err,
-                                    "worker could not send CompleteExecution because backend peer detached"
-                                );
-                            } else {
-                                return Err(err);
-                            }
-                        }
-                        metrics.add_elapsed(MetricId::WorkerTotalNs, worker_start);
-                        steps.push_back(runtime.mark_execution_complete()?);
-                    }
-                    Err(err) => {
-                        let detail = worker_execution_failure_detail(
-                            &err,
-                            config.control_backend_to_worker_capacity,
-                        );
-                        warn!(
-                            component = "worker",
-                            session_epoch = result.session_epoch,
-                            peer = ?peer,
-                            error = %err,
-                            "worker execution failed locally; sending FailExecution"
-                        );
-                        if let Err(send_err) = transport.send_peer_message(
-                            peer,
-                            WorkerExecutionToBackend::FailExecution {
-                                session_epoch: result.session_epoch,
-                                code: ExecutionFailureCode::Internal,
-                                detail,
-                            },
-                        ) {
-                            if is_detached_backend_peer_error(&send_err) {
-                                warn!(
-                                    component = "worker",
-                                    session_epoch = result.session_epoch,
-                                    peer = ?peer,
-                                    error = %send_err,
-                                    "worker could not send FailExecution because backend peer detached"
-                                );
-                            } else {
-                                return Err(send_err);
-                            }
-                        }
-                        metrics.add_elapsed(MetricId::WorkerTotalNs, worker_start);
-                        steps.push_back(
-                            runtime.fail_execution_locally(ExecutionFailureCode::Internal, None)?,
-                        );
-                    }
-                }
+                            session_epoch,
+                            result,
+                        })
+                        .await;
+                }));
             }
-            WorkerRuntimeStep::ExecutionCancelled { session_epoch } => {
-                info!(
-                    component = "worker",
-                    session_epoch, "worker observed execution cancel"
-                );
-                plan_rx.take();
-                if runtime.state() == ::worker::fsm::WorkerExecutionState::Terminal {
-                    runtime.cleanup()?;
-                    info!(
-                        component = "worker",
-                        session_epoch, "worker cleaned up terminal execution after cancel"
-                    );
-                }
+            step @ WorkerRuntimeStep::ExecutionCancelled { .. } => {
+                execution.abort_task();
+                handle_terminal_step(execution, step)?;
             }
-            WorkerRuntimeStep::ExecutionFailed {
-                session_epoch,
-                code,
-                detail,
-            } => {
-                warn!(
-                    component = "worker",
-                    session_epoch,
-                    code = ?code,
-                    detail = ?detail,
-                    "worker observed execution failure transition"
-                );
-                plan_rx.take();
-                if runtime.state() == ::worker::fsm::WorkerExecutionState::Terminal {
-                    runtime.cleanup()?;
-                    info!(
-                        component = "worker",
-                        session_epoch, "worker cleaned up terminal execution after failure"
-                    );
-                }
+            step @ WorkerRuntimeStep::ExecutionFailed { .. } => {
+                execution.abort_task();
+                handle_terminal_step(execution, step)?;
             }
-            WorkerRuntimeStep::ExecutionCompleted { session_epoch } => {
-                info!(
-                    component = "worker",
-                    session_epoch, "worker observed execution complete transition"
-                );
-                plan_rx.take();
-                if runtime.state() == ::worker::fsm::WorkerExecutionState::Terminal {
-                    runtime.cleanup()?;
-                    info!(
-                        component = "worker",
-                        session_epoch, "worker cleaned up terminal execution after completion"
-                    );
-                }
+            step @ WorkerRuntimeStep::ExecutionCompleted { .. } => {
+                handle_terminal_step(execution, step)?;
             }
         }
     }
@@ -820,14 +1406,12 @@ struct DataFusionRuntimePlan {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum DataFusionRuntimeMode {
-    CurrentThread,
     MultiThread,
 }
 
 impl DataFusionRuntimeMode {
     fn as_str(self) -> &'static str {
         match self {
-            Self::CurrentThread => "current-thread",
             Self::MultiThread => "multi-thread",
         }
     }
@@ -842,16 +1426,11 @@ fn resolve_datafusion_runtime_plan_with(
     default_worker_threads: impl FnOnce() -> usize,
 ) -> DataFusionRuntimePlan {
     let effective_worker_threads = worker_threads.unwrap_or_else(default_worker_threads).max(1);
-    let mode = if effective_worker_threads == 1 {
-        DataFusionRuntimeMode::CurrentThread
-    } else {
-        DataFusionRuntimeMode::MultiThread
-    };
 
     DataFusionRuntimePlan {
         requested_worker_threads: worker_threads,
         worker_threads: effective_worker_threads,
-        mode,
+        mode: DataFusionRuntimeMode::MultiThread,
     }
 }
 
@@ -864,15 +1443,10 @@ fn default_datafusion_worker_threads() -> usize {
 fn build_datafusion_runtime(
     plan: DataFusionRuntimePlan,
 ) -> Result<tokio::runtime::Runtime, WorkerRuntimeError> {
-    let result = match plan.mode {
-        DataFusionRuntimeMode::CurrentThread => tokio::runtime::Builder::new_current_thread()
-            .thread_name("pg_fusion-df")
-            .build(),
-        DataFusionRuntimeMode::MultiThread => tokio::runtime::Builder::new_multi_thread()
-            .worker_threads(plan.worker_threads)
-            .thread_name("pg_fusion-df")
-            .build(),
-    };
+    let result = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(plan.worker_threads)
+        .thread_name("pg_fusion-df")
+        .build();
 
     result.map_err(|err| {
         WorkerRuntimeError::ProtocolViolation(format!(
@@ -882,44 +1456,25 @@ fn build_datafusion_runtime(
 }
 
 #[allow(clippy::too_many_arguments)]
-async fn execute_physical_plan(
-    transport: &mut TransportWorkerRuntime,
-    spill_runtime: &mut WorkerSpillRuntime,
-    config: &crate::HostConfig,
-    page_pool: PagePool,
-    issuance_pool: IssuancePool,
-    metrics: RuntimeMetrics,
-    peer: BackendLeaseSlot,
-    session_epoch: u64,
-    plan: Arc<dyn ExecutionPlan>,
-) -> Result<(), WorkerRuntimeError> {
-    let spill_dir = spill_runtime.execution_dir(peer, session_epoch)?;
-    let spill_dir_created = spill_dir.path().is_some();
-    if spill_dir_created {
-        metrics.increment(MetricId::WorkerSpillDirsCreatedTotal);
-    }
-    let task_ctx = match spill_runtime.task_context(&spill_dir) {
-        Ok(task_ctx) => task_ctx,
-        Err(err) => {
-            let cleanup_result = cleanup_execution_spill_dir(
-                spill_dir,
-                spill_dir_created,
-                metrics,
-                peer,
-                session_epoch,
-            );
-            if let Err(cleanup_err) = cleanup_result {
-                warn!(
-                    component = "worker",
-                    session_epoch,
-                    peer = ?peer,
-                    error = %cleanup_err,
-                    "worker failed to clean execution spill directory after task context failure"
-                );
-            }
-            return Err(err);
-        }
-    };
+async fn execute_physical_plan_task(input: ExecutionTaskInput) -> Result<(), WorkerRuntimeError> {
+    let ExecutionTaskInput {
+        task_tx,
+        page_pool,
+        issuance_pool,
+        metrics,
+        peer,
+        session_epoch,
+        plan,
+        task_ctx,
+        spill_dir,
+        spill_dir_created,
+        estimator_initial_tail_bytes_per_row,
+        #[cfg(feature = "pg_test")]
+        test_execution_gate,
+    } = input;
+    #[cfg(feature = "pg_test")]
+    test_execution_gate.wait_at_execution_start().await;
+
     let execution_result: Result<(), WorkerRuntimeError> = async {
         let stream = execute_stream(Arc::clone(&plan), Arc::clone(&task_ctx))?;
         let page_tx = PageTx::new(page_pool);
@@ -932,7 +1487,7 @@ async fn execute_physical_plan(
             payload_capacity,
             ResultPageProducerConfig {
                 estimator: row_estimator::EstimatorConfig {
-                    initial_tail_bytes_per_row: config.estimator_initial_tail_bytes_per_row,
+                    initial_tail_bytes_per_row: estimator_initial_tail_bytes_per_row,
                 },
                 metrics,
                 ..ResultPageProducerConfig::default()
@@ -942,38 +1497,30 @@ async fn execute_physical_plan(
         loop {
             match producer.next_step_async().await? {
                 Some(ResultPageStep::OutboundPage(outbound)) => {
-                    trace!(
-                        component = "worker",
-                        session_epoch,
-                        peer = ?peer,
-                        "worker produced one result page"
-                    );
-                    let descriptor = outbound.descriptor();
-                    let payload_len = outbound.payload_len();
-                    let frame = encode_issued_frame(outbound.frame()).map_err(|err| {
-                        WorkerRuntimeError::ProtocolViolation(format!(
-                            "failed to encode result page frame: {err}"
-                        ))
-                    })?;
-                    transport.send_peer_bytes(peer, &frame)?;
-                    metrics.stamp_page(PageDirection::WorkerToBackend, descriptor, payload_len);
-                    metrics.increment(MetricId::WorkerResultPagesTotal);
-                    metrics.add(MetricId::WorkerResultBytesSentTotal, payload_len as u64);
-                    outbound.mark_sent();
+                    let (ack, ack_rx) = oneshot::channel();
+                    task_tx
+                        .send(WorkerTaskEvent::ResultPage {
+                            peer,
+                            session_epoch,
+                            outbound,
+                            ack,
+                        })
+                        .await
+                        .map_err(|_| worker_scheduler_gone_error())?;
+                    ack_rx.await.map_err(|_| worker_scheduler_gone_error())??;
                 }
                 Some(ResultPageStep::CloseFrame(frame)) => {
-                    debug!(
-                        component = "worker",
-                        session_epoch,
-                        peer = ?peer,
-                        "worker produced terminal result close frame"
-                    );
-                    let frame = encode_issued_frame(frame).map_err(|err| {
-                        WorkerRuntimeError::ProtocolViolation(format!(
-                            "failed to encode result close frame: {err}"
-                        ))
-                    })?;
-                    transport.send_peer_bytes(peer, &frame)?;
+                    let (ack, ack_rx) = oneshot::channel();
+                    task_tx
+                        .send(WorkerTaskEvent::ResultClose {
+                            peer,
+                            session_epoch,
+                            frame,
+                            ack,
+                        })
+                        .await
+                        .map_err(|_| worker_scheduler_gone_error())?;
+                    ack_rx.await.map_err(|_| worker_scheduler_gone_error())??;
                 }
                 None => break,
             }
@@ -991,6 +1538,18 @@ async fn execute_physical_plan(
     cleanup_result?;
 
     Ok(())
+}
+
+fn worker_scheduler_gone_error() -> WorkerRuntimeError {
+    WorkerRuntimeError::ProtocolViolation(
+        "worker scheduler stopped while execution task ran".into(),
+    )
+}
+
+fn stale_execution_task_error(peer: BackendLeaseSlot, session_epoch: u64) -> WorkerRuntimeError {
+    WorkerRuntimeError::ProtocolViolation(format!(
+        "stale execution task result ignored for peer {peer:?} session {session_epoch}"
+    ))
 }
 
 fn cleanup_execution_spill_dir(

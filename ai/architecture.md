@@ -167,18 +167,24 @@ page-backed Arrow batches.
    each producer owns a dedicated scan control slot and writes its own Arrow
    pages into shared memory.
 5. Worker imports scan pages as Arrow `RecordBatch` values, runs DataFusion
-   operators under its Tokio runtime, writes Arrow result pages, and sends
-   issued frames back. `pg_fusion.worker_threads` controls the Tokio runtime
-   thread count, but worker physical planning still sets DataFusion
-   `target_partitions = 1`; changing scan/physical partitioning is a separate
-   execution-model change. Zero-row plans whose DataFusion stream has an
+   operators under per-backend Tokio tasks, writes Arrow result pages, and asks
+   the worker scheduler thread to send issued frames back. Tokio task events
+   wake the scheduler through a local nonblocking Unix socket that the
+   PostgreSQL background-worker thread waits on alongside its PG latch. That
+   thread remains the only owner of PG latch/signal polling and primary control
+   transport. `pg_fusion.worker_threads` controls the Tokio runtime thread
+   count; `pg_fusion.max_fusion_tasks` limits concurrent backend execution
+   tasks and defaults to the primary control slot count.
+   Worker physical planning still sets DataFusion `target_partitions = 1`;
+   changing scan/physical partitioning is a separate execution-model change.
+   Zero-row plans whose DataFusion stream has an
    empty schema, such as `EmptyExec`, use a close-only result path with no Arrow
    pages. Row-count-only PostgreSQL scans use dummy SQL projection in
    PostgreSQL but transfer non-empty empty-schema Arrow pages; these scans stay
    leader-only because dynamic scan workers require projected base-relation
    columns. Scan production remains on PostgreSQL backend/scan-worker threads;
-   Tokio only drives DataFusion planning, multi-partition root collection, and
-   result-stream polling.
+   Tokio tasks only drive DataFusion planning, multi-partition root collection,
+   and result-stream polling.
    If `pg_fusion.worker_memory_limit_mb` is positive, execution uses a
    worker-owned DataFusion `RuntimeEnv` with a finite memory pool and
    per-execution OS spill directory below a cluster-scoped worker spill root.

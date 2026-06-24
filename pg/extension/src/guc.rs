@@ -20,6 +20,7 @@ pub(crate) static BACKEND_LOG_LEVEL: GucSetting<i32> = GucSetting::<i32>::new(0)
 pub(crate) static WORKER_MEMORY_LIMIT_MB: GucSetting<i32> = GucSetting::<i32>::new(0);
 pub(crate) static WORKER_SPILL_DIRECTORY: GucSetting<Option<std::ffi::CString>> =
     GucSetting::<Option<std::ffi::CString>>::new(Some(c""));
+pub(crate) static MAX_FUSION_TASKS: GucSetting<i32> = GucSetting::<i32>::new(0);
 
 pub(crate) static CONTROL_SLOT_COUNT: GucSetting<i32> = GucSetting::<i32>::new(64);
 pub(crate) static CONTROL_BACKEND_TO_WORKER_CAPACITY: GucSetting<i32> =
@@ -60,6 +61,7 @@ pub struct HostConfig {
     pub backend_log_level: DiagnosticLogLevel,
     pub worker_memory_limit_bytes: Option<usize>,
     pub worker_spill_directory: Option<PathBuf>,
+    pub max_fusion_tasks: usize,
     pub control_slot_count: u32,
     pub control_backend_to_worker_capacity: usize,
     pub control_worker_to_backend_capacity: usize,
@@ -159,6 +161,16 @@ pub fn register_gucs() {
         c"Worker DataFusion spill directory",
         c"Absolute root directory for worker-owned DataFusion spill files; empty uses the operating system temp directory",
         &WORKER_SPILL_DIRECTORY,
+        GucContext::Postmaster,
+        GucFlags::default(),
+    );
+    GucRegistry::define_int_guc(
+        c"pg_fusion.max_fusion_tasks",
+        c"Maximum concurrent Fusion tasks",
+        c"Maximum concurrent backend executions in the pg_fusion worker; 0 uses pg_fusion.control_slot_count",
+        &MAX_FUSION_TASKS,
+        0,
+        i32::MAX,
         GucContext::Postmaster,
         GucFlags::default(),
     );
@@ -276,6 +288,8 @@ pub fn register_gucs() {
 }
 
 pub fn host_config() -> Result<HostConfig, HostConfigError> {
+    let control_slot_count =
+        positive_u32("pg_fusion.control_slot_count", CONTROL_SLOT_COUNT.get())?;
     let scan_backend_to_worker_capacity = positive_usize(
         "pg_fusion.scan_backend_to_worker_capacity",
         SCAN_BACKEND_TO_WORKER_CAPACITY.get(),
@@ -309,7 +323,8 @@ pub fn host_config() -> Result<HostConfig, HostConfigError> {
             WORKER_MEMORY_LIMIT_MB.get(),
         )?)?,
         worker_spill_directory: worker_spill_directory()?,
-        control_slot_count: positive_u32("pg_fusion.control_slot_count", CONTROL_SLOT_COUNT.get())?,
+        max_fusion_tasks: max_fusion_tasks(MAX_FUSION_TASKS.get(), control_slot_count)?,
+        control_slot_count,
         control_backend_to_worker_capacity: positive_usize(
             "pg_fusion.control_backend_to_worker_capacity",
             CONTROL_BACKEND_TO_WORKER_CAPACITY.get(),
@@ -470,6 +485,16 @@ fn normalize_worker_threads(value: i32) -> Option<usize> {
     }
 }
 
+fn max_fusion_tasks(actual: i32, control_slot_count: u32) -> Result<usize, HostConfigError> {
+    let configured = nonnegative_u32("pg_fusion.max_fusion_tasks", actual)?;
+    let effective = if configured == 0 {
+        control_slot_count
+    } else {
+        configured.min(control_slot_count)
+    };
+    Ok(effective as usize)
+}
+
 fn string_setting(setting: &GucSetting<Option<std::ffi::CString>>, default: &str) -> String {
     setting
         .get()
@@ -555,6 +580,7 @@ mod tests {
             backend_log_level: DiagnosticLogLevel::Trace,
             worker_memory_limit_bytes: Some(128 * 1024 * 1024),
             worker_spill_directory: Some(PathBuf::from("/tmp/pg_fusion_spill")),
+            max_fusion_tasks: 8,
             control_slot_count: 8,
             control_backend_to_worker_capacity: 4096,
             control_worker_to_backend_capacity: 4096,
@@ -602,6 +628,28 @@ mod tests {
         assert_eq!(
             worker_memory_limit_bytes(64).unwrap(),
             Some(64 * 1024 * 1024)
+        );
+    }
+
+    #[test]
+    fn max_fusion_tasks_zero_uses_control_slot_count() {
+        assert_eq!(max_fusion_tasks(0, 64).unwrap(), 64);
+    }
+
+    #[test]
+    fn max_fusion_tasks_clamps_to_control_slot_count() {
+        assert_eq!(max_fusion_tasks(4, 64).unwrap(), 4);
+        assert_eq!(max_fusion_tasks(128, 64).unwrap(), 64);
+    }
+
+    #[test]
+    fn max_fusion_tasks_rejects_negative_values() {
+        assert_eq!(
+            max_fusion_tasks(-1, 64).unwrap_err(),
+            HostConfigError::Negative {
+                name: "pg_fusion.max_fusion_tasks",
+                actual: -1
+            }
         );
     }
 

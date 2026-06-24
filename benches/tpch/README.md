@@ -55,6 +55,7 @@ A practical bounded-memory profile for SF1 and smaller diagnostic runs on a
 shared_preload_libraries = 'pg_fusion'
 
 pg_fusion.worker_threads = 0
+pg_fusion.max_fusion_tasks = 0
 pg_fusion.worker_memory_limit_mb = 2048
 pg_fusion.worker_spill_directory = '/tmp/pg_fusion_spill'
 
