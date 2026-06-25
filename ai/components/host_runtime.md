@@ -3,7 +3,7 @@ id: comp-host-runtime-0001
 type: fact
 scope: host_runtime
 tags: ["pgrx", "datafusion", "shared-memory", "protocol", "slot_scan"]
-updated_at: "2026-05-11"
+updated_at: "2026-06-25"
 importance: 0.8
 ---
 
@@ -69,14 +69,14 @@ importance: 0.8
   (default `on`) plus postmaster-sized pool settings
   `pg_fusion.runtime_filter_count`, `pg_fusion.runtime_filter_bits`, and
   `pg_fusion.runtime_filter_hashes`. Worker physical planning allocates filters
-  from a shared-memory pool and records `(session_epoch, scan_id,
-  output_column, key_type)` metadata there. Backend scan producers, including
-  dynamic standalone scan workers, attach probes by `(session_epoch, scan_id)`
-  at scan open and test supported bool, integer, float, uuid, binary, and
+  from a shared-memory pool and records metadata keyed by `RuntimeFilterExecId`
+  (primary control slot id, generation, lease epoch, session epoch), scan id,
+  output column, and key type. Backend scan producers, including dynamic
+  standalone scan workers, attach probes by `(RuntimeFilterExecId, scan_id)` at
+  scan open and test supported bool, integer, float, uuid, binary, and
   text-like keys before Arrow encoding. No control-ring message is needed for
-  readiness;
-  probes read the shared lifecycle word and pass rows unfiltered until the
-  matching generation is `Ready`.
+  readiness; probes read the shared lifecycle word and pass rows unfiltered
+  until the matching generation is `Ready`.
 - Results return as issued Arrow pages and are projected into PostgreSQL tuple
   slots through `pg/slot_import`.
 - Worker-originated execution failures send a bounded UTF-8 detail string in

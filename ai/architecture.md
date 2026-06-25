@@ -3,7 +3,7 @@ id: arch-overview-0001
 type: fact
 scope: repo
 tags: ["architecture", "datafusion", "pgrx", "shared-memory", "ipc", "slot_scan", "statistics"]
-updated_at: "2026-05-31"
+updated_at: "2026-06-25"
 importance: 0.8
 ---
 
@@ -31,7 +31,11 @@ page-backed Arrow batches.
   with a CAS, and probes only reject rows for a matching ready generation.
   Stale or in-progress generations pass rows unfiltered. Pool slots use
   reference counts so ready storage is reused only after the owner and all
-  probes have exited, preserving the no-false-negative property.
+  probes have exited, preserving the no-false-negative property. Pool slots are
+  claimed in an unprobeable initializing state and published only after refs
+  and target metadata are initialized. Filter execution namespaces are derived
+  from `control_transport::BackendLeaseSlot` plus the backend session epoch so
+  worker and backend scan producers use the same primary lease identity.
 - `page/pool`, `page/transfer`, `page/issuance`: fixed-page ownership,
   transfer, and issued-frame flow.
 - `runtime/metrics`: shared-memory runtime counters and page-slot handoff
@@ -149,10 +153,12 @@ page-backed Arrow batches.
    `text`/`varchar`/`bpchar`/`name`), and a `WorkerPgScanExec` on the
    probe side, possibly below DataFusion's
    schema-preserving `CooperativeExec` wrapper. The worker registers the target
-   by `(session_epoch,
-   scan_id, output_column)` in shared memory, fills the filter while consuming
-   the build side, and publishes it when that stream reaches EOF. If the pool
-   is full the join runs unchanged and increments a diagnostic counter.
+   by the primary backend lease identity plus session epoch, scan id, and
+   output column in shared memory, fills the filter while consuming the build
+   side, and publishes it when that stream reaches EOF. Backend scan producers,
+   including dynamic standalone scan workers, attach with the same execution
+   namespace so concurrently running backends cannot share filter targets. If
+   the pool is full the join runs unchanged and increments a diagnostic counter.
 3. Worker DataFusion execution opens scans through the runtime protocol.
 4. Backend executes trusted scan SQL through `slot_scan`, drains PostgreSQL
    executor slots with a custom `DestReceiver` and explicit fetch row budgets,

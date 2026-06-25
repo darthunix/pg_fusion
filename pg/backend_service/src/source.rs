@@ -3,8 +3,8 @@ use arrow_layout::{init_block, LayoutPlan};
 use arrow_schema::SchemaRef;
 use filter::{
     hash_bool_key, hash_bytes_key, hash_decimal128_key, hash_float32_key, hash_float64_key,
-    hash_int_key, hash_interval_month_day_nano_key, ProbeDecision, RuntimeFilterKeyType,
-    RuntimeFilterPool, RuntimeFilterProbeHandle,
+    hash_int_key, hash_interval_month_day_nano_key, ProbeDecision, RuntimeFilterExecId,
+    RuntimeFilterKeyType, RuntimeFilterPool, RuntimeFilterProbeHandle,
 };
 use metrics::{MetricId, RuntimeMetrics};
 use pgrx::pg_sys;
@@ -29,7 +29,7 @@ pub(crate) struct SlotScanPageSource {
     metrics: RuntimeMetrics,
     runtime_filter_enabled: bool,
     runtime_filters: RuntimeFilterPool,
-    session_epoch: u64,
+    runtime_filter_exec_id: RuntimeFilterExecId,
     scan_id: u64,
     runtime_filter_probes: Vec<RuntimeFilterProbeHandle>,
     runtime_filter_needed_attrs: i32,
@@ -50,7 +50,7 @@ pub(crate) struct SlotScanPageSourceInput {
     pub(crate) metrics: RuntimeMetrics,
     pub(crate) runtime_filter_enabled: bool,
     pub(crate) runtime_filters: RuntimeFilterPool,
-    pub(crate) session_epoch: u64,
+    pub(crate) runtime_filter_exec_id: RuntimeFilterExecId,
     pub(crate) scan_id: u64,
 }
 
@@ -68,7 +68,7 @@ impl SlotScanPageSource {
             metrics,
             runtime_filter_enabled,
             runtime_filters,
-            session_epoch,
+            runtime_filter_exec_id,
             scan_id,
         } = input;
         let single_row_drains = estimator
@@ -87,7 +87,7 @@ impl SlotScanPageSource {
             metrics,
             runtime_filter_enabled,
             runtime_filters,
-            session_epoch,
+            runtime_filter_exec_id,
             scan_id,
             runtime_filter_probes: Vec::new(),
             runtime_filter_needed_attrs: 0,
@@ -105,7 +105,7 @@ impl SlotScanPageSource {
         }
 
         self.runtime_filters.lookup_probes(
-            self.session_epoch,
+            self.runtime_filter_exec_id,
             self.scan_id,
             &mut self.runtime_filter_probes,
         );

@@ -23,9 +23,9 @@ The crate is split into three layers:
   Probes reject rows only when their expected generation is currently `Ready`;
   all stale, free, building, or disabled states pass rows unfiltered.
 - `RuntimeFilterPool` adds fixed-slot shared-memory ownership metadata and
-  probe reference counts. It maps `(session_epoch, scan_id, output_column,
-  key_type)` to a lifecycle slot and delays storage reuse until the owner and
-  all probe handles are gone.
+  probe reference counts. It maps `(RuntimeFilterExecId, scan_id,
+  output_column, key_type)` to a lifecycle slot and delays storage reuse until
+  the owner and all probe handles are gone.
 
 This keeps the filter payload reusable while avoiding false negatives from
 clearing storage under old probes or letting stale builders overwrite newer
@@ -59,7 +59,7 @@ still be reading Bloom words.
    region with the returned size/alignment.
 2. Startup code initializes the region with `RuntimeFilterPool::init_in_place`.
 3. Workers attach and call `allocate_build(target)` for a specific scan target.
-4. Backends attach and call `lookup_probes(session_epoch, scan_id, &mut probes)`.
+4. Backends attach and call `lookup_probes(exec_id, scan_id, &mut probes)`.
 5. Build and probe handles release references on drop; the pool retires and
    frees a slot only after the owner and all probes have gone away.
 
@@ -71,7 +71,7 @@ is a performance miss, not a correctness failure.
 ```rust
 use filter::{
     BloomParams, ProbeDecision, RuntimeFilterPool, RuntimeFilterPoolConfig,
-    RuntimeFilterTarget, RuntimeFilterKeyType, hash_int_key,
+    RuntimeFilterExecId, RuntimeFilterTarget, RuntimeFilterKeyType, hash_int_key,
 };
 
 # fn example(region: *mut u8, region_len: usize) -> Result<(), Box<dyn std::error::Error>> {
@@ -81,8 +81,9 @@ let config = RuntimeFilterPoolConfig::new(64, params);
 // Startup path initializes the caller-owned shared-memory region.
 let pool = unsafe { RuntimeFilterPool::init_in_place(region, region_len, config)? };
 
+let exec_id = RuntimeFilterExecId::new(1, 2, 3, 7);
 let target = RuntimeFilterTarget {
-    session_epoch: 7,
+    exec_id,
     scan_id: 42,
     output_column: 3,
     key_type: RuntimeFilterKeyType::Int64,
@@ -94,7 +95,7 @@ if let Some(build) = pool.allocate_build(target)? {
 }
 
 let mut probes = Vec::new();
-pool.lookup_probes(7, 42, &mut probes);
+pool.lookup_probes(exec_id, 42, &mut probes);
 for probe in &probes {
     if probe.decision_for_hash(hash_int_key(11)) == ProbeDecision::DefinitelyAbsent {
         // The row can be skipped before expensive decode/encode work.

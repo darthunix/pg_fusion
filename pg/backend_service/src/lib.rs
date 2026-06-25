@@ -12,7 +12,7 @@ use control_transport::{
 };
 use datafusion_common::tree_node::{TreeNode, TreeNodeRecursion};
 use datafusion_expr::logical_plan::LogicalPlan;
-use filter::RuntimeFilterPool;
+use filter::{RuntimeFilterExecId, RuntimeFilterPool};
 use fsm::backend_execution_flow::StateMachine as BackendExecutionMachine;
 pub use fsm::{BackendExecutionAction, BackendExecutionEvent, BackendExecutionState};
 use issuance::{encode_issued_frame, IssuedTx};
@@ -189,7 +189,7 @@ impl Drop for ExecutionSnapshot {
 }
 
 pub struct StartExecutionInput<'a> {
-    pub slot_id: u32,
+    pub primary_peer: BackendLeaseSlot,
     pub plan_source: ExecutionPlanSource<'a>,
     pub plan_tx: IssuedTx,
     pub scan_slot_region: &'a TransportRegion,
@@ -198,7 +198,7 @@ pub struct StartExecutionInput<'a> {
 }
 
 pub struct StartPreparedExecutionInput<'a> {
-    pub slot_id: u32,
+    pub primary_peer: BackendLeaseSlot,
     pub plan: PreparedExecutionPlan,
     pub plan_tx: IssuedTx,
     pub scan_slot_region: &'a TransportRegion,
@@ -247,6 +247,7 @@ pub struct ScanWorkerQueryInput<'a> {
 
 pub struct ScanWorkerLaunchInput<'a> {
     pub session_epoch: u64,
+    pub runtime_filter_exec_id: RuntimeFilterExecId,
     pub scan_id: u64,
     pub spec: &'a PgScanSpec,
     pub leader_peer: BackendLeaseSlot,
@@ -333,6 +334,7 @@ pub struct StandaloneScanDescriptor {
 pub struct StandaloneScanProducerInput {
     pub descriptor: StandaloneScanDescriptor,
     pub session_epoch: u64,
+    pub runtime_filter_exec_id: RuntimeFilterExecId,
     pub scan_id: u64,
     pub producer_id: u16,
     pub producer_count: u16,
@@ -590,6 +592,7 @@ fn output_schema_from_logical_plan(logical_plan: &LogicalPlan) -> SchemaRef {
 
 struct ActiveExecution {
     key: ExecutionKey,
+    runtime_filter_exec_id: RuntimeFilterExecId,
     snapshot: ExecutionSnapshot,
     _logical_plan: LogicalPlan,
     machine: BackendExecutionMachine,
@@ -829,7 +832,7 @@ impl BackendService {
             config: input.config.clone(),
         })?;
         Self::begin_prepared_execution(StartPreparedExecutionInput {
-            slot_id: input.slot_id,
+            primary_peer: input.primary_peer,
             plan: prepared,
             plan_tx: input.plan_tx,
             scan_slot_region: input.scan_slot_region,
@@ -850,9 +853,11 @@ impl BackendService {
 
             let session_epoch = bump_current_session_epoch();
             let key = ExecutionKey {
-                slot_id: input.slot_id,
+                slot_id: input.primary_peer.slot_id(),
                 session_epoch,
             };
+            let runtime_filter_exec_id =
+                make_runtime_filter_exec_id(input.primary_peer, session_epoch);
 
             let PreparedExecutionPlan {
                 logical_plan,
@@ -905,6 +910,7 @@ impl BackendService {
                 if let Some(launcher) = scan_worker_launcher.as_deref_mut() {
                     let mut output = launcher.launch_scan_workers(ScanWorkerLaunchInput {
                         session_epoch,
+                        runtime_filter_exec_id,
                         scan_id,
                         spec: spec.as_ref(),
                         leader_peer: scan_peer,
@@ -963,6 +969,7 @@ impl BackendService {
 
             *slot.borrow_mut() = Some(ActiveExecution {
                 key,
+                runtime_filter_exec_id,
                 snapshot,
                 _logical_plan: logical_plan,
                 machine,
@@ -1164,7 +1171,7 @@ impl BackendService {
                 metrics: execution.config.metrics,
                 runtime_filter_enabled: execution.config.runtime_filter_enabled,
                 runtime_filters: execution.config.runtime_filters,
-                session_epoch: input.session_epoch,
+                runtime_filter_exec_id: execution.runtime_filter_exec_id,
                 scan_id: input.scan_id,
             });
 
@@ -1395,6 +1402,7 @@ impl BackendService {
                     slot_id,
                     session_epoch,
                 },
+                runtime_filter_exec_id: RuntimeFilterExecId::new(slot_id, 0, 0, session_epoch),
                 snapshot: ExecutionSnapshot::unregistered_for_tests(),
                 _logical_plan: datafusion_expr::logical_plan::LogicalPlan::EmptyRelation(
                     datafusion_expr::logical_plan::EmptyRelation {
@@ -1428,6 +1436,7 @@ impl BackendService {
                     slot_id,
                     session_epoch,
                 },
+                runtime_filter_exec_id: RuntimeFilterExecId::new(slot_id, 0, 0, session_epoch),
                 snapshot: ExecutionSnapshot::unregistered_for_tests(),
                 _logical_plan: datafusion_expr::logical_plan::LogicalPlan::EmptyRelation(
                     datafusion_expr::logical_plan::EmptyRelation {
@@ -1479,6 +1488,10 @@ fn bump_current_session_epoch() -> u64 {
         epoch.set(next);
         next
     })
+}
+
+fn make_runtime_filter_exec_id(peer: BackendLeaseSlot, session_epoch: u64) -> RuntimeFilterExecId {
+    RuntimeFilterExecId::from_peer(peer, session_epoch)
 }
 
 fn wait_for_scan_backpressure(
@@ -1972,7 +1985,7 @@ fn run_standalone_scan_producer(
     )?;
 
     let source = match standalone_page_source(
-        input.session_epoch,
+        input.runtime_filter_exec_id,
         input.scan_id,
         input.scan_tx.payload_capacity(),
         &input.config,
@@ -2013,7 +2026,7 @@ fn run_standalone_scan_producer(
 }
 
 fn standalone_page_source(
-    session_epoch: u64,
+    runtime_filter_exec_id: RuntimeFilterExecId,
     scan_id: u64,
     payload_capacity: usize,
     config: &BackendServiceConfig,
@@ -2081,7 +2094,7 @@ fn standalone_page_source(
             metrics: config.metrics,
             runtime_filter_enabled: config.runtime_filter_enabled,
             runtime_filters: config.runtime_filters,
-            session_epoch,
+            runtime_filter_exec_id,
             scan_id,
         },
     ))
@@ -2964,6 +2977,7 @@ fn cleanup_execution(
 
     let ActiveExecution {
         key,
+        runtime_filter_exec_id: _,
         snapshot,
         _logical_plan,
         machine: _machine,

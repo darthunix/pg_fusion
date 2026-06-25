@@ -2,6 +2,8 @@ use std::alloc::{alloc_zeroed, dealloc, Layout};
 use std::ptr::NonNull;
 use std::sync::atomic::{AtomicU64, Ordering};
 
+use control_transport::{BackendLeaseId, BackendLeaseSlot};
+
 use super::*;
 
 fn bit_storage(words: usize) -> Vec<AtomicU64> {
@@ -34,6 +36,21 @@ fn pool_fixture(slot_count: u32) -> (RuntimeFilterPool, PoolMemory) {
     let pool = unsafe { RuntimeFilterPool::init_in_place(ptr.as_ptr(), pool_layout.size, config) }
         .expect("pool init");
     (pool, memory)
+}
+
+fn make_exec_id(slot_id: u32) -> RuntimeFilterExecId {
+    RuntimeFilterExecId::new(slot_id, 101, 202, 303)
+}
+
+#[test]
+fn exec_id_from_peer_uses_full_backend_lease_identity() {
+    let peer = BackendLeaseSlot::new(7, BackendLeaseId::new(11, 13));
+    let exec_id = RuntimeFilterExecId::from_peer(peer, 17);
+
+    assert_eq!(exec_id.slot_id(), 7);
+    assert_eq!(exec_id.generation(), 11);
+    assert_eq!(exec_id.lease_epoch(), 13);
+    assert_eq!(exec_id.session_epoch(), 17);
 }
 
 fn expect_builder_error(
@@ -495,8 +512,9 @@ fn raw_attach_accepts_valid_atomic_storage() {
 #[test]
 fn pool_publishes_filter_and_probe_rejects_absent_keys() {
     let (pool, _memory) = pool_fixture(1);
+    let exec_id = make_exec_id(11);
     let target = RuntimeFilterTarget {
-        session_epoch: 11,
+        exec_id,
         scan_id: 22,
         output_column: 3,
         key_type: RuntimeFilterKeyType::Int64,
@@ -509,7 +527,7 @@ fn pool_publishes_filter_and_probe_rejects_absent_keys() {
     build.publish_ready().unwrap();
 
     let mut probes = Vec::new();
-    pool.lookup_probes(11, 22, &mut probes);
+    pool.lookup_probes(exec_id, 22, &mut probes);
     assert_eq!(probes.len(), 1);
     assert_eq!(probes[0].output_column(), 3);
     assert_eq!(probes[0].key_type(), RuntimeFilterKeyType::Int64);
@@ -528,10 +546,31 @@ fn pool_publishes_filter_and_probe_rejects_absent_keys() {
 }
 
 #[test]
+fn initializing_pool_slot_is_invisible_to_probe_lookup() {
+    let (pool, _memory) = pool_fixture(1);
+    let exec_id = make_exec_id(11);
+    let target = RuntimeFilterTarget {
+        exec_id,
+        scan_id: 22,
+        output_column: 3,
+        key_type: RuntimeFilterKeyType::Int64,
+    };
+    pool.initialize_slot_for_test(0, target);
+
+    let mut probes = Vec::new();
+    pool.lookup_probes(exec_id, 22, &mut probes);
+
+    assert!(probes.is_empty());
+    assert_eq!(pool.refs_for_test(0), 1);
+}
+
+#[test]
 fn pool_does_not_reuse_storage_until_probes_are_dropped() {
     let (pool, _memory) = pool_fixture(1);
+    let first_exec_id = make_exec_id(1);
+    let next_exec_id = make_exec_id(3);
     let target = RuntimeFilterTarget {
-        session_epoch: 1,
+        exec_id: first_exec_id,
         scan_id: 2,
         output_column: 0,
         key_type: RuntimeFilterKeyType::Int32,
@@ -544,13 +583,13 @@ fn pool_does_not_reuse_storage_until_probes_are_dropped() {
     build.publish_ready().unwrap();
 
     let mut probes = Vec::new();
-    pool.lookup_probes(1, 2, &mut probes);
+    pool.lookup_probes(first_exec_id, 2, &mut probes);
     assert_eq!(probes.len(), 1);
     drop(build);
 
     let next = pool
         .allocate_build(RuntimeFilterTarget {
-            session_epoch: 3,
+            exec_id: next_exec_id,
             scan_id: 4,
             output_column: 0,
             key_type: RuntimeFilterKeyType::Int32,
@@ -561,11 +600,37 @@ fn pool_does_not_reuse_storage_until_probes_are_dropped() {
     drop(probes);
     assert!(pool
         .allocate_build(RuntimeFilterTarget {
-            session_epoch: 3,
+            exec_id: next_exec_id,
             scan_id: 4,
             output_column: 0,
             key_type: RuntimeFilterKeyType::Int32,
         })
         .expect("allocate after old probe exits")
         .is_some());
+}
+
+#[test]
+fn pool_namespaces_targets_by_execution_identity() {
+    let (pool, _memory) = pool_fixture(1);
+    let target_exec_id = RuntimeFilterExecId::new(1, 2, 3, 4);
+    let other_exec_id = RuntimeFilterExecId::new(1, 2, 5, 4);
+    let build = pool
+        .allocate_build(RuntimeFilterTarget {
+            exec_id: target_exec_id,
+            scan_id: 22,
+            output_column: 3,
+            key_type: RuntimeFilterKeyType::Int64,
+        })
+        .expect("allocate")
+        .expect("available slot");
+    build.insert_hash(hash_int_key(42)).unwrap();
+    build.publish_ready().unwrap();
+
+    let mut probes = Vec::new();
+    pool.lookup_probes(other_exec_id, 22, &mut probes);
+    assert!(probes.is_empty());
+
+    pool.lookup_probes(target_exec_id, 22, &mut probes);
+    assert_eq!(probes.len(), 1);
+    assert_eq!(probes[0].output_column(), 3);
 }

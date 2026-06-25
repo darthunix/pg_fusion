@@ -7,6 +7,11 @@ const BUILDING: u64 = 1;
 const READY: u64 = 2;
 const DISABLED: u64 = 3;
 
+const POOL_FREE: u64 = 0;
+const POOL_INITIALIZING: u64 = 1;
+const POOL_ALLOCATED: u64 = 2;
+const POOL_RETIRING: u64 = 3;
+
 fn pack(generation: u64, state: u64) -> u64 {
     (generation << 2) | state
 }
@@ -90,6 +95,76 @@ impl ModelSlot {
         state(current) == READY
             && generation(current) == expected_generation
             && (self.bitset.load(Ordering::Relaxed) & 1) == 0
+    }
+}
+
+struct ModelPoolSlot {
+    state: AtomicU64,
+    refs: AtomicU64,
+    exec_id: AtomicU64,
+}
+
+impl ModelPoolSlot {
+    fn new() -> Self {
+        Self {
+            state: AtomicU64::new(POOL_FREE),
+            refs: AtomicU64::new(0),
+            exec_id: AtomicU64::new(0),
+        }
+    }
+
+    fn allocate_publish_and_release(&self) {
+        if self
+            .state
+            .compare_exchange(
+                POOL_FREE,
+                POOL_INITIALIZING,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            )
+            .is_err()
+        {
+            return;
+        }
+
+        thread::yield_now();
+        self.refs.store(1, Ordering::Release);
+        self.exec_id.store(1, Ordering::Release);
+        self.state.store(POOL_ALLOCATED, Ordering::Release);
+        thread::yield_now();
+        self.release_owner();
+    }
+
+    fn lookup_nonmatching_probe(&self) {
+        if self.state.load(Ordering::Acquire) != POOL_ALLOCATED {
+            return;
+        }
+
+        self.refs.fetch_add(1, Ordering::AcqRel);
+        let matches = self.state.load(Ordering::Acquire) == POOL_ALLOCATED
+            && self.exec_id.load(Ordering::Acquire) == 2;
+        if !matches {
+            self.release_ref();
+        }
+    }
+
+    fn release_owner(&self) {
+        let _ = self.state.compare_exchange(
+            POOL_ALLOCATED,
+            POOL_RETIRING,
+            Ordering::AcqRel,
+            Ordering::Acquire,
+        );
+        self.release_ref();
+    }
+
+    fn release_ref(&self) {
+        let old_refs = self.refs.fetch_sub(1, Ordering::AcqRel);
+        assert!(old_refs > 0, "pool reference count underflowed");
+        if old_refs == 1 && self.state.load(Ordering::Acquire) == POOL_RETIRING {
+            self.exec_id.store(0, Ordering::Release);
+            self.state.store(POOL_FREE, Ordering::Release);
+        }
     }
 }
 
@@ -190,5 +265,32 @@ fn stale_disable_cannot_move_lifecycle_backward() {
 
         stale.join().expect("stale actor should join");
         observer.join().expect("observer should join");
+    });
+}
+
+#[test]
+fn pool_initializing_state_blocks_probe_refcount_race() {
+    loom::model(|| {
+        let slot = Arc::new(ModelPoolSlot::new());
+
+        let allocator = {
+            let slot = slot.clone();
+            thread::spawn(move || {
+                slot.allocate_publish_and_release();
+            })
+        };
+
+        let probe = {
+            let slot = slot.clone();
+            thread::spawn(move || {
+                slot.lookup_nonmatching_probe();
+            })
+        };
+
+        allocator.join().expect("allocator should join");
+        probe.join().expect("probe should join");
+
+        assert_eq!(slot.state.load(Ordering::Acquire), POOL_FREE);
+        assert_eq!(slot.refs.load(Ordering::Acquire), 0);
     });
 }

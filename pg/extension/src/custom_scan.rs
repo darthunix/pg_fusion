@@ -405,7 +405,7 @@ unsafe fn begin_pg_fusion_scan_impl(
     let begin = {
         let _planner_bypass = PlannerBypassGuard::enter();
         BackendService::begin_prepared_execution(StartPreparedExecutionInput {
-            slot_id: control_lease.slot_id(),
+            primary_peer: control_lease.backend_lease_slot(),
             plan: prepared_plan,
             plan_tx,
             scan_slot_region: &scan_region,
@@ -1571,6 +1571,7 @@ impl ScanWorkerLauncher for DynamicScanWorkerLauncher {
                 db_oid,
                 user_oid,
                 session_epoch: input.session_epoch,
+                runtime_filter_exec_id: input.runtime_filter_exec_id,
                 scan_id: input.scan_id,
                 producer_id,
                 producer_count: total_producers,

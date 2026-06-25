@@ -5,6 +5,7 @@ use std::time::{Duration, Instant};
 
 use backend_service::{StandaloneScanDescriptor, StandaloneScanField};
 use control_transport::{BackendLeaseId, BackendLeaseSlot};
+use filter::RuntimeFilterExecId;
 
 pub(crate) const SCAN_WORKER_JOB_CAPACITY: usize = 64;
 pub(crate) const SCAN_WORKER_PAYLOAD_CAPACITY: usize = 64 * 1024;
@@ -35,6 +36,10 @@ struct ScanWorkerJob {
     db_oid: AtomicU32,
     user_oid: AtomicU32,
     session_epoch: AtomicU64,
+    exec_slot_id: AtomicU32,
+    exec_generation: AtomicU64,
+    exec_lease_epoch: AtomicU64,
+    exec_session_epoch: AtomicU64,
     scan_id: AtomicU64,
     producer_id: AtomicU32,
     producer_count: AtomicU32,
@@ -60,6 +65,7 @@ pub(crate) struct ScanWorkerJobSpec<'a> {
     pub(crate) db_oid: u32,
     pub(crate) user_oid: u32,
     pub(crate) session_epoch: u64,
+    pub(crate) runtime_filter_exec_id: RuntimeFilterExecId,
     pub(crate) scan_id: u64,
     pub(crate) producer_id: u16,
     pub(crate) producer_count: u16,
@@ -71,6 +77,7 @@ pub(crate) struct ScanWorkerJobSnapshot {
     pub(crate) db_oid: u32,
     pub(crate) user_oid: u32,
     pub(crate) session_epoch: u64,
+    pub(crate) runtime_filter_exec_id: RuntimeFilterExecId,
     pub(crate) scan_id: u64,
     pub(crate) producer_id: u16,
     pub(crate) producer_count: u16,
@@ -141,6 +148,7 @@ impl ScanWorkerJobRegistryHandle {
             job.user_oid.store(spec.user_oid, Ordering::Relaxed);
             job.session_epoch
                 .store(spec.session_epoch, Ordering::Relaxed);
+            store_exec_id(job, spec.runtime_filter_exec_id);
             job.scan_id.store(spec.scan_id, Ordering::Relaxed);
             job.producer_id
                 .store(u32::from(spec.producer_id), Ordering::Relaxed);
@@ -185,6 +193,7 @@ impl ScanWorkerJobRegistryHandle {
             db_oid: job.db_oid.load(Ordering::Relaxed),
             user_oid: job.user_oid.load(Ordering::Relaxed),
             session_epoch: job.session_epoch.load(Ordering::Relaxed),
+            runtime_filter_exec_id: load_exec_id(job),
             scan_id: job.scan_id.load(Ordering::Relaxed),
             producer_id: job.producer_id.load(Ordering::Relaxed) as u16,
             producer_count: job.producer_count.load(Ordering::Relaxed) as u16,
@@ -312,6 +321,25 @@ fn try_reserve_job(job: &ScanWorkerJob) -> bool {
         }
     }
     false
+}
+
+fn store_exec_id(job: &ScanWorkerJob, exec_id: RuntimeFilterExecId) {
+    job.exec_slot_id.store(exec_id.slot_id(), Ordering::Relaxed);
+    job.exec_generation
+        .store(exec_id.generation(), Ordering::Relaxed);
+    job.exec_lease_epoch
+        .store(exec_id.lease_epoch(), Ordering::Relaxed);
+    job.exec_session_epoch
+        .store(exec_id.session_epoch(), Ordering::Relaxed);
+}
+
+fn load_exec_id(job: &ScanWorkerJob) -> RuntimeFilterExecId {
+    RuntimeFilterExecId::new(
+        job.exec_slot_id.load(Ordering::Relaxed),
+        job.exec_generation.load(Ordering::Relaxed),
+        job.exec_lease_epoch.load(Ordering::Relaxed),
+        job.exec_session_epoch.load(Ordering::Relaxed),
+    )
 }
 
 fn transition_job_state(
@@ -636,6 +664,7 @@ mod tests {
             db_oid: 1,
             user_oid: 2,
             session_epoch: 3,
+            runtime_filter_exec_id: RuntimeFilterExecId::new(7, 11, 13, 3),
             scan_id: 4,
             producer_id: 1,
             producer_count: 2,
@@ -664,6 +693,10 @@ mod tests {
         assert_eq!(snapshot.descriptor.sql, "select 2");
         assert_eq!(snapshot.descriptor.fields[0].name, "id");
         assert_eq!(snapshot.descriptor.planner_fetch_hint, Some(128));
+        assert_eq!(
+            snapshot.runtime_filter_exec_id,
+            RuntimeFilterExecId::new(7, 11, 13, 3)
+        );
     }
 
     #[test]

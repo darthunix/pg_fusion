@@ -23,8 +23,8 @@ use datafusion_expr::JoinType;
 use datafusion_physical_expr::expressions::Column;
 use filter::{
     hash_bool_key, hash_bytes_key, hash_decimal128_key, hash_float32_key, hash_float64_key,
-    hash_int_key, hash_interval_month_day_nano_key, RuntimeFilterBuildHandle, RuntimeFilterKeyType,
-    RuntimeFilterPool, RuntimeFilterTarget,
+    hash_int_key, hash_interval_month_day_nano_key, RuntimeFilterBuildHandle, RuntimeFilterExecId,
+    RuntimeFilterKeyType, RuntimeFilterPool, RuntimeFilterTarget,
 };
 use futures::{ready, Stream, StreamExt};
 use metrics::{MetricId, RuntimeMetrics};
@@ -33,14 +33,14 @@ use crate::scan_exec::WorkerPgScanExec;
 
 pub(crate) fn install_runtime_filters(
     plan: Arc<dyn ExecutionPlan>,
-    session_epoch: u64,
+    exec_id: RuntimeFilterExecId,
     pool: RuntimeFilterPool,
     metrics: RuntimeMetrics,
 ) -> DFResult<Arc<dyn ExecutionPlan>> {
     let children = plan.children();
     let rewritten_children = children
         .into_iter()
-        .map(|child| install_runtime_filters(Arc::clone(child), session_epoch, pool, metrics))
+        .map(|child| install_runtime_filters(Arc::clone(child), exec_id, pool, metrics))
         .collect::<DFResult<Vec<_>>>()?;
     let plan = if rewritten_children.is_empty() {
         plan
@@ -51,12 +51,12 @@ pub(crate) fn install_runtime_filters(
     let Some(join) = plan.as_any().downcast_ref::<HashJoinExec>() else {
         return Ok(plan);
     };
-    maybe_wrap_hash_join(join, session_epoch, pool, metrics).map(|wrapped| wrapped.unwrap_or(plan))
+    maybe_wrap_hash_join(join, exec_id, pool, metrics).map(|wrapped| wrapped.unwrap_or(plan))
 }
 
 fn maybe_wrap_hash_join(
     join: &HashJoinExec,
-    session_epoch: u64,
+    exec_id: RuntimeFilterExecId,
     pool: RuntimeFilterPool,
     metrics: RuntimeMetrics,
 ) -> DFResult<Option<Arc<dyn ExecutionPlan>>> {
@@ -89,7 +89,7 @@ fn maybe_wrap_hash_join(
     };
 
     let target = RuntimeFilterTarget {
-        session_epoch,
+        exec_id,
         scan_id: right_scan.scan_id().get(),
         output_column: right_col.index() as u32,
         key_type,
@@ -607,7 +607,10 @@ mod tests {
 
     use arrow_array::ArrayRef;
     use arrow_schema::{Field, Schema};
-    use filter::{BloomParams, ProbeDecision, RuntimeFilterPoolConfig, RuntimeFilterTarget};
+    use filter::{
+        BloomParams, ProbeDecision, RuntimeFilterExecId, RuntimeFilterPoolConfig,
+        RuntimeFilterTarget,
+    };
 
     struct PoolMemory {
         ptr: NonNull<u8>,
@@ -633,6 +636,10 @@ mod tests {
         (pool, memory)
     }
 
+    fn make_exec_id() -> RuntimeFilterExecId {
+        RuntimeFilterExecId::new(1, 2, 3, 4)
+    }
+
     fn build_and_probe(
         key_type: RuntimeFilterKeyType,
         data_type: DataType,
@@ -640,8 +647,9 @@ mod tests {
         present_hash: u64,
     ) {
         let (pool, _memory) = pool_fixture(1);
+        let exec_id = make_exec_id();
         let target = RuntimeFilterTarget {
-            session_epoch: 1,
+            exec_id,
             scan_id: 2,
             output_column: 0,
             key_type,
@@ -665,7 +673,7 @@ mod tests {
         state.publish_ready().expect("publish");
 
         let mut probes = Vec::new();
-        pool.lookup_probes(1, 2, &mut probes);
+        pool.lookup_probes(exec_id, 2, &mut probes);
         assert_eq!(probes.len(), 1);
         assert_eq!(
             probes[0].decision_for_hash(present_hash),

@@ -56,7 +56,7 @@ streaming:
   `SET LOCAL` state
 - runtime filter settings are also captured into backend/worker config. Scan
   producers attach probes from the shared runtime-filter pool by
-  `(session_epoch, scan_id)` and apply ready integer-key filters before
+  `(RuntimeFilterExecId, scan_id)` and apply ready filters before
   `slot_encoder` writes the row into an Arrow page
 - public `slot_scan::ScanOptions` stay unchanged; these knobs only affect the
   internal backend-service streaming path

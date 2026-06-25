@@ -282,6 +282,7 @@ fn run_scan_worker_main(job_id: usize) -> Result<(), String> {
         BackendService::run_standalone_scan_producer(StandaloneScanProducerInput {
             descriptor: job.descriptor,
             session_epoch: job.session_epoch,
+            runtime_filter_exec_id: job.runtime_filter_exec_id,
             scan_id: job.scan_id,
             producer_id: job.producer_id,
             producer_count: job.producer_count,
