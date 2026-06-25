@@ -12,7 +12,7 @@ use datafusion::physical_plan::ExecutionPlan;
 use datafusion::physical_planner::{DefaultPhysicalPlanner, PhysicalPlanner};
 use datafusion_expr::logical_plan::LogicalPlan;
 use datafusion_expr::registry::FunctionRegistry;
-use filter::RuntimeFilterPool;
+use filter::{RuntimeFilterExecId, RuntimeFilterPool};
 use issuance::{decode_issued_frame, IssuedOwnedFrame, IssuedRx};
 use metrics::RuntimeMetrics;
 use plan_flow::{FlowId as PlanFlowId, PlanOpen, WorkerPlanRole, WorkerStep as WorkerPlanStep};
@@ -719,7 +719,7 @@ impl PendingPhysicalPlanning {
             if self.runtime_filter_enabled && self.config.runtime_filter_pool.is_attached() {
                 install_runtime_filters(
                     physical_plan,
-                    self.flow.session_epoch,
+                    runtime_filter_exec_id(self.peer, self.flow.session_epoch),
                     self.config.runtime_filter_pool,
                     self.config.metrics,
                 )?
@@ -731,6 +731,10 @@ impl PendingPhysicalPlanning {
             &|plan| plan.as_any().is::<WorkerPgScanExec>(),
         )?)
     }
+}
+
+fn runtime_filter_exec_id(peer: BackendLeaseSlot, session_epoch: u64) -> RuntimeFilterExecId {
+    RuntimeFilterExecId::from_peer(peer, session_epoch)
 }
 
 fn materialize_scan_peer_map(

@@ -4,6 +4,8 @@ use std::fmt;
 use std::ptr::NonNull;
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 
+use control_transport::BackendLeaseSlot;
+
 use crate::{
     AtomicBloomRef, BloomAttachError, BloomParams, LifecycleError, ProbeDecision,
     RuntimeFilterHeader, RuntimeFilterSlot, RuntimeFilterState,
@@ -11,11 +13,12 @@ use crate::{
 
 const POOL_MAGIC: u64 = 0x5047_4655_5246_5031;
 /// Shared-memory pool format version.
-pub const RUNTIME_FILTER_POOL_VERSION: u32 = 1;
+pub const RUNTIME_FILTER_POOL_VERSION: u32 = 2;
 
 const SLOT_FREE: u32 = 0;
-const SLOT_ALLOCATED: u32 = 1;
-const SLOT_RETIRING: u32 = 2;
+const SLOT_INITIALIZING: u32 = 1;
+const SLOT_ALLOCATED: u32 = 2;
+const SLOT_RETIRING: u32 = 3;
 
 /// Runtime-filter key types currently supported by pg_fusion scan probes.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -73,11 +76,60 @@ impl RuntimeFilterKeyType {
     }
 }
 
+/// Execution namespace for runtime-filter targets.
+///
+/// Backend-local session epochs are unique only within one primary backend
+/// lease. Runtime filters need the full primary lease identity so concurrent
+/// backend executions cannot attach to each other's filters.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+pub struct RuntimeFilterExecId {
+    slot_id: u32,
+    generation: u64,
+    lease_epoch: u64,
+    session_epoch: u64,
+}
+
+impl RuntimeFilterExecId {
+    pub const fn new(slot_id: u32, generation: u64, lease_epoch: u64, session_epoch: u64) -> Self {
+        Self {
+            slot_id,
+            generation,
+            lease_epoch,
+            session_epoch,
+        }
+    }
+
+    pub const fn from_peer(peer: BackendLeaseSlot, session_epoch: u64) -> Self {
+        Self::new(
+            peer.slot_id(),
+            peer.lease_id().generation(),
+            peer.lease_id().lease_epoch(),
+            session_epoch,
+        )
+    }
+
+    pub const fn slot_id(self) -> u32 {
+        self.slot_id
+    }
+
+    pub const fn generation(self) -> u64 {
+        self.generation
+    }
+
+    pub const fn lease_epoch(self) -> u64 {
+        self.lease_epoch
+    }
+
+    pub const fn session_epoch(self) -> u64 {
+        self.session_epoch
+    }
+}
+
 /// Logical target that connects a worker-built filter to backend scan probes.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct RuntimeFilterTarget {
-    /// Session epoch that scopes scan identifiers.
-    pub session_epoch: u64,
+    /// Execution namespace that scopes scan identifiers.
+    pub exec_id: RuntimeFilterExecId,
     /// Backend scan identifier.
     pub scan_id: u64,
     /// Output column to inspect before tuple-to-Arrow encoding.
@@ -200,7 +252,10 @@ struct PoolSlot {
     state: AtomicU32,
     refs: AtomicU32,
     generation: AtomicU64,
-    session_epoch: AtomicU64,
+    exec_slot_id: AtomicU32,
+    exec_generation: AtomicU64,
+    exec_lease_epoch: AtomicU64,
+    exec_session_epoch: AtomicU64,
     scan_id: AtomicU64,
     output_column: AtomicU32,
     key_type: AtomicU32,
@@ -213,7 +268,10 @@ impl PoolSlot {
             state: AtomicU32::new(SLOT_FREE),
             refs: AtomicU32::new(0),
             generation: AtomicU64::new(0),
-            session_epoch: AtomicU64::new(0),
+            exec_slot_id: AtomicU32::new(0),
+            exec_generation: AtomicU64::new(0),
+            exec_lease_epoch: AtomicU64::new(0),
+            exec_session_epoch: AtomicU64::new(0),
             scan_id: AtomicU64::new(0),
             output_column: AtomicU32::new(0),
             key_type: AtomicU32::new(0),
@@ -422,7 +480,7 @@ impl RuntimeFilterPool {
                 .state
                 .compare_exchange(
                     SLOT_FREE,
-                    SLOT_ALLOCATED,
+                    SLOT_INITIALIZING,
                     Ordering::AcqRel,
                     Ordering::Acquire,
                 )
@@ -432,19 +490,20 @@ impl RuntimeFilterPool {
             }
 
             slot.refs.store(1, Ordering::Release);
-            slot.session_epoch
-                .store(target.session_epoch, Ordering::Release);
+            store_exec_id(slot, target.exec_id);
             slot.scan_id.store(target.scan_id, Ordering::Release);
             slot.output_column
                 .store(target.output_column, Ordering::Release);
             slot.key_type
                 .store(target.key_type as u32, Ordering::Release);
 
-            let runtime_slot = unsafe { self.runtime_slot(slot_index)? };
-            match runtime_slot.try_acquire_builder() {
+            let builder_result = unsafe { self.runtime_slot(slot_index) }
+                .and_then(|runtime_slot| runtime_slot.try_acquire_builder().map_err(Into::into));
+            match builder_result {
                 Ok(builder) => {
                     let generation = builder.detach();
                     slot.generation.store(generation, Ordering::Release);
+                    slot.state.store(SLOT_ALLOCATED, Ordering::Release);
                     return Ok(Some(RuntimeFilterBuildHandle {
                         pool: self,
                         slot_index,
@@ -454,8 +513,9 @@ impl RuntimeFilterPool {
                 }
                 Err(err) => {
                     slot.refs.store(0, Ordering::Release);
+                    clear_slot_metadata(slot);
                     slot.state.store(SLOT_FREE, Ordering::Release);
-                    return Err(err.into());
+                    return Err(err);
                 }
             }
         }
@@ -463,13 +523,13 @@ impl RuntimeFilterPool {
         Ok(None)
     }
 
-    /// Find probe handles matching `(session_epoch, scan_id)`.
+    /// Find probe handles matching `(exec_id, scan_id)`.
     ///
     /// Matching handles are pushed into `probes` and hold pool references until
     /// dropped.
     pub fn lookup_probes(
         self,
-        session_epoch: u64,
+        exec_id: RuntimeFilterExecId,
         scan_id: u64,
         probes: &mut Vec<RuntimeFilterProbeHandle>,
     ) {
@@ -486,7 +546,7 @@ impl RuntimeFilterPool {
 
             let state = slot.state.load(Ordering::Acquire);
             let matches = state == SLOT_ALLOCATED
-                && slot.session_epoch.load(Ordering::Acquire) == session_epoch
+                && load_exec_id(slot) == exec_id
                 && slot.scan_id.load(Ordering::Acquire) == scan_id;
             if !matches {
                 self.release_ref(slot_index);
@@ -577,13 +637,35 @@ impl RuntimeFilterPool {
                     RuntimeFilterState::Free | RuntimeFilterState::Disabled => {}
                 }
             }
-            slot.session_epoch.store(0, Ordering::Release);
-            slot.scan_id.store(0, Ordering::Release);
-            slot.output_column.store(0, Ordering::Release);
-            slot.key_type.store(0, Ordering::Release);
-            slot.generation.store(0, Ordering::Release);
+            clear_slot_metadata(slot);
             slot.state.store(SLOT_FREE, Ordering::Release);
         }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn initialize_slot_for_test(self, slot_index: u32, target: RuntimeFilterTarget) {
+        let slot = unsafe { self.slot(slot_index) };
+        slot.state
+            .compare_exchange(
+                SLOT_FREE,
+                SLOT_INITIALIZING,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            )
+            .expect("test slot should be free");
+        slot.refs.store(1, Ordering::Release);
+        store_exec_id(slot, target.exec_id);
+        slot.scan_id.store(target.scan_id, Ordering::Release);
+        slot.output_column
+            .store(target.output_column, Ordering::Release);
+        slot.key_type
+            .store(target.key_type as u32, Ordering::Release);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn refs_for_test(self, slot_index: u32) -> u32 {
+        let slot = unsafe { self.slot(slot_index) };
+        slot.refs.load(Ordering::Acquire)
     }
 
     unsafe fn slot(self, slot_index: u32) -> &'static PoolSlot {
@@ -618,6 +700,38 @@ impl RuntimeFilterPool {
             self.config.params,
         )?)
     }
+}
+
+fn store_exec_id(slot: &PoolSlot, exec_id: RuntimeFilterExecId) {
+    slot.exec_slot_id
+        .store(exec_id.slot_id(), Ordering::Release);
+    slot.exec_generation
+        .store(exec_id.generation(), Ordering::Release);
+    slot.exec_lease_epoch
+        .store(exec_id.lease_epoch(), Ordering::Release);
+    slot.exec_session_epoch
+        .store(exec_id.session_epoch(), Ordering::Release);
+}
+
+fn load_exec_id(slot: &PoolSlot) -> RuntimeFilterExecId {
+    RuntimeFilterExecId::new(
+        slot.exec_slot_id.load(Ordering::Acquire),
+        slot.exec_generation.load(Ordering::Acquire),
+        slot.exec_lease_epoch.load(Ordering::Acquire),
+        slot.exec_session_epoch.load(Ordering::Acquire),
+    )
+}
+
+fn clear_exec_id(slot: &PoolSlot) {
+    store_exec_id(slot, RuntimeFilterExecId::default());
+}
+
+fn clear_slot_metadata(slot: &PoolSlot) {
+    clear_exec_id(slot);
+    slot.scan_id.store(0, Ordering::Release);
+    slot.output_column.store(0, Ordering::Release);
+    slot.key_type.store(0, Ordering::Release);
+    slot.generation.store(0, Ordering::Release);
 }
 
 #[derive(Debug)]

@@ -535,7 +535,7 @@ fn begin_and_finalize_execution(
     let plan_transport = IssuedTransportHarness::new();
     let plan_rx = plan_transport.rx();
     let begin = BackendService::begin_execution(StartExecutionInput {
-        slot_id,
+        primary_peer: BackendLeaseSlot::new(slot_id, BackendLeaseId::new(1, 1)),
         plan_source: encoded_plan_source(&encoded),
         plan_tx: plan_transport.tx(),
         scan_slot_region: scan_slots,

@@ -12,7 +12,7 @@ pub use bloom::{
     BloomParams, RuntimeFilterLayout,
 };
 pub use pool::{
-    RuntimeFilterBuildHandle, RuntimeFilterKeyType, RuntimeFilterPool,
+    RuntimeFilterBuildHandle, RuntimeFilterExecId, RuntimeFilterKeyType, RuntimeFilterPool,
     RuntimeFilterPoolAttachError, RuntimeFilterPoolConfig, RuntimeFilterPoolLayout,
     RuntimeFilterProbeHandle, RuntimeFilterTarget, RUNTIME_FILTER_POOL_VERSION,
 };
