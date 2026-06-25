@@ -3209,6 +3209,7 @@ dependencies = [
  "futures",
  "import",
  "issuance",
+ "libc",
  "metrics",
  "pg_frontend",
  "pg_type",

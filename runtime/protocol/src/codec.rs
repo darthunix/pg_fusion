@@ -7,9 +7,11 @@
 
 use crate::envelope::{
     decode_runtime_header, expect_runtime_family, write_runtime_header_to,
-    BACKEND_EXECUTION_CANCEL_TAG, BACKEND_EXECUTION_FAIL_TAG, BACKEND_EXECUTION_START_TAG,
+    BACKEND_EXECUTION_CANCEL_RESERVATION_TAG, BACKEND_EXECUTION_CANCEL_TAG,
+    BACKEND_EXECUTION_FAIL_TAG, BACKEND_EXECUTION_RESERVE_SLOT_TAG, BACKEND_EXECUTION_START_TAG,
     BACKEND_SCAN_FAILED_TAG, BACKEND_SCAN_FINISHED_TAG, WORKER_EXECUTION_COMPLETE_TAG,
-    WORKER_EXECUTION_FAIL_TAG, WORKER_SCAN_CANCEL_TAG, WORKER_SCAN_OPEN_TAG,
+    WORKER_EXECUTION_FAIL_TAG, WORKER_EXECUTION_SLOT_RESERVED_TAG, WORKER_SCAN_CANCEL_TAG,
+    WORKER_SCAN_OPEN_TAG,
 };
 use crate::error::{DecodeError, EncodeError};
 use crate::message::{
@@ -119,9 +121,10 @@ pub fn decode_backend_execution_to_worker(
         RuntimeMessageFamily::BackendExecutionToWorker,
     )?;
 
-    let session_epoch = read_u64_from(&mut source)?;
     let message = match header.tag {
+        BACKEND_EXECUTION_RESERVE_SLOT_TAG => BackendExecutionToWorkerRef::ReserveExecutionSlot,
         BACKEND_EXECUTION_START_TAG => {
+            let session_epoch = read_u64_from(&mut source)?;
             let plan = PlanFlowDescriptor {
                 plan_id: read_u64_from(&mut source)?,
                 page_kind: read_u16_from(&mut source)?,
@@ -141,13 +144,20 @@ pub fn decode_backend_execution_to_worker(
             }
         }
         BACKEND_EXECUTION_CANCEL_TAG => {
+            let session_epoch = read_u64_from(&mut source)?;
             BackendExecutionToWorkerRef::CancelExecution { session_epoch }
         }
-        BACKEND_EXECUTION_FAIL_TAG => BackendExecutionToWorkerRef::FailExecution {
-            session_epoch,
-            code: ExecutionFailureCode::try_from(read_u8_from(&mut source)?)?,
-            detail: read_optional_u64_from(&mut source)?,
-        },
+        BACKEND_EXECUTION_CANCEL_RESERVATION_TAG => {
+            BackendExecutionToWorkerRef::CancelExecutionReservation
+        }
+        BACKEND_EXECUTION_FAIL_TAG => {
+            let session_epoch = read_u64_from(&mut source)?;
+            BackendExecutionToWorkerRef::FailExecution {
+                session_epoch,
+                code: ExecutionFailureCode::try_from(read_u8_from(&mut source)?)?,
+                detail: read_optional_u64_from(&mut source)?,
+            }
+        }
         actual => return Err(DecodeError::UnexpectedTag { actual }),
     };
 
@@ -167,16 +177,20 @@ pub fn decode_worker_execution_to_backend(
         RuntimeMessageFamily::WorkerExecutionToBackend,
     )?;
 
-    let session_epoch = read_u64_from(&mut source)?;
     let message = match header.tag {
+        WORKER_EXECUTION_SLOT_RESERVED_TAG => WorkerExecutionToBackend::ExecutionSlotReserved,
         WORKER_EXECUTION_COMPLETE_TAG => {
+            let session_epoch = read_u64_from(&mut source)?;
             WorkerExecutionToBackend::CompleteExecution { session_epoch }
         }
-        WORKER_EXECUTION_FAIL_TAG => WorkerExecutionToBackend::FailExecution {
-            session_epoch,
-            code: ExecutionFailureCode::try_from(read_u8_from(&mut source)?)?,
-            detail: read_optional_str_from(&mut source)?.map(ToOwned::to_owned),
-        },
+        WORKER_EXECUTION_FAIL_TAG => {
+            let session_epoch = read_u64_from(&mut source)?;
+            WorkerExecutionToBackend::FailExecution {
+                session_epoch,
+                code: ExecutionFailureCode::try_from(read_u8_from(&mut source)?)?,
+                detail: read_optional_str_from(&mut source)?.map(ToOwned::to_owned),
+            }
+        }
         actual => return Err(DecodeError::UnexpectedTag { actual }),
     };
 
@@ -277,6 +291,13 @@ fn encode_backend_execution_to_worker_to<W: std::io::Write>(
     sink: &mut W,
 ) -> Result<(), EncodeError> {
     match message {
+        BackendExecutionToWorker::ReserveExecutionSlot => {
+            write_runtime_header_to(
+                sink,
+                RuntimeMessageFamily::BackendExecutionToWorker,
+                BACKEND_EXECUTION_RESERVE_SLOT_TAG,
+            )?;
+        }
         BackendExecutionToWorker::StartExecution {
             session_epoch,
             plan,
@@ -305,6 +326,13 @@ fn encode_backend_execution_to_worker_to<W: std::io::Write>(
             )?;
             write_u64_to(sink, session_epoch)?;
         }
+        BackendExecutionToWorker::CancelExecutionReservation => {
+            write_runtime_header_to(
+                sink,
+                RuntimeMessageFamily::BackendExecutionToWorker,
+                BACKEND_EXECUTION_CANCEL_RESERVATION_TAG,
+            )?;
+        }
         BackendExecutionToWorker::FailExecution {
             session_epoch,
             code,
@@ -328,6 +356,13 @@ fn encode_worker_execution_to_backend_to<W: std::io::Write>(
     sink: &mut W,
 ) -> Result<(), EncodeError> {
     match message {
+        WorkerExecutionToBackend::ExecutionSlotReserved => {
+            write_runtime_header_to(
+                sink,
+                RuntimeMessageFamily::WorkerExecutionToBackend,
+                WORKER_EXECUTION_SLOT_RESERVED_TAG,
+            )?;
+        }
         WorkerExecutionToBackend::CompleteExecution { session_epoch } => {
             write_runtime_header_to(
                 sink,

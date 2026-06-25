@@ -36,7 +36,7 @@ use crate::spill::WorkerSpillConfig;
 /// Static configuration for one worker-side runtime instance.
 #[derive(Clone, Debug)]
 pub struct WorkerRuntimeConfig {
-    /// Maximum single control frame payload read from `control_transport`.
+    /// Scratch capacity for one primary control frame payload, inbound or outbound.
     pub control_frame_capacity: usize,
     /// Page kind expected for backend scan result pages.
     pub scan_page_kind: transfer::MessageKind,
@@ -206,6 +206,11 @@ impl WorkerRuntimeCore {
         self.active_peer
     }
 
+    /// Peer key retained for stale-control classification after cleanup.
+    pub fn retained_peer(&self) -> Option<BackendLeaseSlot> {
+        self.latest_session.map(|session| session.peer)
+    }
+
     /// Borrow the currently prepared physical plan, if planning reached `Running`.
     pub fn physical_plan(&self) -> Option<Arc<dyn ExecutionPlan>> {
         self.physical_plan.as_ref().map(Arc::clone)
@@ -259,6 +264,13 @@ impl WorkerRuntimeCore {
         message: BackendToWorkerRef<'_>,
     ) -> Result<WorkerRuntimeStep, WorkerRuntimeError> {
         match message {
+            BackendToWorkerRef::ReserveExecutionSlot
+            | BackendToWorkerRef::CancelExecutionReservation => {
+                Err(WorkerRuntimeError::ProtocolViolation(
+                    "execution slot reservation messages must be handled by the worker scheduler"
+                        .into(),
+                ))
+            }
             BackendToWorkerRef::StartExecution {
                 session_epoch,
                 plan,
@@ -324,31 +336,56 @@ impl WorkerRuntimeCore {
         flow: PlanFlowId,
         result: Result<Arc<dyn ExecutionPlan>, WorkerRuntimeError>,
     ) -> Result<WorkerRuntimeStep, WorkerRuntimeError> {
+        let (step, planning_err) = self.finish_physical_planning_step(peer, flow, result)?;
+        if let Some(err) = planning_err {
+            Err(err)
+        } else {
+            Ok(step)
+        }
+    }
+
+    /// Commit one physical planning result and return a runtime step.
+    ///
+    /// Planning-stage failures are converted into an `ExecutionFailed` step and
+    /// returned with the original error so the scheduler can report that error
+    /// to the owning backend without treating it as a worker-global failure.
+    pub fn finish_physical_planning_step(
+        &mut self,
+        peer: BackendLeaseSlot,
+        flow: PlanFlowId,
+        result: Result<Arc<dyn ExecutionPlan>, WorkerRuntimeError>,
+    ) -> Result<(WorkerRuntimeStep, Option<WorkerRuntimeError>), WorkerRuntimeError> {
         if !self.matches_active_planning(peer, flow) {
-            return Ok(WorkerRuntimeStep::PlanningResultIgnored {
-                session_epoch: flow.session_epoch,
-                plan_id: flow.plan_id,
-            });
+            return Ok((
+                WorkerRuntimeStep::PlanningResultIgnored {
+                    session_epoch: flow.session_epoch,
+                    plan_id: flow.plan_id,
+                },
+                None,
+            ));
         }
 
         let physical_plan = match result {
             Ok(physical_plan) => physical_plan,
-            Err(err) => return Err(self.fail_planning_stage(err)),
+            Err(err) => return self.fail_planning_stage_step(err),
         };
 
         if let Err(err) = self.plan_role.close() {
-            return Err(self.fail_planning_stage(err.into()));
+            return self.fail_planning_stage_step(err.into());
         }
 
         if let Err(err) = self.consume_event(WorkerExecutionEvent::PhysicalPlanReady) {
-            return Err(self.fail_planning_stage(err));
+            return self.fail_planning_stage_step(err);
         }
 
         self.physical_plan = Some(Arc::clone(&physical_plan));
-        Ok(WorkerRuntimeStep::PhysicalPlanReady(PhysicalPlanResult {
-            session_epoch: flow.session_epoch,
-            plan: physical_plan,
-        }))
+        Ok((
+            WorkerRuntimeStep::PhysicalPlanReady(PhysicalPlanResult {
+                session_epoch: flow.session_epoch,
+                plan: physical_plan,
+            }),
+            None,
+        ))
     }
 
     /// Mark the active execution complete after the physical plan finished.
@@ -462,18 +499,18 @@ impl WorkerRuntimeCore {
         }
     }
 
-    fn fail_planning_stage(&mut self, err: WorkerRuntimeError) -> WorkerRuntimeError {
+    fn fail_planning_stage_step(
+        &mut self,
+        err: WorkerRuntimeError,
+    ) -> Result<(WorkerRuntimeStep, Option<WorkerRuntimeError>), WorkerRuntimeError> {
         self.plan_role.abort();
         self.physical_plan = None;
-        match self.consume_event(WorkerExecutionEvent::FailExecution) {
-            Ok(()) => {
-                self.clear_active_execution_state();
-                err
-            }
-            Err(terminal_err) => WorkerRuntimeError::StateMachine(format!(
+        match self.fail_execution_locally(ExecutionFailureCode::Internal, None) {
+            Ok(step) => Ok((step, Some(err))),
+            Err(terminal_err) => Err(WorkerRuntimeError::StateMachine(format!(
                 "planning failed: {}; failed to transition worker runtime to Terminal: {}",
                 err, terminal_err
-            )),
+            ))),
         }
     }
 
@@ -1414,6 +1451,7 @@ mod tests {
         ));
         assert_eq!(core.state(), WorkerExecutionState::Terminal);
         assert_eq!(core.session_epoch(), None);
+        assert_eq!(core.retained_peer(), Some(peer_a()));
 
         core.cleanup().unwrap();
         assert_eq!(core.state(), WorkerExecutionState::Idle);
@@ -1589,6 +1627,7 @@ mod tests {
         ));
         assert_eq!(core.state(), WorkerExecutionState::Idle);
         assert_eq!(core.session_epoch(), None);
+        assert_eq!(core.retained_peer(), Some(peer_a()));
     }
 
     #[test]
@@ -1634,6 +1673,7 @@ mod tests {
         ));
         assert_eq!(core.state(), WorkerExecutionState::Idle);
         assert_eq!(core.session_epoch(), None);
+        assert_eq!(core.retained_peer(), Some(peer_a()));
     }
 
     #[test]
@@ -2005,6 +2045,49 @@ mod tests {
                 plan_id: 21
             }
         ));
+    }
+
+    #[test]
+    fn physical_planning_failure_step_returns_execution_failed_step() {
+        let mut core = core();
+        accept(
+            &mut core,
+            BackendToWorker::StartExecution {
+                session_epoch: 10,
+                plan: plan_descriptor(20),
+                options: protocol::ExecutionOptionsWire::default(),
+                scans: ScanChannelSet::empty(),
+            },
+        )
+        .unwrap();
+        let flow = core.active_plan_flow.expect("active flow");
+        core.consume_event(WorkerExecutionEvent::PlanDecoded)
+            .unwrap();
+
+        let pending = core.begin_physical_planning(flow, unsupported_plan());
+        let peer = pending.peer();
+        let (step, planning_err) = core
+            .finish_physical_planning_step(peer, flow, block_on(pending.plan()))
+            .unwrap();
+
+        assert!(matches!(
+            planning_err,
+            Some(WorkerRuntimeError::DataFusion(_))
+        ));
+        assert!(matches!(
+            step,
+            WorkerRuntimeStep::ExecutionFailed {
+                session_epoch: 10,
+                code: ExecutionFailureCode::Internal,
+                detail: None
+            }
+        ));
+        assert_eq!(core.state(), WorkerExecutionState::Terminal);
+        assert_eq!(core.session_epoch(), None);
+        assert!(core.physical_plan().is_none());
+
+        core.cleanup().unwrap();
+        assert_eq!(core.state(), WorkerExecutionState::Idle);
     }
 
     #[test]

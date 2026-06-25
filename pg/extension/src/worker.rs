@@ -1,4 +1,4 @@
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::ffi::CStr;
 use std::io::{self, Read, Write};
 use std::os::fd::{AsRawFd, RawFd};
@@ -45,11 +45,79 @@ type WorkerTaskSender = mpsc::Sender<WorkerTaskEvent>;
 type WorkerTaskReceiver = mpsc::Receiver<WorkerTaskEvent>;
 type WorkerTaskAck = oneshot::Sender<Result<(), WorkerRuntimeError>>;
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum PendingTerminalControl {
+    Complete {
+        session_epoch: u64,
+    },
+    Fail {
+        session_epoch: u64,
+        code: ExecutionFailureCode,
+        detail: Option<String>,
+    },
+}
+
+impl PendingTerminalControl {
+    fn session_epoch(&self) -> u64 {
+        match self {
+            Self::Complete { session_epoch } | Self::Fail { session_epoch, .. } => *session_epoch,
+        }
+    }
+
+    fn kind(&self) -> &'static str {
+        match self {
+            Self::Complete { .. } => "CompleteExecution",
+            Self::Fail { .. } => "FailExecution",
+        }
+    }
+
+    fn to_message(&self) -> WorkerExecutionToBackend {
+        match self {
+            Self::Complete { session_epoch } => WorkerExecutionToBackend::CompleteExecution {
+                session_epoch: *session_epoch,
+            },
+            Self::Fail {
+                session_epoch,
+                code,
+                detail,
+            } => WorkerExecutionToBackend::FailExecution {
+                session_epoch: *session_epoch,
+                code: *code,
+                detail: detail.clone(),
+            },
+        }
+    }
+}
+
+enum PeerPollOutcome {
+    Steps(VecDeque<WorkerRuntimeStep>),
+    DetachedIdle,
+    ReservationCancelled,
+    ActiveReservationCancelViolation(WorkerRuntimeError),
+}
+
+#[derive(Debug)]
+enum AdmissionPollOutcome {
+    Idle,
+    Requested,
+    Cancelled,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum PeerSchedulerState {
+    Active,
+    Reserved,
+    Retained,
+    Queued,
+    Unknown,
+}
+
 struct ActiveWorkerExecution {
     runtime: WorkerRuntimeCore,
     plan_rx: Option<IssuedRx>,
     task: Option<JoinHandle<()>>,
     worker_start_ns: Option<u64>,
+    pending_terminal: Option<PendingTerminalControl>,
 }
 
 impl ActiveWorkerExecution {
@@ -59,6 +127,7 @@ impl ActiveWorkerExecution {
             plan_rx: None,
             task: None,
             worker_start_ns: None,
+            pending_terminal: None,
         }
     }
 
@@ -66,6 +135,195 @@ impl ActiveWorkerExecution {
         if let Some(task) = self.task.take() {
             task.abort();
         }
+    }
+}
+
+struct ExecutionRegistry {
+    entries: HashMap<BackendLeaseSlot, ActiveWorkerExecution>,
+    active_peers: HashSet<BackendLeaseSlot>,
+    reserved_peers: HashSet<BackendLeaseSlot>,
+    queued_reservations: VecDeque<BackendLeaseSlot>,
+    queued_peers: HashSet<BackendLeaseSlot>,
+    retained_by_slot: HashMap<u32, BackendLeaseSlot>,
+}
+
+impl ExecutionRegistry {
+    fn with_capacity(capacity: usize) -> Self {
+        Self {
+            entries: HashMap::with_capacity(capacity),
+            active_peers: HashSet::with_capacity(capacity),
+            reserved_peers: HashSet::with_capacity(capacity),
+            queued_reservations: VecDeque::with_capacity(capacity),
+            queued_peers: HashSet::with_capacity(capacity),
+            retained_by_slot: HashMap::with_capacity(capacity),
+        }
+    }
+
+    #[cfg(test)]
+    fn active_len(&self) -> usize {
+        self.active_peers.len()
+    }
+
+    fn admitted_len(&self) -> usize {
+        self.active_peers.len() + self.reserved_peers.len()
+    }
+
+    fn has_admission_capacity(&self, max_fusion_tasks: usize) -> bool {
+        self.admitted_len() < max_fusion_tasks
+    }
+
+    fn active_peers(&self) -> Vec<BackendLeaseSlot> {
+        self.active_peers.iter().copied().collect()
+    }
+
+    fn reserved_peers(&self) -> Vec<BackendLeaseSlot> {
+        self.reserved_peers.iter().copied().collect()
+    }
+
+    fn pending_terminal_peers(&self) -> Vec<BackendLeaseSlot> {
+        self.entries
+            .iter()
+            .filter_map(|(peer, execution)| execution.pending_terminal.as_ref().map(|_| *peer))
+            .collect()
+    }
+
+    fn contains_active(&self, peer: BackendLeaseSlot) -> bool {
+        self.active_peers.contains(&peer)
+    }
+
+    fn contains_reserved(&self, peer: BackendLeaseSlot) -> bool {
+        self.reserved_peers.contains(&peer)
+    }
+
+    fn contains_queued(&self, peer: BackendLeaseSlot) -> bool {
+        self.queued_peers.contains(&peer)
+    }
+
+    fn peer_scheduler_state(&self, peer: BackendLeaseSlot) -> PeerSchedulerState {
+        if self.active_peers.contains(&peer) {
+            PeerSchedulerState::Active
+        } else if self.reserved_peers.contains(&peer) {
+            PeerSchedulerState::Reserved
+        } else if self.retained_by_slot.get(&peer.slot_id()) == Some(&peer)
+            && self.entries.contains_key(&peer)
+        {
+            PeerSchedulerState::Retained
+        } else if self.queued_peers.contains(&peer) {
+            PeerSchedulerState::Queued
+        } else {
+            PeerSchedulerState::Unknown
+        }
+    }
+
+    fn has_queued_reservations(&self) -> bool {
+        !self.queued_peers.is_empty()
+    }
+
+    fn reserve(&mut self, peer: BackendLeaseSlot) {
+        self.remove_queued(peer);
+        self.evict_retained_for_slot(peer.slot_id(), None);
+        self.reserved_peers.insert(peer);
+    }
+
+    fn queue_reservation(&mut self, peer: BackendLeaseSlot) {
+        if self.reserved_peers.contains(&peer) || !self.queued_peers.insert(peer) {
+            return;
+        }
+        self.queued_reservations.push_back(peer);
+    }
+
+    fn cancel_reservation(&mut self, peer: BackendLeaseSlot) {
+        self.reserved_peers.remove(&peer);
+        self.remove_queued(peer);
+    }
+
+    fn remove_queued(&mut self, peer: BackendLeaseSlot) {
+        if !self.queued_peers.remove(&peer) {
+            return;
+        }
+        self.queued_reservations
+            .retain(|queued_peer| *queued_peer != peer);
+    }
+
+    fn pop_next_queued_reservation(&mut self) -> Option<BackendLeaseSlot> {
+        while let Some(peer) = self.queued_reservations.pop_front() {
+            if self.queued_peers.remove(&peer) {
+                return Some(peer);
+            }
+        }
+        None
+    }
+
+    fn remove(&mut self, peer: BackendLeaseSlot) -> Option<ActiveWorkerExecution> {
+        let execution = self.entries.remove(&peer);
+        if execution.is_some() {
+            self.active_peers.remove(&peer);
+            if self.retained_by_slot.get(&peer.slot_id()) == Some(&peer) {
+                self.retained_by_slot.remove(&peer.slot_id());
+            }
+        }
+        execution
+    }
+
+    fn retain_after_poll(&mut self, peer: BackendLeaseSlot, mut execution: ActiveWorkerExecution) {
+        if execution.runtime.active_peer() == Some(peer) {
+            self.reserved_peers.remove(&peer);
+            self.evict_retained_for_slot(peer.slot_id(), Some(peer));
+            self.active_peers.insert(peer);
+            self.entries.insert(peer, execution);
+        } else if execution.runtime.retained_peer() == Some(peer) {
+            self.reserved_peers.remove(&peer);
+            self.evict_retained_for_slot(peer.slot_id(), Some(peer));
+            execution.abort_task();
+            execution.plan_rx.take();
+            self.active_peers.remove(&peer);
+            self.retained_by_slot.insert(peer.slot_id(), peer);
+            self.entries.insert(peer, execution);
+        } else {
+            execution.abort_task();
+        }
+    }
+
+    fn evict_retained_for_slot(&mut self, slot_id: u32, keep: Option<BackendLeaseSlot>) {
+        let Some(retained_peer) = self.retained_by_slot.get(&slot_id).copied() else {
+            return;
+        };
+        if Some(retained_peer) == keep {
+            return;
+        }
+        self.retained_by_slot.remove(&slot_id);
+        if let Some(mut execution) = self.entries.remove(&retained_peer) {
+            self.active_peers.remove(&retained_peer);
+            execution.abort_task();
+        }
+    }
+
+    fn active_session_matches(&self, peer: BackendLeaseSlot, session_epoch: u64) -> bool {
+        self.entries
+            .get(&peer)
+            .and_then(|execution| execution.runtime.session_epoch())
+            == Some(session_epoch)
+    }
+
+    fn remove_active_session(
+        &mut self,
+        peer: BackendLeaseSlot,
+        session_epoch: u64,
+    ) -> Option<ActiveWorkerExecution> {
+        if self.active_session_matches(peer, session_epoch) {
+            self.remove(peer)
+        } else {
+            None
+        }
+    }
+
+    fn abort_all(&mut self) {
+        for execution in self.entries.values_mut() {
+            execution.abort_task();
+        }
+        self.reserved_peers.clear();
+        self.queued_reservations.clear();
+        self.queued_peers.clear();
     }
 }
 
@@ -393,7 +651,8 @@ fn run_worker_main() -> Result<(), WorkerRuntimeError> {
             let (task_event_tx, mut task_rx) =
                 mpsc::channel(config.max_fusion_tasks.saturating_mul(4).max(1));
             let task_tx = WorkerTaskNotifier::new(task_event_tx, scheduler_wake.sender());
-            let mut executions: HashMap<BackendLeaseSlot, ActiveWorkerExecution> = HashMap::new();
+            let mut executions =
+                ExecutionRegistry::with_capacity(config.control_slot_count as usize);
             #[cfg(feature = "pg_test")]
             let test_execution_gate = crate::test_gate::attach();
             let df_runtime_plan = resolve_datafusion_runtime_plan(config.worker_threads);
@@ -423,7 +682,9 @@ fn run_worker_main() -> Result<(), WorkerRuntimeError> {
                     test_execution_gate,
                 )?;
 
-                let active_peers = executions.keys().copied().collect::<Vec<_>>();
+                retry_pending_terminal_controls(&mut executions, &mut transport)?;
+
+                let active_peers = executions.active_peers();
                 for peer in active_peers {
                     trace!(
                         component = "worker",
@@ -448,26 +709,97 @@ fn run_worker_main() -> Result<(), WorkerRuntimeError> {
                     )?;
                 }
 
+                let reserved_peers = executions.reserved_peers();
+                for peer in reserved_peers {
+                    trace!(
+                        component = "worker",
+                        peer = ?peer,
+                        "worker probing reserved backend peer"
+                    );
+                    poll_execution_peer(
+                        &mut executions,
+                        &mut transport,
+                        &df_runtime,
+                        &mut spill_runtime,
+                        &config,
+                        &worker_config,
+                        &scan_source,
+                        &task_tx,
+                        #[cfg(feature = "pg_test")]
+                        test_execution_gate,
+                        peer,
+                        page_pool,
+                        issuance_pool,
+                        metrics,
+                    )?;
+                }
+
                 let mut ready_cursor = 0;
                 while let Some(peer) = transport.next_ready_backend_lease(&mut ready_cursor) {
-                    if executions.contains_key(&peer) {
-                        continue;
+                    match executions.peer_scheduler_state(peer) {
+                        PeerSchedulerState::Active => continue,
+                        PeerSchedulerState::Reserved | PeerSchedulerState::Retained => {
+                            if tracing::enabled!(Level::TRACE) {
+                                trace!(
+                                    component = "worker",
+                                    peer = ?peer,
+                                    state = ?executions.peer_scheduler_state(peer),
+                                    "worker polling known backend peer"
+                                );
+                            }
+                            poll_execution_peer(
+                                &mut executions,
+                                &mut transport,
+                                &df_runtime,
+                                &mut spill_runtime,
+                                &config,
+                                &worker_config,
+                                &scan_source,
+                                &task_tx,
+                                #[cfg(feature = "pg_test")]
+                                test_execution_gate,
+                                peer,
+                                page_pool,
+                                issuance_pool,
+                                metrics,
+                            )?;
+                        }
+                        PeerSchedulerState::Queued | PeerSchedulerState::Unknown => {
+                            let admission = recv_backend_admission_request(&mut transport, peer)?;
+                            match admission {
+                                AdmissionPollOutcome::Idle => {}
+                                AdmissionPollOutcome::Cancelled => {
+                                    executions.cancel_reservation(peer);
+                                }
+                                AdmissionPollOutcome::Requested => {
+                                    handle_requested_execution_reservation(
+                                        &mut executions,
+                                        &mut transport,
+                                        peer,
+                                        config.max_fusion_tasks,
+                                    )?;
+                                }
+                            }
+                        }
                     }
-                    if executions.len() >= config.max_fusion_tasks {
-                        trace!(
-                            component = "worker",
-                            peer = ?peer,
-                            active_executions = executions.len(),
-                            max_fusion_tasks = config.max_fusion_tasks,
-                            "worker deferring new backend peer because fusion task limit is reached"
-                        );
+                }
+
+                grant_queued_execution_reservations(
+                    &mut executions,
+                    &mut transport,
+                    config.max_fusion_tasks,
+                )?;
+
+                let mut ready_cursor = 0;
+                while let Some(peer) = transport.next_ready_backend_lease(&mut ready_cursor) {
+                    if executions.contains_active(peer) || !executions.contains_reserved(peer) {
                         continue;
                     }
                     if tracing::enabled!(Level::TRACE) {
                         trace!(
                             component = "worker",
                             peer = ?peer,
-                            "worker polling ready backend peer"
+                            "worker polling admitted backend peer after queued grants"
                         );
                     }
                     poll_execution_peer(
@@ -502,11 +834,17 @@ fn run_worker_main() -> Result<(), WorkerRuntimeError> {
                     #[cfg(feature = "pg_test")]
                     test_execution_gate,
                 )?;
+
+                retry_pending_terminal_controls(&mut executions, &mut transport)?;
+
+                grant_queued_execution_reservations(
+                    &mut executions,
+                    &mut transport,
+                    config.max_fusion_tasks,
+                )?;
             }
 
-            for execution in executions.values_mut() {
-                execution.abort_task();
-            }
+            executions.abort_all();
             Ok(())
         })();
 
@@ -554,9 +892,151 @@ fn wait_worker_scheduler(wake: &mut WorkerSchedulerWake, timeout: Duration) -> b
     !BackgroundWorker::sigterm_received() && !postmaster_died
 }
 
+fn recv_backend_admission_request(
+    transport: &mut TransportWorkerRuntime,
+    peer: BackendLeaseSlot,
+) -> Result<AdmissionPollOutcome, WorkerRuntimeError> {
+    let mut requested = false;
+    let mut cancelled = false;
+    let recv_result = transport.recv_peer_frames(peer, |bytes| {
+        match WorkerRuntimeCore::decode_inbound(bytes)? {
+            DecodedInbound::Control(
+                protocol::BackendExecutionToWorkerRef::ReserveExecutionSlot,
+            ) => {
+                requested = true;
+            }
+            DecodedInbound::Control(
+                protocol::BackendExecutionToWorkerRef::CancelExecutionReservation,
+            ) => {
+                cancelled = true;
+            }
+            DecodedInbound::Control(message) => {
+                return Err(WorkerRuntimeError::ProtocolViolation(format!(
+                    "backend sent {message:?} before execution reservation was granted"
+                )));
+            }
+            DecodedInbound::IssuedFrame(_) => {
+                return Err(WorkerRuntimeError::ProtocolViolation(
+                    "backend sent plan frame before execution reservation was granted".into(),
+                ));
+            }
+        }
+        Ok(())
+    });
+
+    match recv_result {
+        Ok(()) if cancelled => Ok(AdmissionPollOutcome::Cancelled),
+        Ok(()) if requested => Ok(AdmissionPollOutcome::Requested),
+        Ok(()) => Ok(AdmissionPollOutcome::Idle),
+        Err(err) if is_detached_backend_peer_error(&err) => {
+            warn!(
+                component = "worker",
+                peer = ?peer,
+                error = %err,
+                "worker could not read admission request because backend peer detached"
+            );
+            Ok(AdmissionPollOutcome::Cancelled)
+        }
+        Err(err) => Err(err),
+    }
+}
+
+fn grant_execution_reservation(
+    executions: &mut ExecutionRegistry,
+    transport: &mut TransportWorkerRuntime,
+    peer: BackendLeaseSlot,
+) -> Result<bool, WorkerRuntimeError> {
+    executions.reserve(peer);
+    match transport.send_peer_message(peer, WorkerExecutionToBackend::ExecutionSlotReserved) {
+        Ok(_) => Ok(true),
+        Err(err) if is_detached_backend_peer_error(&err) => {
+            executions.cancel_reservation(peer);
+            warn!(
+                component = "worker",
+                peer = ?peer,
+                error = %err,
+                "worker could not grant execution reservation because backend peer detached"
+            );
+            Ok(false)
+        }
+        Err(err) => {
+            executions.cancel_reservation(peer);
+            Err(err)
+        }
+    }
+}
+
+fn handle_requested_execution_reservation(
+    executions: &mut ExecutionRegistry,
+    transport: &mut TransportWorkerRuntime,
+    peer: BackendLeaseSlot,
+    max_fusion_tasks: usize,
+) -> Result<(), WorkerRuntimeError> {
+    if executions.contains_queued(peer) {
+        trace!(
+            component = "worker",
+            peer = ?peer,
+            "worker observed duplicate queued backend execution reservation"
+        );
+    } else if executions.has_queued_reservations() {
+        executions.queue_reservation(peer);
+        trace!(
+            component = "worker",
+            peer = ?peer,
+            admitted_executions = executions.admitted_len(),
+            max_fusion_tasks,
+            "worker queued backend execution reservation behind older reservations"
+        );
+    } else if executions.has_admission_capacity(max_fusion_tasks) {
+        let granted = grant_execution_reservation(executions, transport, peer)?;
+        if granted {
+            trace!(
+                component = "worker",
+                peer = ?peer,
+                admitted_executions = executions.admitted_len(),
+                max_fusion_tasks,
+                "worker granted backend execution reservation"
+            );
+        }
+    } else {
+        executions.queue_reservation(peer);
+        trace!(
+            component = "worker",
+            peer = ?peer,
+            admitted_executions = executions.admitted_len(),
+            max_fusion_tasks,
+            "worker queued backend execution reservation because fusion task limit is reached"
+        );
+    }
+    Ok(())
+}
+
+fn grant_queued_execution_reservations(
+    executions: &mut ExecutionRegistry,
+    transport: &mut TransportWorkerRuntime,
+    max_fusion_tasks: usize,
+) -> Result<(), WorkerRuntimeError> {
+    while executions.has_admission_capacity(max_fusion_tasks) {
+        let Some(peer) = executions.pop_next_queued_reservation() else {
+            break;
+        };
+        let granted = grant_execution_reservation(executions, transport, peer)?;
+        if granted {
+            trace!(
+                component = "worker",
+                peer = ?peer,
+                admitted_executions = executions.admitted_len(),
+                max_fusion_tasks,
+                "worker granted queued backend execution reservation"
+            );
+        }
+    }
+    Ok(())
+}
+
 #[allow(clippy::too_many_arguments)]
 fn poll_execution_peer(
-    executions: &mut HashMap<BackendLeaseSlot, ActiveWorkerExecution>,
+    executions: &mut ExecutionRegistry,
     transport: &mut TransportWorkerRuntime,
     df_runtime: &tokio::runtime::Runtime,
     spill_runtime: &mut WorkerSpillRuntime,
@@ -570,10 +1050,16 @@ fn poll_execution_peer(
     issuance_pool: IssuancePool,
     metrics: RuntimeMetrics,
 ) -> Result<(), WorkerRuntimeError> {
-    let mut execution = executions.remove(&peer).unwrap_or_else(|| {
+    let execution = executions.remove(peer);
+    if execution.is_none() && !executions.contains_reserved(peer) {
+        return Err(WorkerRuntimeError::ProtocolViolation(format!(
+            "backend peer {peer:?} sent execution frames without a granted reservation"
+        )));
+    }
+    let mut execution = execution.unwrap_or_else(|| {
         ActiveWorkerExecution::new(worker_config.clone(), Arc::clone(scan_source))
     });
-    let steps = recv_backend_peer_steps(
+    let poll = recv_backend_peer_steps(
         transport,
         &mut execution.runtime,
         peer,
@@ -581,31 +1067,56 @@ fn poll_execution_peer(
         issuance_pool,
         &mut execution.plan_rx,
     )?;
-    handle_steps(
-        transport,
-        &mut execution,
-        df_runtime,
-        spill_runtime,
-        config,
-        page_pool,
-        issuance_pool,
-        metrics,
-        task_tx,
-        #[cfg(feature = "pg_test")]
-        test_execution_gate,
-        steps,
-    )?;
-    if execution.runtime.active_peer().is_some() {
-        executions.insert(peer, execution);
-    } else {
-        execution.abort_task();
+    match poll {
+        PeerPollOutcome::Steps(steps) => {
+            handle_steps(
+                transport,
+                &mut execution,
+                df_runtime,
+                spill_runtime,
+                config,
+                page_pool,
+                issuance_pool,
+                metrics,
+                task_tx,
+                #[cfg(feature = "pg_test")]
+                test_execution_gate,
+                steps,
+            )?;
+            executions.retain_after_poll(peer, execution);
+        }
+        PeerPollOutcome::DetachedIdle => {
+            execution.abort_task();
+            executions.cancel_reservation(peer);
+        }
+        PeerPollOutcome::ReservationCancelled => {
+            execution.abort_task();
+            executions.cancel_reservation(peer);
+        }
+        PeerPollOutcome::ActiveReservationCancelViolation(err) => {
+            let session_epoch = execution
+                .runtime
+                .session_epoch()
+                .ok_or(WorkerRuntimeError::NoActiveExecution)?;
+            execution.abort_task();
+            finish_execution_task(
+                transport,
+                &mut execution,
+                config,
+                metrics,
+                peer,
+                session_epoch,
+                Err(err),
+            )?;
+            executions.retain_after_poll(peer, execution);
+        }
     }
     Ok(())
 }
 
 #[allow(clippy::too_many_arguments)]
 fn drain_task_events(
-    executions: &mut HashMap<BackendLeaseSlot, ActiveWorkerExecution>,
+    executions: &mut ExecutionRegistry,
     transport: &mut TransportWorkerRuntime,
     df_runtime: &tokio::runtime::Runtime,
     spill_runtime: &mut WorkerSpillRuntime,
@@ -638,7 +1149,7 @@ fn drain_task_events(
 
 #[allow(clippy::too_many_arguments)]
 fn handle_task_event(
-    executions: &mut HashMap<BackendLeaseSlot, ActiveWorkerExecution>,
+    executions: &mut ExecutionRegistry,
     transport: &mut TransportWorkerRuntime,
     df_runtime: &tokio::runtime::Runtime,
     spill_runtime: &mut WorkerSpillRuntime,
@@ -652,32 +1163,36 @@ fn handle_task_event(
 ) -> Result<(), WorkerRuntimeError> {
     match event {
         WorkerTaskEvent::PhysicalPlanningFinished { peer, flow, result } => {
-            let Some(mut execution) = executions.remove(&peer) else {
+            let Some(mut execution) = executions.remove(peer) else {
                 return Ok(());
             };
-            execution.task = None;
-            let step = execution
+            let (step, planning_err) = execution
                 .runtime
-                .finish_physical_planning(peer, flow, result)?;
-            handle_steps(
-                transport,
-                &mut execution,
-                df_runtime,
-                spill_runtime,
-                config,
-                page_pool,
-                issuance_pool,
-                metrics,
-                task_tx,
-                #[cfg(feature = "pg_test")]
-                test_execution_gate,
-                VecDeque::from([step]),
-            )?;
-            if execution.runtime.active_peer().is_some() {
-                executions.insert(peer, execution);
-            } else {
-                execution.abort_task();
+                .finish_physical_planning_step(peer, flow, result)?;
+            if planning_err.is_some()
+                || !matches!(step, WorkerRuntimeStep::PlanningResultIgnored { .. })
+            {
+                execution.task = None;
             }
+            if let Some(err) = planning_err {
+                finish_failed_terminal_step(transport, &mut execution, config, peer, err, step)?;
+            } else {
+                handle_steps(
+                    transport,
+                    &mut execution,
+                    df_runtime,
+                    spill_runtime,
+                    config,
+                    page_pool,
+                    issuance_pool,
+                    metrics,
+                    task_tx,
+                    #[cfg(feature = "pg_test")]
+                    test_execution_gate,
+                    VecDeque::from([step]),
+                )?;
+            }
+            executions.retain_after_poll(peer, execution);
         }
         WorkerTaskEvent::ResultPage {
             peer,
@@ -685,7 +1200,7 @@ fn handle_task_event(
             outbound,
             ack,
         } => {
-            let result = if active_execution_session_matches(executions, peer, session_epoch) {
+            let result = if executions.active_session_matches(peer, session_epoch) {
                 send_result_page_from_task(transport, metrics, peer, session_epoch, outbound)
             } else {
                 Err(stale_execution_task_error(peer, session_epoch))
@@ -698,7 +1213,7 @@ fn handle_task_event(
             frame,
             ack,
         } => {
-            let result = if active_execution_session_matches(executions, peer, session_epoch) {
+            let result = if executions.active_session_matches(peer, session_epoch) {
                 send_result_close_from_task(transport, peer, session_epoch, frame)
             } else {
                 Err(stale_execution_task_error(peer, session_epoch))
@@ -710,7 +1225,7 @@ fn handle_task_event(
             session_epoch,
             result,
         } => {
-            let Some(mut execution) = executions.remove(&peer) else {
+            let Some(mut execution) = executions.remove_active_session(peer, session_epoch) else {
                 return Ok(());
             };
             execution.task = None;
@@ -723,25 +1238,10 @@ fn handle_task_event(
                 session_epoch,
                 result,
             )?;
-            if execution.runtime.active_peer().is_some() {
-                executions.insert(peer, execution);
-            } else {
-                execution.abort_task();
-            }
+            executions.retain_after_poll(peer, execution);
         }
     }
     Ok(())
-}
-
-fn active_execution_session_matches(
-    executions: &HashMap<BackendLeaseSlot, ActiveWorkerExecution>,
-    peer: BackendLeaseSlot,
-    session_epoch: u64,
-) -> bool {
-    executions
-        .get(&peer)
-        .and_then(|execution| execution.runtime.session_epoch())
-        == Some(session_epoch)
 }
 
 fn recv_backend_peer_steps(
@@ -751,11 +1251,39 @@ fn recv_backend_peer_steps(
     page_pool: PagePool,
     issuance_pool: IssuancePool,
     plan_rx: &mut Option<IssuedRx>,
-) -> Result<VecDeque<WorkerRuntimeStep>, WorkerRuntimeError> {
+) -> Result<PeerPollOutcome, WorkerRuntimeError> {
     let mut steps = VecDeque::new();
+    let mut reservation_cancelled = false;
+    let mut active_reservation_cancel_violation = None;
     let recv_result = transport.recv_peer_frames(peer, |bytes| {
+        if active_reservation_cancel_violation.is_some() {
+            return Ok(());
+        }
         let decoded = WorkerRuntimeCore::decode_inbound(bytes)?;
         let step = match decoded {
+            DecodedInbound::Control(
+                protocol::BackendExecutionToWorkerRef::ReserveExecutionSlot,
+            ) => {
+                return Ok(());
+            }
+            DecodedInbound::Control(
+                protocol::BackendExecutionToWorkerRef::CancelExecutionReservation,
+            ) => {
+                if runtime.active_peer() == Some(peer) {
+                    active_reservation_cancel_violation =
+                        Some(WorkerRuntimeError::ProtocolViolation(format!(
+                            "backend peer {peer:?} sent CancelExecutionReservation after execution started"
+                        )));
+                } else if runtime.retained_peer() == Some(peer) {
+                    // Reservation cancellation is only meaningful before
+                    // StartExecution. Once the runtime is retained, treat it
+                    // like stale pre-session traffic so pending terminal
+                    // delivery is not discarded.
+                } else {
+                    reservation_cancelled = true;
+                }
+                return Ok(());
+            }
             DecodedInbound::Control(message) => runtime.accept_backend_control(peer, message)?,
             DecodedInbound::IssuedFrame(frame) => {
                 let rx = plan_rx.as_ref().ok_or_else(|| {
@@ -777,7 +1305,15 @@ fn recv_backend_peer_steps(
     });
 
     match recv_result {
-        Ok(()) => Ok(steps),
+        Ok(()) if active_reservation_cancel_violation.is_some() => {
+            Ok(PeerPollOutcome::ActiveReservationCancelViolation(
+                active_reservation_cancel_violation.expect("violation error"),
+            ))
+        }
+        Ok(()) if reservation_cancelled && steps.is_empty() => {
+            Ok(PeerPollOutcome::ReservationCancelled)
+        }
+        Ok(()) => Ok(PeerPollOutcome::Steps(steps)),
         Err(err) if is_detached_backend_peer_error(&err) => {
             warn!(
                 component = "worker",
@@ -788,8 +1324,9 @@ fn recv_backend_peer_steps(
             steps.clear();
             if let Some(step) = runtime.cancel_detached_backend_peer(peer)? {
                 steps.push_back(step);
+                return Ok(PeerPollOutcome::Steps(steps));
             }
-            Ok(steps)
+            Ok(PeerPollOutcome::DetachedIdle)
         }
         Err(err) => Err(err),
     }
@@ -858,31 +1395,21 @@ fn finish_execution_task(
                 peer = ?peer,
                 "worker finished execution successfully and is sending CompleteExecution"
             );
-            if let Err(err) = transport.send_peer_message(
-                peer,
-                WorkerExecutionToBackend::CompleteExecution { session_epoch },
-            ) {
-                if is_detached_backend_peer_error(&err) {
-                    warn!(
-                        component = "worker",
-                        session_epoch,
-                        peer = ?peer,
-                        error = %err,
-                        "worker could not send CompleteExecution because backend peer detached"
-                    );
-                } else {
-                    return Err(err);
-                }
-            }
             if let Some(worker_start) = worker_start {
                 metrics.add_elapsed(MetricId::WorkerTotalNs, worker_start);
             }
             let step = execution.runtime.mark_execution_complete()?;
             handle_terminal_step(execution, step)?;
+            queue_and_try_send_terminal_control(
+                transport,
+                execution,
+                peer,
+                PendingTerminalControl::Complete { session_epoch },
+            )?;
         }
         Err(err) => {
             let detail =
-                worker_execution_failure_detail(&err, config.control_backend_to_worker_capacity);
+                worker_execution_failure_detail(&err, config.control_worker_to_backend_capacity);
             warn!(
                 component = "worker",
                 session_epoch,
@@ -890,26 +1417,6 @@ fn finish_execution_task(
                 error = %err,
                 "worker execution failed locally; sending FailExecution"
             );
-            if let Err(send_err) = transport.send_peer_message(
-                peer,
-                WorkerExecutionToBackend::FailExecution {
-                    session_epoch,
-                    code: ExecutionFailureCode::Internal,
-                    detail,
-                },
-            ) {
-                if is_detached_backend_peer_error(&send_err) {
-                    warn!(
-                        component = "worker",
-                        session_epoch,
-                        peer = ?peer,
-                        error = %send_err,
-                        "worker could not send FailExecution because backend peer detached"
-                    );
-                } else {
-                    return Err(send_err);
-                }
-            }
             if let Some(worker_start) = worker_start {
                 metrics.add_elapsed(MetricId::WorkerTotalNs, worker_start);
             }
@@ -917,9 +1424,132 @@ fn finish_execution_task(
                 .runtime
                 .fail_execution_locally(ExecutionFailureCode::Internal, None)?;
             handle_terminal_step(execution, step)?;
+            queue_and_try_send_terminal_control(
+                transport,
+                execution,
+                peer,
+                PendingTerminalControl::Fail {
+                    session_epoch,
+                    code: ExecutionFailureCode::Internal,
+                    detail,
+                },
+            )?;
         }
     }
     Ok(())
+}
+
+fn finish_failed_terminal_step(
+    transport: &mut TransportWorkerRuntime,
+    execution: &mut ActiveWorkerExecution,
+    config: &crate::HostConfig,
+    peer: BackendLeaseSlot,
+    err: WorkerRuntimeError,
+    step: WorkerRuntimeStep,
+) -> Result<(), WorkerRuntimeError> {
+    let WorkerRuntimeStep::ExecutionFailed {
+        session_epoch,
+        code,
+        ..
+    } = step
+    else {
+        return Err(WorkerRuntimeError::ProtocolViolation(format!(
+            "planning failure produced non-failure runtime step: {step:?}"
+        )));
+    };
+    let detail = worker_execution_failure_detail(&err, config.control_worker_to_backend_capacity);
+    warn!(
+        component = "worker",
+        session_epoch,
+        peer = ?peer,
+        error = %err,
+        "worker physical planning failed locally; sending FailExecution"
+    );
+    handle_terminal_step(
+        execution,
+        WorkerRuntimeStep::ExecutionFailed {
+            session_epoch,
+            code,
+            detail: None,
+        },
+    )?;
+    queue_and_try_send_terminal_control(
+        transport,
+        execution,
+        peer,
+        PendingTerminalControl::Fail {
+            session_epoch,
+            code,
+            detail,
+        },
+    )
+}
+
+fn queue_and_try_send_terminal_control(
+    transport: &mut TransportWorkerRuntime,
+    execution: &mut ActiveWorkerExecution,
+    peer: BackendLeaseSlot,
+    terminal: PendingTerminalControl,
+) -> Result<(), WorkerRuntimeError> {
+    execution.pending_terminal = Some(terminal);
+    retry_pending_terminal_control(transport, execution, peer)
+}
+
+fn retry_pending_terminal_controls(
+    executions: &mut ExecutionRegistry,
+    transport: &mut TransportWorkerRuntime,
+) -> Result<(), WorkerRuntimeError> {
+    for peer in executions.pending_terminal_peers() {
+        let Some(mut execution) = executions.remove(peer) else {
+            continue;
+        };
+        let retry = retry_pending_terminal_control(transport, &mut execution, peer);
+        executions.retain_after_poll(peer, execution);
+        retry?;
+    }
+    Ok(())
+}
+
+fn retry_pending_terminal_control(
+    transport: &mut TransportWorkerRuntime,
+    execution: &mut ActiveWorkerExecution,
+    peer: BackendLeaseSlot,
+) -> Result<(), WorkerRuntimeError> {
+    let Some(terminal) = execution.pending_terminal.clone() else {
+        return Ok(());
+    };
+    let session_epoch = terminal.session_epoch();
+    let kind = terminal.kind();
+    match transport.send_peer_message(peer, terminal.to_message()) {
+        Ok(_) => {
+            execution.pending_terminal = None;
+            Ok(())
+        }
+        Err(err) if is_detached_backend_peer_error(&err) => {
+            warn!(
+                component = "worker",
+                session_epoch,
+                peer = ?peer,
+                error = %err,
+                terminal = kind,
+                "worker could not send terminal control because backend peer detached"
+            );
+            execution.pending_terminal = None;
+            Ok(())
+        }
+        Err(err) if is_worker_to_backend_ring_full_error(&err) => {
+            warn!(
+                component = "worker",
+                session_epoch,
+                peer = ?peer,
+                error = %err,
+                terminal = kind,
+                "worker terminal control ring is full; deferring terminal control"
+            );
+            Ok(())
+        }
+        Err(err) => Err(err),
+    }
 }
 
 fn handle_terminal_step(
@@ -994,6 +1624,15 @@ fn is_detached_backend_peer_error(err: &WorkerRuntimeError) -> bool {
         }
         _ => false,
     }
+}
+
+fn is_worker_to_backend_ring_full_error(err: &WorkerRuntimeError) -> bool {
+    matches!(
+        err,
+        WorkerRuntimeError::WorkerTx(control_transport::WorkerTxError::Ring(
+            control_transport::TxError::Full { .. }
+        ))
+    )
 }
 
 fn is_detached_slot_access_error(err: &control_transport::SlotAccessError) -> bool {
@@ -1081,6 +1720,1401 @@ fn truncate_utf8(value: &str, max_len: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::alloc::{alloc_zeroed, dealloc, Layout};
+    use std::ptr::NonNull;
+    use std::sync::Once;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    use control_transport::{TransportRegion, TransportRegionLayout};
+
+    #[derive(Debug)]
+    struct NoopScanSource;
+
+    impl ::worker::ScanBatchSource for NoopScanSource {
+        fn open_scan(
+            &self,
+            _request: ::worker::OpenScanRequest,
+        ) -> datafusion_common::Result<datafusion::physical_plan::SendableRecordBatchStream>
+        {
+            Err(datafusion_common::DataFusionError::Execution(
+                "test scan source is unused".into(),
+            ))
+        }
+    }
+
+    struct OwnedRegion {
+        base: NonNull<u8>,
+        layout: Layout,
+    }
+
+    impl OwnedRegion {
+        fn new(size: usize, align: usize) -> Self {
+            let layout = Layout::from_size_align(size, align).expect("layout");
+            let base = unsafe { alloc_zeroed(layout) };
+            let base = NonNull::new(base).expect("allocation");
+            Self { base, layout }
+        }
+    }
+
+    impl Drop for OwnedRegion {
+        fn drop(&mut self) {
+            unsafe { dealloc(self.base.as_ptr(), self.layout) };
+        }
+    }
+
+    struct TestTransport {
+        worker: TransportWorkerRuntime,
+        region: TransportRegion,
+        backend: BackendSlotLease,
+        _region_mem: OwnedRegion,
+    }
+
+    impl TestTransport {
+        fn new(worker_to_backend_capacity: usize) -> Self {
+            Self::with_slots(1, worker_to_backend_capacity)
+        }
+
+        fn with_slots(slot_count: u32, worker_to_backend_capacity: usize) -> Self {
+            ignore_sigusr1_for_tests();
+            let layout = TransportRegionLayout::new(slot_count, 256, worker_to_backend_capacity)
+                .expect("transport layout");
+            let worker_config = WorkerRuntimeConfig {
+                control_frame_capacity: worker_to_backend_capacity,
+                ..WorkerRuntimeConfig::default()
+            };
+            Self::with_layout_and_worker_config(layout, worker_config)
+        }
+
+        fn with_host_config(config: &crate::HostConfig) -> Self {
+            ignore_sigusr1_for_tests();
+            let layout = config.control_transport_layout().expect("transport layout");
+            Self::with_layout_and_worker_config(layout, config.worker_runtime_config())
+        }
+
+        fn with_layout_and_worker_config(
+            layout: TransportRegionLayout,
+            worker_config: WorkerRuntimeConfig,
+        ) -> Self {
+            let region_mem = OwnedRegion::new(layout.size, layout.align);
+            let region =
+                unsafe { TransportRegion::init_in_place(region_mem.base, layout.size, layout) }
+                    .expect("transport region");
+            let worker = TransportWorkerRuntime::attach(&region, &worker_config)
+                .expect("attach worker transport");
+            worker
+                .activate_generation(std::process::id() as i32)
+                .expect("activate worker generation");
+            let backend = BackendSlotLease::acquire(&region).expect("acquire backend lease");
+
+            Self {
+                worker,
+                region,
+                backend,
+                _region_mem: region_mem,
+            }
+        }
+
+        fn acquire_backend(&self) -> BackendSlotLease {
+            BackendSlotLease::acquire(&self.region).expect("acquire backend lease")
+        }
+
+        fn peer(&self) -> BackendLeaseSlot {
+            self.backend.backend_lease_slot()
+        }
+
+        fn recv_worker_execution(&mut self) -> protocol::WorkerExecutionToBackend {
+            recv_worker_execution_from(&mut self.backend)
+        }
+    }
+
+    fn send_backend_execution_frame(
+        backend: &mut BackendSlotLease,
+        message: protocol::BackendExecutionToWorker<'_>,
+    ) {
+        let mut buf = vec![0_u8; protocol::encoded_len_backend_execution_to_worker(message)];
+        let len = protocol::encode_backend_execution_to_worker_into(message, &mut buf)
+            .expect("encode backend execution frame");
+        let mut tx = backend.to_worker_tx();
+        tx.send_frame(&buf[..len]).expect("send backend frame");
+    }
+
+    fn recv_worker_execution_from(
+        backend: &mut BackendSlotLease,
+    ) -> protocol::WorkerExecutionToBackend {
+        let mut rx = backend.from_worker_rx();
+        let mut buf = vec![0_u8; 4096];
+        let len = rx
+            .recv_frame_into(&mut buf)
+            .expect("receive worker frame")
+            .expect("worker frame");
+        protocol::decode_worker_execution_to_backend(&buf[..len]).expect("decode worker frame")
+    }
+
+    fn drain_worker_execution_frames(
+        backend: &mut BackendSlotLease,
+    ) -> Vec<protocol::WorkerExecutionToBackend> {
+        let mut rx = backend.from_worker_rx();
+        let mut buf = vec![0_u8; 4096];
+        let mut frames = Vec::new();
+        while let Some(len) = rx.recv_frame_into(&mut buf).expect("receive worker frame") {
+            frames.push(
+                protocol::decode_worker_execution_to_backend(&buf[..len])
+                    .expect("decode worker frame"),
+            );
+        }
+        frames
+    }
+
+    fn fill_worker_to_backend_ring_until_full(
+        worker: &mut TransportWorkerRuntime,
+        peer: BackendLeaseSlot,
+    ) {
+        loop {
+            match worker.send_peer_message(peer, WorkerExecutionToBackend::ExecutionSlotReserved) {
+                Ok(_) => {}
+                Err(err) if is_worker_to_backend_ring_full_error(&err) => return,
+                Err(err) => panic!("unexpected worker-to-backend fill error: {err}"),
+            }
+        }
+    }
+
+    fn assert_fail_execution_frame(
+        frame: protocol::WorkerExecutionToBackend,
+        session_epoch: u64,
+        expected_detail: &str,
+    ) {
+        match frame {
+            protocol::WorkerExecutionToBackend::FailExecution {
+                session_epoch: actual_session_epoch,
+                code,
+                detail,
+            } => {
+                assert_eq!(actual_session_epoch, session_epoch);
+                assert_eq!(code, ExecutionFailureCode::Internal);
+                assert!(detail
+                    .as_deref()
+                    .is_some_and(|detail| detail.contains(expected_detail)));
+            }
+            other => panic!("unexpected worker frame: {other:?}"),
+        }
+    }
+
+    fn init_page_pool_for_test() -> (OwnedRegion, PagePool) {
+        let config = pool::PagePoolConfig::new(4096, 1).expect("page pool config");
+        let layout = PagePool::layout(config).expect("page pool layout");
+        let region = OwnedRegion::new(layout.size, layout.align);
+        let page_pool = unsafe { PagePool::init_in_place(region.base, layout.size, config) }
+            .expect("page pool init");
+        (region, page_pool)
+    }
+
+    fn init_issuance_pool_for_test() -> (OwnedRegion, IssuancePool) {
+        let config = issuance::IssuanceConfig::new(1).expect("issuance config");
+        let layout = IssuancePool::layout(config).expect("issuance layout");
+        let region = OwnedRegion::new(layout.size, layout.align);
+        let issuance_pool =
+            unsafe { IssuancePool::init_in_place(region.base, layout.size, config) }
+                .expect("issuance pool init");
+        (region, issuance_pool)
+    }
+
+    fn poll_test_execution_peer(
+        registry: &mut ExecutionRegistry,
+        worker: &mut TransportWorkerRuntime,
+        peer: BackendLeaseSlot,
+    ) {
+        let (_page_region, page_pool) = init_page_pool_for_test();
+        let (_issuance_region, issuance_pool) = init_issuance_pool_for_test();
+        let df_runtime = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .expect("create datafusion runtime");
+        let mut spill_runtime =
+            WorkerSpillRuntime::new(::worker::WorkerSpillConfig::default(), 123, 456)
+                .expect("create spill runtime");
+        let worker_config = WorkerRuntimeConfig::default();
+        let scan_source: Arc<dyn ::worker::ScanBatchSource> = Arc::new(NoopScanSource);
+        let wake = WorkerSchedulerWake::new().expect("create scheduler wake");
+        let (task_event_tx, _task_rx) = mpsc::channel(1);
+        let task_tx = WorkerTaskNotifier::new(task_event_tx, wake.sender());
+
+        poll_execution_peer(
+            registry,
+            worker,
+            &df_runtime,
+            &mut spill_runtime,
+            &test_host_config(4096),
+            &worker_config,
+            &scan_source,
+            &task_tx,
+            #[cfg(feature = "pg_test")]
+            crate::test_gate::attach(),
+            peer,
+            page_pool,
+            issuance_pool,
+            RuntimeMetrics::default(),
+        )
+        .expect("poll execution peer");
+    }
+
+    fn ignore_sigusr1_for_tests() {
+        static ONCE: Once = Once::new();
+        ONCE.call_once(|| unsafe {
+            libc::signal(libc::SIGUSR1, libc::SIG_IGN);
+        });
+    }
+
+    struct TestTempDir {
+        path: PathBuf,
+    }
+
+    impl TestTempDir {
+        fn new() -> Self {
+            let unique = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .expect("system time")
+                .as_nanos();
+            let path = std::env::temp_dir().join(format!(
+                "pg_fusion_worker_test_{}_{}",
+                std::process::id(),
+                unique
+            ));
+            std::fs::create_dir(&path).expect("create test temp dir");
+            Self { path }
+        }
+
+        fn path(&self) -> &std::path::Path {
+            &self.path
+        }
+    }
+
+    impl Drop for TestTempDir {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.path);
+        }
+    }
+
+    fn test_host_config(control_worker_to_backend_capacity: usize) -> crate::HostConfig {
+        crate::HostConfig {
+            enable: true,
+            worker_threads: Some(1),
+            log_path: "/tmp/pg_fusion.log".into(),
+            worker_log_filter: "warn".into(),
+            backend_log_level: backend_service::DiagnosticLogLevel::Basic,
+            worker_memory_limit_bytes: None,
+            worker_spill_directory: None,
+            max_fusion_tasks: 1,
+            control_slot_count: 1,
+            control_backend_to_worker_capacity: 256,
+            control_worker_to_backend_capacity,
+            scan_slot_count: 1,
+            scan_backend_to_worker_capacity: protocol::MIN_SCAN_BACKEND_TO_WORKER_RING_CAPACITY,
+            scan_worker_to_backend_capacity: protocol::MIN_SCAN_WORKER_TO_BACKEND_RING_CAPACITY,
+            page_size: 4096,
+            page_count: 4,
+            scan_fetch_batch_rows: 16,
+            scan_batch_channel_capacity: 1,
+            scan_idle_poll_interval_us: 50,
+            estimator_initial_tail_bytes_per_row: 64,
+            join_reordering: false,
+            runtime_filter_enable: true,
+            runtime_filter_count: 1,
+            runtime_filter_bits: 1024,
+            runtime_filter_hashes: 1,
+        }
+    }
+
+    fn test_peer(slot_id: u32) -> BackendLeaseSlot {
+        test_peer_incarnation(slot_id, u64::from(slot_id) + 1)
+    }
+
+    fn test_peer_incarnation(slot_id: u32, lease_epoch: u64) -> BackendLeaseSlot {
+        BackendLeaseSlot::new(
+            slot_id,
+            control_transport::BackendLeaseId::new(1, lease_epoch),
+        )
+    }
+
+    fn test_execution() -> ActiveWorkerExecution {
+        ActiveWorkerExecution::new(
+            WorkerRuntimeConfig::default(),
+            std::sync::Arc::new(NoopScanSource),
+        )
+    }
+
+    fn test_plan_descriptor(plan_id: u64) -> protocol::PlanFlowDescriptor {
+        protocol::PlanFlowDescriptor {
+            plan_id,
+            page_kind: 0x504c,
+            page_flags: 0,
+        }
+    }
+
+    fn start_test_execution(
+        execution: &mut ActiveWorkerExecution,
+        peer: BackendLeaseSlot,
+        session_epoch: u64,
+    ) {
+        execution
+            .runtime
+            .accept_backend_control(
+                peer,
+                protocol::BackendExecutionToWorkerRef::StartExecution {
+                    session_epoch,
+                    plan: test_plan_descriptor(1),
+                    options: protocol::ExecutionOptionsWire::default(),
+                    scans: protocol::ScanChannelSetRef::empty(),
+                },
+            )
+            .expect("start test execution");
+    }
+
+    fn test_empty_logical_plan() -> datafusion::logical_expr::LogicalPlan {
+        datafusion::logical_expr::LogicalPlan::EmptyRelation(
+            datafusion::logical_expr::logical_plan::EmptyRelation {
+                produce_one_row: false,
+                schema: Arc::new(datafusion_common::DFSchema::empty()),
+            },
+        )
+    }
+
+    fn start_planning_test_execution(
+        execution: &mut ActiveWorkerExecution,
+        peer: BackendLeaseSlot,
+        session_epoch: u64,
+    ) -> Box<::worker::PendingPhysicalPlanning> {
+        start_test_execution(execution, peer, session_epoch);
+
+        let (_page_region, page_pool) = init_page_pool_for_test();
+        let (_issuance_region, issuance_pool) = init_issuance_pool_for_test();
+        let tx = IssuedTx::new(PageTx::new(page_pool), issuance_pool);
+        let rx = IssuedRx::new(transfer::PageRx::new(page_pool), issuance_pool);
+        let plan_descriptor = test_plan_descriptor(1);
+        let flow = plan_flow::FlowId {
+            session_epoch,
+            plan_id: plan_descriptor.plan_id,
+        };
+        let open =
+            plan_flow::PlanOpen::new(flow, plan_descriptor.page_kind, plan_descriptor.page_flags);
+        let plan = test_empty_logical_plan();
+        let mut backend = plan_flow::BackendPlanRole::new(tx);
+        backend.open(open, &plan).expect("open test plan flow");
+
+        loop {
+            match backend.step().expect("step test plan flow") {
+                plan_flow::BackendPlanStep::OutboundPage { flow, outbound } => {
+                    let frame = outbound.frame();
+                    outbound.mark_sent();
+                    assert!(matches!(
+                        execution
+                            .runtime
+                            .accept_issued_plan_frame(peer, &rx, &frame)
+                            .expect("accept plan page"),
+                        WorkerRuntimeStep::PlanFrameAccepted { .. }
+                    ));
+                    assert_eq!(flow.session_epoch, session_epoch);
+                }
+                plan_flow::BackendPlanStep::CloseFrame { flow, frame } => {
+                    let step = execution
+                        .runtime
+                        .accept_issued_plan_frame(peer, &rx, &frame)
+                        .expect("accept plan close");
+                    let WorkerRuntimeStep::PlanningStarted(pending) = step else {
+                        panic!("expected planning start, got {step:?}");
+                    };
+                    assert_eq!(pending.flow(), flow);
+                    backend.close().expect("close test plan flow");
+                    return pending;
+                }
+                plan_flow::BackendPlanStep::Blocked { .. } => {
+                    panic!("test plan flow unexpectedly blocked")
+                }
+                plan_flow::BackendPlanStep::LogicalError { message, .. } => {
+                    panic!("test plan flow failed: {message}")
+                }
+            }
+        }
+    }
+
+    fn start_running_test_execution(
+        execution: &mut ActiveWorkerExecution,
+        peer: BackendLeaseSlot,
+        session_epoch: u64,
+    ) {
+        let pending = start_planning_test_execution(execution, peer, session_epoch);
+        let flow = pending.flow();
+        let plan = futures::executor::block_on(pending.plan()).expect("build test physical plan");
+        let (step, planning_err) = execution
+            .runtime
+            .finish_physical_planning_step(peer, flow, Ok(plan))
+            .expect("finish test physical planning");
+        assert!(planning_err.is_none());
+        assert!(matches!(step, WorkerRuntimeStep::PhysicalPlanReady(_)));
+        assert_eq!(
+            execution.runtime.state(),
+            ::worker::fsm::WorkerExecutionState::Running
+        );
+    }
+
+    fn retained_idle_execution(peer: BackendLeaseSlot) -> ActiveWorkerExecution {
+        let mut execution = test_execution();
+        start_test_execution(&mut execution, peer, 10);
+        let step = execution
+            .runtime
+            .accept_backend_control(
+                peer,
+                protocol::BackendExecutionToWorkerRef::CancelExecution { session_epoch: 10 },
+            )
+            .expect("cancel test execution");
+        handle_terminal_step(&mut execution, step).expect("cleanup terminal execution");
+        assert_eq!(execution.runtime.active_peer(), None);
+        assert_eq!(execution.runtime.retained_peer(), Some(peer));
+        execution
+    }
+
+    #[test]
+    fn execution_registry_counts_only_active_entries() {
+        let peer = test_peer(1);
+        let mut registry = ExecutionRegistry::with_capacity(4);
+        let mut execution = test_execution();
+        start_test_execution(&mut execution, peer, 10);
+
+        registry.retain_after_poll(peer, execution);
+        assert_eq!(registry.active_len(), 1);
+        assert!(registry.contains_active(peer));
+        assert!(registry.entries.capacity() >= 4);
+        assert!(registry.active_peers.capacity() >= 4);
+
+        let mut execution = registry.remove(peer).expect("active entry");
+        assert_eq!(registry.active_len(), 0);
+        let step = execution
+            .runtime
+            .accept_backend_control(
+                peer,
+                protocol::BackendExecutionToWorkerRef::CancelExecution { session_epoch: 10 },
+            )
+            .expect("cancel active execution");
+        handle_terminal_step(&mut execution, step).expect("cleanup terminal execution");
+
+        registry.retain_after_poll(peer, execution);
+        assert_eq!(registry.active_len(), 0);
+        assert!(!registry.contains_active(peer));
+        assert!(registry.entries.contains_key(&peer));
+    }
+
+    #[test]
+    fn execution_registry_retained_entries_do_not_consume_active_capacity() {
+        let retained_peer = test_peer(1);
+        let active_peer = test_peer(2);
+        let mut registry = ExecutionRegistry::with_capacity(2);
+
+        registry.retain_after_poll(retained_peer, retained_idle_execution(retained_peer));
+        assert_eq!(registry.active_len(), 0);
+        assert!(!registry.contains_active(retained_peer));
+
+        let mut active = test_execution();
+        start_test_execution(&mut active, active_peer, 20);
+        registry.retain_after_poll(active_peer, active);
+
+        assert_eq!(registry.active_len(), 1);
+        assert!(registry.contains_active(active_peer));
+        assert!(registry.entries.contains_key(&retained_peer));
+    }
+
+    #[test]
+    fn execution_registry_can_evict_retained_idle_entries() {
+        let peer = test_peer(1);
+        let mut registry = ExecutionRegistry::with_capacity(1);
+        registry.retain_after_poll(peer, retained_idle_execution(peer));
+
+        let execution = registry.remove(peer).expect("retained entry");
+        assert_eq!(execution.runtime.active_peer(), None);
+        assert_eq!(execution.runtime.retained_peer(), Some(peer));
+        assert_eq!(registry.active_len(), 0);
+        assert!(!registry.entries.contains_key(&peer));
+    }
+
+    #[test]
+    fn execution_registry_bounds_retained_entries_by_slot_id() {
+        let old_peer = test_peer_incarnation(1, 2);
+        let new_peer = test_peer_incarnation(1, 3);
+        let mut registry = ExecutionRegistry::with_capacity(1);
+
+        registry.retain_after_poll(old_peer, retained_idle_execution(old_peer));
+        registry.retain_after_poll(new_peer, retained_idle_execution(new_peer));
+
+        assert_eq!(registry.active_len(), 0);
+        assert_eq!(registry.entries.len(), 1);
+        assert!(!registry.entries.contains_key(&old_peer));
+        assert!(registry.entries.contains_key(&new_peer));
+        assert_eq!(registry.retained_by_slot.get(&1), Some(&new_peer));
+    }
+
+    #[test]
+    fn execution_registry_active_peer_evicts_retained_entry_for_same_slot() {
+        let retained_peer = test_peer_incarnation(1, 2);
+        let active_peer = test_peer_incarnation(1, 3);
+        let mut registry = ExecutionRegistry::with_capacity(1);
+        registry.retain_after_poll(retained_peer, retained_idle_execution(retained_peer));
+
+        let mut active = test_execution();
+        start_test_execution(&mut active, active_peer, 20);
+        registry.retain_after_poll(active_peer, active);
+
+        assert_eq!(registry.active_len(), 1);
+        assert!(registry.contains_active(active_peer));
+        assert!(!registry.entries.contains_key(&retained_peer));
+        assert!(!registry.retained_by_slot.contains_key(&1));
+    }
+
+    #[test]
+    fn retained_cancel_routes_through_runtime_polling() {
+        let mut transport = TestTransport::new(4096);
+        let peer = transport.peer();
+        let mut registry = ExecutionRegistry::with_capacity(1);
+        registry.retain_after_poll(peer, retained_idle_execution(peer));
+        assert_eq!(
+            registry.peer_scheduler_state(peer),
+            PeerSchedulerState::Retained
+        );
+
+        send_backend_execution_frame(
+            &mut transport.backend,
+            protocol::BackendExecutionToWorker::CancelExecution { session_epoch: 10 },
+        );
+        poll_test_execution_peer(&mut registry, &mut transport.worker, peer);
+
+        assert_eq!(
+            registry.peer_scheduler_state(peer),
+            PeerSchedulerState::Retained
+        );
+        assert!(registry.entries.contains_key(&peer));
+    }
+
+    #[test]
+    fn retained_fail_routes_through_runtime_polling() {
+        let mut transport = TestTransport::new(4096);
+        let peer = transport.peer();
+        let mut registry = ExecutionRegistry::with_capacity(1);
+        registry.retain_after_poll(peer, retained_idle_execution(peer));
+        assert_eq!(
+            registry.peer_scheduler_state(peer),
+            PeerSchedulerState::Retained
+        );
+
+        send_backend_execution_frame(
+            &mut transport.backend,
+            protocol::BackendExecutionToWorker::FailExecution {
+                session_epoch: 10,
+                code: ExecutionFailureCode::Internal,
+                detail: None,
+            },
+        );
+        poll_test_execution_peer(&mut registry, &mut transport.worker, peer);
+
+        assert_eq!(
+            registry.peer_scheduler_state(peer),
+            PeerSchedulerState::Retained
+        );
+        assert!(registry.entries.contains_key(&peer));
+    }
+
+    #[test]
+    fn retained_cancel_reservation_preserves_pending_terminal() {
+        let mut transport = TestTransport::new(4096);
+        let peer = transport.peer();
+        let mut registry = ExecutionRegistry::with_capacity(1);
+        let mut execution = retained_idle_execution(peer);
+        execution.pending_terminal = Some(PendingTerminalControl::Fail {
+            session_epoch: 10,
+            code: ExecutionFailureCode::Internal,
+            detail: Some("deferred failure".into()),
+        });
+        registry.retain_after_poll(peer, execution);
+        assert_eq!(
+            registry.peer_scheduler_state(peer),
+            PeerSchedulerState::Retained
+        );
+
+        send_backend_execution_frame(
+            &mut transport.backend,
+            protocol::BackendExecutionToWorker::CancelExecutionReservation,
+        );
+        poll_test_execution_peer(&mut registry, &mut transport.worker, peer);
+
+        let execution = registry.entries.get(&peer).expect("retained execution");
+        assert_eq!(
+            registry.peer_scheduler_state(peer),
+            PeerSchedulerState::Retained
+        );
+        assert_eq!(
+            execution.pending_terminal,
+            Some(PendingTerminalControl::Fail {
+                session_epoch: 10,
+                code: ExecutionFailureCode::Internal,
+                detail: Some("deferred failure".into()),
+            })
+        );
+        assert!(drain_worker_execution_frames(&mut transport.backend).is_empty());
+    }
+
+    #[test]
+    fn execution_reservation_counts_until_start_becomes_active() {
+        let mut transport = TestTransport::new(4096);
+        let peer = transport.peer();
+        let mut registry = ExecutionRegistry::with_capacity(1);
+
+        assert!(
+            grant_execution_reservation(&mut registry, &mut transport.worker, peer)
+                .expect("grant reservation")
+        );
+        assert!(registry.contains_reserved(peer));
+        assert_eq!(registry.admitted_len(), 1);
+        assert_eq!(
+            transport.recv_worker_execution(),
+            protocol::WorkerExecutionToBackend::ExecutionSlotReserved
+        );
+
+        let mut execution = test_execution();
+        start_test_execution(&mut execution, peer, 10);
+        registry.retain_after_poll(peer, execution);
+
+        assert!(!registry.contains_reserved(peer));
+        assert!(registry.contains_active(peer));
+        assert_eq!(registry.admitted_len(), 1);
+    }
+
+    #[test]
+    fn queued_execution_reservation_grants_after_active_slot_frees() {
+        let mut transport = TestTransport::with_slots(2, 4096);
+        let active_peer = transport.peer();
+        let mut queued_backend = transport.acquire_backend();
+        let queued_peer = queued_backend.backend_lease_slot();
+        let mut registry = ExecutionRegistry::with_capacity(2);
+
+        let mut active = test_execution();
+        start_test_execution(&mut active, active_peer, 10);
+        registry.retain_after_poll(active_peer, active);
+        registry.queue_reservation(queued_peer);
+
+        grant_queued_execution_reservations(&mut registry, &mut transport.worker, 1)
+            .expect("capacity full keeps reservation queued");
+        assert!(registry.contains_queued(queued_peer));
+        assert_eq!(registry.admitted_len(), 1);
+
+        let mut active = registry.remove(active_peer).expect("active execution");
+        let step = active
+            .runtime
+            .accept_backend_control(
+                active_peer,
+                protocol::BackendExecutionToWorkerRef::CancelExecution { session_epoch: 10 },
+            )
+            .expect("cancel active execution");
+        handle_terminal_step(&mut active, step).expect("cleanup active execution");
+        registry.retain_after_poll(active_peer, active);
+
+        grant_queued_execution_reservations(&mut registry, &mut transport.worker, 1)
+            .expect("free capacity grants queued reservation");
+        assert!(!registry.contains_queued(queued_peer));
+        assert!(registry.contains_reserved(queued_peer));
+        assert_eq!(
+            recv_worker_execution_from(&mut queued_backend),
+            protocol::WorkerExecutionToBackend::ExecutionSlotReserved
+        );
+    }
+
+    #[test]
+    fn new_reservation_request_waits_behind_existing_queue() {
+        let mut transport = TestTransport::with_slots(2, 4096);
+        let mut newer_backend = transport.acquire_backend();
+        let mut older_backend = transport.backend;
+        let older_peer = older_backend.backend_lease_slot();
+        let newer_peer = newer_backend.backend_lease_slot();
+        let mut registry = ExecutionRegistry::with_capacity(2);
+
+        registry.queue_reservation(older_peer);
+        handle_requested_execution_reservation(&mut registry, &mut transport.worker, newer_peer, 1)
+            .expect("new request is admitted into queue");
+
+        assert!(registry.contains_queued(older_peer));
+        assert!(registry.contains_queued(newer_peer));
+        assert!(!registry.contains_reserved(newer_peer));
+
+        grant_queued_execution_reservations(&mut registry, &mut transport.worker, 1)
+            .expect("grant queued reservation");
+
+        assert!(registry.contains_reserved(older_peer));
+        assert!(registry.contains_queued(newer_peer));
+        assert!(!registry.contains_reserved(newer_peer));
+        assert_eq!(
+            recv_worker_execution_from(&mut older_backend),
+            protocol::WorkerExecutionToBackend::ExecutionSlotReserved
+        );
+        let mut scratch = vec![0_u8; 4096];
+        assert!(newer_backend
+            .from_worker_rx()
+            .recv_frame_into(&mut scratch)
+            .unwrap()
+            .is_none());
+    }
+
+    #[test]
+    fn detached_reserved_peer_releases_admission_slot() {
+        let mut transport = TestTransport::new(4096);
+        let peer = transport.peer();
+        let mut registry = ExecutionRegistry::with_capacity(1);
+
+        assert!(
+            grant_execution_reservation(&mut registry, &mut transport.worker, peer)
+                .expect("grant reservation")
+        );
+        assert_eq!(
+            transport.recv_worker_execution(),
+            protocol::WorkerExecutionToBackend::ExecutionSlotReserved
+        );
+        assert!(registry.contains_reserved(peer));
+
+        let TestTransport {
+            mut worker,
+            backend,
+            region: _region,
+            _region_mem,
+        } = transport;
+        drop(backend);
+
+        let (_page_region, page_pool) = init_page_pool_for_test();
+        let (_issuance_region, issuance_pool) = init_issuance_pool_for_test();
+        let df_runtime = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .expect("create datafusion runtime");
+        let mut spill_runtime =
+            WorkerSpillRuntime::new(::worker::WorkerSpillConfig::default(), 123, 456)
+                .expect("create spill runtime");
+        let worker_config = WorkerRuntimeConfig::default();
+        let scan_source: Arc<dyn ::worker::ScanBatchSource> = Arc::new(NoopScanSource);
+        let wake = WorkerSchedulerWake::new().expect("create scheduler wake");
+        let (task_event_tx, _task_rx) = mpsc::channel(1);
+        let task_tx = WorkerTaskNotifier::new(task_event_tx, wake.sender());
+
+        poll_execution_peer(
+            &mut registry,
+            &mut worker,
+            &df_runtime,
+            &mut spill_runtime,
+            &test_host_config(4096),
+            &worker_config,
+            &scan_source,
+            &task_tx,
+            #[cfg(feature = "pg_test")]
+            crate::test_gate::attach(),
+            peer,
+            page_pool,
+            issuance_pool,
+            RuntimeMetrics::default(),
+        )
+        .expect("poll detached reserved peer");
+
+        assert!(!registry.contains_reserved(peer));
+        assert_eq!(registry.admitted_len(), 0);
+    }
+
+    #[test]
+    fn admission_request_reads_reserve_and_cancel_messages() {
+        let mut transport = TestTransport::new(4096);
+        let peer = transport.peer();
+
+        send_backend_execution_frame(
+            &mut transport.backend,
+            protocol::BackendExecutionToWorker::ReserveExecutionSlot,
+        );
+        assert!(matches!(
+            recv_backend_admission_request(&mut transport.worker, peer),
+            Ok(AdmissionPollOutcome::Requested)
+        ));
+
+        send_backend_execution_frame(
+            &mut transport.backend,
+            protocol::BackendExecutionToWorker::CancelExecutionReservation,
+        );
+        assert!(matches!(
+            recv_backend_admission_request(&mut transport.worker, peer),
+            Ok(AdmissionPollOutcome::Cancelled)
+        ));
+    }
+
+    #[test]
+    fn admission_request_rejects_start_before_reservation_grant() {
+        let mut transport = TestTransport::new(4096);
+        let peer = transport.peer();
+        send_backend_execution_frame(
+            &mut transport.backend,
+            protocol::BackendExecutionToWorker::StartExecution {
+                session_epoch: 10,
+                plan: test_plan_descriptor(1),
+                options: protocol::ExecutionOptionsWire::default(),
+                scans: protocol::ScanChannelSet::empty(),
+            },
+        );
+
+        let err = recv_backend_admission_request(&mut transport.worker, peer)
+            .expect_err("start before grant must fail");
+        assert!(
+            err.to_string()
+                .contains("before execution reservation was granted"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn reserved_peer_cancel_reservation_before_start_releases_admission_slot() {
+        let mut transport = TestTransport::new(4096);
+        let peer = transport.peer();
+        let mut registry = ExecutionRegistry::with_capacity(1);
+
+        assert!(
+            grant_execution_reservation(&mut registry, &mut transport.worker, peer)
+                .expect("grant reservation")
+        );
+        assert_eq!(
+            transport.recv_worker_execution(),
+            protocol::WorkerExecutionToBackend::ExecutionSlotReserved
+        );
+        assert!(registry.contains_reserved(peer));
+
+        send_backend_execution_frame(
+            &mut transport.backend,
+            protocol::BackendExecutionToWorker::CancelExecutionReservation,
+        );
+        poll_test_execution_peer(&mut registry, &mut transport.worker, peer);
+
+        assert!(!registry.contains_reserved(peer));
+        assert_eq!(registry.admitted_len(), 0);
+        assert!(!registry.entries.contains_key(&peer));
+    }
+
+    #[test]
+    fn active_receiving_plan_cancel_reservation_reports_failed_execution() {
+        let mut transport = TestTransport::new(4096);
+        let peer = transport.peer();
+        let mut registry = ExecutionRegistry::with_capacity(1);
+        let mut execution = test_execution();
+        start_test_execution(&mut execution, peer, 10);
+        registry.retain_after_poll(peer, execution);
+
+        send_backend_execution_frame(
+            &mut transport.backend,
+            protocol::BackendExecutionToWorker::CancelExecutionReservation,
+        );
+        poll_test_execution_peer(&mut registry, &mut transport.worker, peer);
+
+        let execution = registry.entries.get(&peer).expect("retained execution");
+        assert_eq!(execution.runtime.active_peer(), None);
+        assert_eq!(execution.runtime.retained_peer(), Some(peer));
+        assert!(execution.pending_terminal.is_none());
+        assert!(!registry.contains_active(peer));
+        assert_fail_execution_frame(
+            transport.recv_worker_execution(),
+            10,
+            "CancelExecutionReservation after execution started",
+        );
+    }
+
+    #[test]
+    fn active_running_cancel_reservation_aborts_task_and_reports_failure() {
+        let mut transport = TestTransport::new(4096);
+        let peer = transport.peer();
+        let mut registry = ExecutionRegistry::with_capacity(1);
+        let df_runtime = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .expect("create datafusion runtime");
+        let mut execution = test_execution();
+        start_running_test_execution(&mut execution, peer, 10);
+        execution.task = Some(df_runtime.spawn(async {
+            std::future::pending::<()>().await;
+        }));
+        registry.retain_after_poll(peer, execution);
+
+        send_backend_execution_frame(
+            &mut transport.backend,
+            protocol::BackendExecutionToWorker::CancelExecutionReservation,
+        );
+        poll_test_execution_peer(&mut registry, &mut transport.worker, peer);
+
+        let execution = registry.entries.get(&peer).expect("retained execution");
+        assert_eq!(execution.runtime.active_peer(), None);
+        assert_eq!(execution.runtime.retained_peer(), Some(peer));
+        assert!(execution.task.is_none());
+        assert!(execution.pending_terminal.is_none());
+        assert!(!registry.contains_active(peer));
+        assert_fail_execution_frame(
+            transport.recv_worker_execution(),
+            10,
+            "CancelExecutionReservation after execution started",
+        );
+    }
+
+    #[test]
+    fn active_cancel_reservation_failure_defers_when_terminal_ring_is_full() {
+        let mut transport = TestTransport::new(256);
+        let peer = transport.peer();
+        let mut registry = ExecutionRegistry::with_capacity(1);
+        let mut execution = test_execution();
+        start_running_test_execution(&mut execution, peer, 10);
+        registry.retain_after_poll(peer, execution);
+        fill_worker_to_backend_ring_until_full(&mut transport.worker, peer);
+
+        send_backend_execution_frame(
+            &mut transport.backend,
+            protocol::BackendExecutionToWorker::CancelExecutionReservation,
+        );
+        poll_test_execution_peer(&mut registry, &mut transport.worker, peer);
+
+        let execution = registry.entries.get(&peer).expect("retained execution");
+        assert_eq!(execution.runtime.active_peer(), None);
+        assert_eq!(execution.runtime.retained_peer(), Some(peer));
+        assert!(!registry.contains_active(peer));
+        assert!(matches!(
+            execution.pending_terminal,
+            Some(PendingTerminalControl::Fail {
+                session_epoch: 10,
+                code: ExecutionFailureCode::Internal,
+                ..
+            })
+        ));
+
+        let filled = drain_worker_execution_frames(&mut transport.backend);
+        assert!(!filled.is_empty());
+        assert!(filled
+            .iter()
+            .all(|frame| matches!(frame, WorkerExecutionToBackend::ExecutionSlotReserved)));
+
+        let mut execution = registry.remove(peer).expect("retained execution");
+        retry_pending_terminal_control(&mut transport.worker, &mut execution, peer)
+            .expect("retry pending failure after drain");
+        assert!(execution.pending_terminal.is_none());
+        registry.retain_after_poll(peer, execution);
+
+        assert_fail_execution_frame(
+            transport.recv_worker_execution(),
+            10,
+            "CancelExecutionReservation after execution started",
+        );
+    }
+
+    #[test]
+    fn execution_registry_removes_only_matching_active_terminal_task_event() {
+        let peer = test_peer(1);
+        let mut registry = ExecutionRegistry::with_capacity(1);
+        let mut execution = test_execution();
+        start_test_execution(&mut execution, peer, 10);
+        registry.retain_after_poll(peer, execution);
+
+        assert!(registry.remove_active_session(peer, 11).is_none());
+        assert_eq!(registry.active_len(), 1);
+        assert!(registry.entries.contains_key(&peer));
+
+        let removed = registry
+            .remove_active_session(peer, 10)
+            .expect("matching active session");
+        assert_eq!(removed.runtime.active_peer(), Some(peer));
+        assert_eq!(registry.active_len(), 0);
+        assert!(!registry.entries.contains_key(&peer));
+    }
+
+    #[test]
+    fn execution_registry_ignores_retained_terminal_task_event() {
+        let peer = test_peer(1);
+        let mut registry = ExecutionRegistry::with_capacity(1);
+        registry.retain_after_poll(peer, retained_idle_execution(peer));
+
+        assert!(registry.remove_active_session(peer, 10).is_none());
+        assert_eq!(registry.active_len(), 0);
+        assert!(registry.entries.contains_key(&peer));
+        assert_eq!(registry.retained_by_slot.get(&peer.slot_id()), Some(&peer));
+    }
+
+    #[test]
+    fn stale_physical_planning_result_preserves_current_task_handle() {
+        let mut transport = TestTransport::new(4096);
+        let peer = transport.peer();
+        let mut registry = ExecutionRegistry::with_capacity(1);
+        let df_runtime = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .expect("create datafusion runtime");
+        let mut execution = test_execution();
+        start_test_execution(&mut execution, peer, 11);
+        execution.task = Some(df_runtime.spawn(async {
+            std::future::pending::<()>().await;
+        }));
+        registry.retain_after_poll(peer, execution);
+
+        let (_page_region, page_pool) = init_page_pool_for_test();
+        let (_issuance_region, issuance_pool) = init_issuance_pool_for_test();
+        let mut spill_runtime =
+            WorkerSpillRuntime::new(::worker::WorkerSpillConfig::default(), 123, 456)
+                .expect("create spill runtime");
+        let wake = WorkerSchedulerWake::new().expect("create scheduler wake");
+        let (task_event_tx, _task_rx) = mpsc::channel(1);
+        let task_tx = WorkerTaskNotifier::new(task_event_tx, wake.sender());
+
+        handle_task_event(
+            &mut registry,
+            &mut transport.worker,
+            &df_runtime,
+            &mut spill_runtime,
+            &test_host_config(4096),
+            page_pool,
+            issuance_pool,
+            RuntimeMetrics::default(),
+            &task_tx,
+            #[cfg(feature = "pg_test")]
+            crate::test_gate::attach(),
+            WorkerTaskEvent::PhysicalPlanningFinished {
+                peer,
+                flow: plan_flow::FlowId {
+                    session_epoch: 10,
+                    plan_id: 1,
+                },
+                result: Err(protocol_error("stale planning result")),
+            },
+        )
+        .expect("stale planning result is ignored");
+
+        let execution = registry.entries.get(&peer).expect("current execution");
+        assert!(registry.contains_active(peer));
+        assert!(execution.task.is_some());
+
+        let mut execution = registry.remove(peer).expect("current execution");
+        execution.abort_task();
+    }
+
+    #[test]
+    fn active_physical_planning_failure_reports_failed_execution() {
+        let mut transport = TestTransport::new(4096);
+        let peer = transport.peer();
+        let mut registry = ExecutionRegistry::with_capacity(1);
+        let df_runtime = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .expect("create datafusion runtime");
+        let mut execution = test_execution();
+        let pending = start_planning_test_execution(&mut execution, peer, 10);
+        let flow = pending.flow();
+        drop(pending);
+        registry.retain_after_poll(peer, execution);
+
+        let (_page_region, page_pool) = init_page_pool_for_test();
+        let (_issuance_region, issuance_pool) = init_issuance_pool_for_test();
+        let mut spill_runtime =
+            WorkerSpillRuntime::new(::worker::WorkerSpillConfig::default(), 123, 456)
+                .expect("create spill runtime");
+        let wake = WorkerSchedulerWake::new().expect("create scheduler wake");
+        let (task_event_tx, _task_rx) = mpsc::channel(1);
+        let task_tx = WorkerTaskNotifier::new(task_event_tx, wake.sender());
+
+        handle_task_event(
+            &mut registry,
+            &mut transport.worker,
+            &df_runtime,
+            &mut spill_runtime,
+            &test_host_config(4096),
+            page_pool,
+            issuance_pool,
+            RuntimeMetrics::default(),
+            &task_tx,
+            #[cfg(feature = "pg_test")]
+            crate::test_gate::attach(),
+            WorkerTaskEvent::PhysicalPlanningFinished {
+                peer,
+                flow,
+                result: Err(protocol_error("physical planning failed for test")),
+            },
+        )
+        .expect("planning failure is reported to backend");
+
+        let execution = registry.entries.get(&peer).expect("retained execution");
+        assert_eq!(execution.runtime.active_peer(), None);
+        assert_eq!(execution.runtime.retained_peer(), Some(peer));
+        assert!(execution.pending_terminal.is_none());
+        assert!(!registry.contains_active(peer));
+
+        match transport.recv_worker_execution() {
+            WorkerExecutionToBackend::FailExecution {
+                session_epoch,
+                code,
+                detail,
+            } => {
+                assert_eq!(session_epoch, 10);
+                assert_eq!(code, ExecutionFailureCode::Internal);
+                assert!(detail
+                    .as_deref()
+                    .is_some_and(|detail| detail.contains("physical planning failed for test")));
+            }
+            other => panic!("unexpected worker frame: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn execution_spill_dir_failure_reports_failed_execution() {
+        let mut transport = TestTransport::new(4096);
+        let peer = transport.peer();
+        let mut execution = test_execution();
+        start_test_execution(&mut execution, peer, 10);
+        execution.worker_start_ns = Some(RuntimeMetrics::default().now_ns());
+
+        let tmp = TestTempDir::new();
+        let spill_config =
+            ::worker::WorkerSpillConfig::new(Some(1024 * 1024), Some(tmp.path().to_path_buf()));
+        let mut spill_runtime =
+            WorkerSpillRuntime::new(spill_config, 123, 456).expect("create spill runtime");
+        let active_dir = spill_runtime
+            .active_dir()
+            .expect("active spill dir")
+            .to_path_buf();
+        std::fs::remove_dir_all(&active_dir).expect("remove active spill dir");
+        std::fs::write(&active_dir, b"not a directory").expect("replace active dir with file");
+
+        let result = execution_spill_dir_or_fail(
+            &mut transport.worker,
+            &mut execution,
+            &mut spill_runtime,
+            &test_host_config(4096),
+            RuntimeMetrics::default(),
+            peer,
+            10,
+        )
+        .expect("spill dir failure is contained");
+
+        assert!(result.is_none());
+        assert_eq!(execution.runtime.active_peer(), None);
+        assert_eq!(execution.runtime.retained_peer(), Some(peer));
+        let frame = transport.recv_worker_execution();
+        match frame {
+            protocol::WorkerExecutionToBackend::FailExecution {
+                session_epoch,
+                code,
+                detail,
+            } => {
+                assert_eq!(session_epoch, 10);
+                assert_eq!(code, ExecutionFailureCode::Internal);
+                assert!(detail
+                    .as_deref()
+                    .is_some_and(|detail| detail.contains("create execution spill directory")));
+            }
+            other => panic!("unexpected worker frame: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn complete_execution_terminal_send_full_defers_and_retries() {
+        let mut transport = TestTransport::new(128);
+        let peer = transport.peer();
+        fill_worker_to_backend_ring_until_full(&mut transport.worker, peer);
+
+        let mut execution = test_execution();
+        start_running_test_execution(&mut execution, peer, 10);
+        finish_execution_task(
+            &mut transport.worker,
+            &mut execution,
+            &test_host_config(128),
+            RuntimeMetrics::default(),
+            peer,
+            10,
+            Ok(()),
+        )
+        .expect("full terminal ring should defer complete");
+
+        assert_eq!(execution.runtime.active_peer(), None);
+        assert_eq!(execution.runtime.retained_peer(), Some(peer));
+        assert_eq!(
+            execution.pending_terminal,
+            Some(PendingTerminalControl::Complete { session_epoch: 10 })
+        );
+
+        let filled = drain_worker_execution_frames(&mut transport.backend);
+        assert!(!filled.is_empty());
+        assert!(filled
+            .iter()
+            .all(|frame| matches!(frame, WorkerExecutionToBackend::ExecutionSlotReserved)));
+
+        retry_pending_terminal_control(&mut transport.worker, &mut execution, peer)
+            .expect("retry complete after drain");
+        assert!(execution.pending_terminal.is_none());
+        assert_eq!(
+            transport.recv_worker_execution(),
+            WorkerExecutionToBackend::CompleteExecution { session_epoch: 10 }
+        );
+    }
+
+    #[test]
+    fn fail_execution_terminal_send_full_defers_and_retries_with_detail() {
+        let mut transport = TestTransport::new(256);
+        let peer = transport.peer();
+        fill_worker_to_backend_ring_until_full(&mut transport.worker, peer);
+
+        let mut execution = test_execution();
+        start_test_execution(&mut execution, peer, 10);
+        finish_execution_task(
+            &mut transport.worker,
+            &mut execution,
+            &test_host_config(256),
+            RuntimeMetrics::default(),
+            peer,
+            10,
+            Err(protocol_error("deferred terminal failure")),
+        )
+        .expect("full terminal ring should defer failure");
+
+        assert_eq!(execution.runtime.active_peer(), None);
+        assert_eq!(execution.runtime.retained_peer(), Some(peer));
+        assert!(matches!(
+            execution.pending_terminal,
+            Some(PendingTerminalControl::Fail {
+                session_epoch: 10,
+                code: ExecutionFailureCode::Internal,
+                ..
+            })
+        ));
+
+        let filled = drain_worker_execution_frames(&mut transport.backend);
+        assert!(!filled.is_empty());
+        retry_pending_terminal_control(&mut transport.worker, &mut execution, peer)
+            .expect("retry failure after drain");
+        assert!(execution.pending_terminal.is_none());
+
+        match transport.recv_worker_execution() {
+            WorkerExecutionToBackend::FailExecution {
+                session_epoch,
+                code,
+                detail,
+            } => {
+                assert_eq!(session_epoch, 10);
+                assert_eq!(code, ExecutionFailureCode::Internal);
+                assert!(detail
+                    .as_deref()
+                    .is_some_and(|detail| detail.contains("deferred terminal failure")));
+            }
+            other => panic!("unexpected worker frame: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn worker_failure_detail_fits_asymmetric_primary_control_scratch() {
+        let config = test_host_config(4096);
+        assert!(
+            config.control_backend_to_worker_capacity < config.control_worker_to_backend_capacity
+        );
+        let mut transport = TestTransport::with_host_config(&config);
+        let peer = transport.peer();
+        let mut execution = test_execution();
+        start_test_execution(&mut execution, peer, 10);
+
+        let detail = "asymmetric worker scratch execution failure ".repeat(128);
+        finish_execution_task(
+            &mut transport.worker,
+            &mut execution,
+            &config,
+            RuntimeMetrics::default(),
+            peer,
+            10,
+            Err(protocol_error(&detail)),
+        )
+        .expect("worker failure detail should fit resized scratch");
+
+        assert_eq!(execution.runtime.active_peer(), None);
+        assert_eq!(execution.runtime.retained_peer(), Some(peer));
+        assert_fail_execution_frame(
+            transport.recv_worker_execution(),
+            10,
+            "asymmetric worker scratch execution failure",
+        );
+    }
+
+    #[test]
+    fn planning_failure_detail_fits_asymmetric_primary_control_scratch() {
+        let config = test_host_config(4096);
+        assert!(
+            config.control_backend_to_worker_capacity < config.control_worker_to_backend_capacity
+        );
+        let mut transport = TestTransport::with_host_config(&config);
+        let peer = transport.peer();
+        let mut execution = test_execution();
+        let pending = start_planning_test_execution(&mut execution, peer, 10);
+        let flow = pending.flow();
+        drop(pending);
+
+        let detail = "asymmetric worker scratch planning failure ".repeat(128);
+        let (step, planning_err) = execution
+            .runtime
+            .finish_physical_planning_step(peer, flow, Err(protocol_error(&detail)))
+            .expect("finish failed physical planning");
+        let err = planning_err.expect("planning error");
+
+        finish_failed_terminal_step(
+            &mut transport.worker,
+            &mut execution,
+            &config,
+            peer,
+            err,
+            step,
+        )
+        .expect("planning failure detail should fit resized scratch");
+
+        assert_eq!(execution.runtime.active_peer(), None);
+        assert_eq!(execution.runtime.retained_peer(), Some(peer));
+        assert_fail_execution_frame(
+            transport.recv_worker_execution(),
+            10,
+            "asymmetric worker scratch planning failure",
+        );
+    }
+
+    #[test]
+    fn detached_terminal_send_cleans_without_pending_retry() {
+        let mut transport = TestTransport::new(128);
+        let peer = transport.peer();
+        transport.backend.release();
+
+        let mut execution = test_execution();
+        start_running_test_execution(&mut execution, peer, 10);
+        finish_execution_task(
+            &mut transport.worker,
+            &mut execution,
+            &test_host_config(128),
+            RuntimeMetrics::default(),
+            peer,
+            10,
+            Ok(()),
+        )
+        .expect("detached terminal peer should be contained");
+
+        assert_eq!(execution.runtime.active_peer(), None);
+        assert_eq!(execution.runtime.retained_peer(), Some(peer));
+        assert!(execution.pending_terminal.is_none());
+    }
+
+    #[test]
+    fn terminal_send_config_error_remains_fatal() {
+        let mut transport = TestTransport::new(5);
+        let peer = transport.peer();
+        let mut execution = test_execution();
+        start_running_test_execution(&mut execution, peer, 10);
+
+        let err = finish_execution_task(
+            &mut transport.worker,
+            &mut execution,
+            &test_host_config(5),
+            RuntimeMetrics::default(),
+            peer,
+            10,
+            Ok(()),
+        )
+        .expect_err("terminal frame larger than scratch remains fatal");
+
+        assert!(matches!(err, WorkerRuntimeError::ControlFrameTooLarge));
+        assert!(matches!(
+            execution.pending_terminal,
+            Some(PendingTerminalControl::Complete { session_epoch: 10 })
+        ));
+    }
 
     #[test]
     fn deactivation_helper_preserves_primary_failure() {
@@ -1313,7 +3347,18 @@ fn handle_steps(
                     .runtime
                     .take_physical_plan()
                     .ok_or(WorkerRuntimeError::MissingPhysicalPlan)?;
-                let spill_dir = spill_runtime.execution_dir(peer, result.session_epoch)?;
+                let Some(spill_dir) = execution_spill_dir_or_fail(
+                    transport,
+                    execution,
+                    spill_runtime,
+                    config,
+                    metrics,
+                    peer,
+                    result.session_epoch,
+                )?
+                else {
+                    continue;
+                };
                 execution.worker_start_ns = Some(worker_start);
                 let spill_dir_created = spill_dir.path().is_some();
                 if spill_dir_created {
@@ -1396,6 +3441,32 @@ fn handle_steps(
         }
     }
     Ok(())
+}
+
+fn execution_spill_dir_or_fail(
+    transport: &mut TransportWorkerRuntime,
+    execution: &mut ActiveWorkerExecution,
+    spill_runtime: &mut WorkerSpillRuntime,
+    config: &crate::HostConfig,
+    metrics: RuntimeMetrics,
+    peer: BackendLeaseSlot,
+    session_epoch: u64,
+) -> Result<Option<ExecutionSpillDir>, WorkerRuntimeError> {
+    match spill_runtime.execution_dir(peer, session_epoch) {
+        Ok(spill_dir) => Ok(Some(spill_dir)),
+        Err(err) => {
+            finish_execution_task(
+                transport,
+                execution,
+                config,
+                metrics,
+                peer,
+                session_epoch,
+                Err(err),
+            )?;
+            Ok(None)
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

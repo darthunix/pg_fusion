@@ -3,7 +3,8 @@
 //! `protocol` stays intentionally small:
 //!
 //! - one protocol payload fits into one `control_transport` frame
-//! - `session_epoch` is always explicit
+//! - execution messages that target a running session carry an explicit
+//!   `session_epoch`; pre-session admission messages do not
 //! - plan and scan page streams are referenced through narrow descriptor types
 //! - decode of scan producer descriptors is borrow-friendly and allocation-free
 //! - scan terminal signals use their own dedicated wire family
@@ -19,9 +20,9 @@
 //! - [`error`] for protocol encoding and decoding failures
 //!
 //! The crate does not own execution state or flow runtimes. Higher layers are
-//! responsible for classifying `session_epoch`, dropping stale traffic, and
-//! reconstructing concrete `plan_flow` / `scan_flow` descriptors from the
-//! values returned here.
+//! responsible for classifying `session_epoch`, dropping stale traffic,
+//! admitting pre-session execution reservations, and reconstructing concrete
+//! `plan_flow` / `scan_flow` descriptors from the values returned here.
 //!
 //! Typical control encode/decode stays available from the crate root:
 //!
