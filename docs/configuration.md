@@ -51,8 +51,9 @@ The worker is the DataFusion resource box. These settings are postmaster-level.
 | `pg_fusion.log_path` | `/tmp/pg_fusion.log` | Worker diagnostic log path. |
 
 Set `pg_fusion.worker_memory_limit_mb` above `0` only when you want a finite
-DataFusion memory pool and worker-owned spill. Spill files are not PostgreSQL
-temporary files.
+DataFusion memory pool and worker-owned spill. The memory pool is shared across
+concurrent worker execution tasks; spill directories remain per execution.
+Spill files are not PostgreSQL temporary files.
 
 `pg_fusion.worker_threads` controls the Tokio runtime threads inside the
 pg_fusion worker process. It does not control PostgreSQL dynamic scan workers,
@@ -169,9 +170,10 @@ records a diagnostic counter.
 `pg_fusion.worker_memory_limit_mb = 0` keeps DataFusion on the default
 unbounded runtime and disables worker spill.
 
-Setting it above `0` enables a finite DataFusion memory pool and worker-owned
-OS temporary spill files. `pg_fusion.worker_spill_directory` may point at an
-absolute spill root; empty uses OS temporary storage under `pg_fusion/spill`.
+Setting it above `0` enables a finite worker-wide DataFusion memory pool and
+worker-owned OS temporary spill files. `pg_fusion.worker_spill_directory` may
+point at an absolute spill root; empty uses OS temporary storage under
+`pg_fusion/spill`.
 
 This v1 spill path is owned by the pg_fusion worker. It does not use PostgreSQL
 `temp_tablespaces`, `temp_file_limit`, or `ResourceOwner` cleanup.

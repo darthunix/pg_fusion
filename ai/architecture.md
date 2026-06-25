@@ -186,7 +186,7 @@ page-backed Arrow batches.
    Tokio tasks only drive DataFusion planning, multi-partition root collection,
    and result-stream polling.
    If `pg_fusion.worker_memory_limit_mb` is positive, execution uses a
-   worker-owned DataFusion `RuntimeEnv` with a finite memory pool and
+   worker-owned finite memory pool shared by concurrent worker tasks plus a
    per-execution OS spill directory below a cluster-scoped worker spill root.
    The worker garbage-collects pg_fusion-marked stale spill directories in that
    cluster namespace at generation startup; disabled spill does not create
