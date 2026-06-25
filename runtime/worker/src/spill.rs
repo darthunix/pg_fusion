@@ -4,7 +4,7 @@ use std::sync::Arc;
 use control_transport::BackendLeaseSlot;
 use datafusion_execution::{
     disk_manager::{DiskManagerBuilder, DiskManagerMode},
-    memory_pool::FairSpillPool,
+    memory_pool::{FairSpillPool, MemoryPool},
     runtime_env::RuntimeEnvBuilder,
     TaskContext,
 };
@@ -58,6 +58,7 @@ impl Default for WorkerSpillConfig {
 pub struct WorkerSpillRuntime {
     config: WorkerSpillConfig,
     active_dir: Option<PathBuf>,
+    memory_pool: Option<Arc<dyn MemoryPool>>,
     next_execution_serial: u64,
 }
 
@@ -71,10 +72,15 @@ impl WorkerSpillRuntime {
             return Ok(Self {
                 config,
                 active_dir: None,
+                memory_pool: None,
                 next_execution_serial: 0,
             });
         }
 
+        let memory_limit_bytes = config
+            .memory_limit_bytes
+            .expect("enabled worker spill must have a memory limit");
+        let memory_pool = Arc::new(FairSpillPool::new(memory_limit_bytes));
         create_dir_all(&config.root, "create spill root")?;
         let active_dir = config
             .root
@@ -86,6 +92,7 @@ impl WorkerSpillRuntime {
         Ok(Self {
             config,
             active_dir: Some(active_dir),
+            memory_pool: Some(memory_pool),
             next_execution_serial: 0,
         })
     }
@@ -124,7 +131,7 @@ impl WorkerSpillRuntime {
         &self,
         spill_dir: &ExecutionSpillDir,
     ) -> Result<Arc<TaskContext>, WorkerRuntimeError> {
-        let Some(memory_limit_bytes) = self.config.memory_limit_bytes else {
+        let Some(memory_pool) = &self.memory_pool else {
             return Ok(Arc::new(TaskContext::default()));
         };
         let spill_path = spill_dir.path().ok_or_else(|| {
@@ -133,7 +140,7 @@ impl WorkerSpillRuntime {
             )
         })?;
         let runtime = RuntimeEnvBuilder::new()
-            .with_memory_pool(Arc::new(FairSpillPool::new(memory_limit_bytes)))
+            .with_memory_pool(Arc::clone(memory_pool))
             .with_disk_manager_builder(
                 DiskManagerBuilder::default()
                     .with_mode(DiskManagerMode::Directories(vec![spill_path.to_path_buf()])),
@@ -322,6 +329,7 @@ mod tests {
     use std::time::{SystemTime, UNIX_EPOCH};
 
     use control_transport::BackendLeaseId;
+    use datafusion_execution::memory_pool::MemoryConsumer;
 
     use super::*;
 
@@ -475,6 +483,42 @@ mod tests {
 
         drop(file);
         dir.cleanup().unwrap();
+        drop(runtime);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn task_contexts_share_worker_memory_pool() {
+        let root = unique_root("shared_pool");
+        let config = WorkerSpillConfig::new(Some(1000), Some(root.clone()));
+        let mut runtime = WorkerSpillRuntime::new(config, 6, 9).unwrap();
+        let first_peer = BackendLeaseSlot::new(4, BackendLeaseId::new(10, 11));
+        let second_peer = BackendLeaseSlot::new(5, BackendLeaseId::new(10, 12));
+        let first_dir = runtime.execution_dir(first_peer, 12).unwrap();
+        let second_dir = runtime.execution_dir(second_peer, 13).unwrap();
+        let first_ctx = runtime.task_context(&first_dir).unwrap();
+        let second_ctx = runtime.task_context(&second_dir).unwrap();
+        let first_pool = first_ctx.runtime_env().memory_pool.clone();
+        let second_pool = second_ctx.runtime_env().memory_pool.clone();
+
+        let first_reservation = MemoryConsumer::new("first").register(&first_pool);
+        first_reservation.try_resize(700).unwrap();
+        assert_eq!(first_pool.reserved(), 700);
+        assert_eq!(second_pool.reserved(), 700);
+
+        let second_reservation = MemoryConsumer::new("second").register(&second_pool);
+        assert!(second_reservation.try_resize(400).is_err());
+        second_reservation.try_resize(300).unwrap();
+        assert_eq!(first_pool.reserved(), 1000);
+        assert_eq!(second_pool.reserved(), 1000);
+
+        drop(second_reservation);
+        drop(first_reservation);
+        assert_eq!(first_pool.reserved(), 0);
+        assert_eq!(second_pool.reserved(), 0);
+
+        first_dir.cleanup().unwrap();
+        second_dir.cleanup().unwrap();
         drop(runtime);
         let _ = std::fs::remove_dir_all(root);
     }

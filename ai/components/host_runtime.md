@@ -44,8 +44,9 @@ importance: 0.8
   PostgreSQL APIs from Tokio tasks.
 - Worker-side DataFusion spill is opt-in through Postmaster GUC
   `pg_fusion.worker_memory_limit_mb`. `0` preserves the default unbounded
-  DataFusion runtime; positive values use a finite `FairSpillPool` and
-  per-execution OS temp directories under a cluster-scoped worker spill root.
+  DataFusion runtime; positive values use one finite `FairSpillPool` shared by
+  concurrent worker tasks and per-execution OS temp directories under a
+  cluster-scoped worker spill root.
   The primary worker marks owned worker-incarnation directories, removes stale
   marked directories in the same cluster namespace on startup, and removes
   execution directories on success, failure, or cancel. Disabled spill does not
