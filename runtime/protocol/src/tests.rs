@@ -263,6 +263,25 @@ fn classify_session_orders_epochs() {
 }
 
 #[test]
+fn backend_execution_reservation_round_trips() {
+    let encoded = encode_backend(BackendExecutionToWorker::ReserveExecutionSlot);
+    let decoded = decode_backend_execution_to_worker(&encoded).expect("decode");
+    assert_eq!(decoded, BackendExecutionToWorkerRef::ReserveExecutionSlot);
+    assert_eq!(decoded.session_epoch(), None);
+}
+
+#[test]
+fn backend_execution_reservation_cancel_round_trips() {
+    let encoded = encode_backend(BackendExecutionToWorker::CancelExecutionReservation);
+    let decoded = decode_backend_execution_to_worker(&encoded).expect("decode");
+    assert_eq!(
+        decoded,
+        BackendExecutionToWorkerRef::CancelExecutionReservation
+    );
+    assert_eq!(decoded.session_epoch(), None);
+}
+
+#[test]
 fn backend_start_execution_round_trips_with_empty_scan_map() {
     let message = BackendExecutionToWorker::StartExecution {
         session_epoch: 9,
@@ -281,6 +300,7 @@ fn backend_start_execution_round_trips_with_empty_scan_map() {
             scans: ScanChannelSetRef::empty(),
         }
     );
+    assert_eq!(decoded.session_epoch(), Some(9));
 }
 
 #[test]
@@ -622,6 +642,14 @@ fn backend_scan_failed_rejects_message_over_bounded_len() {
             maximum: MAX_SCAN_FAILURE_MESSAGE_LEN,
         }
     );
+}
+
+#[test]
+fn worker_execution_slot_reserved_round_trips() {
+    let encoded = encode_worker_execution(WorkerExecutionToBackend::ExecutionSlotReserved);
+    let decoded = decode_worker_execution_to_backend(&encoded).expect("decode");
+    assert_eq!(decoded, WorkerExecutionToBackend::ExecutionSlotReserved);
+    assert_eq!(decoded.session_epoch(), None);
 }
 
 #[test]

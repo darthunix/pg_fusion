@@ -429,7 +429,9 @@ impl HostConfig {
 
     pub fn worker_runtime_config(&self) -> WorkerRuntimeConfig {
         WorkerRuntimeConfig {
-            control_frame_capacity: self.control_backend_to_worker_capacity,
+            control_frame_capacity: self
+                .control_backend_to_worker_capacity
+                .max(self.control_worker_to_backend_capacity),
             spill: WorkerSpillConfig::new(
                 self.worker_memory_limit_bytes,
                 self.worker_spill_directory.clone(),
@@ -582,7 +584,7 @@ mod tests {
             worker_spill_directory: Some(PathBuf::from("/tmp/pg_fusion_spill")),
             max_fusion_tasks: 8,
             control_slot_count: 8,
-            control_backend_to_worker_capacity: 4096,
+            control_backend_to_worker_capacity: 1024,
             control_worker_to_backend_capacity: 4096,
             scan_slot_count: 8,
             scan_backend_to_worker_capacity: MIN_SCAN_BACKEND_TO_WORKER_RING_CAPACITY,

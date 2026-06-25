@@ -45,3 +45,6 @@ tracing-appender = "0.2"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
 transfer = { path = "../../page/transfer", version = "25.0" }
 worker = { path = "../../runtime/worker", version = "25.0" }
+
+[dev-dependencies]
+libc = "0.2"

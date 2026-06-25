@@ -17,6 +17,17 @@ importance: 0.8
   host keeps unsent scan pages and terminal scan frames pending and retries the
   same frame later; `IssuedOutboundPage::mark_sent()` only follows successful
   carrier delivery.
+- Backend execution admission reserves a worker slot before
+  `StartExecution` and before any dynamic standalone scan workers are launched.
+  Active executions plus granted-but-not-yet-started reservations count against
+  `pg_fusion.max_fusion_tasks`; queued reservation requests do not. This keeps
+  the task cap from leaving dynamic scan workers waiting for `OpenScan` behind
+  an unread backend control ring. The reservation queue is FIFO: once any
+  backend is queued, later requests must queue behind it instead of taking newly
+  freed capacity directly. `CancelExecutionReservation` only releases
+  admission before `StartExecution`; while active it is a peer-scoped protocol
+  failure reported through `FailExecution`, and once retained it is stale
+  traffic that must not discard pending terminal delivery.
 - PostgreSQL `max_parallel_workers_per_gather` controls the query-wide dynamic
   background-worker scan producer budget for eligible heap scans. Each scan
   always has a leader backend producer; positive budget is shared across scans,
@@ -35,13 +46,32 @@ importance: 0.8
   own control transport or PostgreSQL APIs. `pg_fusion.worker_threads` controls
   the runtime thread count (`0` chooses from available CPU parallelism), and
   `pg_fusion.max_fusion_tasks` limits concurrent backend execution tasks (`0`
-  defaults to the primary control slot count). Worker physical planning still
-  fixes DataFusion `target_partitions` at `1`. Root physical plans are driven
-  through DataFusion `execute_stream`, so multi-partition roots such as `UNION`
-  are collected by DataFusion rather than by manually executing only partition
-  `0`. PostgreSQL scan producers remain ordinary backend/scan-worker threads:
-  they communicate through shared-memory scan transport and never call
-  PostgreSQL APIs from Tokio tasks.
+  defaults to the primary control slot count). After terminal cleanup, the
+  scheduler can retain an idle per-peer runtime entry until the backend lease
+  detaches; that retained state does not count against `max_fusion_tasks` and
+  exists only to classify duplicate or late terminal control frames as stale;
+  retention is bounded by physical primary slot id and replaced on slot reuse.
+  Scheduler routing checks active, reserved, and retained peers before
+  admission, so late session-scoped controls for retained peers are decoded by
+  the runtime instead of by the pre-session reservation parser.
+  Late Tokio task events are also matched against the active execution session
+  before the scheduler sends result or terminal frames, so stale task output is
+  contained to the obsolete execution instead of failing the primary worker.
+  Worker-side planning and execution failures are reported as
+  `FailExecution` to the owning backend. If the worker-to-backend terminal
+  control ring is full, the scheduler keeps that terminal control on the
+  retained execution and retries it without counting the cleaned execution
+  against `pg_fusion.max_fusion_tasks`; detached peers clear the pending
+  terminal, while corrupt/global transport errors remain worker-fatal.
+  The primary worker transport scratch buffer is sized for the larger of the
+  backend-to-worker and worker-to-backend primary control capacities because it
+  is reused for both inbound decode and outbound terminal encode.
+  Worker physical planning still fixes DataFusion `target_partitions` at `1`.
+  Root physical plans are driven through DataFusion `execute_stream`, so
+  multi-partition roots such as `UNION` are collected by DataFusion rather than
+  by manually executing only partition `0`. PostgreSQL scan producers remain
+  ordinary backend/scan-worker threads: they communicate through shared-memory
+  scan transport and never call PostgreSQL APIs from Tokio tasks.
 - Worker-side DataFusion spill is opt-in through Postmaster GUC
   `pg_fusion.worker_memory_limit_mb`. `0` preserves the default unbounded
   DataFusion runtime; positive values use one finite `FairSpillPool` shared by

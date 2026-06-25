@@ -386,7 +386,7 @@ unsafe fn begin_pg_fusion_scan_impl(
     let (transport_schema, _) = normalize_result_transport_schema(&output_schema)
         .map_err(|err| err.to_string())
         .unwrap_or_else(|err| error!("pg_fusion schema preparation failed: {err}"));
-    let control_lease = BackendSlotLease::acquire(&control_region)
+    let mut control_lease = BackendSlotLease::acquire(&control_region)
         .unwrap_or_else(|err| error!("pg_fusion failed to acquire primary control slot: {err}"));
     host_diag(DiagnosticLogLevel::Basic, || {
         format!(
@@ -394,6 +394,16 @@ unsafe fn begin_pg_fusion_scan_impl(
             control_lease_snapshot(&control_lease),
             host_state_snapshot(state)
         )
+    });
+    let mut primary_scratch = vec![
+        0_u8;
+        config
+            .control_backend_to_worker_capacity
+            .max(config.control_worker_to_backend_capacity)
+    ];
+    reserve_worker_execution_slot(&mut control_lease, &mut primary_scratch).unwrap_or_else(|err| {
+        let _ = cancel_worker_execution_reservation(&mut control_lease, &mut primary_scratch);
+        error!("pg_fusion failed to reserve worker execution slot: {err}");
     });
 
     let plan_tx = IssuedTx::new(PageTx::new(page_pool), issuance_pool);
@@ -413,7 +423,10 @@ unsafe fn begin_pg_fusion_scan_impl(
             scan_worker_launcher: Some(&mut scan_worker_launcher),
         })
     }
-    .unwrap_or_else(|err| error!("pg_fusion begin execution failed: {err}"));
+    .unwrap_or_else(|err| {
+        let _ = cancel_worker_execution_reservation(&mut control_lease, &mut primary_scratch);
+        error!("pg_fusion begin execution failed: {err}");
+    });
     state.execution_key = Some(begin.key);
     host_diag(DiagnosticLogLevel::Basic, || {
         format!(
@@ -425,13 +438,12 @@ unsafe fn begin_pg_fusion_scan_impl(
         )
     });
 
-    let mut control_lease = control_lease;
-    send_backend_execution(&mut control_lease, begin.control(), &mut Vec::new()).unwrap_or_else(
-        |err| {
+    send_backend_execution(&mut control_lease, begin.control(), &mut primary_scratch)
+        .unwrap_or_else(|err| {
+            let _ = cancel_worker_execution_reservation(&mut control_lease, &mut primary_scratch);
             let _ = BackendService::abort_execution_start();
             error!("pg_fusion failed to send StartExecution: {err}");
-        },
-    );
+        });
     publish_plan_to_worker(&mut control_lease).unwrap_or_else(|err| {
         let _ = BackendService::abort_execution_start();
         error!("pg_fusion failed to publish logical plan: {err}");
@@ -464,12 +476,7 @@ unsafe fn begin_pg_fusion_scan_impl(
     state.scan_peers = scan_peers_from_begin(&begin);
     state.scan_channels = begin.scan_channels.to_vec();
     state.pending_complete_session_epoch = None;
-    state.primary_scratch = vec![
-        0_u8;
-        config
-            .control_backend_to_worker_capacity
-            .max(config.control_worker_to_backend_capacity)
-    ];
+    state.primary_scratch = primary_scratch;
     state.scan_scratch = vec![
         0_u8;
         config
@@ -885,6 +892,11 @@ fn handle_primary_control(
         .map(|lease| lease.slot_id())
         .ok_or(BackendServiceError::NoActiveExecution)?;
     match message {
+        WorkerExecutionToBackend::ExecutionSlotReserved => {
+            return Err(BackendServiceError::ProtocolViolation(
+                "received execution reservation grant after execution start".into(),
+            ));
+        }
         WorkerExecutionToBackend::CompleteExecution { session_epoch } => {
             host_diag(DiagnosticLogLevel::Basic, || {
                 format!(
@@ -1459,6 +1471,64 @@ fn send_backend_execution(
     let mut tx = lease.to_worker_tx();
     let _ = tx.send_frame(&scratch[..written])?;
     Ok(())
+}
+
+fn reserve_worker_execution_slot(
+    lease: &mut BackendSlotLease,
+    scratch: &mut Vec<u8>,
+) -> Result<(), BackendServiceError> {
+    reserve_worker_execution_slot_with_wait(lease, scratch, || {
+        wait_latch_checked(Some(Duration::from_millis(1)))
+    })
+}
+
+fn reserve_worker_execution_slot_with_wait(
+    lease: &mut BackendSlotLease,
+    scratch: &mut Vec<u8>,
+    mut wait_for_control_ready: impl FnMut() -> Result<(), BackendServiceError>,
+) -> Result<(), BackendServiceError> {
+    send_backend_execution(
+        lease,
+        BackendExecutionToWorker::ReserveExecutionSlot,
+        scratch,
+    )?;
+    loop {
+        let received = {
+            let mut rx = lease.from_worker_rx();
+            rx.recv_frame_into(scratch)?
+        };
+        if let Some(len) = received {
+            match decode_primary_inbound(&scratch[..len])
+                .map_err(|err| BackendServiceError::ProtocolViolation(err.to_string()))?
+            {
+                PrimaryInbound::Control(WorkerExecutionToBackend::ExecutionSlotReserved) => {
+                    return Ok(());
+                }
+                PrimaryInbound::Control(message) => {
+                    return Err(BackendServiceError::ProtocolViolation(format!(
+                        "received {message:?} while waiting for execution reservation"
+                    )));
+                }
+                PrimaryInbound::Issued(_) => {
+                    return Err(BackendServiceError::ProtocolViolation(
+                        "received result frame while waiting for execution reservation".into(),
+                    ));
+                }
+            }
+        }
+        wait_for_control_ready()?;
+    }
+}
+
+fn cancel_worker_execution_reservation(
+    lease: &mut BackendSlotLease,
+    scratch: &mut Vec<u8>,
+) -> Result<(), BackendServiceError> {
+    send_backend_execution(
+        lease,
+        BackendExecutionToWorker::CancelExecutionReservation,
+        scratch,
+    )
 }
 
 fn decode_primary_inbound(bytes: &[u8]) -> Result<PrimaryInbound, Box<dyn std::error::Error>> {
@@ -2269,6 +2339,102 @@ fn wait_latch(timeout: Option<Duration>) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(feature = "pg_test")]
+    use std::alloc::{alloc_zeroed, dealloc, Layout};
+    #[cfg(feature = "pg_test")]
+    use std::ptr::NonNull;
+    #[cfg(feature = "pg_test")]
+    use std::sync::Once;
+
+    #[cfg(feature = "pg_test")]
+    use control_transport::{TransportRegion, TransportRegionLayout};
+
+    #[cfg(feature = "pg_test")]
+    struct OwnedRegion {
+        base: NonNull<u8>,
+        layout: Layout,
+    }
+
+    #[cfg(feature = "pg_test")]
+    impl OwnedRegion {
+        fn new(size: usize, align: usize) -> Self {
+            let layout = Layout::from_size_align(size, align).expect("layout");
+            let base = unsafe { alloc_zeroed(layout) };
+            let base = NonNull::new(base).expect("allocation");
+            Self { base, layout }
+        }
+    }
+
+    #[cfg(feature = "pg_test")]
+    impl Drop for OwnedRegion {
+        fn drop(&mut self) {
+            unsafe { dealloc(self.base.as_ptr(), self.layout) };
+        }
+    }
+
+    #[cfg(feature = "pg_test")]
+    fn ignore_sigusr1_for_tests() {
+        static ONCE: Once = Once::new();
+        ONCE.call_once(|| unsafe {
+            libc::signal(libc::SIGUSR1, libc::SIG_IGN);
+        });
+    }
+
+    #[cfg(feature = "pg_test")]
+    fn init_control_transport() -> (
+        OwnedRegion,
+        TransportRegion,
+        WorkerTransport,
+        BackendSlotLease,
+    ) {
+        ignore_sigusr1_for_tests();
+        let layout = TransportRegionLayout::new(1, 256, 256).expect("layout");
+        let region_mem = OwnedRegion::new(layout.size, layout.align);
+        let region =
+            unsafe { TransportRegion::init_in_place(region_mem.base, layout.size, layout) }
+                .expect("transport region");
+        let worker = WorkerTransport::attach(&region).expect("attach worker");
+        worker
+            .activate_generation(std::process::id() as i32)
+            .expect("activate generation");
+        let backend = BackendSlotLease::acquire(&region).expect("backend lease");
+        (region_mem, region, worker, backend)
+    }
+
+    #[cfg(feature = "pg_test")]
+    fn send_worker_execution(
+        worker: &WorkerTransport,
+        peer: BackendLeaseSlot,
+        message: WorkerExecutionToBackend,
+    ) {
+        let mut scratch = vec![0_u8; protocol::encoded_len_worker_execution_to_backend(&message)];
+        let written = protocol::encode_worker_execution_to_backend_into(&message, &mut scratch)
+            .expect("encode worker execution");
+        let mut slot = worker
+            .slot_for_backend_lease(peer)
+            .expect("worker slot for backend");
+        let mut tx = slot.to_backend_tx().expect("worker tx");
+        tx.send_frame(&scratch[..written])
+            .expect("send worker frame");
+    }
+
+    #[cfg(feature = "pg_test")]
+    fn recv_backend_execution(
+        worker: &WorkerTransport,
+        peer: BackendLeaseSlot,
+    ) -> protocol::BackendExecutionToWorkerRef<'static> {
+        let mut scratch = vec![0_u8; 256];
+        let mut slot = worker
+            .slot_for_backend_lease(peer)
+            .expect("worker slot for backend");
+        let mut rx = slot.from_backend_rx().expect("worker rx");
+        let len = rx
+            .recv_frame_into(&mut scratch)
+            .expect("receive backend frame")
+            .expect("backend frame");
+        let frame = scratch[..len].to_vec().into_boxed_slice();
+        protocol::decode_backend_execution_to_worker(Box::leak(frame)).expect("decode backend")
+    }
 
     fn candidate(scan_id: u64, block_count: u64, max_workers: u16) -> ScanWorkerBudgetCandidate {
         ScanWorkerBudgetCandidate {
@@ -2284,6 +2450,75 @@ mod tests {
             .get(&scan_id)
             .map(|budget| budget.worker_count)
             .unwrap_or(0)
+    }
+
+    #[cfg(feature = "pg_test")]
+    #[test]
+    fn reserve_worker_execution_slot_uses_ready_grant_without_waiting() {
+        let (_region_mem, _region, worker, mut backend) = init_control_transport();
+        let peer = backend.backend_lease_slot();
+        send_worker_execution(
+            &worker,
+            peer,
+            WorkerExecutionToBackend::ExecutionSlotReserved,
+        );
+        let mut scratch = vec![0_u8; 256];
+        let mut wait_calls = 0;
+
+        reserve_worker_execution_slot_with_wait(&mut backend, &mut scratch, || {
+            wait_calls += 1;
+            Ok(())
+        })
+        .expect("reserve worker slot");
+
+        assert_eq!(
+            recv_backend_execution(&worker, peer),
+            protocol::BackendExecutionToWorkerRef::ReserveExecutionSlot
+        );
+        assert_eq!(wait_calls, 0);
+    }
+
+    #[cfg(feature = "pg_test")]
+    #[test]
+    fn reserve_worker_execution_slot_waits_until_grant_arrives() {
+        let (_region_mem, _region, worker, mut backend) = init_control_transport();
+        let peer = backend.backend_lease_slot();
+        let mut scratch = vec![0_u8; 256];
+        let mut wait_calls = 0;
+
+        reserve_worker_execution_slot_with_wait(&mut backend, &mut scratch, || {
+            wait_calls += 1;
+            assert_eq!(wait_calls, 1);
+            send_worker_execution(
+                &worker,
+                peer,
+                WorkerExecutionToBackend::ExecutionSlotReserved,
+            );
+            Ok(())
+        })
+        .expect("reserve worker slot");
+
+        assert_eq!(
+            recv_backend_execution(&worker, peer),
+            protocol::BackendExecutionToWorkerRef::ReserveExecutionSlot
+        );
+        assert_eq!(wait_calls, 1);
+    }
+
+    #[cfg(feature = "pg_test")]
+    #[test]
+    fn cancel_worker_execution_reservation_sends_cancel_reservation() {
+        let (_region_mem, _region, worker, mut backend) = init_control_transport();
+        let peer = backend.backend_lease_slot();
+        let mut scratch = Vec::new();
+
+        cancel_worker_execution_reservation(&mut backend, &mut scratch)
+            .expect("cancel worker reservation");
+
+        assert_eq!(
+            recv_backend_execution(&worker, peer),
+            protocol::BackendExecutionToWorkerRef::CancelExecutionReservation
+        );
     }
 
     #[test]

@@ -79,11 +79,21 @@ importance: 0.7
   later queries fail with `control worker generation is not active`. The worker
   must probe its active backend peer even when `next_ready_backend_lease` has
   not reported it; backend cleanup can release/finalize the slot without
-  leaving another frame to mark the peer ready.
+  leaving another frame to mark the peer ready. Retained peers must also route
+  through runtime polling before admission parsing, because late
+  session-scoped cancel/fail frames are stale controls, not malformed
+  pre-session reservation traffic.
 - Dynamic standalone scan workers must keep polling their scan control ring
   after `OpenScan`. `CancelScan` is the worker-side signal that releases those
   PostgreSQL backends and their relation locks when another producer fails or
   the result stream is dropped.
+- `pg_fusion.max_fusion_tasks` must throttle at execution admission, not by
+  ignoring ready backend slots. The backend reserves a worker execution slot
+  before launching dynamic standalone scan workers; if the worker leaves
+  `StartExecution` unread behind the task cap, those producers can time out
+  waiting for `OpenScan` and turn throttling into query failure. Once a
+  reservation request is queued, its frame has already been consumed, so newly
+  ready backend slots must not receive grants ahead of that FIFO queue.
 - `plan_builder` validates subquery shapes after DataFusion logical
   optimization. Subqueries that decorrelate into ordinary relational operators
   can lower PostgreSQL leaf scans; subquery nodes that survive optimization

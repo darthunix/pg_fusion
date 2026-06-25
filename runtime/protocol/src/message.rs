@@ -91,6 +91,8 @@ impl Default for ExecutionOptionsWire {
 /// Encode-side backend execution control messages carried on the primary slot.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum BackendExecutionToWorker<'a> {
+    /// Reserve one worker execution slot before backend-side scan workers start.
+    ReserveExecutionSlot,
     /// Start one execution with its plan descriptor and published scan channels.
     StartExecution {
         session_epoch: u64,
@@ -98,6 +100,8 @@ pub enum BackendExecutionToWorker<'a> {
         options: ExecutionOptionsWire,
         scans: ScanChannelSet<'a>,
     },
+    /// Cancel a previously requested or granted execution reservation.
+    CancelExecutionReservation,
     /// Cancel one execution identified by `session_epoch`.
     CancelExecution { session_epoch: u64 },
     /// Fail one execution identified by `session_epoch`.
@@ -110,11 +114,12 @@ pub enum BackendExecutionToWorker<'a> {
 
 impl BackendExecutionToWorker<'_> {
     /// Return the `session_epoch` targeted by this message.
-    pub fn session_epoch(self) -> u64 {
+    pub fn session_epoch(self) -> Option<u64> {
         match self {
             Self::StartExecution { session_epoch, .. }
             | Self::CancelExecution { session_epoch }
-            | Self::FailExecution { session_epoch, .. } => session_epoch,
+            | Self::FailExecution { session_epoch, .. } => Some(session_epoch),
+            Self::ReserveExecutionSlot | Self::CancelExecutionReservation => None,
         }
     }
 }
@@ -122,6 +127,8 @@ impl BackendExecutionToWorker<'_> {
 /// Decode-side borrowed backend execution control messages.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum BackendExecutionToWorkerRef<'a> {
+    /// Borrowed reservation request.
+    ReserveExecutionSlot,
     /// Borrowed `StartExecution` view with validated borrowed scan-channel set.
     StartExecution {
         session_epoch: u64,
@@ -129,6 +136,8 @@ pub enum BackendExecutionToWorkerRef<'a> {
         options: ExecutionOptionsWire,
         scans: ScanChannelSetRef<'a>,
     },
+    /// Borrowed reservation cancellation.
+    CancelExecutionReservation,
     /// Borrowed `CancelExecution` view.
     CancelExecution { session_epoch: u64 },
     /// Borrowed `FailExecution` view.
@@ -141,11 +150,12 @@ pub enum BackendExecutionToWorkerRef<'a> {
 
 impl BackendExecutionToWorkerRef<'_> {
     /// Return the `session_epoch` targeted by this message.
-    pub fn session_epoch(self) -> u64 {
+    pub fn session_epoch(self) -> Option<u64> {
         match self {
             Self::StartExecution { session_epoch, .. }
             | Self::CancelExecution { session_epoch }
-            | Self::FailExecution { session_epoch, .. } => session_epoch,
+            | Self::FailExecution { session_epoch, .. } => Some(session_epoch),
+            Self::ReserveExecutionSlot | Self::CancelExecutionReservation => None,
         }
     }
 }
@@ -153,6 +163,8 @@ impl BackendExecutionToWorkerRef<'_> {
 /// Execution-level worker-to-backend control sent only on the primary slot.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum WorkerExecutionToBackend {
+    /// Grant a previously requested execution slot reservation.
+    ExecutionSlotReserved,
     /// Mark one execution as complete.
     CompleteExecution { session_epoch: u64 },
     /// Mark one execution as failed.
@@ -165,10 +177,11 @@ pub enum WorkerExecutionToBackend {
 
 impl WorkerExecutionToBackend {
     /// Return the `session_epoch` targeted by this message.
-    pub fn session_epoch(&self) -> u64 {
+    pub fn session_epoch(&self) -> Option<u64> {
         match self {
             Self::CompleteExecution { session_epoch }
-            | Self::FailExecution { session_epoch, .. } => *session_epoch,
+            | Self::FailExecution { session_epoch, .. } => Some(*session_epoch),
+            Self::ExecutionSlotReserved => None,
         }
     }
 }
