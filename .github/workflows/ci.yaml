@@ -100,18 +100,22 @@ jobs:
                            $(/usr/lib/postgresql/${{ env.PG_MAJOR }}/bin/pg_config --sharedir)/extension \
                            /var/run/postgresql/
 
-      - name: Run pgrx coverage tests
+      - name: Run pg_test pgrx coverage tests
         working-directory: .
         run: |
-          # Run PostgreSQL-bound crates with coverage inside pgrx/PostgreSQL.
+          # Run PostgreSQL-bound test crate with coverage inside pgrx/PostgreSQL.
           LLVM_COV_ENV=$(mktemp)
           cargo llvm-cov show-env --export-prefix > "$LLVM_COV_ENV"
           source "$LLVM_COV_ENV"
           cargo llvm-cov clean
           cargo pgrx test pg${{ env.PG_MAJOR }} -p pg_test --no-default-features
+          cargo llvm-cov report --lcov --output-path pgrx_lcov.info
+
+      - name: Run pg_fusion pgrx smoke tests
+        working-directory: .
+        run: |
           cargo pgrx test pg${{ env.PG_MAJOR }} -p pg_fusion --features pg_test pg_fusion_simple_select_smoke
           PG_FUSION_SPILL_PG_TEST=1 cargo pgrx test pg${{ env.PG_MAJOR }} -p pg_fusion --features pg_test pg_fusion_spill_metrics_smoke
-          cargo llvm-cov report --lcov --output-path pgrx_lcov.info
 
       - name: Upload pgrx coverage to Codecov
         uses: codecov/codecov-action@v4

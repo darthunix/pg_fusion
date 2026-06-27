@@ -25,9 +25,11 @@ importance: 0.7
 - `slot_scan` should execute trusted compiler-generated scan SQL. SQL safety and
   expression pushdown policy belong in `scan_sql`.
 - PostgreSQL-bound crates should not be included in standalone `cargo test` or
-  library coverage: they reference PostgreSQL backend symbols. Keep their
-  coverage in pgrx tests (`cargo pgrx test pg17 -p pg_test` and
-  `cargo pgrx test pg17 -p pg_fusion --features pg_test`).
+  library coverage: they reference PostgreSQL backend symbols. `pg_test` can
+  run under `cargo llvm-cov` through pgrx, but `pg_fusion` extension smoke
+  tests should run as plain `cargo pgrx test`; coverage flags retain dead
+  PostgreSQL extern references that the pgrx test harness expects the Linux
+  linker to discard.
 - The committed `pg_compat` corpus under `pg/extension/pg_compat` is a
   differential pgrx test, not upstream `pg_regress`: fixtures are local,
   `passed.sql` cases must use `Custom Scan (PgFusionScan)`, and results are
