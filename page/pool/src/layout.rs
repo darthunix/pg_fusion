@@ -75,7 +75,7 @@ pub(crate) fn validate_region(
     expected_size: usize,
 ) -> Result<(), (usize, usize, bool)> {
     let address = base.as_ptr() as usize;
-    if address % expected_align != 0 {
+    if !address.is_multiple_of(expected_align) {
         return Err((expected_align, address, false));
     }
     if len < expected_size {
@@ -94,7 +94,7 @@ fn validate_page_size(page_size: usize) -> Result<(), ConfigError> {
             actual: page_size,
         });
     }
-    if page_size % PAGE_ALIGN != 0 {
+    if !page_size.is_multiple_of(PAGE_ALIGN) {
         return Err(ConfigError::PageSizeNotAligned {
             align: PAGE_ALIGN,
             actual: page_size,

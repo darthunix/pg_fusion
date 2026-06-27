@@ -350,7 +350,7 @@ fn bpchar_chars(value: &str, length: usize) -> Cow<'_, str> {
             Cow::Owned(output)
         }
     } else {
-        output.extend(std::iter::repeat(' ').take(length - copied));
+        output.extend(std::iter::repeat_n(' ', length - copied));
         Cow::Owned(output)
     }
 }

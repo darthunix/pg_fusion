@@ -244,7 +244,7 @@ pub(super) fn validate_region(
     expected: usize,
 ) -> Result<(), (usize, usize, bool)> {
     let actual = base.as_ptr() as usize;
-    if actual % align != 0 {
+    if !actual.is_multiple_of(align) {
         return Err((align, actual, false));
     }
     if len < expected {
