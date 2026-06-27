@@ -308,7 +308,7 @@ impl SearchCtx {
                 max_pairs: self.max_pairs,
             });
         }
-        if self.pairs % TIMEOUT_CHECK_INTERVAL == 0 {
+        if self.pairs.is_multiple_of(TIMEOUT_CHECK_INTERVAL) {
             if let Some(timeout) = self.timeout {
                 if self.started_at.elapsed() >= timeout {
                     return Err(OptimizeError::Timeout { pairs: self.pairs });

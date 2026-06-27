@@ -251,7 +251,7 @@ pub fn decimal128_to_numeric_varlena(
         if magnitude == 0 {
             dscale = 0;
         } else {
-            while dscale > 0 && magnitude % 10 == 0 {
+            while dscale > 0 && magnitude.is_multiple_of(10) {
                 magnitude /= 10;
                 dscale -= 1;
             }

@@ -172,7 +172,7 @@ fn match_regex_arrays(op: PgRegexOp, values: &ArrayRef, patterns: &ArrayRef) -> 
     Ok(Arc::new(builder.finish()))
 }
 
-fn array_text<'a>(array: &'a ArrayRef, row: usize) -> Result<Option<&'a str>> {
+fn array_text(array: &ArrayRef, row: usize) -> Result<Option<&str>> {
     if array.is_null(row) {
         return Ok(None);
     }

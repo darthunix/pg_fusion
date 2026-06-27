@@ -569,7 +569,7 @@ mod tests {
 
     #[test]
     fn runtime_filter_defaults_to_enabled() {
-        assert!(DEFAULT_RUNTIME_FILTER_ENABLE);
+        const { assert!(DEFAULT_RUNTIME_FILTER_ENABLE) };
     }
 
     #[test]

@@ -358,9 +358,7 @@ pub(super) fn compile_cast(
 }
 
 fn text_typmod_cast_udf(pg_type: pg_type::PgTypeRef) -> Option<Arc<ScalarUDF>> {
-    if pg_type::text_typmod_length(pg_type.typmod).is_none() {
-        return None;
-    }
+    pg_type::text_typmod_length(pg_type.typmod)?;
     if pg_type.oid == u32::from(pgrx::pg_sys::VARCHAROID) {
         return Some(df_functions::pg_varchar_typmod_udf());
     }
@@ -637,6 +635,7 @@ pub(super) fn compile_array_subscript(
     ))
 }
 
+#[allow(clippy::too_many_arguments)]
 pub(super) fn compile_scalar_function(
     func: ScalarFunction,
     args: &[QueryExpr],

@@ -956,7 +956,7 @@ fn validate_min_header(base: NonNull<u8>, len: usize) -> Result<(), MetricsError
 }
 
 fn validate_region(base: NonNull<u8>, len: usize, layout: Layout) -> Result<(), MetricsError> {
-    if (base.as_ptr() as usize) % layout.align() != 0 {
+    if !(base.as_ptr() as usize).is_multiple_of(layout.align()) {
         return Err(MetricsError::BadAlignment {
             expected: layout.align(),
             actual: base.as_ptr() as usize,
@@ -980,7 +980,7 @@ fn align_up(value: usize, align: usize) -> Result<usize, MetricsError> {
 }
 
 fn pack_epoch_direction(epoch: u64, direction: PageDirection) -> u64 {
-    epoch.checked_shl(8).unwrap_or(u64::MAX & !0xff) | direction as u64
+    epoch.checked_shl(8).unwrap_or(!0xff) | direction as u64
 }
 
 pub fn monotonic_ns() -> u64 {

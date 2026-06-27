@@ -136,7 +136,7 @@ impl PagePool {
                 actual: len,
             });
         }
-        if (base.as_ptr() as usize) % header_align != 0 {
+        if !(base.as_ptr() as usize).is_multiple_of(header_align) {
             return Err(AttachError::BadAlignment {
                 expected: header_align,
                 actual: base.as_ptr() as usize,

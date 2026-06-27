@@ -90,7 +90,7 @@ fn hex_encode(bytes: &[u8]) -> String {
 }
 
 fn hex_decode(value: &str) -> Result<Vec<u8>, PlanPayloadError> {
-    if value.len() % 2 != 0 {
+    if !value.len().is_multiple_of(2) {
         return Err(PlanPayloadError::Invalid(
             "hex payload has odd length".into(),
         ));

@@ -209,6 +209,7 @@ fn expr_pg_type(expr: &QueryExpr) -> Option<u32> {
 }
 
 #[cfg(test)]
+#[allow(clippy::items_after_test_module)]
 mod tests {
     use super::*;
 

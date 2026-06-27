@@ -396,10 +396,7 @@ pub(super) fn function_call_needs_pg_text_semantics(
         return false;
     }
 
-    match func {
-        ScalarFunction::Length => false,
-        _ => true,
-    }
+    !matches!(func, ScalarFunction::Length)
 }
 
 pub(super) fn pg_text_cast_needs_pg_semantics(pg_type: pg_type::PgTypeRef) -> bool {
