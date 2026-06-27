@@ -43,9 +43,10 @@ cargo pgrx test pg17 -p pg_test
 These tests require the pgrx PostgreSQL 17 environment described in
 [Development](development.md#development-environment).
 
-The `pg_fusion` extension smoke tests are run outside `cargo llvm-cov` in CI.
-Coverage flags retain PostgreSQL extension symbols that the Linux pgrx test
-harness normally lets the linker discard.
+In CI, `pg_fusion` extension smoke coverage runs through SQL against a
+temporary PostgreSQL cluster after `cargo pgrx install`. This avoids building
+the `pg_fusion` Rust test harness on Linux, where PostgreSQL extension symbols
+are not available to the harness linker.
 
 ## Spill Tests
 
