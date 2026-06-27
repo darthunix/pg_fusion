@@ -111,11 +111,102 @@ jobs:
           cargo pgrx test pg${{ env.PG_MAJOR }} -p pg_test --no-default-features
           cargo llvm-cov report --lcov --output-path pgrx_lcov.info
 
-      - name: Run pg_fusion pgrx smoke tests
+      - name: Run pg_fusion SQL smoke tests
         working-directory: .
         run: |
-          cargo pgrx test pg${{ env.PG_MAJOR }} -p pg_fusion --features pg_test pg_fusion_simple_select_smoke
-          PG_FUSION_SPILL_PG_TEST=1 cargo pgrx test pg${{ env.PG_MAJOR }} -p pg_fusion --features pg_test pg_fusion_spill_metrics_smoke
+          PG_BIN="/usr/lib/postgresql/${{ env.PG_MAJOR }}/bin"
+          PGDATA="$(mktemp -d)"
+          PORT=55432
+
+          cleanup() {
+            "$PG_BIN/pg_ctl" -D "$PGDATA" -m fast -w stop || true
+            rm -rf "$PGDATA"
+          }
+          trap cleanup EXIT
+
+          cargo pgrx install \
+            --pg-config "$PG_BIN/pg_config" \
+            -p pg_fusion \
+            --no-default-features \
+            --features "pg${{ env.PG_MAJOR }} pg_test"
+
+          "$PG_BIN/initdb" -D "$PGDATA" -A trust -U postgres --locale=C --encoding=UTF8
+          cat >> "$PGDATA/postgresql.conf" <<EOF
+          shared_preload_libraries = 'pg_fusion'
+          pg_fusion.worker_memory_limit_mb = 128
+          listen_addresses = '127.0.0.1'
+          port = $PORT
+          unix_socket_directories = '/tmp'
+          EOF
+          "$PG_BIN/pg_ctl" -D "$PGDATA" -l "$PGDATA/postgres.log" -w start || {
+            cat "$PGDATA/postgres.log"
+            exit 1
+          }
+
+          "$PG_BIN/psql" \
+            -h 127.0.0.1 \
+            -p "$PORT" \
+            -U postgres \
+            -d postgres \
+            -v ON_ERROR_STOP=1 <<'SQL'
+          CREATE EXTENSION pg_fusion;
+
+          SELECT 1 / CASE
+            WHEN current_setting('shared_preload_libraries') = 'pg_fusion'
+            THEN 1 ELSE 0
+          END AS shared_preload_ok;
+
+          SET pg_fusion.enable = on;
+          SELECT 1 / CASE WHEN (SELECT 1::bigint) = 1 THEN 1 ELSE 0 END AS simple_select_ok;
+
+          BEGIN;
+          SET LOCAL pg_fusion.enable = off;
+          CREATE TEMP TABLE pgf_spill_metrics_smoke AS
+            SELECT g::int AS k, repeat(md5(g::text), 8) AS payload
+            FROM generate_series(1, 200000) AS g;
+          SET LOCAL pg_fusion.enable = on;
+          CREATE TEMP TABLE pgf_spill_epoch AS
+            SELECT pg_fusion_metrics_reset() AS epoch;
+
+          SELECT 1 / CASE
+            WHEN (
+              SELECT max(rn)::bigint
+              FROM (
+                SELECT row_number() OVER (ORDER BY payload) AS rn
+                FROM pgf_spill_metrics_smoke
+              ) AS ordered_src
+            ) = 200000
+            THEN 1 ELSE 0
+          END AS spill_query_ok;
+
+          WITH summary AS (
+            SELECT
+              coalesce(max(value) FILTER (WHERE metric = 'worker_spill_count_total'), 0) AS spill_count,
+              coalesce(max(value) FILTER (WHERE metric = 'worker_spilled_rows_total'), 0) AS spilled_rows,
+              coalesce(max(value) FILTER (WHERE metric = 'worker_spilled_bytes_total'), 0) AS spilled_bytes,
+              coalesce(max(value) FILTER (WHERE metric = 'worker_spill_dirs_created_total'), 0) AS dirs_created,
+              coalesce(max(value) FILTER (WHERE metric = 'worker_spill_dirs_removed_total'), 0) AS dirs_removed,
+              coalesce(max(value) FILTER (WHERE metric = 'worker_spill_leaked_files_total'), 0) AS leaked_files,
+              coalesce(max(value) FILTER (WHERE metric = 'worker_spill_leaked_bytes_total'), 0) AS leaked_bytes,
+              coalesce(max(value) FILTER (WHERE metric = 'worker_spill_cleanup_errors_total'), 0) AS cleanup_errors,
+              coalesce(max(reset_epoch), 0) AS reset_epoch
+            FROM pg_fusion_metrics()
+          )
+          SELECT 1 / CASE
+            WHEN spill_count > 0
+              AND spilled_rows > 0
+              AND spilled_bytes > 0
+              AND dirs_created > 0
+              AND dirs_removed > 0
+              AND leaked_files = 0
+              AND leaked_bytes = 0
+              AND cleanup_errors = 0
+              AND reset_epoch = (SELECT epoch FROM pgf_spill_epoch)
+            THEN 1 ELSE 0
+          END AS spill_metrics_ok
+          FROM summary;
+          ROLLBACK;
+          SQL
 
       - name: Upload pgrx coverage to Codecov
         uses: codecov/codecov-action@v4

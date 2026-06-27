@@ -27,9 +27,10 @@ importance: 0.7
 - PostgreSQL-bound crates should not be included in standalone `cargo test` or
   library coverage: they reference PostgreSQL backend symbols. `pg_test` can
   run under `cargo llvm-cov` through pgrx, but `pg_fusion` extension smoke
-  tests should run as plain `cargo pgrx test`; coverage flags retain dead
-  PostgreSQL extern references that the pgrx test harness expects the Linux
-  linker to discard.
+  coverage should not use `cargo pgrx test -p pg_fusion` on Linux; its Rust
+  test harness can retain PostgreSQL extern references. CI should install the
+  extension into a temporary PostgreSQL cluster and run SQL smoke assertions
+  instead.
 - The committed `pg_compat` corpus under `pg/extension/pg_compat` is a
   differential pgrx test, not upstream `pg_regress`: fixtures are local,
   `passed.sql` cases must use `Custom Scan (PgFusionScan)`, and results are
