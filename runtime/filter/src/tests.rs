@@ -561,7 +561,7 @@ fn initializing_pool_slot_is_invisible_to_probe_lookup() {
     pool.lookup_probes(exec_id, 22, &mut probes);
 
     assert!(probes.is_empty());
-    assert_eq!(pool.refs_for_test(0), 1);
+    assert_eq!(pool.refs_for_test(0), 0);
 }
 
 #[test]

@@ -25,7 +25,9 @@ The crate is split into three layers:
 - `RuntimeFilterPool` adds fixed-slot shared-memory ownership metadata and
   probe reference counts. It maps `(RuntimeFilterExecId, scan_id,
   output_column, key_type)` to a lifecycle slot and delays storage reuse until
-  the owner and all probe handles are gone.
+  the owner and all probe handles are gone. Slot state, refcount, and
+  publication epoch are one packed atomic word, so a probe can only acquire a
+  ref for the exact slot publication it observed.
 
 This keeps the filter payload reusable while avoiding false negatives from
 clearing storage under old probes or letting stale builders overwrite newer
@@ -128,6 +130,8 @@ sites.
 
 - Never apply a filter while it is `Building`; that can create false negatives.
 - Never clear/reuse Bloom storage until every old probe reference is gone.
+- Never acquire a pool probe ref with separate state/refcount atomics; the
+  packed publication word is the incarnation guard.
 - Stale builders must not publish or disable newer generations.
 - Missing, disabled, stale, or exhausted filters must pass rows unfiltered.
 - Null probe values are `DefinitelyAbsent` only for a matching `Ready`

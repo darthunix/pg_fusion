@@ -33,9 +33,12 @@ page-backed Arrow batches.
   reference counts so ready storage is reused only after the owner and all
   probes have exited, preserving the no-false-negative property. Pool slots are
   claimed in an unprobeable initializing state and published only after refs
-  and target metadata are initialized. Filter execution namespaces are derived
-  from `control_transport::BackendLeaseSlot` plus the backend session epoch so
-  worker and backend scan producers use the same primary lease identity.
+  and target metadata are initialized. Pool slot state, refcount, and
+  publication epoch are packed into one atomic word so delayed probe lookups
+  cannot acquire references against a reused slot incarnation. Filter execution
+  namespaces are derived from `control_transport::BackendLeaseSlot` plus the
+  backend session epoch so worker and backend scan producers use the same
+  primary lease identity.
 - `page/pool`, `page/transfer`, `page/issuance`: fixed-page ownership,
   transfer, and issued-frame flow.
 - `runtime/metrics`: shared-memory runtime counters and page-slot handoff
