@@ -11,6 +11,10 @@ const POOL_FREE: u64 = 0;
 const POOL_INITIALIZING: u64 = 1;
 const POOL_ALLOCATED: u64 = 2;
 const POOL_RETIRING: u64 = 3;
+const POOL_REF_BITS: u32 = 16;
+const POOL_REF_SHIFT: u32 = 2;
+const POOL_EPOCH_SHIFT: u32 = POOL_REF_SHIFT + POOL_REF_BITS;
+const POOL_REF_MASK: u64 = (1u64 << POOL_REF_BITS) - 1;
 
 fn pack(generation: u64, state: u64) -> u64 {
     (generation << 2) | state
@@ -22,6 +26,22 @@ fn generation(word: u64) -> u64 {
 
 fn state(word: u64) -> u64 {
     word & 3
+}
+
+fn pack_pool(state: u64, refs: u64, epoch: u64) -> u64 {
+    state | (refs << POOL_REF_SHIFT) | (epoch << POOL_EPOCH_SHIFT)
+}
+
+fn pool_state(word: u64) -> u64 {
+    word & 3
+}
+
+fn pool_refs(word: u64) -> u64 {
+    (word >> POOL_REF_SHIFT) & POOL_REF_MASK
+}
+
+fn pool_epoch(word: u64) -> u64 {
+    word >> POOL_EPOCH_SHIFT
 }
 
 struct ModelSlot {
@@ -99,72 +119,146 @@ impl ModelSlot {
 }
 
 struct ModelPoolSlot {
-    state: AtomicU64,
-    refs: AtomicU64,
+    meta: AtomicU64,
     exec_id: AtomicU64,
 }
 
 impl ModelPoolSlot {
     fn new() -> Self {
         Self {
-            state: AtomicU64::new(POOL_FREE),
-            refs: AtomicU64::new(0),
+            meta: AtomicU64::new(pack_pool(POOL_FREE, 0, 0)),
             exec_id: AtomicU64::new(0),
         }
     }
 
+    fn allocate(&self, exec_id: u64) -> bool {
+        let mut current = self.meta.load(Ordering::Acquire);
+        loop {
+            if pool_state(current) != POOL_FREE || pool_refs(current) != 0 {
+                return false;
+            }
+            let epoch = pool_epoch(current) + 1;
+            match self.meta.compare_exchange(
+                current,
+                pack_pool(POOL_INITIALIZING, 0, epoch),
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            ) {
+                Ok(_) => {
+                    thread::yield_now();
+                    self.exec_id.store(exec_id, Ordering::Release);
+                    self.meta
+                        .store(pack_pool(POOL_ALLOCATED, 1, epoch), Ordering::Release);
+                    return true;
+                }
+                Err(actual) => current = actual,
+            }
+        }
+    }
+
     fn allocate_publish_and_release(&self) {
-        if self
-            .state
+        if self.allocate(1) {
+            thread::yield_now();
+            self.release_owner();
+        }
+    }
+
+    fn acquire_probe_ref_from(&self, observed: u64) -> bool {
+        if pool_state(observed) != POOL_ALLOCATED {
+            return false;
+        }
+        let refs = pool_refs(observed);
+        if refs == POOL_REF_MASK {
+            return false;
+        }
+        self.meta
             .compare_exchange(
-                POOL_FREE,
-                POOL_INITIALIZING,
+                observed,
+                pack_pool(POOL_ALLOCATED, refs + 1, pool_epoch(observed)),
                 Ordering::AcqRel,
                 Ordering::Acquire,
             )
-            .is_err()
-        {
-            return;
-        }
-
-        thread::yield_now();
-        self.refs.store(1, Ordering::Release);
-        self.exec_id.store(1, Ordering::Release);
-        self.state.store(POOL_ALLOCATED, Ordering::Release);
-        thread::yield_now();
-        self.release_owner();
+            .is_ok()
     }
 
     fn lookup_nonmatching_probe(&self) {
-        if self.state.load(Ordering::Acquire) != POOL_ALLOCATED {
+        let observed = self.meta.load(Ordering::Acquire);
+        if self.acquire_probe_ref_from(observed) && self.exec_id.load(Ordering::Acquire) != 2 {
+            self.release_ref();
+        }
+    }
+
+    fn lookup_nonmatching_probe_after_observation_delay(&self) {
+        let observed = self.meta.load(Ordering::Acquire);
+        if pool_state(observed) != POOL_ALLOCATED {
             return;
         }
-
-        self.refs.fetch_add(1, Ordering::AcqRel);
-        let matches = self.state.load(Ordering::Acquire) == POOL_ALLOCATED
-            && self.exec_id.load(Ordering::Acquire) == 2;
-        if !matches {
+        thread::yield_now();
+        if self.acquire_probe_ref_from(observed) && self.exec_id.load(Ordering::Acquire) != 2 {
             self.release_ref();
         }
     }
 
     fn release_owner(&self) {
-        let _ = self.state.compare_exchange(
-            POOL_ALLOCATED,
-            POOL_RETIRING,
-            Ordering::AcqRel,
-            Ordering::Acquire,
-        );
-        self.release_ref();
+        let mut current = self.meta.load(Ordering::Acquire);
+        loop {
+            if pool_state(current) != POOL_ALLOCATED {
+                return;
+            }
+            let refs = pool_refs(current);
+            assert!(refs > 0, "owner ref is missing");
+            let epoch = pool_epoch(current);
+            let next_refs = refs - 1;
+            match self.meta.compare_exchange(
+                current,
+                pack_pool(POOL_RETIRING, next_refs, epoch),
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            ) {
+                Ok(_) => {
+                    if next_refs == 0 {
+                        self.finish_retire(epoch);
+                    }
+                    return;
+                }
+                Err(actual) => current = actual,
+            }
+        }
     }
 
     fn release_ref(&self) {
-        let old_refs = self.refs.fetch_sub(1, Ordering::AcqRel);
-        assert!(old_refs > 0, "pool reference count underflowed");
-        if old_refs == 1 && self.state.load(Ordering::Acquire) == POOL_RETIRING {
-            self.exec_id.store(0, Ordering::Release);
-            self.state.store(POOL_FREE, Ordering::Release);
+        let mut current = self.meta.load(Ordering::Acquire);
+        loop {
+            let state = pool_state(current);
+            assert!(
+                state == POOL_ALLOCATED || state == POOL_RETIRING,
+                "ref released from inactive slot",
+            );
+            let refs = pool_refs(current);
+            assert!(refs > 0, "pool reference count underflowed");
+            let epoch = pool_epoch(current);
+            let next_refs = refs - 1;
+            match self.meta.compare_exchange(
+                current,
+                pack_pool(state, next_refs, epoch),
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            ) {
+                Ok(_) => {
+                    if state == POOL_RETIRING && next_refs == 0 {
+                        self.finish_retire(epoch);
+                    }
+                    return;
+                }
+                Err(actual) => current = actual,
+            }
         }
+    }
+
+    fn finish_retire(&self, epoch: u64) {
+        self.exec_id.store(0, Ordering::Release);
+        self.meta
+            .store(pack_pool(POOL_FREE, 0, epoch), Ordering::Release);
     }
 }
 
@@ -290,7 +384,42 @@ fn pool_initializing_state_blocks_probe_refcount_race() {
         allocator.join().expect("allocator should join");
         probe.join().expect("probe should join");
 
-        assert_eq!(slot.state.load(Ordering::Acquire), POOL_FREE);
-        assert_eq!(slot.refs.load(Ordering::Acquire), 0);
+        let final_meta = slot.meta.load(Ordering::Acquire);
+        assert_eq!(pool_state(final_meta), POOL_FREE);
+        assert_eq!(pool_refs(final_meta), 0);
+    });
+}
+
+#[test]
+fn stale_observed_probe_cannot_mutate_reused_pool_slot() {
+    loom::model(|| {
+        let slot = Arc::new(ModelPoolSlot::new());
+        assert!(slot.allocate(1));
+
+        let stale_probe = {
+            let slot = slot.clone();
+            thread::spawn(move || {
+                slot.lookup_nonmatching_probe_after_observation_delay();
+            })
+        };
+
+        let recycler = {
+            let slot = slot.clone();
+            thread::spawn(move || {
+                thread::yield_now();
+                slot.release_owner();
+                let _ = slot.allocate(2);
+            })
+        };
+
+        stale_probe.join().expect("stale probe should join");
+        recycler.join().expect("recycler should join");
+
+        let final_meta = slot.meta.load(Ordering::Acquire);
+        match pool_state(final_meta) {
+            POOL_FREE => assert_eq!(pool_refs(final_meta), 0),
+            POOL_ALLOCATED => assert_eq!(pool_refs(final_meta), 1),
+            other => panic!("unexpected final pool state {other}"),
+        }
     });
 }

@@ -13,12 +13,22 @@ use crate::{
 
 const POOL_MAGIC: u64 = 0x5047_4655_5246_5031;
 /// Shared-memory pool format version.
-pub const RUNTIME_FILTER_POOL_VERSION: u32 = 2;
+pub const RUNTIME_FILTER_POOL_VERSION: u32 = 3;
 
-const SLOT_FREE: u32 = 0;
-const SLOT_INITIALIZING: u32 = 1;
-const SLOT_ALLOCATED: u32 = 2;
-const SLOT_RETIRING: u32 = 3;
+const SLOT_FREE: u64 = 0;
+const SLOT_INITIALIZING: u64 = 1;
+const SLOT_ALLOCATED: u64 = 2;
+const SLOT_RETIRING: u64 = 3;
+
+const SLOT_STATE_BITS: u32 = 2;
+const SLOT_REF_BITS: u32 = 16;
+const SLOT_REF_SHIFT: u32 = SLOT_STATE_BITS;
+const SLOT_EPOCH_SHIFT: u32 = SLOT_STATE_BITS + SLOT_REF_BITS;
+const SLOT_STATE_MASK: u64 = (1u64 << SLOT_STATE_BITS) - 1;
+const SLOT_REF_MASK: u64 = (1u64 << SLOT_REF_BITS) - 1;
+const SLOT_EPOCH_MASK: u64 = (1u64 << (64 - SLOT_EPOCH_SHIFT)) - 1;
+const SLOT_MAX_REFS: u32 = SLOT_REF_MASK as u32;
+const SLOT_MAX_EPOCH: u64 = SLOT_EPOCH_MASK;
 
 /// Runtime-filter key types currently supported by pg_fusion scan probes.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -249,8 +259,7 @@ struct PoolHeader {
 
 #[repr(C)]
 struct PoolSlot {
-    state: AtomicU32,
-    refs: AtomicU32,
+    meta: AtomicU64,
     generation: AtomicU64,
     exec_slot_id: AtomicU32,
     exec_generation: AtomicU64,
@@ -265,8 +274,7 @@ struct PoolSlot {
 impl PoolSlot {
     fn new() -> Self {
         Self {
-            state: AtomicU32::new(SLOT_FREE),
-            refs: AtomicU32::new(0),
+            meta: AtomicU64::new(pack_pool_word(SLOT_FREE, 0, 0)),
             generation: AtomicU64::new(0),
             exec_slot_id: AtomicU32::new(0),
             exec_generation: AtomicU64::new(0),
@@ -276,6 +284,67 @@ impl PoolSlot {
             output_column: AtomicU32::new(0),
             key_type: AtomicU32::new(0),
             header: RuntimeFilterHeader::free(),
+        }
+    }
+}
+
+fn pack_pool_word(state: u64, refs: u32, publication_epoch: u64) -> u64 {
+    debug_assert!(state <= SLOT_STATE_MASK);
+    debug_assert!((refs as u64) <= SLOT_REF_MASK);
+    debug_assert!(publication_epoch <= SLOT_EPOCH_MASK);
+    state | ((refs as u64) << SLOT_REF_SHIFT) | (publication_epoch << SLOT_EPOCH_SHIFT)
+}
+
+fn pool_word_state(word: u64) -> u64 {
+    word & SLOT_STATE_MASK
+}
+
+fn pool_word_refs(word: u64) -> u32 {
+    ((word >> SLOT_REF_SHIFT) & SLOT_REF_MASK) as u32
+}
+
+fn pool_word_epoch(word: u64) -> u64 {
+    (word >> SLOT_EPOCH_SHIFT) & SLOT_EPOCH_MASK
+}
+
+fn claim_initializing_slot(slot: &PoolSlot) -> Option<u64> {
+    let mut current = slot.meta.load(Ordering::Acquire);
+    loop {
+        if pool_word_state(current) != SLOT_FREE || pool_word_refs(current) != 0 {
+            return None;
+        }
+        let publication_epoch = pool_word_epoch(current).checked_add(1)?;
+        if publication_epoch > SLOT_MAX_EPOCH {
+            return None;
+        }
+        let next = pack_pool_word(SLOT_INITIALIZING, 0, publication_epoch);
+        match slot
+            .meta
+            .compare_exchange(current, next, Ordering::AcqRel, Ordering::Acquire)
+        {
+            Ok(_) => return Some(publication_epoch),
+            Err(actual) => current = actual,
+        }
+    }
+}
+
+fn acquire_probe_ref(slot: &PoolSlot) -> bool {
+    let mut current = slot.meta.load(Ordering::Acquire);
+    loop {
+        if pool_word_state(current) != SLOT_ALLOCATED {
+            return false;
+        }
+        let refs = pool_word_refs(current);
+        if refs == SLOT_MAX_REFS {
+            return false;
+        }
+        let next = pack_pool_word(SLOT_ALLOCATED, refs + 1, pool_word_epoch(current));
+        match slot
+            .meta
+            .compare_exchange(current, next, Ordering::AcqRel, Ordering::Acquire)
+        {
+            Ok(_) => return true,
+            Err(actual) => current = actual,
         }
     }
 }
@@ -476,20 +545,10 @@ impl RuntimeFilterPool {
 
         for slot_index in 0..self.config.slot_count {
             let slot = unsafe { self.slot(slot_index) };
-            if slot
-                .state
-                .compare_exchange(
-                    SLOT_FREE,
-                    SLOT_INITIALIZING,
-                    Ordering::AcqRel,
-                    Ordering::Acquire,
-                )
-                .is_err()
-            {
+            let Some(publication_epoch) = claim_initializing_slot(slot) else {
                 continue;
-            }
+            };
 
-            slot.refs.store(1, Ordering::Release);
             store_exec_id(slot, target.exec_id);
             slot.scan_id.store(target.scan_id, Ordering::Release);
             slot.output_column
@@ -503,7 +562,10 @@ impl RuntimeFilterPool {
                 Ok(builder) => {
                     let generation = builder.detach();
                     slot.generation.store(generation, Ordering::Release);
-                    slot.state.store(SLOT_ALLOCATED, Ordering::Release);
+                    slot.meta.store(
+                        pack_pool_word(SLOT_ALLOCATED, 1, publication_epoch),
+                        Ordering::Release,
+                    );
                     return Ok(Some(RuntimeFilterBuildHandle {
                         pool: self,
                         slot_index,
@@ -512,9 +574,11 @@ impl RuntimeFilterPool {
                     }));
                 }
                 Err(err) => {
-                    slot.refs.store(0, Ordering::Release);
                     clear_slot_metadata(slot);
-                    slot.state.store(SLOT_FREE, Ordering::Release);
+                    slot.meta.store(
+                        pack_pool_word(SLOT_FREE, 0, publication_epoch),
+                        Ordering::Release,
+                    );
                     return Err(err);
                 }
             }
@@ -539,15 +603,12 @@ impl RuntimeFilterPool {
 
         for slot_index in 0..self.config.slot_count {
             let slot = unsafe { self.slot(slot_index) };
-            if slot.state.load(Ordering::Acquire) != SLOT_ALLOCATED {
+            if !acquire_probe_ref(slot) {
                 continue;
             }
-            slot.refs.fetch_add(1, Ordering::AcqRel);
 
-            let state = slot.state.load(Ordering::Acquire);
-            let matches = state == SLOT_ALLOCATED
-                && load_exec_id(slot) == exec_id
-                && slot.scan_id.load(Ordering::Acquire) == scan_id;
+            let matches =
+                load_exec_id(slot) == exec_id && slot.scan_id.load(Ordering::Acquire) == scan_id;
             if !matches {
                 self.release_ref(slot_index);
                 continue;
@@ -608,52 +669,120 @@ impl RuntimeFilterPool {
 
     fn release_owner(self, slot_index: u32) {
         let slot = unsafe { self.slot(slot_index) };
-        let _ = slot.state.compare_exchange(
-            SLOT_ALLOCATED,
-            SLOT_RETIRING,
-            Ordering::AcqRel,
-            Ordering::Acquire,
-        );
-        self.release_ref(slot_index);
+        let mut current = slot.meta.load(Ordering::Acquire);
+        loop {
+            if pool_word_state(current) != SLOT_ALLOCATED {
+                return;
+            }
+            let refs = pool_word_refs(current);
+            if refs == 0 {
+                debug_assert!(refs > 0, "allocated runtime filter slot has no owner ref");
+                return;
+            }
+
+            let next_refs = refs - 1;
+            let publication_epoch = pool_word_epoch(current);
+            let next = pack_pool_word(SLOT_RETIRING, next_refs, publication_epoch);
+            match slot
+                .meta
+                .compare_exchange(current, next, Ordering::AcqRel, Ordering::Acquire)
+            {
+                Ok(_) => {
+                    if next_refs == 0 {
+                        self.finish_retire(slot_index, publication_epoch);
+                    }
+                    return;
+                }
+                Err(actual) => current = actual,
+            }
+        }
     }
 
     fn release_ref(self, slot_index: u32) {
         let slot = unsafe { self.slot(slot_index) };
-        let old_refs = slot.refs.fetch_sub(1, Ordering::AcqRel);
-        debug_assert!(old_refs > 0);
-        if old_refs == 1 && slot.state.load(Ordering::Acquire) == SLOT_RETIRING {
-            let generation = slot.generation.load(Ordering::Acquire);
-            if let Ok(runtime_slot) = unsafe { self.runtime_slot(slot_index) } {
-                match runtime_slot.snapshot().state {
-                    RuntimeFilterState::Ready => {
-                        // SAFETY: this is the last pool reference after the
-                        // owner entered RETIRING, so no old probe can still be
-                        // inside a bit read and no new probe can attach.
-                        let _ = unsafe { runtime_slot.retire_ready_after_quiescence(generation) };
-                    }
-                    RuntimeFilterState::Building => {
-                        let _ = runtime_slot.disable_build(generation);
-                    }
-                    RuntimeFilterState::Free | RuntimeFilterState::Disabled => {}
-                }
+        let mut current = slot.meta.load(Ordering::Acquire);
+        loop {
+            let state = pool_word_state(current);
+            if state != SLOT_ALLOCATED && state != SLOT_RETIRING {
+                debug_assert!(
+                    state == SLOT_ALLOCATED || state == SLOT_RETIRING,
+                    "runtime filter ref released from inactive slot",
+                );
+                return;
             }
-            clear_slot_metadata(slot);
-            slot.state.store(SLOT_FREE, Ordering::Release);
+            let refs = pool_word_refs(current);
+            if refs == 0 {
+                debug_assert!(refs > 0, "runtime filter reference count underflowed");
+                return;
+            }
+            debug_assert!(
+                state != SLOT_ALLOCATED || refs > 1,
+                "allocated runtime filter slot lost owner ref",
+            );
+
+            let next_refs = refs - 1;
+            let publication_epoch = pool_word_epoch(current);
+            let next = pack_pool_word(state, next_refs, publication_epoch);
+            match slot
+                .meta
+                .compare_exchange(current, next, Ordering::AcqRel, Ordering::Acquire)
+            {
+                Ok(_) => {
+                    if state == SLOT_RETIRING && next_refs == 0 {
+                        self.finish_retire(slot_index, publication_epoch);
+                    }
+                    return;
+                }
+                Err(actual) => current = actual,
+            }
         }
+    }
+
+    fn finish_retire(self, slot_index: u32, publication_epoch: u64) {
+        let slot = unsafe { self.slot(slot_index) };
+        debug_assert_eq!(
+            slot.meta.load(Ordering::Acquire),
+            pack_pool_word(SLOT_RETIRING, 0, publication_epoch),
+        );
+        let generation = slot.generation.load(Ordering::Acquire);
+        if let Ok(runtime_slot) = unsafe { self.runtime_slot(slot_index) } {
+            match runtime_slot.snapshot().state {
+                RuntimeFilterState::Ready => {
+                    // SAFETY: this is the last pool reference after the owner
+                    // entered RETIRING, so no old probe can still be inside a
+                    // bit read and no new probe can attach.
+                    let _ = unsafe { runtime_slot.retire_ready_after_quiescence(generation) };
+                }
+                RuntimeFilterState::Building => {
+                    let _ = runtime_slot.disable_build(generation);
+                }
+                RuntimeFilterState::Free | RuntimeFilterState::Disabled => {}
+            }
+        }
+        clear_slot_metadata(slot);
+        slot.meta.store(
+            pack_pool_word(SLOT_FREE, 0, publication_epoch),
+            Ordering::Release,
+        );
     }
 
     #[cfg(test)]
     pub(crate) fn initialize_slot_for_test(self, slot_index: u32, target: RuntimeFilterTarget) {
         let slot = unsafe { self.slot(slot_index) };
-        slot.state
+        let current = slot.meta.load(Ordering::Acquire);
+        assert_eq!(pool_word_state(current), SLOT_FREE);
+        assert_eq!(pool_word_refs(current), 0);
+        let publication_epoch = pool_word_epoch(current)
+            .checked_add(1)
+            .expect("test publication epoch should not overflow");
+        slot.meta
             .compare_exchange(
-                SLOT_FREE,
-                SLOT_INITIALIZING,
+                current,
+                pack_pool_word(SLOT_INITIALIZING, 0, publication_epoch),
                 Ordering::AcqRel,
                 Ordering::Acquire,
             )
             .expect("test slot should be free");
-        slot.refs.store(1, Ordering::Release);
         store_exec_id(slot, target.exec_id);
         slot.scan_id.store(target.scan_id, Ordering::Release);
         slot.output_column
@@ -665,7 +794,7 @@ impl RuntimeFilterPool {
     #[cfg(test)]
     pub(crate) fn refs_for_test(self, slot_index: u32) -> u32 {
         let slot = unsafe { self.slot(slot_index) };
-        slot.refs.load(Ordering::Acquire)
+        pool_word_refs(slot.meta.load(Ordering::Acquire))
     }
 
     unsafe fn slot(self, slot_index: u32) -> &'static PoolSlot {
